@@ -2876,6 +2876,17 @@ if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
     runLmMultisession(ggufPath: ggufPath, promptsStr: prompts, maxNewPerSession: maxN)
 }
 if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
+   let stPath = ProcessInfo.processInfo.environment["VISION_ST"],
+   let imagePath = ProcessInfo.processInfo.environment["LM_MULTIMODAL"] {
+    let prefix = ProcessInfo.processInfo.environment["LM_MULTIMODAL_PREFIX"]
+        ?? "<|turn>user\n"
+    let suffix = ProcessInfo.processInfo.environment["LM_MULTIMODAL_SUFFIX"]
+        ?? "\nDescribe this image in one short sentence.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+    let maxN = Int(ProcessInfo.processInfo.environment["LM_MULTIMODAL_MAX"] ?? "48") ?? 48
+    runLmMultimodal(ggufPath: ggufPath, stPath: stPath, imagePath: imagePath,
+                     prefix: prefix, suffix: suffix, maxNew: maxN)
+}
+if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
    let refDir = ProcessInfo.processInfo.environment["LM_KL_REF"],
    !isDumpRun {
     let tag = ProcessInfo.processInfo.environment["LM_KL_TAG"] ?? "hello"

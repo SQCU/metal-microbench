@@ -61,15 +61,18 @@ enum PrimingChunk {
     case tokens([UInt32])
 
     // Pre-embedded image soft tokens produced by the vision tower. Layout
-    // is [count, HIDDEN] and the storage dtype is either fp16 or fp32.
-    // Prefill copies these into pre_hidden and skips embed_lookup +
-    // embed-scale (the vision projection already did both).
-    case softTokens(buffer: MTLBuffer, count: Int, isFp32: Bool)
+    // is [count, HIDDEN] (row-major) and the storage dtype is either fp16
+    // or fp32. Prefill copies these into pre_hidden and skips embed_lookup
+    // + embed-scale (the vision projection already did both).
+    // `byteOffset` lets a chunk point at a sub-range of the same buffer,
+    // which is how multi-tile soft-token prefills walk through a big
+    // image one MAX_Q_LEN-sized chunk per tick.
+    case softTokens(buffer: MTLBuffer, count: Int, isFp32: Bool, byteOffset: Int)
 
     var count: Int {
         switch self {
         case .tokens(let ts): return ts.count
-        case .softTokens(_, let c, _): return c
+        case .softTokens(_, let c, _, _): return c
         }
     }
 }
@@ -126,7 +129,8 @@ final class Session {
     // a caller who's already downcast to fp16.
     func submit(softTokens: MTLBuffer, count: Int, isFp32: Bool) {
         guard count > 0 else { return }
-        chunkQueue.append(.softTokens(buffer: softTokens, count: count, isFp32: isFp32))
+        chunkQueue.append(.softTokens(buffer: softTokens, count: count,
+                                       isFp32: isFp32, byteOffset: 0))
         if state == .idle || state == .generating { state = .priming }
     }
 
@@ -399,21 +403,22 @@ final class LmEngine {
             for i in 0..<thisTile {
                 tokP[s.slot * thisTile + i] = ts[i]
             }
-        case let .softTokens(buf, _, isFp32):
-            // Vision tower output. Copy softTokens[0..thisTile*HIDDEN]
-            // into pre_hidden at rows [s.slot*thisTile, s.slot*thisTile+thisTile),
-            // converting fp32→fp16 if needed. Other slots' rows are left as
-            // whatever was there; they'll compute junk that gets discarded.
+        case let .softTokens(buf, _, isFp32, byteOffset):
+            // Vision tower output. Copy the thisTile-row window starting
+            // at `byteOffset` into pre_hidden at rows [s.slot*thisTile,
+            // s.slot*thisTile+thisTile), downcasting fp32→fp16 if needed.
+            // Other slots' rows are untouched (they'll compute junk that
+            // gets discarded via block_table redirect to scratch).
             let dstPtr = pre_hidden.contents().assumingMemoryBound(to: Float16.self)
             let dstBase = (s.slot * thisTile) * HIDDEN
+            let srcRaw = buf.contents().advanced(by: byteOffset)
             if isFp32 {
-                let srcPtr = buf.contents().assumingMemoryBound(to: Float.self)
+                let srcPtr = srcRaw.assumingMemoryBound(to: Float.self)
                 for i in 0..<(thisTile * HIDDEN) {
                     dstPtr[dstBase + i] = Float16(srcPtr[i])
                 }
             } else {
-                let srcPtr = buf.contents().assumingMemoryBound(to: Float16.self)
-                memcpy(dstPtr.advanced(by: dstBase), srcPtr, thisTile * HIDDEN * 2)
+                memcpy(dstPtr.advanced(by: dstBase), srcRaw, thisTile * HIDDEN * 2)
             }
             skipEmbed = true
         }
@@ -442,17 +447,16 @@ final class LmEngine {
             ts.removeFirst(thisTile)
             if ts.isEmpty { s.chunkQueue.removeFirst() }
             else          { s.chunkQueue[0] = .tokens(ts) }
-        case let .softTokens(_, count, _):
+        case let .softTokens(buf, _, isFp32, byteOffset):
             if remaining == 0 {
                 s.chunkQueue.removeFirst()
             } else {
-                // Not yet supported: image chunks larger than MAX_Q_LEN
-                // would need sub-offset bookkeeping. Vision tower output
-                // for 224×224 Gemma-4 images is 256 soft tokens — well
-                // beyond the single-tile budget — so this is flagged for
-                // the next iteration along with multi-tile prefill.
-                print("  WARN: soft-tokens chunk (\(count)) > MAX_Q_LEN=\(MAX_Q_LEN); partial prefill dropping the tail")
-                s.chunkQueue.removeFirst()
+                // Leave the chunk in the queue with its offset advanced
+                // by thisTile rows; next tick picks up where we left off.
+                let bpe = isFp32 ? 4 : 2
+                let newOffset = byteOffset + thisTile * HIDDEN * bpe
+                s.chunkQueue[0] = .softTokens(buffer: buf, count: remaining,
+                                               isFp32: isFp32, byteOffset: newOffset)
             }
         }
 
@@ -629,3 +633,87 @@ func runLmMultisession(ggufPath: String, promptsStr: String, maxNewPerSession: I
         engine.closeSession(s)
     }
 }
+
+// ----------------------------------------------------------------------
+// Multimodal demo driver — feeds vision-tower output through a session.
+// Env vars:
+//   GGUF_PATH=<gguf>                 # LM weights
+//   VISION_ST=<safetensors path>     # vision tower weights
+//   LM_MULTIMODAL=<image png path>   # image to embed and prompt with
+//   [LM_MULTIMODAL_PREFIX="…"]       # text before image tokens
+//   [LM_MULTIMODAL_SUFFIX="…"]       # text after image tokens
+//   [LM_MULTIMODAL_MAX=48]           # generation budget
+//   [LM_ADD_BOS=1]
+//
+// Runs: vision_tower(image) → soft_tokens, opens a session, submits
+// prefix-text + soft_tokens + suffix-text into the session queue, then
+// pumps the scheduler. Each chunk dispatches as either a text-token
+// fast prefill or a soft-token fast prefill (skip embed). Stream
+// output per session.
+// ----------------------------------------------------------------------
+func runLmMultimodal(ggufPath: String, stPath: String, imagePath: String,
+                      prefix: String, suffix: String, maxNew: Int) {
+    print("\n=== LM multimodal engine demo ===")
+    let w: LmWeights
+    do { w = try loadLmWeights(ggufPath: ggufPath) }
+    catch { print("  loadLmWeights failed: \(error)"); return }
+
+    let visWeights: VisionWeights
+    do {
+        let st = try SafetensorsFile(stPath)
+        visWeights = try loadVisionWeights(st, device: device)
+    } catch {
+        print("  loadVisionWeights failed: \(error)"); return
+    }
+
+    let batch: PatchBatch
+    do { batch = try gemma4ImagePreprocess(path: imagePath, device: device) }
+    catch { print("  gemma4ImagePreprocess failed: \(error)"); return }
+    print("  image preprocessed: \(batch.numRealPatches) real patches, grid \(batch.gridH)×\(batch.gridW)")
+
+    let (softTokens, nPooled) = runVisionTowerForward(batch: batch, weights: visWeights,
+                                                       device: device, queue: queue)
+    print("  vision tower → \(nPooled) soft tokens (fp32, [\(nPooled), \(HIDDEN)])")
+    if nPooled == 0 {
+        print("  0 soft tokens — image too small? aborting"); return
+    }
+
+    let addBosEnv = ProcessInfo.processInfo.environment["LM_ADD_BOS"]
+        .flatMap { ["0", "false", "no"].contains($0.lowercased()) ? false : true }
+
+    let engine = LmEngine(weights: w)
+    guard let sess = engine.openSession(maxNewTokens: maxNew) else {
+        print("  no free slot"); return
+    }
+    let prefixToks = engine.tokenize(prefix, addBos: addBosEnv)
+    let suffixToks = engine.tokenize(suffix, addBos: false)
+    print("  prefix tokens: \(prefixToks.count); suffix tokens: \(suffixToks.count)")
+    sess.submit(prefixToks)
+    sess.submit(softTokens: softTokens, count: nPooled, isFp32: true)
+    sess.submit(suffixToks)
+
+    print("")
+    print("  --- generation ---")
+    print("  \(prefix)<image:\(nPooled)soft>\(suffix)", terminator: "")
+    fflush(stdout)
+
+    let tStart = Date()
+    var output = ""
+    while engine.hasWork {
+        _ = engine.tick()
+        while let tok = sess.nextToken() {
+            let frag = engine.detokenize([tok])
+            output += frag
+            print(frag.replacingOccurrences(of: "\n", with: "\\n"), terminator: "")
+            fflush(stdout)
+        }
+    }
+    print("")
+    let dtMs = Date().timeIntervalSince(tStart) * 1000
+    print("")
+    print(String(format: "  wall: %.1f ms  steps: %d  tokens: %d",
+                 dtMs, engine.totalSteps, engine.totalTokensGenerated))
+    print("  output: \(output.debugDescription)")
+    engine.closeSession(sess)
+}
+
