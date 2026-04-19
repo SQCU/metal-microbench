@@ -1,0 +1,25 @@
+# Compiled Swift binaries
+/mem_mountain
+/tile_gemm
+/paged_attention
+/moe_matmul
+/dense_gemv
+/forward_ops
+/forward_graph
+/gguf_loader
+/microbench
+
+# macOS
+.DS_Store
+
+# Python venv (lives under test_data/reference/)
+test_data/**/.venv/
+test_data/**/__pycache__/
+
+# Oracle / validation .npy files — regenerate via test_data/reference/extract_*.py
+# scripts; too large for git (vision_soft_tokens.npy alone is 605 MB).
+test_data/**/*.npy
+test_data/**/*.bin
+
+# Misc build artifacts
+*.dSYM/
