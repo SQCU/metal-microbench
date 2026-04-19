@@ -35,6 +35,7 @@
 // submit / step / next_token / close_session), translated to Swift,
 // without adopting llama.cpp's internal data model.
 import Foundation
+import Metal
 
 enum SessionState: Equatable {
     case idle           // no pending work
@@ -50,6 +51,29 @@ enum SessionState: Equatable {
     }
 }
 
+// A chunk of work queued into a session's priming lane. Text and image
+// chunks travel together in one queue so the scheduler can preserve the
+// caller's interleaving: "user: [text prefix] [image] [text suffix]"
+// becomes three chunks processed in order. The engine turns each chunk
+// into the right prefill/AR dispatch.
+enum PrimingChunk {
+    // Plain text tokens — go through embed_lookup + the full prefill pipe.
+    case tokens([UInt32])
+
+    // Pre-embedded image soft tokens produced by the vision tower. Layout
+    // is [count, HIDDEN] and the storage dtype is either fp16 or fp32.
+    // Prefill copies these into pre_hidden and skips embed_lookup +
+    // embed-scale (the vision projection already did both).
+    case softTokens(buffer: MTLBuffer, count: Int, isFp32: Bool)
+
+    var count: Int {
+        switch self {
+        case .tokens(let ts): return ts.count
+        case .softTokens(_, let c, _): return c
+        }
+    }
+}
+
 final class Session {
     let id: Int
     let slot: Int
@@ -58,11 +82,13 @@ final class Session {
     fileprivate weak var engine: LmEngine?
 
     fileprivate(set) var state: SessionState = .idle
-    // Tokens queued to be teacher-forced (prompt prefix or tool-result
-    // continuations). Consumed one per step while state == .priming.
-    fileprivate var primingQueue: [UInt32] = []
+    // Ordered chunks to teacher-force (text tokens or image soft tokens).
+    // The scheduler pops the front chunk and dispatches it — either as a
+    // fast prefill (whole chunk at once) or as token-by-token AR priming,
+    // depending on scheduler mode and concurrent session load.
+    fileprivate var chunkQueue: [PrimingChunk] = []
     // When state == .generating, the token we sampled on the previous step
-    // becomes the next step's input. Kept separate from primingQueue so
+    // becomes the next step's input. Kept separate from the chunk queue so
     // the state machine doesn't have to pun inputs.
     fileprivate var nextGeneratedInput: UInt32 = 0
     // Next KV-cache write position. k_len after a step == position + 1.
@@ -79,12 +105,12 @@ final class Session {
         self.engine = engine
     }
 
-    // Queue more input tokens to be teacher-forced on subsequent steps.
-    // Valid in any state: calling during .generating flips back to .priming,
-    // which is how tool-call continuations re-enter the stream.
+    // Queue more input tokens to be teacher-forced. Valid in any state:
+    // calling during .generating flips back to .priming, which is how
+    // tool-call continuations re-enter the stream.
     func submit(_ tokens: [UInt32]) {
         guard !tokens.isEmpty else { return }
-        primingQueue.append(contentsOf: tokens)
+        chunkQueue.append(.tokens(tokens))
         if state == .idle || state == .generating { state = .priming }
     }
 
@@ -92,6 +118,16 @@ final class Session {
     func submit(text: String, addBos: Bool? = nil) {
         guard let eng = engine else { return }
         submit(eng.tokenizer.encode(text, addBos: addBos))
+    }
+
+    // Queue a pre-computed block of vision-tower soft tokens (shape
+    // [count, HIDDEN], already projected into the text hidden space).
+    // `isFp32` distinguishes the vision tower's default fp32 output from
+    // a caller who's already downcast to fp16.
+    func submit(softTokens: MTLBuffer, count: Int, isFp32: Bool) {
+        guard count > 0 else { return }
+        chunkQueue.append(.softTokens(buffer: softTokens, count: count, isFp32: isFp32))
+        if state == .idle || state == .generating { state = .priming }
     }
 
     // Pull the next generated token, or nil if none ready. Caller should
@@ -103,6 +139,8 @@ final class Session {
 
     // How many tokens are ready to consume.
     var pendingOutputCount: Int { outputQueue.count }
+    // Sum of all queued priming work (for scheduler heuristics).
+    var pendingPrimingCount: Int { chunkQueue.reduce(0) { $0 + $1.count } }
 
     // Mark as done; engine will not schedule any more steps for this session.
     func finish() { state = .done }
@@ -163,15 +201,55 @@ final class LmEngine {
     var activeSessions: [Session] { sessionBySlot.compactMap { $0 } }
     var hasWork: Bool { activeSessions.contains { $0.state.isBusy } }
 
+    // Take one token off the head chunk if it's a .tokens chunk. Returns
+    // nil if the head is .softTokens (that chunk needs fast prefill, not
+    // AR priming) or the queue is empty. Also removes emptied chunks and
+    // updates session state.
+    private func popArPrimingToken(_ s: Session) -> UInt32? {
+        while let head = s.chunkQueue.first {
+            switch head {
+            case .tokens(var ts):
+                if ts.isEmpty {
+                    s.chunkQueue.removeFirst(); continue
+                }
+                let t = ts.removeFirst()
+                if ts.isEmpty { s.chunkQueue.removeFirst() }
+                else { s.chunkQueue[0] = .tokens(ts) }
+                return t
+            case .softTokens:
+                // Head is image soft tokens — can't consume via AR. Caller
+                // should use the fast-prefill path for this chunk.
+                return nil
+            }
+        }
+        return nil
+    }
+
+    // True if this session has a pending chunk that must go through fast
+    // prefill (soft-tokens OR a .tokens chunk of size ≥ 2 for efficiency).
+    // Used by the scheduler to decide when to run single-slot prefill.
+    private func hasPrefillChunk(_ s: Session, minTokensThreshold: Int = 2) -> Bool {
+        guard let head = s.chunkQueue.first else { return false }
+        switch head {
+        case .tokens(let ts): return ts.count >= minTokensThreshold
+        case .softTokens:    return true
+        }
+    }
+
     // Run exactly one buildStepCB covering every slot, with per-slot state
     // driven by each session's queue. Returns the number of tokens emitted
     // into output queues this step (across all sessions).
+    //
+    // Sessions whose next chunk is .softTokens get parked (their slot runs
+    // a no-op forward this step). The caller must invoke `tick()` — which
+    // routes those sessions through fast prefill — rather than calling
+    // `step()` directly in the multimodal case.
     @discardableResult
     func step() -> Int {
         let busy = activeSessions.filter { $0.state.isBusy }
         if busy.isEmpty { return 0 }
 
-        // --- Prepare per-slot inputs ---
+        // Per-slot inputs (AR path).
         let tokP = input_tokens.contents().bindMemory(to: UInt32.self, capacity: B)
         let posP = positions.contents().bindMemory(to: UInt32.self, capacity: B)
         let klsP = k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
@@ -179,37 +257,40 @@ final class LmEngine {
         let npsP = num_pages_slide.contents().bindMemory(to: UInt32.self, capacity: B)
         let npfP = num_pages_full.contents().bindMemory(to: UInt32.self, capacity: B)
 
+        // Track which slots run REAL work this step — used downstream when
+        // we read logits to decide whether to emit a sampled token.
+        var realSlot = [Bool](repeating: false, count: B)
+
         for slot in 0..<B {
             if let s = sessionBySlot[slot], s.state.isBusy {
-                // What token goes in this step?
-                let inputTok: UInt32
+                let inputTok: UInt32?
                 if s.state == .priming {
-                    inputTok = s.primingQueue.removeFirst()
+                    inputTok = popArPrimingToken(s)
+                    // If nil, head chunk is .softTokens — can't AR-prime
+                    // here. Park this slot; caller should run fast prefill.
                 } else {
                     inputTok = s.nextGeneratedInput
                 }
-                tokP[slot] = inputTok
-                posP[slot] = UInt32(s.position)
-                let kLen = s.position + 1
-                klsP[slot] = UInt32(kLen)
-                klfP[slot] = UInt32(kLen)
-                npsP[slot] = UInt32((kLen + PAGE_SLIDE - 1) / PAGE_SLIDE)
-                npfP[slot] = UInt32((kLen + PAGE_FULL  - 1) / PAGE_FULL)
-            } else {
-                // No session or session is done: park this slot at position
-                // 0 feeding BOS. Its KV write lands in its own dedicated
-                // page[0] and can't disturb other slots. Wasted compute,
-                // but correct.
-                tokP[slot] = weights.bosTokenId
-                posP[slot] = 0
-                klsP[slot] = 1
-                klfP[slot] = 1
-                npsP[slot] = 1
-                npfP[slot] = 1
+                if let tok = inputTok {
+                    tokP[slot] = tok
+                    posP[slot] = UInt32(s.position)
+                    let kLen = s.position + 1
+                    klsP[slot] = UInt32(kLen); klfP[slot] = UInt32(kLen)
+                    npsP[slot] = UInt32((kLen + PAGE_SLIDE - 1) / PAGE_SLIDE)
+                    npfP[slot] = UInt32((kLen + PAGE_FULL  - 1) / PAGE_FULL)
+                    realSlot[slot] = true
+                    continue
+                }
             }
+            // Park: BOS at position 0, k_len=1, 1 page. Writes land in the
+            // slot's own dedicated page strip and can't disturb any other
+            // session's KV.
+            tokP[slot] = weights.bosTokenId
+            posP[slot] = 0
+            klsP[slot] = 1; klfP[slot] = 1
+            npsP[slot] = 1; npfP[slot] = 1
         }
 
-        // Flex mask precompute — reads positions/k_len we just wrote.
         if USE_FLEX_ATTN {
             precomputeFlexBlockMaskSlide(slidingWindow: SLIDING_WINDOW)
             precomputeFlexBlockMaskFull()
@@ -222,12 +303,10 @@ final class LmEngine {
         totalSteps += 1
         if let err = cb.error { print("  GPU step error: \(err)"); return 0 }
 
-        // --- Distribute outputs ---
         let logP = logits.contents().assumingMemoryBound(to: Float16.self)
         var emitted = 0
-        for s in busy {
-            // Greedy argmax per-slot — picks the next token this slot would
-            // sample given its logit.
+        for slot in 0..<B where realSlot[slot] {
+            guard let s = sessionBySlot[slot], s.state.isBusy else { continue }
             let base = s.slot * VOCAB
             var bestI = 0; var bestV: Float = -.infinity
             for v in 0..<VOCAB {
@@ -235,17 +314,13 @@ final class LmEngine {
                 if x > bestV { bestV = x; bestI = v }
             }
             let sampled = UInt32(bestI)
-
-            // Advance position: we just wrote at s.position, next step
-            // writes at s.position + 1.
             s.position += 1
 
             if s.state == .priming {
-                // If that was the last priming token, the logit we just
-                // computed IS the first generated token's prediction —
-                // sample it immediately and flip to .generating so the
-                // caller sees no stall.
-                if s.primingQueue.isEmpty {
+                // Drained ALL chunks? The logit we just computed is the
+                // first generated token's prediction. Flip to .generating,
+                // emit, check EOS.
+                if s.chunkQueue.isEmpty {
                     s.state = .generating
                     s.outputQueue.append(sampled)
                     s.nextGeneratedInput = sampled
@@ -254,10 +329,8 @@ final class LmEngine {
                         s.state = .done
                     }
                 }
-                // else: still priming; discard logit, feed next queue token
-                // on the next step.
+                // else: more priming to do — discard this logit.
             } else {
-                // .generating: this is the next output token.
                 s.outputQueue.append(sampled)
                 s.nextGeneratedInput = sampled
                 s.numGenerated += 1; emitted += 1; totalTokensGenerated += 1
@@ -266,8 +339,182 @@ final class LmEngine {
                 }
             }
         }
-
         return emitted
+    }
+
+    // Run a single-slot fast prefill: the given session's next chunk is
+    // dispatched as a proper buildPrefillCB filling only its slot. Other
+    // slots are silenced via block_table redirect to the scratch strip.
+    // Returns true if a prefill actually ran (chunk was consumed).
+    @discardableResult
+    func stepPrefillForSession(_ s: Session) -> Bool {
+        guard s.state == .priming, let head = s.chunkQueue.first else { return false }
+        let qLen = head.count
+        precondition(qLen >= 1)
+        // Current prefill kernel supports Q_BLOCK=8 (one tile). If the chunk
+        // is larger, process the first MAX_Q_LEN tokens here and leave the
+        // tail for subsequent calls.
+        let thisTile = min(qLen, MAX_Q_LEN)
+        let remaining = qLen - thisTile
+        let positionStart = s.position
+
+        // --- Save block_table; redirect non-target slots to scratch strip ---
+        let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
+        var savedBT = [UInt32](repeating: 0, count: B * MAX_PAGES_PER_SLOT)
+        for i in 0..<(B * MAX_PAGES_PER_SLOT) { savedBT[i] = btP[i] }
+        for slot in 0..<B where slot != s.slot {
+            for p in 0..<MAX_PAGES_PER_SLOT {
+                // All silenced slots redirect to the single scratch strip;
+                // their KV writes race but nobody reads the outputs.
+                btP[slot * MAX_PAGES_PER_SLOT + p] = UInt32(SCRATCH_PAGE_BASE + p)
+            }
+        }
+        defer {
+            for i in 0..<(B * MAX_PAGES_PER_SLOT) { btP[i] = savedBT[i] }
+        }
+
+        // --- Populate prefill scratch for all B slots, but only s.slot
+        // carries real data. The silenced slots get meaningless filler that
+        // doesn't matter (their outputs hit scratch pages).
+        let tokP = pre_input_tokens.contents().bindMemory(to: UInt32.self, capacity: B * MAX_Q_LEN)
+        let posP = pre_q_positions.contents().bindMemory(to: UInt32.self, capacity: B * MAX_Q_LEN)
+        for b in 0..<B {
+            for i in 0..<thisTile {
+                posP[b * thisTile + i] = UInt32(positionStart + i)
+                tokP[b * thisTile + i] = weights.bosTokenId  // silenced-slot filler
+            }
+        }
+        let klsP = pre_k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
+        let klfP = pre_k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
+        for b in 0..<B {
+            klsP[b] = UInt32(positionStart + thisTile)
+            klfP[b] = UInt32(positionStart + thisTile)
+        }
+
+        // --- Chunk-specific setup ---
+        var skipEmbed = false
+        switch head {
+        case .tokens(let ts):
+            // Real text tokens go in s.slot's row.
+            for i in 0..<thisTile {
+                tokP[s.slot * thisTile + i] = ts[i]
+            }
+        case let .softTokens(buf, _, isFp32):
+            // Vision tower output. Copy softTokens[0..thisTile*HIDDEN]
+            // into pre_hidden at rows [s.slot*thisTile, s.slot*thisTile+thisTile),
+            // converting fp32→fp16 if needed. Other slots' rows are left as
+            // whatever was there; they'll compute junk that gets discarded.
+            let dstPtr = pre_hidden.contents().assumingMemoryBound(to: Float16.self)
+            let dstBase = (s.slot * thisTile) * HIDDEN
+            if isFp32 {
+                let srcPtr = buf.contents().assumingMemoryBound(to: Float.self)
+                for i in 0..<(thisTile * HIDDEN) {
+                    dstPtr[dstBase + i] = Float16(srcPtr[i])
+                }
+            } else {
+                let srcPtr = buf.contents().assumingMemoryBound(to: Float16.self)
+                memcpy(dstPtr.advanced(by: dstBase), srcPtr, thisTile * HIDDEN * 2)
+            }
+            skipEmbed = true
+        }
+
+        precomputeFlexPrefillMasks(qLen: thisTile, positionStart: positionStart)
+        let t0 = Date()
+        let cb = buildPrefillCB(weights, qLen: thisTile, skipEmbed: skipEmbed)
+        cb.commit(); cb.waitUntilCompleted()
+        lastStepMs = Date().timeIntervalSince(t0) * 1000
+        totalSteps += 1
+        if let err = cb.error { print("  GPU prefill error: \(err)"); return false }
+
+        // --- Advance session state by thisTile positions. Copy slot-s's
+        // last-position logit into the AR `logits` buffer so that the next
+        // .step() or sampling sees a coherent post-prefill state.
+        s.position += thisTile
+        let srcPtr = pre_logits.contents().assumingMemoryBound(to: Float16.self)
+        let dstPtr = logits.contents().assumingMemoryBound(to: Float16.self)
+        let src = srcPtr.advanced(by: (s.slot * thisTile + (thisTile - 1)) * VOCAB)
+        let dst = dstPtr.advanced(by: s.slot * VOCAB)
+        memcpy(dst, src, VOCAB * 2)
+
+        // Pop / trim the head chunk.
+        switch head {
+        case .tokens(var ts):
+            ts.removeFirst(thisTile)
+            if ts.isEmpty { s.chunkQueue.removeFirst() }
+            else          { s.chunkQueue[0] = .tokens(ts) }
+        case let .softTokens(_, count, _):
+            if remaining == 0 {
+                s.chunkQueue.removeFirst()
+            } else {
+                // Not yet supported: image chunks larger than MAX_Q_LEN
+                // would need sub-offset bookkeeping. Vision tower output
+                // for 224×224 Gemma-4 images is 256 soft tokens — well
+                // beyond the single-tile budget — so this is flagged for
+                // the next iteration along with multi-tile prefill.
+                print("  WARN: soft-tokens chunk (\(count)) > MAX_Q_LEN=\(MAX_Q_LEN); partial prefill dropping the tail")
+                s.chunkQueue.removeFirst()
+            }
+        }
+
+        // If the queue is now empty, sample the post-prefill logit as the
+        // first generated token so callers don't see a stall step.
+        if s.chunkQueue.isEmpty {
+            let base = s.slot * VOCAB
+            let logP = logits.contents().assumingMemoryBound(to: Float16.self)
+            var bestI = 0; var bestV: Float = -.infinity
+            for v in 0..<VOCAB {
+                let x = Float(logP[base + v])
+                if x > bestV { bestV = x; bestI = v }
+            }
+            let sampled = UInt32(bestI)
+            s.state = .generating
+            s.outputQueue.append(sampled)
+            s.nextGeneratedInput = sampled
+            s.numGenerated += 1; totalTokensGenerated += 1
+            if sampled == s.eosId || s.numGenerated >= s.maxNewTokens {
+                s.state = .done
+            }
+        }
+        return true
+    }
+
+    // Unified scheduler tick. Picks between fast prefill and AR batch each
+    // call. Policy for v1 — mostly AR-batch, use prefill only when it's
+    // strictly better or strictly required:
+    //
+    //   1. Any session has a .softTokens head chunk  →  single-slot fast
+    //      prefill for that session (image tokens can't go through AR;
+    //      paused AR work for other sessions is unavoidable here).
+    //   2. Exactly one session busy AND its head is tokens-chunk ≥ 2  →
+    //      fast prefill (no AR-batch advantage to forfeit since it's the
+    //      only busy slot anyway).
+    //   3. Otherwise  →  AR step across all busy sessions. Even for many
+    //      long prompts, parallel AR-prime beats serial fast prefill:
+    //      prefill wastes (B-1)/B of each CB, AR doesn't.
+    //
+    // Returns tokens emitted this tick (0 during prefill unless the chunk
+    // drained and we sampled the first generated token).
+    @discardableResult
+    func tick() -> Int {
+        let busy = activeSessions.filter { $0.state.isBusy }
+        if busy.isEmpty { return 0 }
+        // 1. Soft-tokens forced prefill.
+        if let s = busy.first(where: { sess in
+            if case .softTokens = sess.chunkQueue.first { return true }
+            return false
+        }) {
+            let before = s.outputQueue.count
+            _ = stepPrefillForSession(s)
+            return s.outputQueue.count - before
+        }
+        // 2. Single-session fast prefill.
+        if busy.count == 1, hasPrefillChunk(busy[0], minTokensThreshold: 2) {
+            let before = busy[0].outputQueue.count
+            _ = stepPrefillForSession(busy[0])
+            return busy[0].outputQueue.count - before
+        }
+        // 3. AR batch across all busy sessions.
+        return step()
     }
 
     // Pump the scheduler until all sessions hit .done or a budget elapses.
@@ -277,7 +524,7 @@ final class LmEngine {
         var emitted = 0
         for _ in 0..<maxSteps {
             if !hasWork { break }
-            emitted += step()
+            emitted += tick()
         }
         return emitted
     }
@@ -356,7 +603,7 @@ func runLmMultisession(ggufPath: String, promptsStr: String, maxNewPerSession: I
 
     let tStart = Date()
     while engine.hasWork {
-        _ = engine.step()
+        _ = engine.tick()
         // Drain any tokens that landed this step, per session, in slot order.
         for s in sessions {
             while let tok = s.nextToken() {

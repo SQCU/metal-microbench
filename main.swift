@@ -221,7 +221,16 @@ let logits      = emptyHalf(B * VOCAB)
 // Paging. TOTAL_PAGES is per-layer (per-layer K/V caches allocated at GGUF
 // load time). 256 pages × PAGE_SLIDE=16 tokens = 4096 slide tokens of
 // per-layer capacity; at B=4 disjoint sequences that's ~1024 tokens/seq.
-let TOTAL_PAGES = B * MAX_PAGES_PER_SLOT   // 512 at B=4; guarantees disjoint default routing
+// The scratch strip at the end (SCRATCH_PAGE_BASE..) is not assigned to
+// any session; it absorbs KV writes from slots we deliberately silence
+// during a single-session prefill. Without this, running prefill for
+// slot S would over-write the other slots' active KV at positions
+// 0..qLen-1 — which is exactly where earlier sessions started.
+// One shared scratch strip is enough because silenced slots all write
+// ignored garbage; concurrent writes may race per-cell, but nothing reads
+// the result. Cuts KV-cache memory overhead from 2× to 1.25×.
+let SCRATCH_PAGE_BASE = B * MAX_PAGES_PER_SLOT
+let TOTAL_PAGES = (B + 1) * MAX_PAGES_PER_SLOT   // 640 at B=4 (was 512)
 // Load-time assert: if this ever drops below B*MAX_PAGES_PER_SLOT, default
 // initLmState's `(b*MAX + p) % TOTAL_PAGES` routing will alias batches.
 let PAGE_SLIDE = 16
@@ -1749,17 +1758,23 @@ func buildStepCB(_ w: LmWeights) -> MTLCommandBuffer {
 //
 // Returns the built (uncommitted) CB. After commit+wait, pre_logits is
 // populated with [B, qLen, VOCAB] fp16 logits.
-func buildPrefillCB(_ w: LmWeights, qLen: Int) -> MTLCommandBuffer {
+func buildPrefillCB(_ w: LmWeights, qLen: Int, skipEmbed: Bool = false) -> MTLCommandBuffer {
     precondition(qLen <= MAX_Q_LEN, "qLen \(qLen) exceeds MAX_Q_LEN=\(MAX_Q_LEN)")
     let N = B * qLen               // total token rows
     let NS = B * qLen * TOPK       // total MoE slots
 
     let cb = queue.makeCommandBuffer()!
 
-    // Embed + Gemma-4 sqrt(hidden) scale, now over N = B*qLen tokens.
-    encEmbedInto(cb, tokens: pre_input_tokens, embedTable: w.embedTable,
-                 out: pre_hidden, numVecs: N)
-    encScaleByScalar(cb, x: pre_hidden, scalar: w.embedScaleBuf, N: HIDDEN, numVecs: N)
+    if !skipEmbed {
+        // Embed + Gemma-4 sqrt(hidden) scale, now over N = B*qLen tokens.
+        encEmbedInto(cb, tokens: pre_input_tokens, embedTable: w.embedTable,
+                     out: pre_hidden, numVecs: N)
+        encScaleByScalar(cb, x: pre_hidden, scalar: w.embedScaleBuf, N: HIDDEN, numVecs: N)
+    }
+    // When skipEmbed=true, caller has already written pre_hidden with the
+    // vision-tower-produced soft tokens (already scaled). Image tokens
+    // skip embed_lookup entirely — the vision projection already mapped
+    // them into the text hidden space.
 
     for L in 0..<NUM_LAYERS {
         let lw = w.layers[L]
