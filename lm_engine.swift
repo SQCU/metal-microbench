@@ -414,6 +414,16 @@ final class LmEngine {
             let srcRaw = buf.contents().advanced(by: byteOffset)
             if isFp32 {
                 let srcPtr = srcRaw.assumingMemoryBound(to: Float.self)
+                if ProcessInfo.processInfo.environment["LM_MM_DEBUG"] != nil && byteOffset == 0 {
+                    var mn: Float = .infinity, mx: Float = -.infinity, sumAbs: Float = 0
+                    for i in 0..<(thisTile * HIDDEN) {
+                        let v = srcPtr[i]
+                        if v < mn { mn = v }; if v > mx { mx = v }
+                        sumAbs += abs(v)
+                    }
+                    print(String(format: "  [softTokens tile0] min=%.3f max=%.3f mean|v|=%.3f (first-tile, fp32)",
+                                 mn, mx, sumAbs / Float(thisTile * HIDDEN)))
+                }
                 for i in 0..<(thisTile * HIDDEN) {
                     dstPtr[dstBase + i] = Float16(srcPtr[i])
                 }
@@ -689,8 +699,18 @@ func runLmMultimodal(ggufPath: String, stPath: String, imagePath: String,
     let suffixToks = engine.tokenize(suffix, addBos: false)
     print("  prefix tokens: \(prefixToks.count); suffix tokens: \(suffixToks.count)")
     sess.submit(prefixToks)
+    // Bracket the soft tokens with Gemma-4's BOI/EOI markers so the model
+    // sees the same turn-boundary signal it was trained on:
+    //   boi_token_id = 255999 (<|image>)
+    //   eoi_token_id = 258882 (<image|>)
+    // Without these markers, image-region attention heads have no signal
+    // that the following hidden states are image features, and the model
+    // falls back to <pad> as a uniform prior.
+    let BOI: UInt32 = 255999
+    let EOI: UInt32 = 258882
+    sess.submit([BOI])
     sess.submit(softTokens: softTokens, count: nPooled, isFp32: true)
-    sess.submit(suffixToks)
+    sess.submit([EOI])
 
     print("")
     print("  --- generation ---")
