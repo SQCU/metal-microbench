@@ -2842,10 +2842,11 @@ if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
    ProcessInfo.processInfo.environment["LM_KL_REF"] == nil,
    ProcessInfo.processInfo.environment["LM_PREFILL_VALIDATE"] == nil,
    ProcessInfo.processInfo.environment["LM_GENERATE"] == nil,
+   ProcessInfo.processInfo.environment["LM_MULTISESSION"] == nil,
    !isDumpRun {
     // GGUF_PATH alone → LM forward benchmark. If LM_KL_REF, LM_PREFILL_VALIDATE,
-    // LM_GENERATE, or any dump flag is also set, let those harnesses drive
-    // (all reuse loadLmWeights).
+    // LM_GENERATE, LM_MULTISESSION, or any dump flag is also set, let those
+    // harnesses drive (all reuse loadLmWeights).
     runGgufPathHarness(ggufPath: ggufPath)
 }
 if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
@@ -2853,6 +2854,11 @@ if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
     let maxN = Int(ProcessInfo.processInfo.environment["LM_GENERATE_MAX"] ?? "64") ?? 64
     let eos = (ProcessInfo.processInfo.environment["LM_GENERATE_EOS"]).flatMap { UInt32($0) }
     runLmGenerate(ggufPath: ggufPath, prompt: prompt, maxNewTokens: maxN, eos: eos)
+}
+if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
+   let prompts = ProcessInfo.processInfo.environment["LM_MULTISESSION"] {
+    let maxN = Int(ProcessInfo.processInfo.environment["LM_MULTISESSION_MAX"] ?? "32") ?? 32
+    runLmMultisession(ggufPath: ggufPath, promptsStr: prompts, maxNewPerSession: maxN)
 }
 if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
    let refDir = ProcessInfo.processInfo.environment["LM_KL_REF"],
