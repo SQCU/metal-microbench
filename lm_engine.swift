@@ -157,6 +157,13 @@ final class LmEngine {
     private var sessionBySlot: [Session?]
     private var nextId: Int = 1
 
+    // Page manager owns the KV cache's physical page pool and answers
+    // "who owns this page, who's sharing it, what content hash is cached
+    // here". Excludes the scratch strip at the end (that's reserved for
+    // silencing inactive slots during single-slot prefill and must never
+    // be owned by a session).
+    let pageManager: PageManager
+
     // Instrumentation — helps the scheduler-behaviour tests measure how
     // well we're batching. One CB per step regardless of active count.
     private(set) var totalSteps: Int = 0
@@ -167,40 +174,71 @@ final class LmEngine {
         self.weights = weights
         self.tokenizer = GemmaBpe(weights: weights)
         self.sessionBySlot = Array(repeating: nil, count: B)
+        // Usable pool excludes the scratch strip at [SCRATCH_PAGE_BASE..].
+        // pageSize is PAGE_SLIDE; PAGE_FULL differs (8 vs 16) but we hash
+        // by token count, and the block_table indexes phys pages uniformly
+        // for both caches — PAGE_SLIDE is the coarser unit per-prefix.
+        self.pageManager = PageManager(numPhysPages: SCRATCH_PAGE_BASE,
+                                        pageSize: PAGE_SLIDE)
     }
 
     // Open a new session on the first free slot. Returns nil if the engine
-    // is at capacity (B active sessions). Caller owns the Session and must
-    // call `closeSession` to free the slot.
+    // is at capacity (B active sessions) OR the page pool is exhausted.
+    // Caller owns the Session and must call `closeSession` to free both
+    // the slot and the allocated pages.
     func openSession(eosId: UInt32? = nil, maxNewTokens: Int = 128) -> Session? {
-        for slot in 0..<B where sessionBySlot[slot] == nil {
-            let s = Session(id: nextId, slot: slot,
-                            eosId: eosId ?? weights.eosTokenId,
-                            maxNewTokens: maxNewTokens, engine: self)
-            nextId += 1
-            sessionBySlot[slot] = s
-            // Prime per-slot block_table and reset the slot's KV pages to
-            // its own dedicated strip. Each session gets pages
-            // [slot*MAX_PAGES_PER_SLOT, (slot+1)*MAX_PAGES_PER_SLOT) —
-            // disjoint from every other slot's strip.
-            let btP = block_table.contents().bindMemory(to: UInt32.self,
-                        capacity: B * MAX_PAGES_PER_SLOT)
-            for p in 0..<MAX_PAGES_PER_SLOT {
-                btP[slot * MAX_PAGES_PER_SLOT + p] =
-                    UInt32(slot * MAX_PAGES_PER_SLOT + p) % UInt32(TOTAL_PAGES)
-            }
-            return s
+        guard let slot = (0..<B).first(where: { sessionBySlot[$0] == nil }) else {
+            return nil
         }
-        return nil
+        let sessionId = nextId; nextId += 1
+        // Allocate this session's MAX_PAGES_PER_SLOT pages via PageManager.
+        // Up front allocation matches the old strip behaviour and guarantees
+        // contiguous available capacity; on exhaustion we fail fast instead
+        // of corrupting some other session's KV.
+        var ownedPages: [Int] = []
+        ownedPages.reserveCapacity(MAX_PAGES_PER_SLOT)
+        for _ in 0..<MAX_PAGES_PER_SLOT {
+            do {
+                ownedPages.append(try pageManager.allocFresh(sessionId: sessionId))
+            } catch PageManagerError.outOfPages(let needed, let available) {
+                print("  openSession: pool exhausted (needed \(needed), have \(available))")
+                // Roll back partial allocation.
+                pageManager.releaseAllForSession(sessionId)
+                return nil
+            } catch {
+                print("  openSession: unexpected PageManager error: \(error)")
+                pageManager.releaseAllForSession(sessionId)
+                return nil
+            }
+        }
+        let s = Session(id: sessionId, slot: slot,
+                        eosId: eosId ?? weights.eosTokenId,
+                        maxNewTokens: maxNewTokens, engine: self)
+        sessionBySlot[slot] = s
+        // Populate block_table[slot][p] = this session's p-th phys page.
+        // The AR and prefill kernels both read block_table[slot * max_pages + p]
+        // to resolve logical page p into a physical cache page.
+        let btP = block_table.contents().bindMemory(to: UInt32.self,
+                    capacity: B * MAX_PAGES_PER_SLOT)
+        for p in 0..<MAX_PAGES_PER_SLOT {
+            btP[slot * MAX_PAGES_PER_SLOT + p] = UInt32(ownedPages[p])
+        }
+        return s
     }
 
-    // Close a session and free its slot. The KV strip stays allocated (it
-    // will get overwritten when a new session lands on this slot).
+    // Close a session, free its slot, and return its pages to the pool. A
+    // subsequent openSession can reuse those phys pages. This is the exit
+    // from the "you have to manage resource lifetimes" responsibility the
+    // caller inherits when they take a session handle.
     func closeSession(_ s: Session) {
         guard sessionBySlot[s.slot]?.id == s.id else { return }
         s.state = .done
+        pageManager.releaseAllForSession(s.id)
         sessionBySlot[s.slot] = nil
     }
+
+    // Diagnostic — useful for scheduler tests + debugging "why did openSession fail".
+    func poolStats() -> PageManager.Stats { return pageManager.stats() }
 
     var activeSessions: [Session] { sessionBySlot.compactMap { $0 } }
     var hasWork: Bool { activeSessions.contains { $0.state.isBusy } }
