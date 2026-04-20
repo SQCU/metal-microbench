@@ -32,7 +32,10 @@ import Foundation
 final class StreamState: ObservableObject, Identifiable {
     let id: String
     let color: Color
-    let prompt: String
+    let prefix: String           // text before the image chunk (empty if no image)
+    let suffix: String           // text after the image chunk (or the whole prompt if no image)
+    let imagePath: String?       // nil = text-only stream
+    let promptLabel: String      // short human-readable description of what this pane asks
     @Published var text: String = ""
     @Published var tokenCount: Int = 0
     @Published var ttftSec: Double? = nil
@@ -46,8 +49,22 @@ final class StreamState: ObservableObject, Identifiable {
     fileprivate var submitTime: Date?
     fileprivate var arrivalTimes: [Date] = []
 
+    // Text-only convenience init — prompt becomes the "suffix" (whole prompt).
     init(id: String, color: Color, prompt: String) {
-        self.id = id; self.color = color; self.prompt = prompt
+        self.id = id; self.color = color
+        self.prefix = ""; self.suffix = prompt
+        self.imagePath = nil
+        self.promptLabel = prompt.replacingOccurrences(of: "<|turn>user\n", with: "")
+            .replacingOccurrences(of: "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", with: "")
+    }
+
+    // Multimodal init: prefix + <image> + suffix, with a visible thumbnail.
+    init(id: String, color: Color, imagePath: String, userPrompt: String) {
+        self.id = id; self.color = color
+        self.imagePath = imagePath
+        self.prefix = "<|turn>user\n"
+        self.suffix = "\n\(userPrompt)<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+        self.promptLabel = userPrompt
     }
 }
 
@@ -77,18 +94,42 @@ final class DemoState: ObservableObject {
     private var running = false
 
     init() {
-        self.streams = [
-            StreamState(id: "A", color: .cyan,
-                        prompt: "<|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"),
-            StreamState(id: "B", color: .orange,
-                        prompt: "<|turn>user\nWrite a one-sentence haiku about compilers.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"),
-            StreamState(id: "C", color: .green,
-                        prompt: "<|turn>user\nList three colors and their hex codes.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"),
-            StreamState(id: "D", color: .pink,
-                        prompt: "<|turn>user\nCount from one to ten out loud.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"),
-        ]
+        // Mode selector: TETRAPLEX_MODE=multimodal switches to the 4-image
+        // variant. Otherwise the default text-only prompts run.
+        let mode = ProcessInfo.processInfo.environment["TETRAPLEX_MODE"] ?? "text"
+        switch mode {
+        case "multimodal":
+            let frames = "/Users/mdot/metal-microbench/test_data/frames"
+            self.streams = [
+                StreamState(id: "A", color: .cyan,
+                            imagePath: "\(frames)/frame_00_fbb737dcf6b0.png",
+                            userPrompt: "Describe this image in one short sentence."),
+                StreamState(id: "B", color: .orange,
+                            imagePath: "\(frames)/frame_100_933b3a8dd9ce.png",
+                            userPrompt: "Describe this image in one short sentence."),
+                StreamState(id: "C", color: .green,
+                            imagePath: "\(frames)/frame_200_77689ab7b649.png",
+                            userPrompt: "Write a four-line sonnet about this image."),
+                StreamState(id: "D", color: .pink,
+                            imagePath: "\(frames)/frame_300_38b60f37136f.png",
+                            userPrompt: "Write a four-line sonnet about this image."),
+            ]
+        default:
+            self.streams = [
+                StreamState(id: "A", color: .cyan,
+                            prompt: "<|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"),
+                StreamState(id: "B", color: .orange,
+                            prompt: "<|turn>user\nWrite a one-sentence haiku about compilers.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"),
+                StreamState(id: "C", color: .green,
+                            prompt: "<|turn>user\nList three colors and their hex codes.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"),
+                StreamState(id: "D", color: .pink,
+                            prompt: "<|turn>user\nCount from one to ten out loud.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"),
+            ]
+        }
         for s in streams { streamRateHistory[s.id] = [] }
     }
+
+    private var visionWeights: VisionWeights?
 
     func start() {
         guard !running else { return }
@@ -102,9 +143,22 @@ final class DemoState: ObservableObject {
             do {
                 let w = try loadLmWeights(ggufPath: ggufPath)
                 let eng = LmEngine(weights: w)
+                // If any stream needs vision, load vision weights too.
+                let anyImages = self.streams.contains { $0.imagePath != nil }
+                var visW: VisionWeights? = nil
+                if anyImages {
+                    DispatchQueue.main.async { self.status = "loading vision weights…" }
+                    let visionPath = ProcessInfo.processInfo.environment["VISION_ST"]
+                        ?? "/Users/mdot/models/gemma-4-a4b-bf16/model-00001-of-00002.safetensors"
+                    let st = try SafetensorsFile(visionPath)
+                    visW = try loadVisionWeights(st, device: device)
+                }
                 DispatchQueue.main.async {
                     self.engine = eng
-                    self.status = "engine ready, dispatching 4 streams…"
+                    self.visionWeights = visW
+                    self.status = anyImages
+                        ? "engine + vision ready, running vision tower on 4 images…"
+                        : "engine ready, dispatching 4 streams…"
                     self.kickoff()
                 }
             } catch {
@@ -115,12 +169,55 @@ final class DemoState: ObservableObject {
 
     private func kickoff() {
         guard let engine else { return }
+        // Pre-run vision tower for any streams with images BEFORE we begin
+        // recording, so the mp4 only captures the AR decode phase (vision is
+        // 7 s of solid GPU work per image, very boring to watch). Softs are
+        // kept in MTLBuffers until submit below.
+        struct ImageSofts {
+            let stream: StreamState
+            let softs: MTLBuffer  // padded to 280 rows, fp32
+            let count: Int
+        }
+        var visionDone: [ImageSofts] = []
+        if let visWeights = visionWeights {
+            for stream in streams {
+                guard let path = stream.imagePath else { continue }
+                do {
+                    let batch = try gemma4ImagePreprocess(path: path, device: device)
+                    let (raw, nPooled) = runVisionTowerForward(batch: batch, weights: visWeights,
+                                                                device: device, queue: queue)
+                    let target = 280
+                    let padded = device.makeBuffer(length: target * HIDDEN * 4,
+                                                    options: .storageModeShared)!
+                    memset(padded.contents(), 0, padded.length)
+                    memcpy(padded.contents(), raw.contents(), min(nPooled, target) * HIDDEN * 4)
+                    visionDone.append(ImageSofts(stream: stream, softs: padded, count: target))
+                } catch {
+                    print("vision tower failed for \(stream.id): \(error)")
+                }
+            }
+        }
+
         demoStart = Date()
+        status = "dispatching \(streams.count) streams"
+        let BOI: UInt32 = 255999
+        let EOI: UInt32 = 258882
         for stream in streams {
             guard let s = engine.openSession(maxNewTokens: 256) else { continue }
             stream.session = s
             stream.submitTime = Date()
-            s.submit(engine.tokenize(stream.prompt, addBos: true))
+
+            if let img = visionDone.first(where: { $0.stream === stream }) {
+                // prefix text tokens (with BOS once) → BOI → softs → EOI → suffix text
+                s.submit(engine.tokenize(stream.prefix, addBos: true))
+                s.submit([BOI])
+                s.submit(softTokens: img.softs, count: img.count, isFp32: true)
+                s.submit([EOI])
+                s.submit(engine.tokenize(stream.suffix, addBos: false))
+            } else {
+                // Text-only path: "suffix" carries the whole prompt.
+                s.submit(engine.tokenize(stream.suffix, addBos: true))
+            }
         }
         pumpThread = Thread { [weak self] in self?.pumpLoop() }
         pumpThread?.name = "gemma-pump"
@@ -289,12 +386,24 @@ struct StreamPaneView: View {
                         .foregroundColor(Color(white: 0.5))
                 }
             }
-            Text(stream.prompt.replacingOccurrences(of: "<|turn>user\n", with: "")
-                 .replacingOccurrences(of: "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", with: ""))
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundColor(Color(white: 0.45))
-                .lineLimit(1)
-                .truncationMode(.tail)
+            // Prompt subtitle + optional image thumbnail so the viewer can
+            // see what each pane is actually asking about.
+            HStack(alignment: .top, spacing: 6) {
+                if let path = stream.imagePath, let img = NSImage(contentsOfFile: path) {
+                    Image(nsImage: img)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 40, height: 40)
+                        .cornerRadius(3)
+                        .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color(white: 0.18), lineWidth: 1))
+                }
+                Text(stream.promptLabel)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(Color(white: 0.55))
+                    .lineLimit(3)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             // Plain Text, not ScrollView — ImageRenderer doesn't render
             // ScrollView contents off-screen. We tail the last ~18 lines
             // with a manual clip so long generations don't blow the pane
