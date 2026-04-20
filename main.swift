@@ -319,6 +319,21 @@ let pre_slide_full_indices = device.makeBuffer(length: B * MAX_PAGES_PER_SLOT * 
 let pre_slide_part_offsets = device.makeBuffer(length: (B + 1) * 4, options: .storageModeShared)!
 let pre_slide_part_indices = device.makeBuffer(length: B * MAX_PAGES_PER_SLOT * 4, options: .storageModeShared)!
 
+// Per-partial-block attention mask bitmap. Each partial block is a Q_BLOCK ×
+// PAGE mask; we store one uint32 per Q-row (low PAGE bits set = visible).
+// Kernel-agnostic: CPU fills these from whatever mask_mod policy the caller
+// wants (causal, sliding, doc-isolation, prefix-bidi, arbitrary). The kernel
+// just reads "is bit k of row r set" to decide whether to include k in
+// softmax or send it to -infinity.
+//
+// Sized for the worst case: every page is partial. Slide uses PAGE=16 (fits
+// in low 16 bits); full uses PAGE=8 (fits in low 8 bits). Q_BLOCK=8 rows.
+let FLEX_Q_BLOCK = 8   // compile-time; must match kernel's Q_BLOCK constant
+let pre_slide_part_masks = device.makeBuffer(length: B * MAX_PAGES_PER_SLOT * FLEX_Q_BLOCK * 4,
+                                               options: .storageModeShared)!
+let flex_full_part_masks = device.makeBuffer(length: B * MAX_PAGES_PER_SLOT * FLEX_Q_BLOCK * 4,
+                                               options: .storageModeShared)!
+
 let pre_k_len_slide = device.makeBuffer(length: B * 4, options: .storageModeShared)!
 let pre_k_len_full  = device.makeBuffer(length: B * 4, options: .storageModeShared)!
 let pre_num_pages_slide = device.makeBuffer(length: B * 4, options: .storageModeShared)!
@@ -877,47 +892,103 @@ func precomputeFlexBlockMaskSlide(slidingWindow: Int) {
     }
 }
 
-// Precompute prefill block masks (slide + full). Q_BLOCK=8 always; q_blocks
-// per slot = ceil(qLen/8). For the v1 use case we stay at qLen<=8 so one
-// q_block per slot. Slide applies causal+sliding mask; full is pure causal.
+// Mask-mod policy. Given an absolute (q_pos, k_pos) and a per-slot context
+// blob, return true if attention from q to k should be kept (softmax sees
+// the score) or false if it should be masked to -infinity. Called
+// Q_BLOCK × PAGE times per partial block at precompute time — NOT on the
+// GPU. The kernel only ever reads the resulting bitmap.
 //
-// Writes into the pre_slide_{full,part}_offsets/indices buffers (slide) and
-// re-uses the AR flex_full_{full,part}_offsets buffers for full (which were
-// already sized for B+1 entries — still valid since we're still one q_block).
-func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int) {
+// Context fields are whatever the policy wants to consume; for Gemma the
+// classic ones are k_len (for truncation), slidingWindow (for local attn),
+// docIds (for doc-isolation during packed-sequence training-style prefills).
+// Adding a new mask type = new case + the bitmap plumbing stays the same.
+struct MaskModContext {
+    var kLen: Int
+    var slidingWindow: Int   // 0 = global; >0 = keep only k >= q+1-window
+    // Future: docIds [Int]? for doc-isolation; prefixLen Int? for bidi prefix.
+}
+
+enum MaskMod {
+    case causal                  // k <= q
+    case causalSliding(Int)      // k <= q && k >= q+1-window
+    case none                    // always keep (trivial)
+    // Future: .docIsolation([Int]), .prefixBidi(prefixLen: Int), ...
+
+    @inline(__always)
+    func keep(q: Int, k: Int, ctx: MaskModContext) -> Bool {
+        switch self {
+        case .causal:
+            return k <= q && k < ctx.kLen
+        case .causalSliding(let w):
+            return k <= q && k < ctx.kLen && (w <= 0 || k + w > q)
+        case .none:
+            return k < ctx.kLen
+        }
+    }
+}
+
+// Precompute prefill block masks for slide + full attention. For each
+// partial block, emit (a) its block index in CSR indices, (b) a Q_BLOCK-row
+// bitmap (one uint32 per row) where bit k = 1 iff mask.keep(q_pos, k_pos)
+// returns true. FULL blocks get the "all keep" classification; EMPTY blocks
+// are skipped entirely.
+//
+// Kernel is mask-policy-agnostic — it just consumes the bitmap. Supports
+// any mask_mod by changing the policy passed to this function.
+func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
+                                 slideMask: MaskMod = .causalSliding(SLIDING_WINDOW),
+                                 fullMask: MaskMod = .causal) {
     let qBlock = 8
     let qBlocks = (qLen + qBlock - 1) / qBlock
     precondition(qBlocks == 1, "v1 prefill assumes single q_block per slot")
 
-    // Slide (sliding + causal). window_lo per Q-tile = max(0, q_last+1 - SLIDING_WINDOW).
+    // ---- Slide (PAGE_SLIDE=16) ----
     do {
         let fullOff = pre_slide_full_offsets.contents().assumingMemoryBound(to: UInt32.self)
         let fullIdx = pre_slide_full_indices.contents().assumingMemoryBound(to: UInt32.self)
         let partOff = pre_slide_part_offsets.contents().assumingMemoryBound(to: UInt32.self)
         let partIdx = pre_slide_part_indices.contents().assumingMemoryBound(to: UInt32.self)
+        let partMask = pre_slide_part_masks.contents().assumingMemoryBound(to: UInt32.self)
         var fc = 0, pc = 0
         fullOff[0] = 0; partOff[0] = 0
         for b in 0..<B {
-            // Per-slot k_len is written to pre_k_len_slide earlier.
             let k_len = Int(pre_k_len_slide.contents().assumingMemoryBound(to: UInt32.self)[b])
             let q_first = positionStart
             let q_last  = positionStart + qLen - 1
-            let window_lo_tile = (SLIDING_WINDOW > 0 && q_first + 1 > SLIDING_WINDOW)
-                                 ? (q_first + 1 - SLIDING_WINDOW) : 0
+            let ctx = MaskModContext(kLen: k_len, slidingWindow: SLIDING_WINDOW)
             let kBlocks = (k_len + PAGE_SLIDE - 1) / PAGE_SLIDE
             for K in 0..<kBlocks {
                 let lo = K * PAGE_SLIDE
                 let hi = lo + PAGE_SLIDE - 1
-                // EMPTY if entirely past q_last or entirely before the tile's window
-                if lo > q_last { continue }
-                if hi < window_lo_tile { continue }
-                // FULL iff fully within [window_lo_for_q_last, q_first] (every q in tile sees every k in block)
-                let window_lo_q_last = (SLIDING_WINDOW > 0 && q_last + 1 > SLIDING_WINDOW)
-                                       ? (q_last + 1 - SLIDING_WINDOW) : 0
-                if lo >= window_lo_q_last && hi <= q_first {
+                // Decide FULL/PARTIAL/EMPTY by sampling corners — safe for
+                // monotonic masks like causal + sliding. If the mask_mod is
+                // non-monotonic the classifier may over-classify as FULL;
+                // fall back to per-cell check when that matters.
+                let topLeft     = slideMask.keep(q: q_first, k: lo, ctx: ctx)
+                let topRight    = slideMask.keep(q: q_first, k: hi, ctx: ctx)
+                let botLeft     = slideMask.keep(q: q_last,  k: lo, ctx: ctx)
+                let botRight    = slideMask.keep(q: q_last,  k: hi, ctx: ctx)
+                if !(topLeft || topRight || botLeft || botRight) { continue }   // all-empty
+                let allKeep = topLeft && topRight && botLeft && botRight
+                if allKeep {
                     fullIdx[fc] = UInt32(K); fc += 1
                 } else {
-                    partIdx[pc] = UInt32(K); pc += 1
+                    partIdx[pc] = UInt32(K)
+                    // Emit bitmap for this partial block: one uint32 per Q row.
+                    for qrow in 0..<qBlock {
+                        let q_abs = q_first + qrow
+                        var row: UInt32 = 0
+                        if q_abs <= q_last {   // don't mask beyond real qLen
+                            for kcell in 0..<PAGE_SLIDE {
+                                let k_abs = lo + kcell
+                                if slideMask.keep(q: q_abs, k: k_abs, ctx: ctx) {
+                                    row |= UInt32(1) << kcell
+                                }
+                            }
+                        }
+                        partMask[pc * FLEX_Q_BLOCK + qrow] = row
+                    }
+                    pc += 1
                 }
             }
             fullOff[b + 1] = UInt32(fc)
@@ -925,27 +996,48 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int) {
         }
     }
 
-    // Full (causal only, no window). Re-use the AR flex_full_* buffers.
+    // ---- Full (PAGE_FULL=8, no sliding window) ----
     do {
         let fullOff = flex_full_full_offsets.contents().assumingMemoryBound(to: UInt32.self)
         let fullIdx = flex_full_full_indices.contents().assumingMemoryBound(to: UInt32.self)
         let partOff = flex_full_partial_offsets.contents().assumingMemoryBound(to: UInt32.self)
         let partIdx = flex_full_partial_indices.contents().assumingMemoryBound(to: UInt32.self)
+        let partMask = flex_full_part_masks.contents().assumingMemoryBound(to: UInt32.self)
         var fc = 0, pc = 0
         fullOff[0] = 0; partOff[0] = 0
         for b in 0..<B {
             let k_len = Int(pre_k_len_full.contents().assumingMemoryBound(to: UInt32.self)[b])
             let q_first = positionStart
             let q_last  = positionStart + qLen - 1
+            let ctx = MaskModContext(kLen: k_len, slidingWindow: 0)
             let kBlocks = (k_len + PAGE_FULL - 1) / PAGE_FULL
             for K in 0..<kBlocks {
                 let lo = K * PAGE_FULL
                 let hi = lo + PAGE_FULL - 1
-                if lo > q_last { continue }
-                if hi <= q_first {
+                let topLeft  = fullMask.keep(q: q_first, k: lo, ctx: ctx)
+                let topRight = fullMask.keep(q: q_first, k: hi, ctx: ctx)
+                let botLeft  = fullMask.keep(q: q_last,  k: lo, ctx: ctx)
+                let botRight = fullMask.keep(q: q_last,  k: hi, ctx: ctx)
+                if !(topLeft || topRight || botLeft || botRight) { continue }
+                let allKeep = topLeft && topRight && botLeft && botRight
+                if allKeep {
                     fullIdx[fc] = UInt32(K); fc += 1
                 } else {
-                    partIdx[pc] = UInt32(K); pc += 1
+                    partIdx[pc] = UInt32(K)
+                    for qrow in 0..<qBlock {
+                        let q_abs = q_first + qrow
+                        var row: UInt32 = 0
+                        if q_abs <= q_last {
+                            for kcell in 0..<PAGE_FULL {
+                                let k_abs = lo + kcell
+                                if fullMask.keep(q: q_abs, k: k_abs, ctx: ctx) {
+                                    row |= UInt32(1) << kcell
+                                }
+                            }
+                        }
+                        partMask[pc * FLEX_Q_BLOCK + qrow] = row
+                    }
+                    pc += 1
                 }
             }
             fullOff[b + 1] = UInt32(fc)
@@ -974,6 +1066,7 @@ func encFlexAttnSlidePrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
     enc1.setBuffer(pre_slide_part_indices, offset: 0, index: 10)
     enc1.setBuffer(qPositions, offset: 0, index: 11)
     enc1.setBuffer(kLenBuf, offset: 0, index: 12)
+    enc1.setBuffer(pre_slide_part_masks, offset: 0, index: 20)
     var sc: Float = 1.0, mv = UInt32(MAX_PAGES_PER_SLOT), hq = UInt32(H_Q), hkv = UInt32(H_KV)
     var ns = UInt32(ATTN_N_SPLITS), sw = UInt32(SLIDING_WINDOW), ql = UInt32(qLen)
     enc1.setBytes(&sc, length: 4, index: 13); enc1.setBytes(&mv, length: 4, index: 14)
@@ -1016,6 +1109,7 @@ func encFlexAttnFullPrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
     enc1.setBuffer(flex_full_partial_indices, offset: 0, index: 10)
     enc1.setBuffer(qPositions, offset: 0, index: 11)
     enc1.setBuffer(kLenBuf, offset: 0, index: 12)
+    enc1.setBuffer(flex_full_part_masks, offset: 0, index: 19)
     var sc: Float = 1.0, mv = UInt32(MAX_PAGES_PER_SLOT), hq = UInt32(H_Q), hkv = UInt32(H_KV)
     var ns = UInt32(ATTN_N_SPLITS), ql = UInt32(qLen)
     enc1.setBytes(&sc, length: 4, index: 13); enc1.setBytes(&mv, length: 4, index: 14)

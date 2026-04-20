@@ -3456,8 +3456,9 @@ kernel void flex_attn_slide_v1_q8(
     constant uint& H_Q                      [[buffer(15)]],
     constant uint& H_KV                     [[buffer(16)]],
     constant uint& N_SPLITS                 [[buffer(17)]],
-    constant uint& sliding_window           [[buffer(18)]],
+    constant uint& sliding_window           [[buffer(18)]],  // legacy: ignored when mask bitmap drives masking
     constant uint& q_len                    [[buffer(19)]],
+    device const uint* partial_block_masks  [[buffer(20)]],  // [total_partials, Q_BLOCK] uint; bit k set = keep
     uint3 tg_pos                            [[threadgroup_position_in_grid]],
     uint3 lid3                              [[thread_position_in_threadgroup]])
 {
@@ -3531,8 +3532,14 @@ kernel void flex_attn_slide_v1_q8(
 
     for (uint ix = ix_begin; ix < ix_end; ++ix) {
         uint p;
-        if (ix < n_full) p = full_kv_indices[full_lo + ix];
-        else             p = partial_kv_indices[part_lo + (ix - n_full)];
+        bool is_partial = (ix >= n_full);
+        uint partial_idx = 0;
+        if (!is_partial) {
+            p = full_kv_indices[full_lo + ix];
+        } else {
+            partial_idx = part_lo + (ix - n_full);
+            p = partial_kv_indices[partial_idx];
+        }
 
         const uint phys = bt_s[p];
         device const half* Kbase = K_cache + (phys * PAGE * H_KV + kv_head) * D;
@@ -3555,24 +3562,29 @@ kernel void flex_attn_slide_v1_q8(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Per-row online softmax. Each real Q row has its own q_pos, and
-        // therefore its own window_lo and causal horizon. Lanes 0..Q_ROWS-1
-        // handle one row each.
+        // Per-row online softmax. For FULL blocks every element is kept; for
+        // PARTIAL blocks we read a per-(q_local, block) bitmap produced by
+        // the CPU mask-mod policy. Bit k of the per-row uint = 1 ⇒ keep, 0
+        // ⇒ -∞. Rows past the real sequence end stay at -INF.
         if (lid < Q_ROWS) {
             const uint r = lid;
             const uint q_local = r / Q_PER_TG;
             const uint q_pos_in_seq = q_local_base + q_local;
-            // Rows past the sequence end: leave m_state at -INF and skip.
             if (q_pos_in_seq < q_len) {
-                const uint q_pos = q_pos_tg[q_local];
-                const uint window_lo = (sliding_window > 0 && q_pos + 1 > sliding_window)
-                                       ? (q_pos + 1 - sliding_window) : 0u;
+                uint mask_word = 0u;
+                if (is_partial) {
+                    // Partial blocks carry a Q_BLOCK-row bitmap. Within the
+                    // tile, q_local = r / Q_PER_TG already collapses the Q_PER_TG
+                    // head-grouping, so several rows share the same q_local
+                    // and the same mask row.
+                    mask_word = partial_block_masks[partial_idx * 8u + q_local];
+                }
                 float row_max = -INFINITY;
                 float s_loc[PAGE];
                 for (uint k = 0; k < PAGE; ++k) {
                     float sv = float(scores_tile[r * PAGE + k]) * qk_scale;
-                    uint k_pos = p * PAGE + k;
-                    if (k_pos > q_pos || k_pos < window_lo) sv = -INFINITY;
+                    bool keep = is_partial ? (((mask_word >> k) & 1u) != 0u) : true;
+                    if (!keep) sv = -INFINITY;
                     s_loc[k] = sv;
                     row_max = max(row_max, sv);
                 }
@@ -3664,6 +3676,7 @@ kernel void flex_attn_full_prefill(
     constant uint& H_KV                     [[buffer(16)]],
     constant uint& N_SPLITS                 [[buffer(17)]],
     constant uint& q_len                    [[buffer(18)]],
+    device const uint* partial_block_masks  [[buffer(19)]],  // [total_partials, Q_BLOCK] uint
     uint3 tg_pos                            [[threadgroup_position_in_grid]],
     uint3 lid3                              [[thread_position_in_threadgroup]])
 {
@@ -3732,8 +3745,14 @@ kernel void flex_attn_full_prefill(
 
     for (uint ix = ix_begin; ix < ix_end; ++ix) {
         uint p;
-        if (ix < n_full) p = full_kv_indices[full_lo + ix];
-        else             p = partial_kv_indices[part_lo + (ix - n_full)];
+        bool is_partial = (ix >= n_full);
+        uint partial_idx = 0;
+        if (!is_partial) {
+            p = full_kv_indices[full_lo + ix];
+        } else {
+            partial_idx = part_lo + (ix - n_full);
+            p = partial_kv_indices[partial_idx];
+        }
 
         const uint phys = bt_s[p];
         device const half* Kbase = K_cache + (phys * PAGE * H_KV + kv_head) * D;
@@ -3750,18 +3769,25 @@ kernel void flex_attn_full_prefill(
         simdgroup_store(mqk, scores_tile, PAGE);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Per-row online softmax with per-q causal mask.
+        // Per-row online softmax. FULL blocks keep every element (no mask
+        // consulted); PARTIAL blocks read a Q_BLOCK-row bitmap produced by
+        // the CPU mask-mod policy and zero-mask via -INF per cell.
         if (lid < Q_ROWS) {
             const uint r = lid;
             const uint q_pos_in_seq = q_local_base + r;
             if (q_pos_in_seq < q_len) {
-                const uint q_pos = q_pos_tg[r];
+                uint mask_word = 0u;
+                if (is_partial) {
+                    // Full-attention prefill: one q_head per TG ⇒ one row per
+                    // q_pos_in_seq, so mask row index = r directly.
+                    mask_word = partial_block_masks[partial_idx * 8u + r];
+                }
                 float row_max = -INFINITY;
                 float s_loc[PAGE];
                 for (uint k = 0; k < PAGE; ++k) {
                     float sv = float(scores_tile[r * PAGE + k]) * qk_scale;
-                    uint k_pos = p * PAGE + k;
-                    if (k_pos > q_pos) sv = -INFINITY;
+                    bool keep = is_partial ? (((mask_word >> k) & 1u) != 0u) : true;
+                    if (!keep) sv = -INFINITY;
                     s_loc[k] = sv;
                     row_max = max(row_max, sv);
                 }
