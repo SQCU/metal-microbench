@@ -329,6 +329,7 @@ let denseGemvFp32In32OutPSO = pso("dense_gemv_fp32in_fp32out_v5")
 let vision2dRopeFp32PSO  = pso("vision_2d_rope_neox_fp32")
 let visionAttnPrefillFp32PSO = pso("vision_attn_prefill_fp32")
 let visionAttnFlashFp32PSO   = pso("vision_attn_flash_fp32")
+let visionGemmFp32MmaPSO     = pso("vision_gemm_fp32_mma")
 let geluMulFp32PSO       = pso("gelu_mul_fp32")
 let visionPool2DFp32InFp32OutPSO = pso("vision_pool_2d_fp32in_fp32out")
 let visionStdNormFp32PSO = pso("vision_scaled_std_normalize_fp32")
@@ -469,6 +470,15 @@ func encVisionAttnPrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, K: MTLBuffer, V:
 
 func encGemvFp32V5(_ cb: MTLCommandBuffer, x: MTLBuffer, W: MTLBuffer, out: MTLBuffer,
                     B: Int, Din: Int, Dout: Int) {
+    // Route through the MMA-based batched GEMM unless explicitly disabled.
+    // The scalar GEMV kernel reloads each W row from DRAM for every batch
+    // element (~7 GB of weight traffic per projection at 2520 patches);
+    // vision_gemm_fp32_mma amortizes by tiling 8 tokens × 8 outputs per TG.
+    // VISION_GEMM_SCALAR=1 keeps the old kernel reachable for A/B.
+    if ProcessInfo.processInfo.environment["VISION_GEMM_SCALAR"] == nil &&
+       Din % 8 == 0 && Dout % 8 == 0 {
+        return encVisionGemmMmaFp32(cb, x: x, W: W, out: out, B: B, Din: Din, Dout: Dout)
+    }
     let enc = cb.makeComputeCommandEncoder()!
     enc.setComputePipelineState(denseGemvFp32In32OutPSO)
     enc.setBuffer(x, offset: 0, index: 0); enc.setBuffer(W, offset: 0, index: 1)
@@ -477,6 +487,26 @@ func encGemvFp32V5(_ cb: MTLCommandBuffer, x: MTLBuffer, W: MTLBuffer, out: MTLB
     enc.setBytes(&du, length: 4, index: 3); enc.setBytes(&dou, length: 4, index: 4)
     enc.dispatchThreadgroups(MTLSize(width: Dout / 32, height: B, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// Batched MMA GEMM dispatcher. Grid: (D_out/8, ceil(B/8)).
+func encVisionGemmMmaFp32(_ cb: MTLCommandBuffer, x: MTLBuffer, W: MTLBuffer, out: MTLBuffer,
+                           B: Int, Din: Int, Dout: Int) {
+    precondition(Din % 8 == 0 && Dout % 8 == 0,
+                 "vision_gemm_fp32_mma requires Din and Dout multiples of 8 (got \(Din), \(Dout))")
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(visionGemmFp32MmaPSO)
+    enc.setBuffer(x, offset: 0, index: 0); enc.setBuffer(W, offset: 0, index: 1)
+    enc.setBuffer(out, offset: 0, index: 2)
+    var Bv = UInt32(B), Dv = UInt32(Din), Ov = UInt32(Dout)
+    enc.setBytes(&Bv, length: 4, index: 3)
+    enc.setBytes(&Dv, length: 4, index: 4)
+    enc.setBytes(&Ov, length: 4, index: 5)
+    let qBlocks = (B + 7) / 8
+    let oBlocks = Dout / 8
+    enc.dispatchThreadgroups(MTLSize(width: oBlocks, height: qBlocks, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
 }
 

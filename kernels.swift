@@ -4592,6 +4592,84 @@ kernel void vision_attn_prefill_fp32(
     }
 }
 
+// Batched MMA-based GEMM for the vision tower's dense layers. X [B, D_in]
+// fp32, W [D_out, D_in] fp16 (row-major: each row is one output neuron's
+// weights), Y [B, D_out] fp32. Uses simdgroup_matrix<half, 8, 8> MMA with
+// fp32 accumulator. Each TG owns an 8-token × 8-output tile and iterates
+// over D_in in 8-sized K-tiles; the weight for this (o_block) is loaded
+// ONCE per TG rather than 2520 times (once per batch element) as the
+// old dense_gemv_fp32in_fp32out_v5 does. Expected speedup at vision
+// shapes: ~15× on 1152×1152 projections, more on the 4304-expanded FFN.
+//
+// Grid: (ceil(D_out/8), ceil(B/8)). 32 threads per TG.
+// D_in and D_out must be multiples of 8.
+kernel void vision_gemm_fp32_mma(
+    device const float* X               [[buffer(0)]],   // [B, D_in]
+    device const half*  W               [[buffer(1)]],   // [D_out, D_in]
+    device float*       Y               [[buffer(2)]],   // [B, D_out]
+    constant uint& B_count              [[buffer(3)]],
+    constant uint& D_in                 [[buffer(4)]],
+    constant uint& D_out                [[buffer(5)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    constexpr uint Q_TILE  = 8;
+    constexpr uint K_TILE  = 8;
+    constexpr uint O_TILE  = 8;
+    constexpr uint THREADS = 32;
+
+    const uint o_block = tg.x;
+    const uint q_block = tg.y;
+    const uint o_start = o_block * O_TILE;
+    const uint q_start = q_block * Q_TILE;
+    const uint lid0    = lid.x;
+
+    // Staging tiles: small, both in tg-mem.
+    threadgroup half  x_stage[Q_TILE * K_TILE];  // 128 B
+    threadgroup half  w_stage[K_TILE * O_TILE];  // 128 B
+    threadgroup float y_stage[Q_TILE * O_TILE];  // 256 B
+
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k = 0; k < D_in; k += K_TILE) {
+        // Stage X[q_start..q_start+8, k..k+8] as half.
+        for (uint i = lid0; i < Q_TILE * K_TILE; i += THREADS) {
+            uint q = i / K_TILE; uint kk = i % K_TILE;
+            uint q_abs = q_start + q;
+            uint k_abs = k + kk;
+            x_stage[i] = (q_abs < B_count && k_abs < D_in)
+                ? half(X[q_abs * D_in + k_abs]) : half(0);
+        }
+        // Stage W-tile: w_stage[kk, oo] = W[o_start+oo, k+kk].
+        // (Transposed layout feeds simdgroup_multiply_accumulate(C, A=X, B=W^T, C).)
+        for (uint i = lid0; i < K_TILE * O_TILE; i += THREADS) {
+            uint kk = i / O_TILE; uint oo = i % O_TILE;
+            uint o_abs = o_start + oo;
+            uint k_abs = k + kk;
+            w_stage[i] = (o_abs < D_out && k_abs < D_in)
+                ? W[o_abs * D_in + k_abs] : half(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_half8x8 mx, mw;
+        simdgroup_load(mx, x_stage, K_TILE);
+        simdgroup_load(mw, w_stage, O_TILE);
+        simdgroup_multiply_accumulate(acc, mx, mw, acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(acc, y_stage, O_TILE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = lid0; i < Q_TILE * O_TILE; i += THREADS) {
+        uint q = i / O_TILE; uint oo = i % O_TILE;
+        uint q_abs = q_start + q;
+        uint o_abs = o_start + oo;
+        if (q_abs < B_count && o_abs < D_out) {
+            Y[q_abs * D_out + o_abs] = y_stage[i];
+        }
+    }
+}
+
 // Flash-attention variant of vision_attn_prefill_fp32. Bidirectional (no
 // causal mask), optional padding mask, per-(head, q_block=8) threadgroup,
 // online softmax, simdgroup_matrix<half, 8, 8> MMA for QK accumulated into
