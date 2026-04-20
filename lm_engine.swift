@@ -845,11 +845,26 @@ final class LmEngine {
         runAdmissionPass()
         let busy = activeSessions.filter { $0.state.isBusy }
         if busy.isEmpty { return 0 }
-        // 1. Soft-tokens forced prefill.
-        if let s = busy.first(where: { sess in
+        // 1a. Multi-slot soft-tokens prefill: ALL busy sessions have a
+        //     .softTokens chunk at head → one buildPrefillCB dispatch
+        //     processes every slot's softs simultaneously (skipEmbed=true,
+        //     per-slot rows in pre_hidden). The point is weight-load
+        //     amortization: one dense-GEMV of attnQ/attnK/attnV runs once
+        //     and feeds all 4 slots' Q/K/V projections, instead of 4
+        //     single-slot dispatches each reloading the weights. Same
+        //     story for every layer's MLP/MoE/projection.
+        let softBusy = busy.filter { sess in
             if case .softTokens = sess.chunkQueue.first { return true }
             return false
-        }) {
+        }
+        if softBusy.count == busy.count && softBusy.count > 1 {
+            let beforeCounts = softBusy.map { $0.outputQueue.count }
+            _ = stepMultiSlotSoftPrefill(softBusy)
+            return zip(softBusy, beforeCounts).reduce(0) { $0 + ($1.0.outputQueue.count - $1.1) }
+        }
+        // 1b. Single-session soft-tokens path (or mixed: only one session
+        //     has softs pending while others are elsewhere in their queue).
+        if let s = softBusy.first {
             let before = s.outputQueue.count
             _ = stepPrefillForSession(s)
             return s.outputQueue.count - before
@@ -986,6 +1001,145 @@ final class LmEngine {
             if ts.isEmpty { s.chunkQueue.removeFirst() }
             else          { s.chunkQueue[0] = .tokens(ts) }
             // Transition if chunk is drained.
+            if s.chunkQueue.isEmpty {
+                let base = b * VOCAB
+                let logP = logits.contents().assumingMemoryBound(to: Float16.self)
+                var bestI = 0; var bestV: Float = -.infinity
+                for v in 0..<VOCAB {
+                    let x = Float(logP[base + v])
+                    if x > bestV { bestV = x; bestI = v }
+                }
+                let sampled = UInt32(bestI)
+                s.state = .generating
+                s.outputQueue.append(sampled)
+                s.consumedTokens.append(sampled)
+                s.nextGeneratedInput = sampled
+                s.numGenerated += 1; totalTokensGenerated += 1
+                if sampled == s.eosId || s.numGenerated >= s.maxNewTokens {
+                    s.state = .done
+                }
+            }
+        }
+        return true
+    }
+
+    // Multi-slot fast prefill for .softTokens chunks. Mirrors
+    // stepMultiSlotPrefill but pre-populates pre_hidden from each slot's
+    // own soft-tokens buffer (at its current byteOffset) and commits with
+    // skipEmbed=true — the vision-tower-produced rows already live in
+    // text-hidden space, no embed_lookup needed.
+    //
+    // Savings: on the tetraplex-with-4-images demo, serial single-slot
+    // soft prefill runs 4 × 35 tiles × ~130 ms = ~18 s wall. This path
+    // runs 35 tiles × ~150 ms = ~5 s wall, because each dense-GEMV loads
+    // its weights once and feeds all 4 slots' projections.
+    @discardableResult
+    func stepMultiSlotSoftPrefill(_ sessions: [Session]) -> Bool {
+        runAdmissionPass()
+        // Gather each busy slot's current soft-tokens chunk.
+        struct SoftRef {
+            let session: Session
+            let buffer: MTLBuffer
+            let remainingCount: Int
+            let isFp32: Bool
+            let byteOffset: Int
+        }
+        var slotSoft: [Int: SoftRef] = [:]
+        for s in sessions {
+            guard let sslot = s.slot else { continue }
+            guard case let .softTokens(buf, count, isFp32, byteOffset) = s.chunkQueue.first
+            else { continue }
+            slotSoft[sslot] = SoftRef(session: s, buffer: buf, remainingCount: count,
+                                       isFp32: isFp32, byteOffset: byteOffset)
+        }
+        guard !slotSoft.isEmpty else { return false }
+        // qLen = min over slots of remaining rows, clamped to MAX_Q_LEN.
+        var qLen = MAX_Q_LEN
+        for (_, sr) in slotSoft { qLen = min(qLen, sr.remainingCount) }
+        guard qLen >= 1 else { return false }
+
+        // Install real block_table entries for participating slots; silence
+        // the rest by redirecting their pages to the scratch strip.
+        let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
+        var savedBT = [UInt32](repeating: 0, count: B * MAX_PAGES_PER_SLOT)
+        for i in 0..<(B * MAX_PAGES_PER_SLOT) { savedBT[i] = btP[i] }
+        for b in 0..<B {
+            if let sr = slotSoft[b] {
+                if !ensurePages(sr.session, forKLen: sr.session.position + qLen + 1) { return false }
+                installBlockTable(sr.session, slot: b)
+            } else {
+                for p in 0..<MAX_PAGES_PER_SLOT {
+                    btP[b * MAX_PAGES_PER_SLOT + p] =
+                        UInt32(SCRATCH_PAGE_BASE + (p % SCRATCH_STRIP))
+                }
+            }
+        }
+        defer { for i in 0..<(B * MAX_PAGES_PER_SLOT) { btP[i] = savedBT[i] } }
+
+        // Populate pre_hidden[slot * qLen * HIDDEN ..] with each slot's softs.
+        // Layout: [B, qLen, HIDDEN] fp16 (pre_hidden is fp16 even though the
+        // source softs may be fp32 — we convert row-by-row). Silenced slots
+        // get zeros so garbage doesn't feed downstream kernels.
+        let pH = pre_hidden.contents().assumingMemoryBound(to: Float16.self)
+        let posP = pre_q_positions.contents().bindMemory(to: UInt32.self, capacity: B * MAX_Q_LEN)
+        let klsP = pre_k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
+        let klfP = pre_k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
+        for b in 0..<B {
+            let dstBase = (b * qLen) * HIDDEN
+            if let sr = slotSoft[b] {
+                let srcRaw = sr.buffer.contents().advanced(by: sr.byteOffset)
+                if sr.isFp32 {
+                    let srcPtr = srcRaw.assumingMemoryBound(to: Float.self)
+                    for i in 0..<(qLen * HIDDEN) {
+                        pH[dstBase + i] = Float16(srcPtr[i])
+                    }
+                } else {
+                    memcpy(pH.advanced(by: dstBase), srcRaw, qLen * HIDDEN * 2)
+                }
+                for i in 0..<qLen {
+                    posP[b * qLen + i] = UInt32(sr.session.position + i)
+                }
+                klsP[b] = UInt32(sr.session.position + qLen)
+                klfP[b] = UInt32(sr.session.position + qLen)
+            } else {
+                for i in 0..<(qLen * HIDDEN) { pH[dstBase + i] = 0 }
+                for i in 0..<qLen { posP[b * qLen + i] = 0 }
+                klsP[b] = 1
+                klfP[b] = 1
+            }
+        }
+
+        precomputeFlexPrefillMasks(qLen: qLen, positionStart: 0)
+        let cb = buildPrefillCB(weights, qLen: qLen, skipEmbed: true)
+        cb.commit(); cb.waitUntilCompleted()
+        totalSteps += 1
+        if let err = cb.error { print("  GPU multi-soft-prefill error: \(err)"); return false }
+
+        // Per-slot: advance position, promote pages, copy final logit,
+        // update the soft-chunk's byteOffset (or pop it + sample first
+        // gen token if this was the last chunk in the queue).
+        let srcPtr = pre_logits.contents().assumingMemoryBound(to: Float16.self)
+        let dstPtr = logits.contents().assumingMemoryBound(to: Float16.self)
+        for b in 0..<B {
+            guard let sr = slotSoft[b] else { continue }
+            let s = sr.session
+            s.position += qLen
+            promoteFinishedPages(s)
+            let src = srcPtr.advanced(by: (b * qLen + (qLen - 1)) * VOCAB)
+            let dst = dstPtr.advanced(by: b * VOCAB)
+            memcpy(dst, src, VOCAB * 2)
+            let remaining = sr.remainingCount - qLen
+            if remaining <= 0 {
+                s.chunkQueue.removeFirst()
+            } else {
+                let bpe = sr.isFp32 ? 4 : 2
+                let newOffset = sr.byteOffset + qLen * HIDDEN * bpe
+                s.chunkQueue[0] = .softTokens(buffer: sr.buffer, count: remaining,
+                                               isFp32: sr.isFp32, byteOffset: newOffset)
+            }
+            // If this was the last chunk of the session's priming queue,
+            // transition to .generating + sample the first token from the
+            // slot's final-Q-row logit (mirrors stepMultiSlotPrefill's tail).
             if s.chunkQueue.isEmpty {
                 let base = b * VOCAB
                 let logP = logits.contents().assumingMemoryBound(to: Float16.self)
