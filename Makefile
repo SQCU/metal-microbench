@@ -1,7 +1,7 @@
 # After the 2026-04-18 refactor, forward_graph is multi-file. `main.swift`
 # holds top-level script entry (Swift requires that name for file-scope
 # executable statements); other files are library-style (declarations only).
-FORWARD_GRAPH_SRCS = main.swift common.swift kernels.swift vision_tower.swift harness.swift tokenizer.swift lm_session.swift lm_engine.swift page_manager.swift
+FORWARD_GRAPH_SRCS = main.swift common.swift kernels.swift vision_tower.swift harness.swift tokenizer.swift lm_session.swift lm_engine.swift page_manager.swift kv_visualizer.swift
 
 all: mem_mountain tile_gemm paged_attention moe_matmul dense_gemv forward_ops forward_graph gguf_loader
 

@@ -3296,6 +3296,9 @@ if ProcessInfo.processInfo.environment["SHARED_PREFIX_PARITY"] != nil {
 if ProcessInfo.processInfo.environment["SHARED_PREFIX_PARITY_FULL"] != nil {
     runSharedPrefixParityFull()
 }
+if ProcessInfo.processInfo.environment["KV_VIZ"] != nil {
+    runKvVisualizer()
+}
 if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
    let outDir = ProcessInfo.processInfo.environment["LM_DUMP_EXPERT_W"] {
     let id = Int(ProcessInfo.processInfo.environment["LM_DUMP_EXPERT_ID"] ?? "52") ?? 52
