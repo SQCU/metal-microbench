@@ -173,6 +173,60 @@ final class Session {
         submit(eng.tokenizer.encode(text, addBos: addBos))
     }
 
+    // Explicit KV-page sharing: borrow this session's first `pageCount`
+    // pages from `source` and install them as our own read-only prefix.
+    // Unlike content-hash auto-sharing (which needs token-level hashable
+    // prefixes), adoptKvFrom operates on phys pages directly — so it
+    // works for ANY kind of prefix, including image soft tokens that
+    // aren't easily fingerprinted from their fp16 content.
+    //
+    // Usage (the "same image, multiple suffixes" pattern):
+    //   let base = engine.openSession(); base.submit(prefix + image)
+    //   while base.state == .priming { engine.tick() }
+    //   let pagesToShare = base.position / PAGE_SLIDE       // full pages only
+    //   for query in queries {
+    //       let s = engine.openSession()
+    //       s.adoptKvFrom(base, pageCount: pagesToShare)
+    //       s.submit(query)
+    //   }
+    //   while engine.hasWork { engine.tick() }              // all concurrent
+    //
+    // Preconditions: this session must be fresh (position=0, no owned
+    // pages yet) and `pageCount` must not exceed source's current owned
+    // page count. Fails silently (returns false) otherwise.
+    @discardableResult
+    func adoptKvFrom(_ source: Session, pageCount: Int) -> Bool {
+        guard position == 0 && ownedPages.isEmpty else { return false }
+        guard pageCount >= 0, pageCount <= source.ownedPages.count else { return false }
+        guard let eng = engine else { return false }
+        // Share each of source's leading phys pages. shareExisting handles
+        // the release-from-freelist path if source has since closed but
+        // the page's content hasn't been overwritten yet.
+        for p in 0..<pageCount {
+            let phys = source.ownedPages[p]
+            eng.pageManager.shareExisting(physPage: phys, sessionId: id)
+            ownedPages.append(phys)
+        }
+        // Advance our position past the shared range. The next submit's
+        // tokens will prefill starting at this position.
+        position = pageCount * PAGE_SLIDE
+        // Copy source's consumedTokens over the shared range so that
+        // post-prefill promotion for our future pages uses a prefix hash
+        // that stays consistent with source's (i.e. a THIRD session
+        // sharing BOTH of us gets a consistent cache hit).
+        let tokensToCopy = min(source.consumedTokens.count, pageCount * PAGE_SLIDE)
+        if tokensToCopy > 0 {
+            consumedTokens.append(contentsOf: source.consumedTokens[0..<tokensToCopy])
+        }
+        // Adopted pages were already content-indexed by source's post-
+        // prefill promotion; skip re-promoting them.
+        promotedPageCount = pageCount
+        // A session that adopted pages is priming-ready: it has KV for
+        // positions [0, pageCount*PAGE_SLIDE) but no queued chunks yet.
+        // The first submit() will queue the divergent suffix.
+        return true
+    }
+
     // Walk the PageManager's content index for leading pages of
     // consumedTokens. Returns the number of pages successfully adopted.
     // Idempotent-ish: safe to call, just returns 0 if none match.
@@ -959,6 +1013,117 @@ func runLmSharedPrefixDemo(ggufPath: String, maxNewPerSession: Int) {
         print(String(format: "  s%d: %.1f ms  (%.2f× vs s1 baseline)  — %d%% of pages cache-adopted",
                      i + 1, wall, speedup, cachedPct))
     }
+}
+
+// ----------------------------------------------------------------------
+// Branch demo driver. Opens a BASE session with a shared prefix, fully
+// prefills it (so KV is populated), then opens N branch sessions that
+// each adoptKvFrom(base, pageCount: prefixPages) and submit their own
+// divergent suffix. All N branches decode CONCURRENTLY — real compute
+// reuse from a single shared prefix.
+//
+//   LM_BRANCH_DEMO=1
+//   LM_BRANCH_PREFIX=<common prompt>
+//   LM_BRANCH_SUFFIX_1=<q1>, LM_BRANCH_SUFFIX_2=<q2>, ...
+//   [LM_BRANCH_MAX=16]       # max new per branch
+//   GGUF_PATH=<gguf> [LM_ADD_BOS=1]
+//
+// This is the text-only prototype of what the real "same image, multiple
+// suffixes" demo will look like — same structure, just with an image
+// chunk in the prefix. Once image scatter semantics are fixed, swap
+// LM_BRANCH_PREFIX text for actual vision-tower soft tokens and the
+// branching API is unchanged.
+// ----------------------------------------------------------------------
+func runLmBranchDemo(ggufPath: String, maxNewPerBranch: Int) {
+    print("\n=== LM prefix-branch demo (adoptKvFrom) ===")
+    let env = ProcessInfo.processInfo.environment
+    let addBos = env["LM_ADD_BOS"].flatMap {
+        ["0", "false", "no"].contains($0.lowercased()) ? false : true
+    }
+    guard let prefix = env["LM_BRANCH_PREFIX"], !prefix.isEmpty else {
+        print("  Missing LM_BRANCH_PREFIX."); return
+    }
+    var suffixes: [String] = []
+    for i in 1...16 {
+        if let s = env["LM_BRANCH_SUFFIX_\(i)"], !s.isEmpty { suffixes.append(s) }
+    }
+    if suffixes.isEmpty {
+        suffixes = [" What is the capital of France? One word.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+                    " What is the capital of Japan? One word.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+                    " What is the capital of Germany? One word.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"]
+    }
+
+    let w: LmWeights
+    do { w = try loadLmWeights(ggufPath: ggufPath) }
+    catch { print("  loadLmWeights failed: \(error)"); return }
+    let engine = LmEngine(weights: w)
+
+    // --- 1. Prime the BASE session with the shared prefix ---
+    let prefixToks = engine.tokenize(prefix, addBos: addBos)
+    print("  shared prefix: \(prefix.debugDescription)")
+    print("  (\(prefixToks.count) tokens ≈ \((prefixToks.count + PAGE_SLIDE - 1) / PAGE_SLIDE) pages; \(prefixToks.count / PAGE_SLIDE) full pages shareable)")
+
+    guard let base = engine.openSession(maxNewTokens: 0) else {
+        print("  openSession(base) failed"); return
+    }
+    base.submit(prefixToks)
+
+    let tPrime = Date()
+    // Pump until base has consumed all prefix tokens. We don't need it to
+    // generate anything — just get its KV populated so the full pages are
+    // promoted to the content index. base's maxNewTokens=0 stops gen
+    // immediately once the last prefill token flips state to generating.
+    while base.state == .priming {
+        _ = engine.tick()
+    }
+    let primeMs = Date().timeIntervalSince(tPrime) * 1000
+    let pagesToShare = base.position / PAGE_SLIDE
+    print(String(format: "  base prefill complete: pos=%d, %d full pages available for sharing, wall=%.1f ms",
+                 base.position, pagesToShare, primeMs))
+
+    // --- 2. Open N branch sessions, each adopts base's first N pages ---
+    var branches: [Session] = []
+    for (i, sfx) in suffixes.enumerated() {
+        guard let branch = engine.openSession(maxNewTokens: maxNewPerBranch) else {
+            print("  openSession(branch \(i+1)) failed"); break
+        }
+        // Adopt base's pages — this is the "skip the prefix prefill" step.
+        _ = branch.adoptKvFrom(base, pageCount: pagesToShare)
+        branch.submit(engine.tokenize(sfx, addBos: false))
+        branches.append(branch)
+    }
+    print("  opened \(branches.count) branches; each inherits \(pagesToShare) pages of KV from base without reprefilling")
+
+    // --- 3. Pump concurrently until all branches finish ---
+    var outputs: [Int: String] = [:]
+    for b in branches { outputs[b.id] = "" }
+    let tRun = Date()
+    while engine.hasWork {
+        _ = engine.tick()
+        for b in branches {
+            while let tok = b.nextToken() {
+                outputs[b.id, default: ""] += engine.detokenize([tok])
+            }
+        }
+    }
+    let runMs = Date().timeIntervalSince(tRun) * 1000
+    print(String(format: "  branches ran concurrently: %.1f ms (mean step %.1f ms × %d steps)",
+                 runMs, engine.lastStepMs, engine.totalSteps))
+
+    // --- 4. Report outputs + stats ---
+    print("")
+    print("  --- branch outputs ---")
+    for (i, b) in branches.enumerated() {
+        print("  branch \(i+1) (session \(b.id)): \(outputs[b.id]!.debugDescription)")
+        engine.closeSession(b)
+    }
+    engine.closeSession(base)
+
+    let pagesPerBranch = pagesToShare
+    let sharedWork = pagesPerBranch * branches.count
+    print("")
+    print(String(format: "  sharing: %d pages × %d branches = %d page-writes skipped vs naive \"reprefill per branch\"",
+                 pagesPerBranch, branches.count, sharedWork))
 }
 
 // ----------------------------------------------------------------------
