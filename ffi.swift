@@ -219,6 +219,71 @@ public func gemma_active_session_count() -> Int32 {
     return Int32(gSessions.count)
 }
 
+// Fill out_sids with the currently-open session handles, return count.
+// If out_sids is nil, returns the count that would be written.
+@_cdecl("gemma_active_session_ids")
+public func gemma_active_session_ids(_ outSids: UnsafeMutablePointer<Int32>?,
+                                      _ maxN: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    let sorted = gSessions.keys.sorted()
+    if outSids == nil { return Int32(sorted.count) }
+    let n = min(sorted.count, Int(maxN))
+    for i in 0..<n { outSids![i] = sorted[i] }
+    return Int32(n)
+}
+
+// Snapshot one session's KV state for the cache-tenancy viz.
+//   outPosition: session.position (current k_len, i.e. token count)
+//   outState:    SessionState enum (0..4), see gemma_session_state
+//   outPages:    fill with phys page IDs this session owns (ordered)
+//   returns:     number of pages written, or query-size when outPages is nil
+@_cdecl("gemma_session_snapshot")
+public func gemma_session_snapshot(_ sid: Int32,
+                                    _ outPosition: UnsafeMutablePointer<Int32>?,
+                                    _ outState: UnsafeMutablePointer<Int32>?,
+                                    _ outPages: UnsafeMutablePointer<UInt32>?,
+                                    _ maxPages: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let s = gSessions[sid] else { return -1 }
+    if let op = outPosition { op.pointee = Int32(s.positionForDebug) }
+    if let os = outState {
+        switch s.state {
+        case .idle: os.pointee = 0
+        case .priming: os.pointee = 1
+        case .generating: os.pointee = 2
+        case .paused: os.pointee = 3
+        case .done: os.pointee = 4
+        }
+    }
+    let pages = s.ownedPagesForDebug
+    if outPages == nil { return Int32(pages.count) }
+    let n = min(pages.count, Int(maxPages))
+    for i in 0..<n { outPages![i] = UInt32(pages[i]) }
+    return Int32(n)
+}
+
+// Refcount (owner-count) for a physical page. > 1 ⇒ shared across sessions.
+@_cdecl("gemma_page_refcount")
+public func gemma_page_refcount(_ phys: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let engine = gEngine else { return 0 }
+    return Int32(engine.pageManager.pageRefcount(Int(phys)))
+}
+
+// Which session IDs currently own a given phys page. Fill outSids, return count.
+@_cdecl("gemma_page_owners")
+public func gemma_page_owners(_ phys: Int32,
+                               _ outSids: UnsafeMutablePointer<Int32>?,
+                               _ maxN: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let engine = gEngine else { return 0 }
+    let owners = engine.pageManager.ownersOfPage(Int(phys))
+    if outSids == nil { return Int32(owners.count) }
+    let n = min(owners.count, Int(maxN))
+    for i in 0..<n { outSids![i] = Int32(owners[i]) }
+    return Int32(n)
+}
+
 // --- Vision / multimodal ---
 
 // Load vision weights from the Gemma-4 safetensors file. Must be called once

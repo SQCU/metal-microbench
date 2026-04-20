@@ -131,6 +131,24 @@ _lib.gemma_vision_cache_bytes.restype = C.c_uint64
 _lib.gemma_vision_cache_clear.argtypes = []
 _lib.gemma_vision_cache_clear.restype = C.c_int32
 
+_lib.gemma_active_session_ids.argtypes = [C.POINTER(C.c_int32), C.c_int32]
+_lib.gemma_active_session_ids.restype = C.c_int32
+
+_lib.gemma_session_snapshot.argtypes = [
+    C.c_int32,                       # sid
+    C.POINTER(C.c_int32),            # out_position
+    C.POINTER(C.c_int32),            # out_state
+    C.POINTER(C.c_uint32),           # out_pages
+    C.c_int32,                       # max_pages
+]
+_lib.gemma_session_snapshot.restype = C.c_int32
+
+_lib.gemma_page_refcount.argtypes = [C.c_int32]
+_lib.gemma_page_refcount.restype = C.c_int32
+
+_lib.gemma_page_owners.argtypes = [C.c_int32, C.POINTER(C.c_int32), C.c_int32]
+_lib.gemma_page_owners.restype = C.c_int32
+
 
 # --- Public Python API ---
 
@@ -308,3 +326,37 @@ def vision_cache_stats() -> dict:
 
 def vision_cache_clear() -> int:
     return _lib.gemma_vision_cache_clear()
+
+
+# --- KV snapshot (for the tenancy viz in the web demo) ---
+
+def active_session_ids(max_n: int = 64) -> list[int]:
+    buf = (C.c_int32 * max_n)()
+    n = _lib.gemma_active_session_ids(buf, max_n)
+    return [buf[i] for i in range(n)] if n > 0 else []
+
+
+def session_snapshot(sid: int, max_pages: int = 1024) -> dict | None:
+    """Return {'sid', 'position', 'state', 'pages': [phys_ids]} or None if missing."""
+    pos = C.c_int32(0)
+    state = C.c_int32(0)
+    pages = (C.c_uint32 * max_pages)()
+    n = _lib.gemma_session_snapshot(int(sid), C.byref(pos), C.byref(state), pages, max_pages)
+    if n < 0:
+        return None
+    return {
+        "sid": int(sid),
+        "position": pos.value,
+        "state": state.value,  # 0..4, see STATE_* constants
+        "pages": [pages[i] for i in range(n)],
+    }
+
+
+def page_refcount(phys: int) -> int:
+    return _lib.gemma_page_refcount(int(phys))
+
+
+def page_owners(phys: int, max_n: int = 32) -> list[int]:
+    buf = (C.c_int32 * max_n)()
+    n = _lib.gemma_page_owners(int(phys), buf, max_n)
+    return [buf[i] for i in range(n)] if n > 0 else []

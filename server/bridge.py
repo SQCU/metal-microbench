@@ -260,6 +260,45 @@ def health() -> JSONResponse:
     })
 
 
+_STATE_NAMES = {0: "idle", 1: "priming", 2: "generating", 3: "paused", 4: "done"}
+
+
+@app.get("/v1/kv/snapshot")
+def kv_snapshot() -> JSONResponse:
+    """Per-session page ownership + per-page refcount. Clients poll this
+    during generation to render a live tenancy strip — pages with refcount>1
+    are shared across sessions (prefix-cache hit or explicit adoptKvFrom).
+    """
+    sids = g.active_session_ids()
+    sessions = []
+    for sid in sids:
+        snap = g.session_snapshot(sid)
+        if not snap:
+            continue
+        # Annotate each page with (refcount, other_owner_sids).
+        page_entries = []
+        for phys in snap["pages"]:
+            owners = g.page_owners(int(phys))
+            page_entries.append({
+                "phys": int(phys),
+                "refcount": len(owners),
+                "shared_with": [o for o in owners if o != snap["sid"]],
+            })
+        sessions.append({
+            "sid": snap["sid"],
+            "position": snap["position"],
+            "state": _STATE_NAMES.get(snap["state"], "?"),
+            "page_count": len(page_entries),
+            "shared_count": sum(1 for p in page_entries if p["refcount"] > 1),
+            "pages": page_entries,
+        })
+    return JSONResponse({
+        "sessions": sessions,
+        "page_size_tokens": 16,      # PAGE_SLIDE — constant for the demo
+        "total_pages": 8192,         # pool capacity
+    })
+
+
 @app.get("/v1/cache/stats")
 def cache_stats() -> JSONResponse:
     """Inspect the vision-tower soft-tokens cache."""
@@ -355,6 +394,16 @@ def _close_session(sid: int) -> None:
     g.close_session(sid)
 
 
+# Short linger before close so the web demo's KV tenancy strip can show
+# the final page-count after generation ends, instead of flicking to empty.
+LINGER_SECONDS = 5.0
+
+
+async def _close_session_lingering(sid: int) -> None:
+    await asyncio.sleep(LINGER_SECONDS)
+    _close_session(sid)
+
+
 async def _iter_session_tokens(state: SessionState):
     """Async generator yielding lists of token ids from a session's queue."""
     loop = asyncio.get_event_loop()
@@ -397,7 +446,8 @@ async def chat_completions(req: Request) -> Any:
                 "finish_reason": "stop",
             }],
             "usage": {"completion_tokens": len(pieces)},
-        })
+        }, headers={"X-Gemma-Session-Id": str(sid),
+                    "Access-Control-Expose-Headers": "X-Gemma-Session-Id"})
 
     # SSE stream.
     async def sse():
@@ -432,9 +482,13 @@ async def chat_completions(req: Request) -> Any:
             }
             yield f"data: {json.dumps(tail)}\n\n"
             yield "data: [DONE]\n\n"
-            _close_session(sid)
+            # Linger briefly so the demo's KV-tenancy viz can render the
+            # session's final page count before it disappears.
+            asyncio.create_task(_close_session_lingering(sid))
 
-    return StreamingResponse(sse(), media_type="text/event-stream")
+    return StreamingResponse(sse(), media_type="text/event-stream",
+                              headers={"X-Gemma-Session-Id": str(sid),
+                                       "Access-Control-Expose-Headers": "X-Gemma-Session-Id"})
 
 
 @app.post("/v1/completions")

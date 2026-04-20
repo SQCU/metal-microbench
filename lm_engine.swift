@@ -301,6 +301,7 @@ final class Session {
     var pendingOutputCount: Int { outputQueue.count }
     var pendingPrimingCount: Int { chunkQueue.reduce(0) { $0 + $1.count } }
     var ownedPagesForDebug: [Int] { ownedPages }
+    var positionForDebug: Int { position }
 
     // Mark as done; engine will release pages + slot on the next tick.
     func finish() { state = .done }

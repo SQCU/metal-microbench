@@ -202,6 +202,18 @@ final class PageManager {
         return sessionPages[sessionId] ?? []
     }
 
+    // Owners of a physical page. Used by the KV-snapshot FFI to surface
+    // which sessions are citing a given page (refcount > 1 ⇒ shared).
+    func ownersOfPage(_ phys: Int) -> [Int] {
+        guard phys >= 0 && phys < pages.count else { return [] }
+        return Array(pages[phys].owners).sorted()
+    }
+
+    func pageRefcount(_ phys: Int) -> Int {
+        guard phys >= 0 && phys < pages.count else { return 0 }
+        return pages[phys].owners.count
+    }
+
     // Diagnostic snapshot.
     struct Stats {
         let totalPages: Int

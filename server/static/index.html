@@ -34,6 +34,16 @@
   .imgrow input[type=file] { font-size: 0.7rem; color: #888; }
   .imgrow .thumb { max-height: 3em; max-width: 3em; border: 1px solid #333; border-radius: 2px; }
   .imgrow .clear { background: none; border: 1px solid #444; color: #888; padding: 0.15em 0.4em; font-size: 0.7rem; cursor: pointer; }
+  .kvstrip { display: flex; flex-wrap: wrap; gap: 2px; margin-top: 0.4em; padding: 0.4em; background: #0a0a0a; border: 1px solid #222; border-radius: 3px; min-height: 2em; }
+  .kvstrip .label { font-size: 0.7rem; color: #666; margin-right: 0.5em; align-self: center; }
+  .kvstrip .cell {
+    width: 0.9em; height: 0.9em; border-radius: 2px; background: #222;
+    flex: none; cursor: default;
+  }
+  .kvstrip .cell.own   { background: #2a5; }    /* private — unique to this session */
+  .kvstrip .cell.shr2  { background: #fa3; }    /* shared with exactly 1 other — hot prefix */
+  .kvstrip .cell.shr3p { background: #f36; }    /* shared with 2+ others — truly hot */
+  .kvstrip:empty::after { content: '(no pages yet)'; color: #444; font-size: 0.75rem; }
 </style>
 </head>
 <body>
@@ -56,6 +66,7 @@
       <span class="meta" id="metaA"></span>
     </div>
     <div class="output" id="oA"></div>
+    <div class="kvstrip" id="kvA"><span class="label">kv pages:</span></div>
   </div>
   <div class="pane">
     <h2>stream B</h2>
@@ -71,6 +82,7 @@
       <span class="meta" id="metaB"></span>
     </div>
     <div class="output" id="oB"></div>
+    <div class="kvstrip" id="kvB"><span class="label">kv pages:</span></div>
   </div>
 </main>
 
@@ -89,8 +101,58 @@ async function pollHealth() {
 pollHealth();
 setInterval(pollHealth, 1500);
 
-// Per-pane attached image state (data URL or null).
+// Per-pane attached image state (data URL or null) + pane → session-id map.
 const imgData = {A: null, B: null};
+const paneSid = {A: null, B: null};
+
+// KV snapshot poll loop (active while any pane has a live session).
+let kvPolling = false;
+async function kvPoll() {
+  if (kvPolling) return;
+  kvPolling = true;
+  try {
+    while (Object.values(paneSid).some(v => v !== null)) {
+      try {
+        const r = await fetch('/v1/kv/snapshot');
+        const j = await r.json();
+        renderKv(j);
+      } catch (e) { /* server may be briefly unavailable — keep polling */ }
+      await new Promise(r => setTimeout(r, 300));
+    }
+    // One final refresh so the strip shows the end-state before fading.
+    try { renderKv(await (await fetch('/v1/kv/snapshot')).json()); } catch (e) {}
+  } finally {
+    kvPolling = false;
+  }
+}
+
+function renderKv(snapshot) {
+  for (const pane of ['A', 'B']) {
+    const strip = document.getElementById(`kv${pane}`);
+    const sid = paneSid[pane];
+    // Clear everything except the leading label span.
+    strip.innerHTML = '<span class="label">kv pages:</span>';
+    if (sid === null) continue;
+    const sess = snapshot.sessions.find(s => s.sid === sid);
+    if (!sess) continue;
+    const tokensLabel = document.createElement('span');
+    tokensLabel.className = 'label';
+    tokensLabel.textContent = `s${sid} · ${sess.state} · ${sess.position} tok · ${sess.page_count} pages (${sess.shared_count} shared)`;
+    strip.appendChild(tokensLabel);
+    for (const p of sess.pages) {
+      const cell = document.createElement('div');
+      cell.className = 'cell';
+      if (p.refcount >= 3) cell.classList.add('shr3p');
+      else if (p.refcount >= 2) cell.classList.add('shr2');
+      else cell.classList.add('own');
+      const others = p.shared_with.length
+        ? ` · shared with s${p.shared_with.join(',s')}`
+        : '';
+      cell.title = `phys ${p.phys}${others}`;
+      strip.appendChild(cell);
+    }
+  }
+}
 
 function onPick(which) {
   const f = document.getElementById(`img${which}`).files[0];
@@ -152,6 +214,11 @@ async function ask(which) {
       oEl.textContent = `(http ${res.status}) ${await res.text()}`;
       return;
     }
+    // Pick up the sid from the response header and start polling the KV
+    // snapshot endpoint so the tenancy strip updates live for this pane.
+    const sidHeader = res.headers.get('X-Gemma-Session-Id');
+    paneSid[which] = sidHeader ? parseInt(sidHeader, 10) : null;
+    if (paneSid[which] !== null) kvPoll();
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
@@ -186,6 +253,10 @@ async function ask(which) {
     meta.textContent = `ttft=${ttft}s · ${tokenCount} chunks in ${wall.toFixed(2)}s`;
   } finally {
     btn.disabled = false;
+    // Clear this pane's sid so the KV poll loop can terminate when both
+    // panes are idle. Leave the strip rendered (snapshot still shows the
+    // session as 'done' briefly, then disappears on next poll).
+    paneSid[which] = null;
   }
 }
 </script>
