@@ -1091,6 +1091,86 @@ func encPagedAttnSlideArShared(_ cb: MTLCommandBuffer,
     enc.endEncoding()
 }
 
+// Tail-only AR attention — runs flex_attn_slide_v0 with prefix_pages > 0 so
+// it skips logical pages already handled by the shared-prefix broadcast
+// kernel, and writes its partials at split_offset=1 into a 2-split layout.
+// The caller provides the same CSR (flex_full_*/flex_partial_*) as a
+// regular v0 call; filtering happens per-block inside the kernel.
+func encFlexAttnSlideV0Tail(_ cb: MTLCommandBuffer, Q: MTLBuffer,
+                             Kc: MTLBuffer, Vc: MTLBuffer,
+                             kLenBuf: MTLBuffer,
+                             mPart: MTLBuffer, lPart: MTLBuffer, OPart: MTLBuffer,
+                             H_Q: Int, H_KV: Int, D: Int,
+                             prefixPages: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(flexAttnSlideV0PSO)
+    enc.setBuffer(Q, offset: 0, index: 0); enc.setBuffer(Kc, offset: 0, index: 1)
+    enc.setBuffer(Vc, offset: 0, index: 2); enc.setBuffer(block_table, offset: 0, index: 3)
+    enc.setBuffer(mPart, offset: 0, index: 4)
+    enc.setBuffer(lPart, offset: 0, index: 5)
+    enc.setBuffer(OPart, offset: 0, index: 6)
+    enc.setBuffer(flex_full_offsets, offset: 0, index: 7)
+    enc.setBuffer(flex_full_indices, offset: 0, index: 8)
+    enc.setBuffer(flex_partial_offsets, offset: 0, index: 9)
+    enc.setBuffer(flex_partial_indices, offset: 0, index: 10)
+    enc.setBuffer(kLenBuf, offset: 0, index: 11)
+    var scale: Float = 1.0
+    var mv = UInt32(MAX_PAGES_PER_SLOT), hq = UInt32(H_Q), hkv = UInt32(H_KV)
+    // Internal N_SPLITS=1: the tail kernel doesn't sub-partition its CSR
+    // work across TGs in this variant. total_splits_out=2 reserves split=0
+    // for the shared-prefix broadcast kernel.
+    var ns: UInt32 = 1, sw = UInt32(SLIDING_WINDOW)
+    var pp = UInt32(prefixPages), so: UInt32 = 1, tso: UInt32 = 2
+    enc.setBytes(&scale, length: 4, index: 12); enc.setBytes(&mv, length: 4, index: 13)
+    enc.setBytes(&hq,  length: 4, index: 14); enc.setBytes(&hkv, length: 4, index: 15)
+    enc.setBytes(&ns,  length: 4, index: 16); enc.setBytes(&sw,  length: 4, index: 17)
+    enc.setBytes(&pp,  length: 4, index: 18); enc.setBytes(&so,  length: 4, index: 19)
+    enc.setBytes(&tso, length: 4, index: 20)
+    enc.dispatchThreadgroups(MTLSize(width: B * H_KV, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// End-to-end shared+tail+reduce AR attention for the slide layer.
+// Caller provides the shared-phys-page list (one per logical page) which
+// applies to ALL active slots; each slot's block_table must agree on those
+// pages. The tail range is driven by each slot's own block_table + k_len.
+func encPagedAttnSlideArSharedAndTail(_ cb: MTLCommandBuffer,
+                                       Q: MTLBuffer, O: MTLBuffer,
+                                       Kc: MTLBuffer, Vc: MTLBuffer,
+                                       sharedPhysPages: MTLBuffer,
+                                       mPart: MTLBuffer, lPart: MTLBuffer, OPart: MTLBuffer,
+                                       kLenBuf: MTLBuffer,
+                                       H_Q: Int, H_KV: Int, D: Int,
+                                       prefixPages: Int, slidingWindow: Int, bBatch: Int) {
+    // 1. Shared kernel writes split=0.
+    encPagedAttnSlideArShared(cb, Q: Q, Kc: Kc, Vc: Vc,
+                               sharedPhysPages: sharedPhysPages,
+                               mPart: mPart, lPart: lPart, OPart: OPart,
+                               kLenBuf: kLenBuf,
+                               H_Q: H_Q, H_KV: H_KV,
+                               prefixPages: prefixPages,
+                               slidingWindow: slidingWindow, bBatch: bBatch)
+    // 2. Tail kernel writes split=1.
+    encFlexAttnSlideV0Tail(cb, Q: Q, Kc: Kc, Vc: Vc,
+                            kLenBuf: kLenBuf,
+                            mPart: mPart, lPart: lPart, OPart: OPart,
+                            H_Q: H_Q, H_KV: H_KV, D: D,
+                            prefixPages: prefixPages)
+    // 3. Reduce merges (split=0, split=1) → final O per (slot, q_head).
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(pagedSplitReducePSO)
+    enc.setBuffer(mPart, offset: 0, index: 0)
+    enc.setBuffer(lPart, offset: 0, index: 1)
+    enc.setBuffer(OPart, offset: 0, index: 2)
+    enc.setBuffer(O, offset: 0, index: 3)
+    var Dv = UInt32(D), ns: UInt32 = 2
+    enc.setBytes(&Dv, length: 4, index: 4); enc.setBytes(&ns, length: 4, index: 5)
+    enc.dispatchThreadgroups(MTLSize(width: bBatch * H_Q, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
 func encFlexAttnSlidePrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
                               Kc: MTLBuffer, Vc: MTLBuffer,
                               kLenBuf: MTLBuffer, qPositions: MTLBuffer,
@@ -1310,6 +1390,12 @@ func encFlexAttnSlideV0(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
     enc1.setBytes(&hq, length: 4, index: 14); enc1.setBytes(&hkv, length: 4, index: 15)
     enc1.setBytes(&ns, length: 4, index: 16)
     enc1.setBytes(&sw, length: 4, index: 17)
+    // New params — zeroed for the default path (no prefix skipping, pidx
+    // stride == N_SPLITS so output layout matches pre-broadcast v0 clients).
+    var pp: UInt32 = 0, so: UInt32 = 0, tso: UInt32 = 0
+    enc1.setBytes(&pp,  length: 4, index: 18)
+    enc1.setBytes(&so,  length: 4, index: 19)
+    enc1.setBytes(&tso, length: 4, index: 20)
     enc1.dispatchThreadgroups(MTLSize(width: B * H_KV, height: ATTN_N_SPLITS, depth: 1),
                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc1.endEncoding()
@@ -3079,6 +3165,9 @@ if ProcessInfo.processInfo.environment["ATTN_BENCH"] != nil {
 }
 if ProcessInfo.processInfo.environment["SHARED_PREFIX_SMOKE"] != nil {
     runSharedPrefixSmoke()
+}
+if ProcessInfo.processInfo.environment["SHARED_PREFIX_PARITY"] != nil {
+    runSharedPrefixParity()
 }
 if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
    let outDir = ProcessInfo.processInfo.environment["LM_DUMP_EXPERT_W"] {

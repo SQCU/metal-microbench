@@ -1716,6 +1716,128 @@ func runSharedPrefixSmoke() {
     }
 }
 
+// Parity test: run the split-kernel (shared + tail + reduce) path against
+// vanilla flex_attn_slide_v0 on identical synthetic inputs and compare
+// the final attention outputs. Should be near-bit-exact (FP non-
+// associativity in softmax ordering may produce differences in the last
+// few bits of mantissa; we allow <1e-3 relative deviation).
+//
+// Setup: all B slots' block_tables point at THE SAME phys pages for the
+// first prefix_pages logical pages, and at DISTINCT phys pages beyond.
+// k_len = prefix_pages * PAGE (pure-shared case: tail contributes nothing
+// and broadcast output alone must match v0). This isolates the shared path.
+//
+// Env: SHARED_PREFIX_PARITY=1
+func runSharedPrefixParity() {
+    print("\n=== Shared-prefix broadcast vs v0 parity ===")
+    let H_Q = 16, H_KV = 8, D = 256, PAGE = 16
+    let B_batch = 4
+    let prefixPages = 2
+
+    // K/V cache sized for prefix_pages phys pages.
+    let Kcache = halfBuf(prefixPages * PAGE * H_KV * D, seed: 0xA1)
+    let Vcache = halfBuf(prefixPages * PAGE * H_KV * D, seed: 0xB2)
+    // Q: [B, H_Q, D]
+    let Qbuf = halfBuf(B_batch * H_Q * D, seed: 0xC3)
+
+    // Block tables for v0 path: every slot b maps logical page p → phys p
+    // (same phys across slots for p < prefix_pages; we only have prefix_pages
+    // pages total, so all slots share identically).
+    let bt = device.makeBuffer(length: B_batch * MAX_PAGES_PER_SLOT * 4, options: .storageModeShared)!
+    let btP = bt.contents().assumingMemoryBound(to: UInt32.self)
+    for b in 0..<B_batch {
+        for p in 0..<MAX_PAGES_PER_SLOT {
+            btP[b * MAX_PAGES_PER_SLOT + p] = UInt32(p % prefixPages)
+        }
+    }
+    // Also write into the global `block_table` since v0 binds it by name.
+    let btGlobal = block_table.contents().bindMemory(to: UInt32.self,
+                    capacity: B_batch * MAX_PAGES_PER_SLOT)
+    for i in 0..<(B_batch * MAX_PAGES_PER_SLOT) { btGlobal[i] = btP[i] }
+
+    // k_len, num_pages — mirror slide path.
+    let kLenBuf = device.makeBuffer(length: B_batch * 4, options: .storageModeShared)!
+    let klP = kLenBuf.contents().assumingMemoryBound(to: UInt32.self)
+    for b in 0..<B_batch { klP[b] = UInt32(prefixPages * PAGE) }
+    let klGlobal = k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B_batch)
+    for b in 0..<B_batch { klGlobal[b] = UInt32(prefixPages * PAGE) }
+    let npGlobal = num_pages_slide.contents().bindMemory(to: UInt32.self, capacity: B_batch)
+    for b in 0..<B_batch { npGlobal[b] = UInt32(prefixPages) }
+
+    // Recompute CSR for v0 (causal + SW against this k_len).
+    precomputeFlexBlockMaskSlide(slidingWindow: SLIDING_WINDOW)
+
+    // Output buffers.
+    let O_v0    = emptyHalf(B_batch * H_Q * D)
+    let O_split = emptyHalf(B_batch * H_Q * D)
+
+    // ---- Path A: v0 alone (uses global m/l/O_partials sized for AR). ----
+    let cbA = queue.makeCommandBuffer()!
+    encFlexAttnSlideV0(cbA, Q: Qbuf, O: O_v0, Kc: Kcache, Vc: Vcache,
+                        kLenBuf: k_len_slide, H_Q: H_Q, H_KV: H_KV, D: D)
+    cbA.commit(); cbA.waitUntilCompleted()
+    if let e = cbA.error { print("  v0: \(e)"); return }
+
+    // ---- Path B: shared + tail + reduce (N_SPLITS=2). ----
+    // Fresh partials sized for 2 splits.
+    let mP = device.makeBuffer(length: B_batch * H_Q * 2 * 4, options: .storageModeShared)!
+    let lP = device.makeBuffer(length: B_batch * H_Q * 2 * 4, options: .storageModeShared)!
+    let OP = device.makeBuffer(length: B_batch * H_Q * 2 * D * 4, options: .storageModeShared)!
+    // Initialize to -INF / 0 so any path that writes nothing leaves the
+    // reducer with the correct empty-split semantics.
+    let mPp = mP.contents().assumingMemoryBound(to: Float.self)
+    let lPp = lP.contents().assumingMemoryBound(to: Float.self)
+    let OPp = OP.contents().assumingMemoryBound(to: Float.self)
+    for i in 0..<(B_batch * H_Q * 2) { mPp[i] = -.infinity; lPp[i] = 0 }
+    for i in 0..<(B_batch * H_Q * 2 * D) { OPp[i] = 0 }
+
+    let sharedPages = device.makeBuffer(length: prefixPages * 4, options: .storageModeShared)!
+    let spp = sharedPages.contents().assumingMemoryBound(to: UInt32.self)
+    for i in 0..<prefixPages { spp[i] = UInt32(i) }
+
+    let cbB = queue.makeCommandBuffer()!
+    encPagedAttnSlideArSharedAndTail(cbB, Q: Qbuf, O: O_split,
+                                      Kc: Kcache, Vc: Vcache,
+                                      sharedPhysPages: sharedPages,
+                                      mPart: mP, lPart: lP, OPart: OP,
+                                      kLenBuf: k_len_slide,
+                                      H_Q: H_Q, H_KV: H_KV, D: D,
+                                      prefixPages: prefixPages,
+                                      slidingWindow: SLIDING_WINDOW,
+                                      bBatch: B_batch)
+    cbB.commit(); cbB.waitUntilCompleted()
+    if let e = cbB.error { print("  split path: \(e)"); return }
+
+    // ---- Compare ----
+    let A = O_v0.contents().assumingMemoryBound(to: Float16.self)
+    let Bp = O_split.contents().assumingMemoryBound(to: Float16.self)
+    var maxAbsDiff: Float = 0
+    var sumAbsDiff: Double = 0
+    var l2A: Double = 0, l2B: Double = 0
+    let N = B_batch * H_Q * D
+    for i in 0..<N {
+        let a = Float(A[i]); let b = Float(Bp[i])
+        let d = abs(a - b)
+        if d > maxAbsDiff { maxAbsDiff = d }
+        sumAbsDiff += Double(d)
+        l2A += Double(a * a); l2B += Double(b * b)
+    }
+    let cos = (A.withMemoryRebound(to: Float16.self, capacity: N) { aPtr -> Double in
+        var dot: Double = 0
+        for i in 0..<N { dot += Double(Float(aPtr[i])) * Double(Float(Bp[i])) }
+        return dot
+    }) / (l2A.squareRoot() * l2B.squareRoot() + 1e-12)
+    print(String(format: "  max|diff|: %.6f   mean|diff|: %.6f",
+                 maxAbsDiff, Float(sumAbsDiff / Double(N))))
+    print(String(format: "  ‖v0‖₂=%.3f   ‖split‖₂=%.3f   cos-sim=%.9f",
+                 l2A.squareRoot(), l2B.squareRoot(), cos))
+    if maxAbsDiff < 1e-2 && cos > 0.999999 {
+        print("  ✓ split path matches v0 within FP tolerance")
+    } else {
+        print("  ✗ split path diverges from v0")
+    }
+}
+
 // ====================================================================
 // Prefill validation harness — drives `buildPrefillCB` against the same
 // lm_<tag>_tokens / lm_<tag>_logits oracle as runLmKLHarness, but in a

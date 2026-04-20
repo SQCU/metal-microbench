@@ -3277,8 +3277,11 @@ kernel void flex_attn_slide_v0(
     constant uint& max_pages                [[buffer(13)]],
     constant uint& H_Q                      [[buffer(14)]],
     constant uint& H_KV                     [[buffer(15)]],
-    constant uint& N_SPLITS                 [[buffer(16)]],
+    constant uint& N_SPLITS                 [[buffer(16)]],    // internal — partitions CSR work (per_split = n_total/N_SPLITS)
     constant uint& sliding_window           [[buffer(17)]],
+    constant uint& prefix_pages             [[buffer(18)]],    // skip logical pages < this (tail mode). 0 = process all.
+    constant uint& split_offset             [[buffer(19)]],    // write partials at total_splits_out stride, + split_offset + tg.y. 0 = default.
+    constant uint& total_splits_out         [[buffer(20)]],    // output layout stride. If 0, falls back to N_SPLITS (v0 back-compat).
     uint3 tg_pos                            [[threadgroup_position_in_grid]],
     uint3 lid3                              [[thread_position_in_threadgroup]])
 {
@@ -3336,7 +3339,9 @@ kernel void flex_attn_slide_v0(
     uint ix_end   = min(ix_begin + per_split, n_total);
 
     // Walk the split's assigned blocks. FULL blocks come first, then PARTIAL,
-    // so we dispatch based on where ix lands.
+    // so we dispatch based on where ix lands. When `prefix_pages > 0` we skip
+    // any logical page index < prefix_pages (those positions are handled by
+    // the shared-prefix broadcast kernel at split=0).
     for (uint ix = ix_begin; ix < ix_end; ++ix) {
         uint p;
         bool is_partial;
@@ -3347,6 +3352,8 @@ kernel void flex_attn_slide_v0(
             p = partial_kv_indices[part_lo + (ix - n_full)];
             is_partial = true;
         }
+        // Skip logical pages owned by the shared-prefix broadcast kernel.
+        if (p < prefix_pages) continue;
 
         const uint phys = bt_s[p];
         device const half* Kbase = K_cache + (phys * PAGE * H_KV + kv_head) * D;
@@ -3419,11 +3426,15 @@ kernel void flex_attn_slide_v0(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Write partials per Q head.
+    // Write partials per Q head. Output layout stride = total_splits_out
+    // (falls back to N_SPLITS for pre-broadcast callers that don't set it).
+    // With split_offset>0, this kernel writes to the tail slice of a shared
+    // partials buffer whose split=0 is owned by the shared-prefix kernel.
+    const uint out_stride = (total_splits_out > 0) ? total_splits_out : N_SPLITS;
     const bool empty_split = (ix_begin >= ix_end);
     for (uint q = 0; q < Q_PER_TG; ++q) {
         const uint q_head = q_head_base + q;
-        const uint pidx = (slot * H_Q + q_head) * N_SPLITS + split;
+        const uint pidx = (slot * H_Q + q_head) * out_stride + split_offset + split;
         if (lid == 0) {
             m_partials[pidx] = empty_split ? -INFINITY : m_state[q];
             l_partials[pidx] = empty_split ? 0.0f : l_state[q];
