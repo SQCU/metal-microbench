@@ -1273,6 +1273,25 @@ func runLmPauseResumeDemo(ggufPath: String) {
 
 // ----------------------------------------------------------------------
 // Multimodal demo driver — feeds vision-tower output through a session.
+//
+// STATUS NOTE: generation quality through this path is currently poor.
+// The plumbing works end-to-end (vision tower → 272 soft tokens →
+// prefill → AR) and all engine-level invariants hold, but the model
+// produces degenerate output regardless of (a) BOI/EOI marker wrapping,
+// (b) padding to image_seq_length=280, or (c) soft-token magnitude
+// scaling. Remaining hypotheses:
+//   - Our Gemma-4 vision tower has a subtle numerical mismatch with
+//     HF's reference image_features (weight loading, layer ordering,
+//     or pre-RMS normalization). Confirming requires a side-by-side
+//     run against transformers' Gemma4ForConditionalGeneration on the
+//     same preprocessed image.
+//   - The HF-compatible scatter-after-embed path (which differs from
+//     our skipEmbed injection only if soft tokens don't match image_
+//     features byte-for-byte) may reveal the divergence point.
+// Both are deferred to a focused debugging session with Python HF
+// reference access; the infrastructure below (count padding, scale
+// factor, skipEmbed prefill) is in place to make that iteration quick.
+//
 // Env vars:
 //   GGUF_PATH=<gguf>                 # LM weights
 //   VISION_ST=<safetensors path>     # vision tower weights
@@ -1280,6 +1299,8 @@ func runLmPauseResumeDemo(ggufPath: String) {
 //   [LM_MULTIMODAL_PREFIX="…"]       # text before image tokens
 //   [LM_MULTIMODAL_SUFFIX="…"]       # text after image tokens
 //   [LM_MULTIMODAL_MAX=48]           # generation budget
+//   [LM_MM_NO_PAD=1]                 # disable 280 padding (run raw count)
+//   [LM_MM_SOFT_SCALE=<f>]           # soft-token magnitude scale (probe tool)
 //   [LM_ADD_BOS=1]
 //
 // Runs: vision_tower(image) → soft_tokens, opens a session, submits
@@ -1308,11 +1329,44 @@ func runLmMultimodal(ggufPath: String, stPath: String, imagePath: String,
     catch { print("  gemma4ImagePreprocess failed: \(error)"); return }
     print("  image preprocessed: \(batch.numRealPatches) real patches, grid \(batch.gridH)×\(batch.gridW)")
 
-    let (softTokens, nPooled) = runVisionTowerForward(batch: batch, weights: visWeights,
-                                                       device: device, queue: queue)
-    print("  vision tower → \(nPooled) soft tokens (fp32, [\(nPooled), \(HIDDEN)])")
-    if nPooled == 0 {
+    let (rawSoftTokens, rawNPooled) = runVisionTowerForward(batch: batch, weights: visWeights,
+                                                             device: device, queue: queue)
+    if rawNPooled == 0 {
         print("  0 soft tokens — image too small? aborting"); return
+    }
+
+    // Pad/truncate to Gemma-4's image_seq_length = 280. Default ON. Set
+    // LM_MM_NO_PAD=1 to run at the raw vision-tower count for comparison.
+    let targetSoft = 280
+    let noPad = ProcessInfo.processInfo.environment["LM_MM_NO_PAD"] != nil
+    // Scale factor applied to soft-token magnitudes. Vision-tower raw
+    // values measured ±1–13 while post-embed-scale text tokens sit ±1–3.
+    // If the imbalance causes image positions to dominate attention
+    // softmax, scaling corrects it. LM_MM_SOFT_SCALE=<float> to override;
+    // default 1.0 (no scaling).
+    let softScale: Float = Float(ProcessInfo.processInfo.environment["LM_MM_SOFT_SCALE"] ?? "") ?? 1.0
+    let softTokens: MTLBuffer
+    let nPooled: Int
+    if noPad && softScale == 1.0 {
+        softTokens = rawSoftTokens; nPooled = rawNPooled
+        print("  vision tower → \(nPooled) soft tokens (fp32; padding + scale skipped)")
+    } else {
+        let outN = noPad ? rawNPooled : targetSoft
+        let buf = device.makeBuffer(length: outN * HIDDEN * 4, options: .storageModeShared)!
+        memset(buf.contents(), 0, buf.length)
+        let copyRows = min(rawNPooled, outN)
+        if softScale == 1.0 {
+            memcpy(buf.contents(), rawSoftTokens.contents(), copyRows * HIDDEN * 4)
+        } else {
+            // CPU scale — O(copyRows * HIDDEN) fp32 ops, tiny.
+            let src = rawSoftTokens.contents().assumingMemoryBound(to: Float.self)
+            let dst = buf.contents().assumingMemoryBound(to: Float.self)
+            for i in 0..<(copyRows * HIDDEN) { dst[i] = src[i] * softScale }
+        }
+        softTokens = buf
+        nPooled = outN
+        print(String(format: "  vision tower → %d raw soft tokens; padded to %d, scale=%.3f",
+                     rawNPooled, outN, softScale))
     }
 
     let addBosEnv = ProcessInfo.processInfo.environment["LM_ADD_BOS"]
