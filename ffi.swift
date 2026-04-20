@@ -18,7 +18,8 @@ import CryptoKit
 
 private let ffiLock = NSRecursiveLock()
 private var gEngine: LmEngine?
-private var gVisionWeights: VisionWeights?
+private var gVisionResidency: VisionResidency?
+private var gPressureSource: DispatchSourceMemoryPressure?
 private var gSessions: [Int32: Session] = [:]
 private var gNextHandle: Int32 = 1
 
@@ -52,12 +53,49 @@ public func gemma_init(_ ggufPath: UnsafePointer<CChar>?) -> Int32 {
         // GPU kernel that reads active_exp — i.e. before the first tick().
         bootstrapGlobalState()
         let w = try loadLmWeights(ggufPath: pathStr)
+        // K/V caches are the thing we MUST NOT evict — losing a layer's K/V
+        // mid-conversation kills in-flight generations. Explicitly pin them
+        // as .nonVolatile (buffers default non-volatile, but explicit makes
+        // the policy legible and survives any ambient purgeability changes).
+        for kc in w.K_caches { _ = kc.setPurgeableState(.nonVolatile) }
+        for vc in w.V_caches { _ = vc.setPurgeableState(.nonVolatile) }
         gEngine = LmEngine(weights: w)
+        // Subscribe to macOS memory-pressure events. .warn ⇒ just ask for
+        // vision soft-cache flush; .critical ⇒ drop vision working weights
+        // + image-softs cache entirely. Session KV stays pinned throughout.
+        subscribePressureSource()
         return 0
     } catch {
         print("gemma_init failed: \(error)")
         return -1
     }
+}
+
+private func subscribePressureSource() {
+    // On macOS, DispatchSource memory-pressure events fire asynchronously
+    // from the kernel. We handle them on a dedicated serial queue so the
+    // handler doesn't contend with in-flight FFI calls on the main thread.
+    let q = DispatchQueue(label: "gemma.pressure", qos: .utility)
+    let src = DispatchSource.makeMemoryPressureSource(
+        eventMask: [.warning, .critical], queue: q)
+    src.setEventHandler {
+        let evt = src.data
+        ffiLock.lock(); defer { ffiLock.unlock() }
+        if evt.contains(.critical) {
+            print("[gemma] memory pressure CRITICAL — dropping vision working set + soft cache")
+            gVisionResidency?.forceDrop()
+            let evicted = gVisionCache.count
+            gVisionCache.removeAll()
+            if evicted > 0 {
+                print("[gemma] evicted \(evicted) soft-tokens cache entries")
+            }
+        } else if evt.contains(.warning) {
+            print("[gemma] memory pressure WARN — marking vision volatile")
+            gVisionResidency?.allowEvict()
+        }
+    }
+    src.resume()
+    gPressureSource = src
 }
 
 @_cdecl("gemma_is_ready")
@@ -286,8 +324,11 @@ public func gemma_page_owners(_ phys: Int32,
 
 // --- Vision / multimodal ---
 
-// Load vision weights from the Gemma-4 safetensors file. Must be called once
-// before any gemma_submit_image_path. Returns 0 on success, -1 on failure.
+// Bind the vision tower to a safetensors file. This is a CHEAP call now:
+// it only creates the zero-copy bf16 source buffers (mmap-backed, ~0 RAM).
+// The fp16 working weights are hydrated on first gemma_submit_image_path,
+// and may be dropped/reloaded across memory-pressure events. Returns 0 on
+// success, -1 on failure.
 @_cdecl("gemma_vision_init")
 public func gemma_vision_init(_ safetensorsPath: UnsafePointer<CChar>?) -> Int32 {
     ffiLock.lock(); defer { ffiLock.unlock() }
@@ -295,7 +336,7 @@ public func gemma_vision_init(_ safetensorsPath: UnsafePointer<CChar>?) -> Int32
     let pathStr = String(cString: p)
     do {
         let st = try SafetensorsFile(pathStr)
-        gVisionWeights = try loadVisionWeights(st, device: device)
+        gVisionResidency = VisionResidency(file: st)
         return 0
     } catch {
         print("gemma_vision_init failed: \(error)")
@@ -306,7 +347,44 @@ public func gemma_vision_init(_ safetensorsPath: UnsafePointer<CChar>?) -> Int32
 @_cdecl("gemma_vision_is_ready")
 public func gemma_vision_is_ready() -> Int32 {
     ffiLock.lock(); defer { ffiLock.unlock() }
-    return gVisionWeights != nil ? 1 : 0
+    return gVisionResidency != nil ? 1 : 0
+}
+
+// Current residency state: 0=unloaded, 1=volatile, 2=pinned, -1=not bound.
+@_cdecl("gemma_vision_residency_state")
+public func gemma_vision_residency_state() -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let r = gVisionResidency else { return -1 }
+    switch r.state {
+    case .unloaded: return 0
+    case .volatile_: return 1
+    case .pinned: return 2
+    }
+}
+
+// Working-set size in bytes. 0 when unloaded.
+@_cdecl("gemma_vision_residency_bytes")
+public func gemma_vision_residency_bytes() -> UInt64 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    return UInt64(gVisionResidency?.workingSetBytes() ?? 0)
+}
+
+// Manually flip to volatile (signal "we're idle, OS take this if needed").
+// Auto-called by the pressure source on .warning.
+@_cdecl("gemma_vision_allow_evict")
+public func gemma_vision_allow_evict() -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    gVisionResidency?.allowEvict()
+    return 0
+}
+
+// Manually drop the working set entirely (simulate a .critical pressure
+// event from tests; real pressure source calls this automatically).
+@_cdecl("gemma_vision_force_drop")
+public func gemma_vision_force_drop() -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    gVisionResidency?.forceDrop()
+    return 0
 }
 
 // Preprocess + vision-tower + submit soft tokens to a session, bracketed
@@ -372,7 +450,7 @@ public func gemma_vision_last_cache_key(_ outHex: UnsafeMutablePointer<CChar>?,
 // Internal: hash the file, check/populate the cache. Shared by submit + prewarm.
 private var gLastCacheKeyHex: String?
 private func ensureCachedSofts(pngPath: String) -> CachedSofts? {
-    guard let visWeights = gVisionWeights else {
+    guard let residency = gVisionResidency else {
         print("ensureCachedSofts: vision not initialized")
         return nil
     }
@@ -393,7 +471,21 @@ private func ensureCachedSofts(pngPath: String) -> CachedSofts? {
     }
     gVisionCacheMisses &+= 1
 
-    // Miss: run preprocess + vision tower.
+    // Miss: run preprocess + vision tower. Ensure the residency is .pinned
+    // for the duration of the forward pass, then flip to .volatile so the
+    // OS can reclaim the working set when we're idle again.
+    do {
+        try residency.ensurePinned()
+    } catch {
+        print("ensureCachedSofts: vision hydrate failed: \(error)")
+        return nil
+    }
+    defer { residency.allowEvict() }
+    guard let visWeights = residency.weights else {
+        print("ensureCachedSofts: residency returned nil weights")
+        return nil
+    }
+
     let batch: PatchBatch
     do { batch = try gemma4ImagePreprocess(path: pngPath, device: device) }
     catch {

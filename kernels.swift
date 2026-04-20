@@ -346,6 +346,24 @@ kernel void rope_half_multi(
     }
 }
 
+// bf16 → fp16 conversion. bf16 is the top 16 bits of fp32; we reinterpret
+// src[i] as a ushort, shift it into the top half of a uint, cast to float,
+// then cast to half. Used by VisionResidency to rehydrate vision weights
+// from a mmap-backed (file-evictable) bf16 source into a working fp16
+// buffer that the kernels actually read. 1 thread per element; the dispatch
+// is pure memory-bandwidth, ~10 ms to convert 1 GB on M5.
+kernel void bf16_to_fp16(
+    device const ushort* src [[buffer(0)]],
+    device half* dst [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= n) return;
+    uint bits = uint(src[i]) << 16;
+    float f = as_type<float>(bits);
+    dst[i] = half(f);
+}
+
 // KV cache write
 kernel void kv_write(
     device const half* K [[buffer(0)]], device const half* V [[buffer(1)]],

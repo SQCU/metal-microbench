@@ -110,6 +110,18 @@ _lib.gemma_vision_is_ready.restype = C.c_int32
 _lib.gemma_submit_image_path.argtypes = [C.c_int32, C.c_char_p]
 _lib.gemma_submit_image_path.restype = C.c_int32
 
+_lib.gemma_vision_residency_state.argtypes = []
+_lib.gemma_vision_residency_state.restype = C.c_int32
+
+_lib.gemma_vision_residency_bytes.argtypes = []
+_lib.gemma_vision_residency_bytes.restype = C.c_uint64
+
+_lib.gemma_vision_allow_evict.argtypes = []
+_lib.gemma_vision_allow_evict.restype = C.c_int32
+
+_lib.gemma_vision_force_drop.argtypes = []
+_lib.gemma_vision_force_drop.restype = C.c_int32
+
 _lib.gemma_vision_prewarm_path.argtypes = [C.c_char_p]
 _lib.gemma_vision_prewarm_path.restype = C.c_int32
 
@@ -285,6 +297,26 @@ def vision_init(safetensors_path: str) -> None:
 
 def vision_is_ready() -> bool:
     return _lib.gemma_vision_is_ready() == 1
+
+
+_RESIDENCY_NAMES = {-1: "unbound", 0: "unloaded", 1: "volatile", 2: "pinned"}
+
+
+def vision_residency_state() -> str:
+    s = _lib.gemma_vision_residency_state()
+    return _RESIDENCY_NAMES.get(s, f"unknown({s})")
+
+
+def vision_residency_bytes() -> int:
+    return int(_lib.gemma_vision_residency_bytes())
+
+
+def vision_allow_evict() -> None:
+    _lib.gemma_vision_allow_evict()
+
+
+def vision_force_drop() -> None:
+    _lib.gemma_vision_force_drop()
 
 
 def submit_image_path(sid: int, png_path: str) -> int:

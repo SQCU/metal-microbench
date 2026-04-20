@@ -287,6 +287,7 @@ enum SafetensorsError: Error {
     case badHeader(String)
     case tensorNotFound(String)
     case unsupportedDtype(String)
+    case failedAlloc(name: String)
 }
 
 final class SafetensorsFile {
@@ -384,6 +385,30 @@ final class SafetensorsFile {
         for i in 0..<nElems { dp[i] = Float16(src[i]) }
         dst.label = name
         return dst
+    }
+
+    /// BF16 tensor bytes staged into a shared MTLBuffer (copied from the
+    /// mmap — cheaper than CPU-side bf16→fp16 conversion because there's
+    /// no per-element arithmetic, just a memcpy). Intended as the "bf16
+    /// staging" half of a hydrate pass: the GPU converter reads from this
+    /// and writes into the working fp16 buffer, then we drop this staging
+    /// buffer. Page-aligned bytesNoCopy would be zero-cost but tensor
+    /// offsets inside a safetensors file aren't page-aligned, so a
+    /// staging copy is the portable path.
+    ///
+    /// Cost: ~150 ms for the full vision tower (1.5 GB at ~10 GB/s memcpy).
+    /// Net hydrate cost from unloaded: ~160 ms including GPU convert;
+    /// ~10x faster than the old CPU per-element loop.
+    func makeBF16StagingBuffer(_ name: String, device: MTLDevice) throws -> MTLBuffer {
+        let info = try tensor(name)
+        guard info.dtype == "BF16" else { throw SafetensorsError.unsupportedDtype(info.dtype) }
+        let src = base.advanced(by: info.byteOffset)
+        guard let buf = device.makeBuffer(length: info.byteSize, options: .storageModeShared) else {
+            throw SafetensorsError.failedAlloc(name: name)
+        }
+        memcpy(buf.contents(), src, info.byteSize)
+        buf.label = "bf16-stage:\(name)"
+        return buf
     }
 
     /// Zero-copy wrap of tensor bytes as an MTLBuffer (for F32 passthrough etc).

@@ -257,6 +257,33 @@ def health() -> JSONResponse:
         "active_sessions": g.active_session_count(),
         "pump_running": _pump_running,
         "vision_cache": g.vision_cache_stats() if g.vision_is_ready() else None,
+        "vision_residency": {
+            "state": g.vision_residency_state() if g.vision_is_ready() else "unbound",
+            "bytes": g.vision_residency_bytes() if g.vision_is_ready() else 0,
+        },
+    })
+
+
+@app.post("/v1/vision/allow_evict")
+def vision_allow_evict() -> JSONResponse:
+    """Flip vision working buffers to .volatile so macOS can reclaim them
+    under pressure. Next vision request either finds the pages still
+    resident (fast re-pin) or rehydrates from the mmap (~160 ms)."""
+    g.vision_allow_evict()
+    return JSONResponse({
+        "state": g.vision_residency_state(),
+        "bytes": g.vision_residency_bytes(),
+    })
+
+
+@app.post("/v1/vision/force_drop")
+def vision_force_drop() -> JSONResponse:
+    """Drop vision working buffers immediately (simulate .critical pressure).
+    Session KV pages stay pinned. Next vision request will fully rehydrate."""
+    g.vision_force_drop()
+    return JSONResponse({
+        "state": g.vision_residency_state(),
+        "bytes": g.vision_residency_bytes(),
     })
 
 
