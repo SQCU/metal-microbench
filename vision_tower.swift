@@ -314,6 +314,19 @@ let visionPool2DFp32InPSO = pso("vision_pool_2d_fp32in_fp16out")
 let rmsNormFp32OutPSO    = pso("rms_norm_fp16in_fp32out")
 let addInplaceFp32FpPSO  = pso("add_inplace_fp32_fp32")
 
+// Fp32-intermediate vision path PSOs. Mirror the fp16-path set above,
+// just with fp32 I/O on all the per-layer intermediate buffers. See the
+// kernel block in kernels.swift for rationale (outlier channels need
+// fp32 precision or MSE compounds past layer 12).
+let rmsNormFp32PSO       = pso("rms_norm_fp32")
+let rmsNormNoScaleFp32PSO = pso("rms_norm_noscale_fp32")
+let denseGemvFp32In32OutPSO = pso("dense_gemv_fp32in_fp32out_v5")
+let vision2dRopeFp32PSO  = pso("vision_2d_rope_neox_fp32")
+let visionAttnPrefillFp32PSO = pso("vision_attn_prefill_fp32")
+let geluMulFp32PSO       = pso("gelu_mul_fp32")
+let visionPool2DFp32InFp32OutPSO = pso("vision_pool_2d_fp32in_fp32out")
+let visionStdNormFp32PSO = pso("vision_scaled_std_normalize_fp32")
+
 // Vision tower: per-layer weight struct + loader.
 // Each of 27 encoder layers has the same tensor set; we load them from the
 // Gemma-4 bf16 safetensors and convert BF16 → FP16 for our kernels.
@@ -441,6 +454,114 @@ func encVisionAttnPrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, K: MTLBuffer, V:
     enc.setBytes(&HDv, length: 4, index: 6)
     enc.setBytes(&sc, length: 4, index: 7)
     enc.dispatchThreadgroups(MTLSize(width: N, height: H, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// ---- Fp32-intermediate dispatch wrappers (mirror the fp16 path above) ----
+
+func encGemvFp32V5(_ cb: MTLCommandBuffer, x: MTLBuffer, W: MTLBuffer, out: MTLBuffer,
+                    B: Int, Din: Int, Dout: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(denseGemvFp32In32OutPSO)
+    enc.setBuffer(x, offset: 0, index: 0); enc.setBuffer(W, offset: 0, index: 1)
+    enc.setBuffer(out, offset: 0, index: 2)
+    var du = UInt32(Din), dou = UInt32(Dout)
+    enc.setBytes(&du, length: 4, index: 3); enc.setBytes(&dou, length: 4, index: 4)
+    enc.dispatchThreadgroups(MTLSize(width: Dout / 32, height: B, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+func encRMSNormGFp32(_ cb: MTLCommandBuffer, x: MTLBuffer, gammaBuf: MTLBuffer, out: MTLBuffer,
+                      D: Int, numVecs: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(rmsNormFp32PSO)
+    enc.setBuffer(x, offset: 0, index: 0); enc.setBuffer(out, offset: 0, index: 1)
+    enc.setBuffer(gammaBuf, offset: 0, index: 2)
+    var Dv = UInt32(D); var eps: Float = 1e-6
+    enc.setBytes(&Dv, length: 4, index: 3); enc.setBytes(&eps, length: 4, index: 4)
+    enc.dispatchThreadgroups(MTLSize(width: numVecs, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+func encRMSNormNoScaleFp32(_ cb: MTLCommandBuffer, x: MTLBuffer, out: MTLBuffer, D: Int, numVecs: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(rmsNormNoScaleFp32PSO)
+    enc.setBuffer(x, offset: 0, index: 0); enc.setBuffer(out, offset: 0, index: 1)
+    var Dv = UInt32(D); var eps: Float = 1e-6
+    enc.setBytes(&Dv, length: 4, index: 2); enc.setBytes(&eps, length: 4, index: 3)
+    enc.dispatchThreadgroups(MTLSize(width: numVecs, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+func encVision2DRopeFp32(_ cb: MTLCommandBuffer, x: MTLBuffer, posX: MTLBuffer, posY: MTLBuffer,
+                          N: Int, H: Int, HD: Int, theta: Float) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(vision2dRopeFp32PSO)
+    enc.setBuffer(x, offset: 0, index: 0)
+    enc.setBuffer(posX, offset: 0, index: 1); enc.setBuffer(posY, offset: 0, index: 2)
+    var Nv = UInt32(N), Hv = UInt32(H), HDv = UInt32(HD), thv = theta
+    enc.setBytes(&Nv, length: 4, index: 3)
+    enc.setBytes(&Hv, length: 4, index: 4)
+    enc.setBytes(&HDv, length: 4, index: 5)
+    enc.setBytes(&thv, length: 4, index: 6)
+    enc.dispatchThreadgroups(MTLSize(width: N, height: H, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+func encVisionAttnPrefillFp32(_ cb: MTLCommandBuffer, Q: MTLBuffer, K: MTLBuffer, V: MTLBuffer, O: MTLBuffer,
+                                N: Int, H: Int, HD: Int, qkScale: Float) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(visionAttnPrefillFp32PSO)
+    enc.setBuffer(Q, offset: 0, index: 0); enc.setBuffer(K, offset: 0, index: 1)
+    enc.setBuffer(V, offset: 0, index: 2); enc.setBuffer(O, offset: 0, index: 3)
+    var Nv = UInt32(N), Hv = UInt32(H), HDv = UInt32(HD), sc = qkScale
+    enc.setBytes(&Nv, length: 4, index: 4)
+    enc.setBytes(&Hv, length: 4, index: 5)
+    enc.setBytes(&HDv, length: 4, index: 6)
+    enc.setBytes(&sc, length: 4, index: 7)
+    enc.dispatchThreadgroups(MTLSize(width: N, height: H, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+func encGeluMulFp32(_ cb: MTLCommandBuffer, gate: MTLBuffer, up: MTLBuffer, N: Int, numVecs: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(geluMulFp32PSO)
+    enc.setBuffer(gate, offset: 0, index: 0); enc.setBuffer(up, offset: 0, index: 1)
+    var Nv = UInt32(N)
+    enc.setBytes(&Nv, length: 4, index: 2)
+    enc.dispatchThreadgroups(MTLSize(width: numVecs, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+func encVisionPool2DFp32InFp32Out(_ cb: MTLCommandBuffer, x: MTLBuffer, out: MTLBuffer,
+                                    gridW: Int, outW: Int, outH: Int, kernelSize: Int, hidden: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(visionPool2DFp32InFp32OutPSO)
+    enc.setBuffer(x, offset: 0, index: 0); enc.setBuffer(out, offset: 0, index: 1)
+    var gw = UInt32(gridW), ow = UInt32(outW), ks = UInt32(kernelSize), h = UInt32(hidden)
+    enc.setBytes(&gw, length: 4, index: 2); enc.setBytes(&ow, length: 4, index: 3)
+    enc.setBytes(&ks, length: 4, index: 4); enc.setBytes(&h, length: 4, index: 5)
+    enc.dispatchThreadgroups(MTLSize(width: outH * outW, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+func encVisionScaledStdNormFp32(_ cb: MTLCommandBuffer, x: MTLBuffer, bias: MTLBuffer, scale: MTLBuffer,
+                                 out: MTLBuffer, D: Int, numVecs: Int, globalScale: Float) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(visionStdNormFp32PSO)
+    enc.setBuffer(x, offset: 0, index: 0); enc.setBuffer(bias, offset: 0, index: 1)
+    enc.setBuffer(scale, offset: 0, index: 2); enc.setBuffer(out, offset: 0, index: 3)
+    var Dv = UInt32(D); var gs = globalScale
+    enc.setBytes(&Dv, length: 4, index: 4); enc.setBytes(&gs, length: 4, index: 5)
+    enc.dispatchThreadgroups(MTLSize(width: numVecs, height: 1, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
 }
@@ -613,26 +734,31 @@ func runVisionTowerForward(batch: PatchBatch, weights: VisionWeights,
         pxp[i] = UInt32(batch.positions[i].1)
     }
 
-    // Scratch buffers. The residual stream `x` is fp32 (keeps accumulated
-    // rounding from compounding over 27 layers on outlier-gamma channels);
-    // soft token output is fp32 (downstream LM wants max precision pre-norm).
-    // Intermediates between kernels stay fp16 — they're recomputed every layer
-    // or renormalized per-token, so no accumulation drift.
-    let x       = device.makeBuffer(length: N * h * 4, options: .storageModeShared)!   // fp32
-    let tmp     = device.makeBuffer(length: N * h * 2, options: .storageModeShared)!
-    let qBuf    = device.makeBuffer(length: N * h * 2, options: .storageModeShared)!
-    let kBuf    = device.makeBuffer(length: N * h * 2, options: .storageModeShared)!
-    let vBuf    = device.makeBuffer(length: N * h * 2, options: .storageModeShared)!
-    let attnOut = device.makeBuffer(length: N * h * 2, options: .storageModeShared)!
-    let gateAct = device.makeBuffer(length: N * interm * 2, options: .storageModeShared)!
-    let upAct   = device.makeBuffer(length: N * interm * 2, options: .storageModeShared)!
-    let mlpOutB = device.makeBuffer(length: N * h * 2, options: .storageModeShared)!
-    // Post-norm outputs promoted to fp32 so residual-stream adds don't round
-    // on outlier-gamma channels. One shared buffer is fine since post_attn_norm
-    // and post_ffn_norm are sequential in the same layer.
+    // Scratch buffers. The residual stream `x` is fp32 and — as of the
+    // outlier-channel fix — every per-layer intermediate (Q/K/V, attention
+    // output, MLP activations) is fp32 as well. Gemma-4 vision trains in
+    // bf16 (fp32 exponent range); dim 213 alone hits 2934 at layer 26.
+    // Our previous fp16 intermediates lost too much precision on these
+    // outlier channels and the LM downstream couldn't make sense of the
+    // resulting soft tokens. Fp32 doubles intermediate memory (tiny vs
+    // the KV cache); the perf cost is a few extra cycles on fp32 math
+    // relative to fp16, but these are L1/L2-cache-resident buffers and
+    // the forward is dominated by weight-memory traffic from the GEMVs.
+    let x       = device.makeBuffer(length: N * h * 4, options: .storageModeShared)!
+    let tmp     = device.makeBuffer(length: N * h * 4, options: .storageModeShared)!
+    let qBuf    = device.makeBuffer(length: N * h * 4, options: .storageModeShared)!
+    let kBuf    = device.makeBuffer(length: N * h * 4, options: .storageModeShared)!
+    let vBuf    = device.makeBuffer(length: N * h * 4, options: .storageModeShared)!
+    let attnOut = device.makeBuffer(length: N * h * 4, options: .storageModeShared)!
+    let gateAct = device.makeBuffer(length: N * interm * 4, options: .storageModeShared)!
+    let upAct   = device.makeBuffer(length: N * interm * 4, options: .storageModeShared)!
+    let mlpOutB = device.makeBuffer(length: N * h * 4, options: .storageModeShared)!
+    // Post-norm outputs feed the fp32 residual adds.
     let postNormFp32 = device.makeBuffer(length: N * h * 4, options: .storageModeShared)!
-    let pooled  = device.makeBuffer(length: nPooled * h * 2, options: .storageModeShared)!
-    let stdNormed = device.makeBuffer(length: nPooled * h * 2, options: .storageModeShared)!
+    // stdNormed is fp32 now so the embed_vision projection can take fp32
+    // input. pooled stays fp16 (pooling averages out per-token noise).
+    let pooled  = device.makeBuffer(length: nPooled * h * 4, options: .storageModeShared)!
+    let stdNormed = device.makeBuffer(length: nPooled * h * 4, options: .storageModeShared)!
     let softTokens = device.makeBuffer(length: nPooled * weights.textHidden * 4, options: .storageModeShared)!  // fp32
 
     // Multi-CB in debug mode so we can inspect buffers between stages.
@@ -708,49 +834,26 @@ func runVisionTowerForward(batch: PatchBatch, weights: VisionWeights,
             }
         }
 
-        // === Attention sub-block ===
+        // === Attention sub-block (fp32 intermediates throughout) ===
         let total = N * h
-        step("input_norm", { encRMSNormGFp32In($0, x: x, gammaBuf: lw.inputNorm, out: tmp, D: h, numVecs: N) }, dumpBuf: tmp, sampleCount: total)
-        step("qProj",      { encGemvFp16V5($0, x: tmp, W: lw.qProj, out: qBuf, B: N, Din: h, Dout: h) }, dumpBuf: qBuf, sampleCount: total)
-        step("kProj",      { encGemvFp16V5($0, x: tmp, W: lw.kProj, out: kBuf, B: N, Din: h, Dout: h) }, dumpBuf: kBuf, sampleCount: total)
-        step("vProj",      { encGemvFp16V5($0, x: tmp, W: lw.vProj, out: vBuf, B: N, Din: h, Dout: h) }, dumpBuf: vBuf, sampleCount: total)
-        step("qNorm",      { encRMSNormG($0, x: qBuf, gammaBuf: lw.qNorm, out: qBuf, D: HD, numVecs: N * H) }, dumpBuf: qBuf, sampleCount: total)
-        step("kNorm",      { encRMSNormG($0, x: kBuf, gammaBuf: lw.kNorm, out: kBuf, D: HD, numVecs: N * H) }, dumpBuf: kBuf, sampleCount: total)
-        step("vNorm",      { encRMSNormNoScale($0, x: vBuf, out: vBuf, D: HD, numVecs: N * H) }, dumpBuf: vBuf, sampleCount: total)
-        step("qRoPE",      { encVision2DRope($0, x: qBuf, posX: posXBuf, posY: posYBuf, N: N, H: H, HD: HD, theta: 100.0) }, dumpBuf: qBuf, sampleCount: total)
-        step("kRoPE",      { encVision2DRope($0, x: kBuf, posX: posXBuf, posY: posYBuf, N: N, H: H, HD: HD, theta: 100.0) }, dumpBuf: kBuf, sampleCount: total)
-        step("attn",       { encVisionAttnPrefill($0, Q: qBuf, K: kBuf, V: vBuf, O: attnOut, N: N, H: H, HD: HD, qkScale: qkScale) }, dumpBuf: attnOut, sampleCount: total)
-        if splitCBs {
-            // Sample stats at a few strided indices (avoid full-buffer scan).
-            let qp = qBuf.contents().assumingMemoryBound(to: Float16.self)
-            let vp = vBuf.contents().assumingMemoryBound(to: Float16.self)
-            let ap = attnOut.contents().assumingMemoryBound(to: Float16.self)
-            var qNaN = 0, vNaN = 0, aNaN = 0
-            for s in stride(from: 0, to: N * h, by: 997) {
-                if Float(qp[s]).isNaN { qNaN += 1 }
-                if Float(vp[s]).isNaN { vNaN += 1 }
-                if Float(ap[s]).isNaN { aNaN += 1 }
-            }
-            print("    L\(L) sampled ~\(N * h / 997): Q NaN=\(qNaN), V NaN=\(vNaN), attn NaN=\(aNaN)")
-        }
-        step("oProj",      { encGemvFp16V5($0, x: attnOut, W: lw.oProj, out: tmp, B: N, Din: h, Dout: h) }, dumpBuf: tmp, sampleCount: total)
-        step("postAttnNorm", { encRMSNormGFp32Out($0, x: tmp, gammaBuf: lw.postAttnNorm, out: postNormFp32, D: h, numVecs: N) }, dumpBuf: postNormFp32, sampleCount: total)
+        step("input_norm", { encRMSNormGFp32($0, x: x, gammaBuf: lw.inputNorm, out: tmp, D: h, numVecs: N) }, dumpBuf: tmp, sampleCount: total)
+        step("qProj",      { encGemvFp32V5($0, x: tmp, W: lw.qProj, out: qBuf, B: N, Din: h, Dout: h) }, dumpBuf: qBuf, sampleCount: total)
+        step("kProj",      { encGemvFp32V5($0, x: tmp, W: lw.kProj, out: kBuf, B: N, Din: h, Dout: h) }, dumpBuf: kBuf, sampleCount: total)
+        step("vProj",      { encGemvFp32V5($0, x: tmp, W: lw.vProj, out: vBuf, B: N, Din: h, Dout: h) }, dumpBuf: vBuf, sampleCount: total)
+        step("qNorm",      { encRMSNormGFp32($0, x: qBuf, gammaBuf: lw.qNorm, out: qBuf, D: HD, numVecs: N * H) }, dumpBuf: qBuf, sampleCount: total)
+        step("kNorm",      { encRMSNormGFp32($0, x: kBuf, gammaBuf: lw.kNorm, out: kBuf, D: HD, numVecs: N * H) }, dumpBuf: kBuf, sampleCount: total)
+        step("vNorm",      { encRMSNormNoScaleFp32($0, x: vBuf, out: vBuf, D: HD, numVecs: N * H) }, dumpBuf: vBuf, sampleCount: total)
+        step("qRoPE",      { encVision2DRopeFp32($0, x: qBuf, posX: posXBuf, posY: posYBuf, N: N, H: H, HD: HD, theta: 100.0) }, dumpBuf: qBuf, sampleCount: total)
+        step("kRoPE",      { encVision2DRopeFp32($0, x: kBuf, posX: posXBuf, posY: posYBuf, N: N, H: H, HD: HD, theta: 100.0) }, dumpBuf: kBuf, sampleCount: total)
+        step("attn",       { encVisionAttnPrefillFp32($0, Q: qBuf, K: kBuf, V: vBuf, O: attnOut, N: N, H: H, HD: HD, qkScale: qkScale) }, dumpBuf: attnOut, sampleCount: total)
+        step("oProj",      { encGemvFp32V5($0, x: attnOut, W: lw.oProj, out: tmp, B: N, Din: h, Dout: h) }, dumpBuf: tmp, sampleCount: total)
+        step("postAttnNorm", { encRMSNormGFp32($0, x: tmp, gammaBuf: lw.postAttnNorm, out: postNormFp32, D: h, numVecs: N) }, dumpBuf: postNormFp32, sampleCount: total)
         step("resid1",     { encAddInplaceFp32Fp32($0, dst: x, src: postNormFp32, N: h, numVecs: N) }, dumpBuf: x, sampleCount: total)
         // === FFN sub-block ===
-        step("preFfnNorm", { encRMSNormGFp32In($0, x: x, gammaBuf: lw.preFfnNorm, out: tmp, D: h, numVecs: N) }, dumpBuf: tmp, sampleCount: total)
-        step("gateProj",   { encGemvFp16V5($0, x: tmp, W: lw.gateProj, out: gateAct, B: N, Din: h, Dout: interm) }, dumpBuf: gateAct, sampleCount: N * interm)
-        step("upProj",     { encGemvFp16V5($0, x: tmp, W: lw.upProj, out: upAct, B: N, Din: h, Dout: interm) }, dumpBuf: upAct, sampleCount: N * interm)
-        if splitCBs {
-            // Peek gate and up at the problem index (643, 2040) pre-GELU.
-            let gp = gateAct.contents().assumingMemoryBound(to: Float16.self)
-            let upp = upAct.contents().assumingMemoryBound(to: Float16.self)
-            let patchBad = 643, dimBad = 2040
-            let idx = patchBad * interm + dimBad
-            print(String(format: "    pre-gelu probe: gate[%d,%d]=%.4f up[%d,%d]=%.4f",
-                         patchBad, dimBad, Float(gp[idx]),
-                         patchBad, dimBad, Float(upp[idx])))
-        }
-        step("geluMul",    { encGeluMul($0, gate: gateAct, up: upAct, N: interm, numVecs: N) }, dumpBuf: gateAct, sampleCount: N * interm)
+        step("preFfnNorm", { encRMSNormGFp32($0, x: x, gammaBuf: lw.preFfnNorm, out: tmp, D: h, numVecs: N) }, dumpBuf: tmp, sampleCount: total)
+        step("gateProj",   { encGemvFp32V5($0, x: tmp, W: lw.gateProj, out: gateAct, B: N, Din: h, Dout: interm) }, dumpBuf: gateAct, sampleCount: N * interm)
+        step("upProj",     { encGemvFp32V5($0, x: tmp, W: lw.upProj, out: upAct, B: N, Din: h, Dout: interm) }, dumpBuf: upAct, sampleCount: N * interm)
+        step("geluMul",    { encGeluMulFp32($0, gate: gateAct, up: upAct, N: interm, numVecs: N) }, dumpBuf: gateAct, sampleCount: N * interm)
         if splitCBs {
             let gp = gateAct.contents().assumingMemoryBound(to: Float16.self)
             let patchBad = 643, dimBad = 2040
@@ -767,8 +870,8 @@ func runVisionTowerForward(batch: PatchBatch, weights: VisionWeights,
                 }
             }
         }
-        step("downProj",   { encGemvFp16V5($0, x: gateAct, W: lw.downProj, out: mlpOutB, B: N, Din: interm, Dout: h) }, dumpBuf: mlpOutB, sampleCount: total)
-        step("postFfnNorm",{ encRMSNormGFp32Out($0, x: mlpOutB, gammaBuf: lw.postFfnNorm, out: postNormFp32, D: h, numVecs: N) }, dumpBuf: postNormFp32, sampleCount: total)
+        step("downProj",   { encGemvFp32V5($0, x: gateAct, W: lw.downProj, out: mlpOutB, B: N, Din: interm, Dout: h) }, dumpBuf: mlpOutB, sampleCount: total)
+        step("postFfnNorm",{ encRMSNormGFp32($0, x: mlpOutB, gammaBuf: lw.postFfnNorm, out: postNormFp32, D: h, numVecs: N) }, dumpBuf: postNormFp32, sampleCount: total)
         step("resid2",     { encAddInplaceFp32Fp32($0, dst: x, src: postNormFp32, N: h, numVecs: N) }, dumpBuf: x, sampleCount: total)
 
         if !splitCBs && !fastPath {
@@ -782,42 +885,37 @@ func runVisionTowerForward(batch: PatchBatch, weights: VisionWeights,
         }
     }
 
-    // 4) Pool 3×3 avg over the patch grid. Reads fp32 x, writes fp16 pooled.
+    // 4) Pool 3×3 avg over the patch grid. Both fp32 I/O now.
     let cbTail: MTLCommandBuffer = fastPath ? cb0 : queue.makeCommandBuffer()!
-    encVisionPool2DFp32In(cbTail, x: x, out: pooled, gridW: gridW, outW: outW,
-                            outH: outH, kernelSize: 3, hidden: h)
+    encVisionPool2DFp32InFp32Out(cbTail, x: x, out: pooled, gridW: gridW, outW: outW,
+                                   outH: outH, kernelSize: 3, hidden: h)
 
-    // 5+6) Fused scale(sqrt(h)) + std-normalize: (x*sqrt(h) - std_bias) * std_scale.
-    // sqrt(h) from Gemma4VisionPooler.forward:628; std-normalize from
-    // Gemma4VisionModel.forward:1945.
     let sqrtH = Float(h).squareRoot()
     if !fastPath {
         commitOne(cbTail)
-        dumpStage("pooled_raw", pooled, nPooled * h)
+        dumpStage("pooled_raw", pooled, nPooled * h, bytesPerElem: 4)
     }
 
     let cbStd: MTLCommandBuffer = fastPath ? cb0 : queue.makeCommandBuffer()!
-    encVisionScaledStdNorm(cbStd, x: pooled, bias: weights.stdBias, scale: weights.stdScale,
-                            out: stdNormed, D: h, numVecs: nPooled, globalScale: sqrtH)
+    encVisionScaledStdNormFp32(cbStd, x: pooled, bias: weights.stdBias, scale: weights.stdScale,
+                                out: stdNormed, D: h, numVecs: nPooled, globalScale: sqrtH)
     if !fastPath {
         commitOne(cbStd)
-        dumpStage("std_normed", stdNormed, nPooled * h)
+        dumpStage("std_normed", stdNormed, nPooled * h, bytesPerElem: 4)
     }
 
-    // 7) embed_vision.embedding_pre_projection_norm: RMSNorm(no scale).
-    // modeling_gemma4.py:1973 — applied before the projection.
+    // 7) embed_vision.embedding_pre_projection_norm: RMSNorm(no scale), fp32.
     let cbPre: MTLCommandBuffer = fastPath ? cb0 : queue.makeCommandBuffer()!
-    encRMSNormNoScale(cbPre, x: stdNormed, out: stdNormed, D: h, numVecs: nPooled)
+    encRMSNormNoScaleFp32(cbPre, x: stdNormed, out: stdNormed, D: h, numVecs: nPooled)
     if !fastPath {
         commitOne(cbPre)
-        dumpStage("pre_proj_norm", stdNormed, nPooled * h)
+        dumpStage("pre_proj_norm", stdNormed, nPooled * h, bytesPerElem: 4)
     }
 
-    // 8) embed_vision.embedding_projection: [nPooled, 1152] @ [2816, 1152].T → [nPooled, 2816].
-    //    Emit fp32 — downstream LM input stream stays fp32 until the first RMSNorm.
+    // 8) embed_vision.embedding_projection: fp32 input, fp16 weights, fp32 output.
     let cbProj: MTLCommandBuffer = fastPath ? cb0 : queue.makeCommandBuffer()!
-    encGemvFp16InFp32Out(cbProj, x: stdNormed, W: weights.embedVisionProj, out: softTokens,
-                           B: nPooled, Din: h, Dout: weights.textHidden)
+    encGemvFp32V5(cbProj, x: stdNormed, W: weights.embedVisionProj, out: softTokens,
+                    B: nPooled, Din: h, Dout: weights.textHidden)
 
     // Commit the single CB once (fast path) or the final tail CB (slow path).
     commitOne(cbProj)

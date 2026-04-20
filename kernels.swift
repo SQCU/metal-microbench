@@ -4360,4 +4360,252 @@ kernel void flex_attn_full_v0(
         for (uint d = lid; d < D; d += THREADS) O_part[d] = O_acc[q * D + d];
     }
 }
+
+// =======================================================================
+// fp32-path vision encoder kernels.
+//
+// Why: Gemma-4's vision tower has outlier channels (dim 213 hits 2934 at
+// layer 26, dims 294/366/989/etc. are secondary hotspots) trained in bf16
+// (fp32 exponent range). Our fp16 intermediate buffers lose too much
+// precision on these channels — per-layer MSE doubles past layer 12,
+// reaching ~28% relative noise at layer 26, enough to destroy LM image
+// understanding downstream. Promoting intermediate buffers to fp32 fixes
+// the precision floor at the cost of ~2× memory per intermediate buffer
+// (tiny compared to the already-fp32 residual stream).
+//
+// These kernels mirror their fp16 counterparts 1-for-1, just with fp32
+// I/O. No algorithmic changes.
+// =======================================================================
+
+// RMSNorm with gamma, fp32 in/out.
+kernel void rms_norm_fp32(
+    device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
+    device const half* gamma [[buffer(2)]],
+    constant uint& D [[buffer(3)]], constant float& eps [[buffer(4)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{
+    uint b = tg.x; uint t = lid.x;
+    float s = 0.0f;
+    for (uint i = t; i < D; i += 32) { float v = x[b*D+i]; s += v*v; }
+    s = simd_sum(s);
+    float sc = rsqrt(s/float(D) + eps);
+    for (uint i = t; i < D; i += 32) { y[b*D+i] = x[b*D+i] * sc * float(gamma[i]); }
+}
+
+// RMSNorm no-scale, fp32 in/out.
+kernel void rms_norm_noscale_fp32(
+    device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
+    constant uint& D [[buffer(2)]], constant float& eps [[buffer(3)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{
+    uint b = tg.x; uint t = lid.x;
+    float s = 0.0f;
+    for (uint i = t; i < D; i += 32) { float v = x[b*D+i]; s += v*v; }
+    s = simd_sum(s);
+    float sc = rsqrt(s/float(D) + eps);
+    for (uint i = t; i < D; i += 32) { y[b*D+i] = x[b*D+i] * sc; }
+}
+
+// Dense GEMV with fp32 input, fp16 weights, fp32 output. Mirrors
+// dense_gemv_fp16_v5's SG-split-K pattern but reads/writes fp32 vectors.
+kernel void dense_gemv_fp32in_fp32out_v5(
+    device const float* x               [[buffer(0)]],
+    device const half*  W               [[buffer(1)]],
+    device float*       output          [[buffer(2)]],
+    constant uint& D_in                 [[buffer(3)]],
+    constant uint& D_out                [[buffer(4)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]],
+    uint sg_id                          [[simdgroup_index_in_threadgroup]])
+{
+    constexpr uint N_SPLITS = 4;
+    uint n_block = tg.x; uint b = tg.y; uint lid_sg = lid.x % 32;
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+    uint k_per_sg = D_in / N_SPLITS;
+    uint k_begin = sg_id * k_per_sg;
+    uint k_end = k_begin + k_per_sg;
+    float acc = 0.0f;
+    device const float* x_b = x + b * D_in;
+    device const half*  W_row = W + n * D_in;
+    for (uint k = k_begin; k < k_end; ++k) {
+        acc += x_b[k] * float(W_row[k]);
+    }
+    threadgroup float partials[N_SPLITS][32];
+    partials[sg_id][lid_sg] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_id == 0) {
+        output[b * D_out + n] = partials[0][lid_sg] + partials[1][lid_sg]
+                              + partials[2][lid_sg] + partials[3][lid_sg];
+    }
+}
+
+// 2D NeoX RoPE in-place on an fp32 buffer. Same math as the fp16 variant
+// vision_2d_rope_neox_fp16 — first half of head-dim rotated by pos_x,
+// second half by pos_y, NeoX pairs are (i, i+quarter) within each half.
+kernel void vision_2d_rope_neox_fp32(
+    device float* x                     [[buffer(0)]],
+    device const uint* pos_x            [[buffer(1)]],
+    device const uint* pos_y            [[buffer(2)]],
+    constant uint& N                    [[buffer(3)]],
+    constant uint& H                    [[buffer(4)]],
+    constant uint& HD                   [[buffer(5)]],
+    constant float& theta               [[buffer(6)]],
+    uint3 tg                            [[threadgroup_position_in_grid]],
+    uint3 lid                           [[thread_position_in_threadgroup]])
+{
+    uint token = tg.x; uint head = tg.y; uint t = lid.x;
+    uint half_dim = HD / 2;
+    uint quarter = half_dim / 2;
+    device float* vec = x + (token * H + head) * HD;
+
+    uint px = pos_x[token];
+    for (uint i = t; i < quarter; i += 32) {
+        float freq = 1.0f / pow(theta, 2.0f * float(i) / float(half_dim));
+        float ang = float(px) * freq;
+        float c = cos(ang), s = sin(ang);
+        float a = vec[i];
+        float b = vec[i + quarter];
+        vec[i]           = a * c - b * s;
+        vec[i + quarter] = a * s + b * c;
+    }
+    uint py = pos_y[token];
+    for (uint i = t; i < quarter; i += 32) {
+        float freq = 1.0f / pow(theta, 2.0f * float(i) / float(half_dim));
+        float ang = float(py) * freq;
+        float c = cos(ang), s = sin(ang);
+        float a = vec[half_dim + i];
+        float b = vec[half_dim + i + quarter];
+        vec[half_dim + i]           = a * c - b * s;
+        vec[half_dim + i + quarter] = a * s + b * c;
+    }
+}
+
+// Bidirectional attention (no causal mask), fp32 Q/K/V/O. One TG per
+// (query token, head). Same N_MAX tg-mem scratch as the fp16 variant.
+kernel void vision_attn_prefill_fp32(
+    device const float* Q               [[buffer(0)]],
+    device const float* K               [[buffer(1)]],
+    device const float* V               [[buffer(2)]],
+    device float* O                     [[buffer(3)]],
+    constant uint& N                    [[buffer(4)]],
+    constant uint& H                    [[buffer(5)]],
+    constant uint& HD                   [[buffer(6)]],
+    constant float& qk_scale            [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    constexpr uint THREADS = 32;
+    constexpr uint N_MAX = 3072;
+    threadgroup float scores[N_MAX];
+    threadgroup float state[3];
+
+    uint q_tok = tg.x; uint head = tg.y; uint t = lid.x;
+    device const float* Q_qh = Q + (q_tok * H + head) * HD;
+    device const float* K_h  = K + head * HD;
+    device const float* V_h  = V + head * HD;
+    uint K_stride = H * HD;
+
+    for (uint k = t; k < N; k += THREADS) {
+        float s = 0;
+        device const float* K_k = K_h + k * K_stride;
+        for (uint d = 0; d < HD; ++d) { s += Q_qh[d] * K_k[d]; }
+        scores[k] = s * qk_scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_max = -INFINITY;
+    for (uint k = t; k < N; k += THREADS) local_max = max(local_max, scores[k]);
+    float row_max = simd_max(local_max);
+    if (t == 0) state[0] = row_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    row_max = state[0];
+
+    float local_sum = 0;
+    for (uint k = t; k < N; k += THREADS) {
+        float e = exp(scores[k] - row_max);
+        scores[k] = e;
+        local_sum += e;
+    }
+    float row_sum = simd_sum(local_sum);
+    if (t == 0) state[1] = row_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_sum = 1.0f / state[1];
+
+    device float* O_qh = O + (q_tok * H + head) * HD;
+    for (uint d = t; d < HD; d += THREADS) {
+        float acc = 0;
+        for (uint k = 0; k < N; ++k) { acc += scores[k] * V_h[k * K_stride + d]; }
+        O_qh[d] = acc * inv_sum;
+    }
+}
+
+// GELU(gate) * up → gate, fp32 in-place on gate, reads fp32 up.
+kernel void gelu_mul_fp32(
+    device float* gate                  [[buffer(0)]],
+    device const float* up              [[buffer(1)]],
+    constant uint& N                    [[buffer(2)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    uint b = tg.x; uint t = lid.x;
+    device float* g = gate + b * N;
+    device const float* u = up + b * N;
+    for (uint i = t; i < N; i += 32) {
+        float x = g[i];
+        // clamp the tanh argument to prevent overflow on outlier channels
+        float arg = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+        if (arg > 20.0f) arg = 20.0f; else if (arg < -20.0f) arg = -20.0f;
+        float gelu_x = 0.5f * x * (1.0f + tanh(arg));
+        g[i] = gelu_x * u[i];
+    }
+}
+
+// Vision 2D pool fp32 → fp32 (spatial 3×3 average over patches).
+kernel void vision_pool_2d_fp32in_fp32out(
+    device const float* x               [[buffer(0)]],
+    device float* out                   [[buffer(1)]],
+    constant uint& grid_w               [[buffer(2)]],
+    constant uint& out_w                [[buffer(3)]],
+    constant uint& kernel_size          [[buffer(4)]],
+    constant uint& hidden               [[buffer(5)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    uint out_idx = tg.x; uint t = lid.x;
+    uint oy = out_idx / out_w;
+    uint ox = out_idx % out_w;
+    uint y_start = oy * kernel_size;
+    uint x_start = ox * kernel_size;
+    float inv_area = 1.0f / float(kernel_size * kernel_size);
+    for (uint i = t; i < hidden; i += 32) {
+        float acc = 0;
+        for (uint dy = 0; dy < kernel_size; ++dy) {
+            for (uint dx = 0; dx < kernel_size; ++dx) {
+                uint px = (y_start + dy) * grid_w + (x_start + dx);
+                acc += x[px * hidden + i];
+            }
+        }
+        out[out_idx * hidden + i] = acc * inv_area;
+    }
+}
+
+// Vision std-normalize + sqrt(hidden) scale, fp32 I/O version.
+kernel void vision_scaled_std_normalize_fp32(
+    device const float* x               [[buffer(0)]],
+    device const half* bias             [[buffer(1)]],
+    device const half* scale            [[buffer(2)]],
+    device float* out                   [[buffer(3)]],
+    constant uint& D                    [[buffer(4)]],
+    constant float& global_scale        [[buffer(5)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    uint b = tg.x; uint t = lid.x;
+    for (uint i = t; i < D; i += 32) {
+        float v = x[b * D + i] * global_scale;
+        v -= float(bias[i]);
+        out[b * D + i] = v * float(scale[i]);
+    }
+}
 """
