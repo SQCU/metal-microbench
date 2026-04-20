@@ -99,9 +99,44 @@ curl -X POST http://localhost:8000/v1/completions \
   -d '{"prompt":"<|turn>user\nHi<turn|>\n<|turn>model\n","max_tokens":16}'
 ```
 
+### multimodal (image_url)
+
+Pass OpenAI-style image content to `/v1/chat/completions`:
+
+```bash
+python3 -c "
+import base64, json, sys
+img = base64.b64encode(open('path/to/image.png','rb').read()).decode()
+print(json.dumps({
+  'messages': [{
+    'role': 'user',
+    'content': [
+      {'type': 'text', 'text': 'Describe this image in one sentence.'},
+      {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{img}'}}
+    ]
+  }],
+  'max_tokens': 32
+}))" > /tmp/body.json
+curl -sS -X POST http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  --data-binary @/tmp/body.json
+```
+
+The bridge decodes the data URI, writes a tempfile, runs the vision tower
+via `gemma_submit_image_path`, brackets the soft tokens with BOI/EOI
+(255999/258882) markers, and the session generates as usual. Vision adds
+~7 s TTFT on M5 (one-time per request; no caching yet).
+
+Multimodal status is reported in `/health`:
+
+```json
+{"status":"ready", "multimodal":true, ...}
+```
+
 ### `GET /`
 
-The side-by-side streaming demo. Two textareas, two response panes, one GPU.
+The side-by-side streaming demo. Two textareas, two response panes, a file
+picker per pane for optional image attachment, one GPU.
 
 ```bash
 open http://localhost:8000/    # macOS

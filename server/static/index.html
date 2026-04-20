@@ -30,6 +30,10 @@
     font-size: 0.9rem; line-height: 1.4;
   }
   .output:empty::before { content: '(output streams here)'; color: #444; }
+  .imgrow { display: flex; align-items: center; gap: 0.5em; font-size: 0.75rem; color: #888; }
+  .imgrow input[type=file] { font-size: 0.7rem; color: #888; }
+  .imgrow .thumb { max-height: 3em; max-width: 3em; border: 1px solid #333; border-radius: 2px; }
+  .imgrow .clear { background: none; border: 1px solid #444; color: #888; padding: 0.15em 0.4em; font-size: 0.7rem; cursor: pointer; }
 </style>
 </head>
 <body>
@@ -41,6 +45,12 @@
   <div class="pane">
     <h2>stream A</h2>
     <textarea id="qA">What is the capital of France?</textarea>
+    <div class="imgrow">
+      <label>image:</label>
+      <input type="file" id="imgA" accept="image/*" onchange="onPick('A')">
+      <img class="thumb" id="thumbA" style="display:none">
+      <button class="clear" onclick="clearImg('A')" id="clearA" style="display:none">×</button>
+    </div>
     <div class="row">
       <button id="askA" onclick="ask('A')">ask</button>
       <span class="meta" id="metaA"></span>
@@ -50,6 +60,12 @@
   <div class="pane">
     <h2>stream B</h2>
     <textarea id="qB">Write a one-sentence haiku about compilers.</textarea>
+    <div class="imgrow">
+      <label>image:</label>
+      <input type="file" id="imgB" accept="image/*" onchange="onPick('B')">
+      <img class="thumb" id="thumbB" style="display:none">
+      <button class="clear" onclick="clearImg('B')" id="clearB" style="display:none">×</button>
+    </div>
     <div class="row">
       <button id="askB" onclick="ask('B')">ask</button>
       <span class="meta" id="metaB"></span>
@@ -73,13 +89,36 @@ async function pollHealth() {
 pollHealth();
 setInterval(pollHealth, 1500);
 
+// Per-pane attached image state (data URL or null).
+const imgData = {A: null, B: null};
+
+function onPick(which) {
+  const f = document.getElementById(`img${which}`).files[0];
+  if (!f) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    imgData[which] = e.target.result;  // data:image/...;base64,...
+    const t = document.getElementById(`thumb${which}`);
+    t.src = e.target.result; t.style.display = 'inline-block';
+    document.getElementById(`clear${which}`).style.display = 'inline-block';
+  };
+  reader.readAsDataURL(f);
+}
+
+function clearImg(which) {
+  imgData[which] = null;
+  document.getElementById(`img${which}`).value = '';
+  document.getElementById(`thumb${which}`).style.display = 'none';
+  document.getElementById(`clear${which}`).style.display = 'none';
+}
+
 async function ask(which) {
   const qEl = document.getElementById(`q${which}`);
   const oEl = document.getElementById(`o${which}`);
   const btn = document.getElementById(`ask${which}`);
   const meta = document.getElementById(`meta${which}`);
   const q = qEl.value.trim();
-  if (!q) return;
+  if (!q && !imgData[which]) return;
 
   oEl.textContent = '';
   btn.disabled = true;
@@ -88,13 +127,23 @@ async function ask(which) {
   const t0 = performance.now();
   let firstTokAt = null, tokenCount = 0;
 
+  // Build content: text + optional image_url (OpenAI-compatible).
+  let content;
+  if (imgData[which]) {
+    content = [];
+    if (q) content.push({type: 'text', text: q});
+    content.push({type: 'image_url', image_url: {url: imgData[which]}});
+  } else {
+    content = q;
+  }
+
   try {
     const res = await fetch('/v1/chat/completions', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
         model: 'gemma-4-a4b-q4km',
-        messages: [{ role: 'user', content: q }],
+        messages: [{ role: 'user', content }],
         max_tokens: 256,
         stream: true,
       }),

@@ -16,6 +16,7 @@ import Foundation
 
 private let ffiLock = NSRecursiveLock()
 private var gEngine: LmEngine?
+private var gVisionWeights: VisionWeights?
 private var gSessions: [Int32: Session] = [:]
 private var gNextHandle: Int32 = 1
 
@@ -197,4 +198,77 @@ public func gemma_eos_id() -> UInt32 {
 public func gemma_active_session_count() -> Int32 {
     ffiLock.lock(); defer { ffiLock.unlock() }
     return Int32(gSessions.count)
+}
+
+// --- Vision / multimodal ---
+
+// Load vision weights from the Gemma-4 safetensors file. Must be called once
+// before any gemma_submit_image_path. Returns 0 on success, -1 on failure.
+@_cdecl("gemma_vision_init")
+public func gemma_vision_init(_ safetensorsPath: UnsafePointer<CChar>?) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let p = safetensorsPath else { return -1 }
+    let pathStr = String(cString: p)
+    do {
+        let st = try SafetensorsFile(pathStr)
+        gVisionWeights = try loadVisionWeights(st, device: device)
+        return 0
+    } catch {
+        print("gemma_vision_init failed: \(error)")
+        return -1
+    }
+}
+
+@_cdecl("gemma_vision_is_ready")
+public func gemma_vision_is_ready() -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    return gVisionWeights != nil ? 1 : 0
+}
+
+// Preprocess + vision-tower + submit soft tokens to a session, bracketed
+// by BOI (255999) / EOI (258882) markers the way Gemma-4 expects for an
+// inline image in a user turn. PNG bytes are read from the given file path
+// (Python writes to tempfile, passes path, cleans up after). Pads to 280
+// soft tokens (Gemma's image_seq_length).
+//
+// Returns number of soft tokens submitted (280 on success), or -1 on error.
+@_cdecl("gemma_submit_image_path")
+public func gemma_submit_image_path(_ sid: Int32,
+                                     _ pngPath: UnsafePointer<CChar>?) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let s = gSessions[sid] else { return -1 }
+    guard let visWeights = gVisionWeights else {
+        print("gemma_submit_image_path: vision not initialized (call gemma_vision_init first)")
+        return -1
+    }
+    guard let p = pngPath else { return -1 }
+    let pathStr = String(cString: p)
+
+    let batch: PatchBatch
+    do { batch = try gemma4ImagePreprocess(path: pathStr, device: device) }
+    catch {
+        print("gemma_submit_image_path: preprocess failed: \(error)")
+        return -1
+    }
+
+    let (rawSoftTokens, rawNPooled) = runVisionTowerForward(
+        batch: batch, weights: visWeights, device: device, queue: queue)
+    if rawNPooled == 0 { return -1 }
+
+    // Pad (or truncate) to 280 soft tokens. Soft tokens are fp32 from the
+    // vision tower; pad with zeros.
+    let targetSoft = 280
+    let padded = device.makeBuffer(length: targetSoft * HIDDEN * 4,
+                                    options: .storageModeShared)!
+    memset(padded.contents(), 0, padded.length)
+    let copyRows = min(rawNPooled, targetSoft)
+    memcpy(padded.contents(), rawSoftTokens.contents(), copyRows * HIDDEN * 4)
+
+    // Bracket with BOI + EOI the same way runLmMultimodal does.
+    let BOI: UInt32 = 255999
+    let EOI: UInt32 = 258882
+    s.submit([BOI])
+    s.submit(softTokens: padded, count: targetSoft, isFp32: true)
+    s.submit([EOI])
+    return Int32(targetSoft)
 }

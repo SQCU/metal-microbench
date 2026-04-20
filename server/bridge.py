@@ -22,11 +22,15 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import queue
+import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,6 +47,10 @@ import gemma_ffi as g
 GGUF_PATH = os.environ.get(
     "GGUF_PATH",
     "/Users/mdot/models/gemma-4-a4b/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
+)
+VISION_SAFETENSORS = os.environ.get(
+    "VISION_ST",
+    "/Users/mdot/models/gemma-4-a4b-bf16/model-00001-of-00002.safetensors",
 )
 MODEL_NAME = os.environ.get("GEMMA_MODEL_NAME", "gemma-4-a4b-q4km")
 
@@ -112,7 +120,21 @@ def _startup() -> None:
     print(f"[bridge] loading {GGUF_PATH}")
     t0 = time.time()
     g.init(GGUF_PATH)
-    print(f"[bridge] ready in {time.time() - t0:.2f}s (bos={g.bos_id()}, eos={g.eos_id()})")
+    print(f"[bridge] LM ready in {time.time() - t0:.2f}s (bos={g.bos_id()}, eos={g.eos_id()})")
+
+    # Vision weights are optional — only loaded if the safetensors file
+    # exists at the configured path. Without them, /v1/chat/completions
+    # with image_url content items will 400.
+    if Path(VISION_SAFETENSORS).exists():
+        t1 = time.time()
+        try:
+            g.vision_init(VISION_SAFETENSORS)
+            print(f"[bridge] vision ready in {time.time() - t1:.2f}s")
+        except Exception as e:
+            print(f"[bridge] vision init failed: {e}")
+    else:
+        print(f"[bridge] vision safetensors not at {VISION_SAFETENSORS} — image_url disabled")
+
     _pump_running = True
     _pump_thread = threading.Thread(target=_pump_loop, name="gemma-pump", daemon=True)
     _pump_thread.start()
@@ -124,30 +146,104 @@ def _shutdown() -> None:
     _pump_running = False
 
 
-# --- Chat template ---
+# --- Chat template + submit orchestration ---
 
 GEMMA_TURN_OPEN = "<|turn>"
 GEMMA_TURN_CLOSE = "<turn|>"
 
 
-def render_messages(messages: list[dict]) -> str:
-    """messages → Gemma chat-format string, ending with the model open-turn.
+def _decode_image_url(url: str) -> bytes:
+    """Accepts data:image/...;base64,... URIs and http(s) URLs.
+    Returns raw PNG/JPEG/... bytes suitable for writing to a temp file."""
+    if url.startswith("data:"):
+        # data:image/png;base64,XXXX
+        try:
+            header, payload = url.split(",", 1)
+        except ValueError:
+            raise HTTPException(400, "malformed data URL")
+        if ";base64" in header:
+            return base64.b64decode(payload)
+        # percent-encoded text (rare for images, but spec-compliant).
+        return urllib.parse.unquote(payload).encode("latin-1")
+    if url.startswith("http://") or url.startswith("https://"):
+        with urllib.request.urlopen(url, timeout=10) as r:  # noqa: S310 (trusted dev demo)
+            return r.read()
+    raise HTTPException(400, f"unsupported image_url scheme: {url[:32]!r}")
 
-    OpenAI format: [{role: user/assistant/system, content: str}, ...]
-    Gemma format:  <|turn>role\\nCONTENT<turn|>\\n<|turn>role\\n...
-    Always emit a trailing '<|turn>model\\n' to prime generation.
+
+def _render_user_content_to_chunks(content) -> list[tuple[str, Any]]:
+    """Break an OpenAI message's `content` into an ordered list of chunks
+    to submit, interleaving text and images as the user sent them.
+
+    Returns: [('text', str), ('image_bytes', bytes), ...]
     """
-    parts = []
+    if isinstance(content, str):
+        return [('text', content)]
+    if isinstance(content, list):
+        out: list[tuple[str, Any]] = []
+        for part in content:
+            t = part.get("type")
+            if t == "text":
+                out.append(('text', part.get("text", "")))
+            elif t == "image_url":
+                url = part.get("image_url", {})
+                if isinstance(url, dict):
+                    url = url.get("url", "")
+                out.append(('image_bytes', _decode_image_url(url)))
+            # Unknown types silently dropped; could also 400 here.
+        return out
+    return [('text', str(content))]
+
+
+def submit_messages(sid: int, messages: list[dict]) -> None:
+    """Build the session's priming queue from an OpenAI messages list.
+
+    The critical correctness property: text spans must be tokenized as
+    long contiguous strings. BPE tokenization is NOT splitting-safe —
+    tokenize('<|turn>user\\n') + tokenize('Count to 5.') does not equal
+    tokenize('<|turn>user\\nCount to 5.'). So we accumulate text into a
+    pending buffer and only flush on image boundaries (or end-of-input).
+    """
+    pending_text: list[str] = []
+    first_submit = True
+
+    def flush_text() -> None:
+        nonlocal first_submit
+        if not pending_text:
+            return
+        combined = "".join(pending_text)
+        pending_text.clear()
+        toks = g.tokenize(combined, add_bos=first_submit)
+        if toks:
+            g.submit(sid, toks)
+            first_submit = False
+
     for m in messages:
         role = m.get("role", "user")
         content = m.get("content", "")
-        if isinstance(content, list):
-            # OpenAI vision-style content: list of {type, text|image_url}.
-            # For now collapse to text only.
-            content = "".join(p.get("text", "") for p in content if p.get("type") == "text")
-        parts.append(f"{GEMMA_TURN_OPEN}{role}\n{content}{GEMMA_TURN_CLOSE}\n")
-    parts.append(f"{GEMMA_TURN_OPEN}model\n")
-    return "".join(parts)
+        pending_text.append(f"{GEMMA_TURN_OPEN}{role}\n")
+        for kind, payload in _render_user_content_to_chunks(content):
+            if kind == 'text':
+                pending_text.append(payload)
+            elif kind == 'image_bytes':
+                # Flush everything pending as one tokenize+submit so the chat
+                # template text tokenizes correctly, THEN run vision and
+                # submit BOI/softs/EOI, THEN start a new pending buffer.
+                flush_text()
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                    f.write(payload)
+                    tmp = f.name
+                try:
+                    n = g.submit_image_path(sid, tmp)
+                    first_submit = False
+                    if n <= 0:
+                        raise HTTPException(500, "vision tower returned no soft tokens")
+                finally:
+                    try: os.unlink(tmp)
+                    except OSError: pass
+        pending_text.append(f"{GEMMA_TURN_CLOSE}\n")
+    pending_text.append(f"{GEMMA_TURN_OPEN}model\n")
+    flush_text()
 
 
 # --- Endpoints ---
@@ -157,6 +253,7 @@ def health() -> JSONResponse:
     return JSONResponse({
         "status": "ready" if g.is_ready() else "loading",
         "model": MODEL_NAME,
+        "multimodal": g.vision_is_ready(),
         "active_sessions": g.active_session_count(),
         "pump_running": _pump_running,
     })
@@ -175,12 +272,22 @@ def list_models() -> JSONResponse:
 
 
 def _open_session_with_prompt(prompt: str, max_tokens: int) -> tuple[int, SessionState]:
+    """Legacy text-only path, used by /v1/completions."""
     sid = g.open_session(max_new_tokens=max_tokens)
     state = SessionState(sid=sid)
     with _sessions_lock:
         _sessions[sid] = state
     tokens = g.tokenize(prompt, add_bos=True)
     g.submit(sid, tokens)
+    return sid, state
+
+
+def _open_session_with_messages(messages: list[dict], max_tokens: int) -> tuple[int, SessionState]:
+    sid = g.open_session(max_new_tokens=max_tokens)
+    state = SessionState(sid=sid)
+    with _sessions_lock:
+        _sessions[sid] = state
+    submit_messages(sid, messages)
     return sid, state
 
 
@@ -210,8 +317,7 @@ async def chat_completions(req: Request) -> Any:
     if not messages:
         raise HTTPException(400, "messages is required")
 
-    prompt = render_messages(messages)
-    sid, state = _open_session_with_prompt(prompt, max_tokens)
+    sid, state = _open_session_with_messages(messages, max_tokens)
     created = int(time.time())
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
 
