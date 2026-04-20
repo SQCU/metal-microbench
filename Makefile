@@ -41,5 +41,18 @@ libgemma_metal.dylib: $(FORWARD_GRAPH_LIB_SRCS) ffi.swift
 gguf_loader: gguf_loader.swift gguf_tool.swift
 	swiftc -O gguf_loader.swift gguf_tool.swift -o gguf_loader -framework Metal -framework Foundation
 
+# tetraplex_recorder — stubbish SwiftUI app that runs the 4-stream demo in
+# one process and writes tetraplex-demo.mp4 via AVAssetWriter. No HTTP, no
+# browser, no external screen capture. Uses the same engine sources as
+# forward_graph minus main.swift (the recorder brings its own @main via
+# SwiftUI.App + -parse-as-library).
+tetraplex_recorder: $(FORWARD_GRAPH_LIB_SRCS) tetraplex_recorder.swift
+	swiftc -O -parse-as-library \
+	    $(FORWARD_GRAPH_LIB_SRCS) tetraplex_recorder.swift \
+	    -o tetraplex_recorder \
+	    -framework Metal -framework Foundation \
+	    -framework SwiftUI -framework AppKit \
+	    -framework AVFoundation -framework CoreMedia -framework CoreVideo
+
 clean:
 	rm -f mem_mountain tile_gemm paged_attention moe_matmul dense_gemv forward_ops forward_graph gguf_loader
