@@ -1,0 +1,18 @@
+[project]
+name = "gemma-metal-bridge"
+version = "0.1.0"
+description = "FastAPI bridge from OpenAI-compatible HTTP to the Swift Metal engine (libgemma_metal.dylib)."
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pillow>=10.0",          # only needed once multimodal image_url lands
+]
+
+[project.scripts]
+gemma-bridge = "bridge:main"
+gemma-webapp = "webapp:main"
+
+[tool.uv]
+# Nothing special — this project has no editable deps; uv sync builds a
+# venv from `dependencies` above.

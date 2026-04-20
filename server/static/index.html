@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>gemma metal bridge — side-by-side streaming demo</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; padding: 0; background: #0a0a0a; color: #d4d4d4; font-family: ui-monospace, 'SF Mono', Monaco, monospace; }
+  header { padding: 0.8em 1.2em; border-bottom: 1px solid #222; display: flex; justify-content: space-between; align-items: center; }
+  header h1 { margin: 0; font-size: 1rem; font-weight: 500; color: #6a9; }
+  header .status { font-size: 0.8rem; color: #888; }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 1em; padding: 1em; height: calc(100vh - 4em); box-sizing: border-box; }
+  .pane { display: flex; flex-direction: column; gap: 0.6em; background: #111; border: 1px solid #222; border-radius: 4px; padding: 0.8em; min-height: 0; }
+  .pane h2 { margin: 0; font-size: 0.85rem; color: #9af; font-weight: 500; }
+  textarea {
+    width: 100%; min-height: 4em; resize: vertical; box-sizing: border-box;
+    background: #0a0a0a; color: #d4d4d4; border: 1px solid #333; border-radius: 3px;
+    font: inherit; padding: 0.5em;
+  }
+  .row { display: flex; gap: 0.5em; align-items: center; }
+  button {
+    padding: 0.4em 1em; background: #1a5; color: #000; border: 0; border-radius: 3px;
+    font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { background: #333; color: #888; cursor: not-allowed; }
+  .meta { font-size: 0.75rem; color: #888; margin-left: auto; }
+  .output {
+    flex: 1; overflow-y: auto; background: #0a0a0a; border: 1px solid #222; border-radius: 3px;
+    padding: 0.6em; white-space: pre-wrap; word-wrap: break-word;
+    font-size: 0.9rem; line-height: 1.4;
+  }
+  .output:empty::before { content: '(output streams here)'; color: #444; }
+</style>
+</head>
+<body>
+<header>
+  <h1>gemma metal bridge — two streams, one GPU</h1>
+  <div class="status" id="status">checking…</div>
+</header>
+<main>
+  <div class="pane">
+    <h2>stream A</h2>
+    <textarea id="qA">What is the capital of France?</textarea>
+    <div class="row">
+      <button id="askA" onclick="ask('A')">ask</button>
+      <span class="meta" id="metaA"></span>
+    </div>
+    <div class="output" id="oA"></div>
+  </div>
+  <div class="pane">
+    <h2>stream B</h2>
+    <textarea id="qB">Write a one-sentence haiku about compilers.</textarea>
+    <div class="row">
+      <button id="askB" onclick="ask('B')">ask</button>
+      <span class="meta" id="metaB"></span>
+    </div>
+    <div class="output" id="oB"></div>
+  </div>
+</main>
+
+<script>
+// Health poll — demonstrates / documents the /health endpoint from JS.
+async function pollHealth() {
+  try {
+    const r = await fetch('/health');
+    const j = await r.json();
+    document.getElementById('status').textContent =
+      `${j.status} · ${j.model} · ${j.active_sessions} active session${j.active_sessions === 1 ? '' : 's'}`;
+  } catch (e) {
+    document.getElementById('status').textContent = `down: ${e.message}`;
+  }
+}
+pollHealth();
+setInterval(pollHealth, 1500);
+
+async function ask(which) {
+  const qEl = document.getElementById(`q${which}`);
+  const oEl = document.getElementById(`o${which}`);
+  const btn = document.getElementById(`ask${which}`);
+  const meta = document.getElementById(`meta${which}`);
+  const q = qEl.value.trim();
+  if (!q) return;
+
+  oEl.textContent = '';
+  btn.disabled = true;
+  meta.textContent = 'streaming…';
+
+  const t0 = performance.now();
+  let firstTokAt = null, tokenCount = 0;
+
+  try {
+    const res = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        model: 'gemma-4-a4b-q4km',
+        messages: [{ role: 'user', content: q }],
+        max_tokens: 256,
+        stream: true,
+      }),
+    });
+    if (!res.ok) {
+      oEl.textContent = `(http ${res.status}) ${await res.text()}`;
+      return;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, {stream: true});
+      // SSE frames split by blank lines.
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) !== -1) {
+        const frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        for (const line of frame.split('\n')) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6);
+          if (data === '[DONE]') continue;
+          try {
+            const j = JSON.parse(data);
+            const delta = j.choices?.[0]?.delta?.content;
+            if (delta) {
+              if (firstTokAt === null) firstTokAt = performance.now();
+              tokenCount++;
+              oEl.textContent += delta;
+              oEl.scrollTop = oEl.scrollHeight;
+            }
+          } catch (e) { /* ignore partial json */ }
+        }
+      }
+    }
+    const wall = (performance.now() - t0) / 1000;
+    const ttft = firstTokAt ? ((firstTokAt - t0) / 1000).toFixed(2) : '?';
+    meta.textContent = `ttft=${ttft}s · ${tokenCount} chunks in ${wall.toFixed(2)}s`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+</script>
+</body>
+</html>

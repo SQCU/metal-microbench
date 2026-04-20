@@ -8,6 +8,13 @@
 /forward_graph
 /gguf_loader
 /microbench
+/libgemma_metal.dylib
+
+# Python bridge
+server/__pycache__/
+server/.venv/
+__pycache__/
+*.pyc
 
 # macOS
 .DS_Store
