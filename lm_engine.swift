@@ -38,17 +38,21 @@ import Foundation
 import Metal
 
 enum SessionState: Equatable {
-    case idle           // no pending work
-    case priming        // primingQueue is non-empty; teacher-forcing
-    case generating     // sampling; pushing to generated queue
-    case done           // EOS / maxTokens / explicit close
+    case idle           // no pending work — e.g. session just opened, nothing submitted
+    case priming        // chunkQueue non-empty — teacher-forcing prompt/tool tokens
+    case generating     // sampling; pushing to outputQueue
+    case paused         // explicit pause (caller is waiting for tool result); KV retained
+    case done           // EOS / maxTokens / caller closed
 
-    var isBusy: Bool {
+    // Does this session want a slot on the next scheduler tick?
+    var wantsSlot: Bool {
         switch self {
         case .priming, .generating: return true
         default: return false
         }
     }
+    // Legacy alias — some code paths still read .isBusy.
+    var isBusy: Bool { return wantsSlot }
 }
 
 // A chunk of work queued into a session's priming lane. Text and image
@@ -79,89 +83,96 @@ enum PrimingChunk {
 
 final class Session {
     let id: Int
-    let slot: Int
+    // Which active-batch slot this session is currently occupying, or nil
+    // when the session is *resident* (KV pages retained, block_table not
+    // populated) but not in the active batch. The scheduler moves sessions
+    // between resident-without-slot and resident-with-slot each tick.
+    var slot: Int?
     let eosId: UInt32
     var maxNewTokens: Int
     fileprivate weak var engine: LmEngine?
 
     fileprivate(set) var state: SessionState = .idle
+    // Phys-page IDs owned by this session, in logical-page order:
+    //   ownedPages[p] = phys page number for this session's page p
+    //   ownedPages.count * PAGE_SLIDE bounds the max k_len this session
+    //   can reach without growing. Pages are allocated on-demand as the
+    //   session's position advances (see growPagesFor(kLen:)).
+    fileprivate var ownedPages: [Int] = []
     // Ordered chunks to teacher-force (text tokens or image soft tokens).
-    // The scheduler pops the front chunk and dispatches it — either as a
-    // fast prefill (whole chunk at once) or as token-by-token AR priming,
-    // depending on scheduler mode and concurrent session load.
     fileprivate var chunkQueue: [PrimingChunk] = []
-    // When state == .generating, the token we sampled on the previous step
-    // becomes the next step's input. Kept separate from the chunk queue so
-    // the state machine doesn't have to pun inputs.
+    // When state == .generating, the last-sampled token becomes the next
+    // step's input; kept separate from the chunk queue for state clarity.
     fileprivate var nextGeneratedInput: UInt32 = 0
     // Next KV-cache write position. k_len after a step == position + 1.
     fileprivate var position: Int = 0
     fileprivate var numGenerated: Int = 0
 
-    // Tokens the caller can consume. Generated-only (prompt tokens are not
-    // echoed). Caller pulls via `nextToken()`.
+    // Tokens the caller can consume.
     fileprivate var outputQueue: [UInt32] = []
 
-    fileprivate init(id: Int, slot: Int, eosId: UInt32, maxNewTokens: Int, engine: LmEngine) {
-        self.id = id; self.slot = slot
+    fileprivate init(id: Int, eosId: UInt32, maxNewTokens: Int, engine: LmEngine) {
+        self.id = id; self.slot = nil
         self.eosId = eosId; self.maxNewTokens = maxNewTokens
         self.engine = engine
     }
 
     // Queue more input tokens to be teacher-forced. Valid in any state:
-    // calling during .generating flips back to .priming, which is how
-    // tool-call continuations re-enter the stream.
+    // calling while .generating/.paused/.idle flips back to .priming.
     func submit(_ tokens: [UInt32]) {
         guard !tokens.isEmpty else { return }
         chunkQueue.append(.tokens(tokens))
-        if state == .idle || state == .generating { state = .priming }
+        if state != .done { state = .priming }
     }
-
-    // Convenience: tokenize and submit.
     func submit(text: String, addBos: Bool? = nil) {
         guard let eng = engine else { return }
         submit(eng.tokenizer.encode(text, addBos: addBos))
     }
-
-    // Queue a pre-computed block of vision-tower soft tokens (shape
-    // [count, HIDDEN], already projected into the text hidden space).
-    // `isFp32` distinguishes the vision tower's default fp32 output from
-    // a caller who's already downcast to fp16.
     func submit(softTokens: MTLBuffer, count: Int, isFp32: Bool) {
         guard count > 0 else { return }
         chunkQueue.append(.softTokens(buffer: softTokens, count: count,
                                        isFp32: isFp32, byteOffset: 0))
-        if state == .idle || state == .generating { state = .priming }
+        if state != .done { state = .priming }
     }
 
-    // Pull the next generated token, or nil if none ready. Caller should
-    // call `engine.step()` to make progress.
+    // Explicit pause — retain KV, release the active slot. Caller uses this
+    // while waiting for a tool call to complete from an external API; the
+    // subsequent submit() of the tool-result tokens flips back to .priming
+    // and re-admits the session on the next scheduler tick.
+    func pause() { if state != .done { state = .paused } }
+
+    // Pull the next generated token, or nil if none ready.
     func nextToken() -> UInt32? {
         guard !outputQueue.isEmpty else { return nil }
         return outputQueue.removeFirst()
     }
 
-    // How many tokens are ready to consume.
     var pendingOutputCount: Int { outputQueue.count }
-    // Sum of all queued priming work (for scheduler heuristics).
     var pendingPrimingCount: Int { chunkQueue.reduce(0) { $0 + $1.count } }
 
-    // Mark as done; engine will not schedule any more steps for this session.
+    // Mark as done; engine will release pages + slot on the next tick.
     func finish() { state = .done }
 }
 
 final class LmEngine {
     let weights: LmWeights
     let tokenizer: GemmaBpe
-    // Slot 0..B-1 is either nil (free) or owns exactly one Session.
-    private var sessionBySlot: [Session?]
+    // All resident sessions (keyed by id). A session is "resident" if the
+    // engine holds its KV pages; it may or may not currently own an active
+    // batch slot. Limited to MAX_RESIDENT_SESSIONS — beyond that, callers
+    // queue externally (a separate admission layer handles that).
+    private(set) var residentSessions: [Int: Session] = [:]
+    // Active-batch slot table: slotAssignment[s] is a session id or nil.
+    // Decoupled from residentSessions — sessions move in and out of slots
+    // each tick based on `wantsSlot` state.
+    private var slotAssignment: [Int?]
     private var nextId: Int = 1
 
-    // Page manager owns the KV cache's physical page pool and answers
-    // "who owns this page, who's sharing it, what content hash is cached
-    // here". Excludes the scratch strip at the end (that's reserved for
-    // silencing inactive slots during single-slot prefill and must never
-    // be owned by a session).
+    // Round-robin cursor for slot admission — avoids sticky-bias toward
+    // low-id sessions when more ready sessions exist than free slots.
+    private var admissionCursor: Int = 0
+
+    // Page manager owns the KV cache's physical page pool.
     let pageManager: PageManager
 
     // Instrumentation — helps the scheduler-behaviour tests measure how
@@ -173,75 +184,122 @@ final class LmEngine {
     init(weights: LmWeights) {
         self.weights = weights
         self.tokenizer = GemmaBpe(weights: weights)
-        self.sessionBySlot = Array(repeating: nil, count: B)
-        // Usable pool excludes the scratch strip at [SCRATCH_PAGE_BASE..].
-        // pageSize is PAGE_SLIDE; PAGE_FULL differs (8 vs 16) but we hash
-        // by token count, and the block_table indexes phys pages uniformly
-        // for both caches — PAGE_SLIDE is the coarser unit per-prefix.
+        self.slotAssignment = Array(repeating: nil, count: B)
         self.pageManager = PageManager(numPhysPages: SCRATCH_PAGE_BASE,
                                         pageSize: PAGE_SLIDE)
+    }
+
+    // Grow a session's owned pages so its logical page count covers k_len.
+    // Called right before admission to a slot and between steps when the
+    // session's position advances past its current allocation.
+    // Fails if the page pool is exhausted — caller must close a session or
+    // evict another resident to make room.
+    fileprivate func ensurePages(_ s: Session, forKLen kLen: Int) -> Bool {
+        let needed = (kLen + PAGE_SLIDE - 1) / PAGE_SLIDE
+        while s.ownedPages.count < needed {
+            do {
+                let p = try pageManager.allocFresh(sessionId: s.id)
+                s.ownedPages.append(p)
+            } catch {
+                print("  ensurePages: pool exhausted for session \(s.id) at logical page \(s.ownedPages.count)")
+                return false
+            }
+        }
+        return true
+    }
+
+    // Install a session's owned pages into block_table[slot][:]. Entries
+    // past ownedPages.count get filled with SCRATCH_PAGE_BASE so that any
+    // accidental read past num_pages lands in scratch (detectable garbage)
+    // rather than aliasing with the session's real pages. Kernels should
+    // only read [0..num_pages-1] but the safety net matters when we're
+    // growing pages lazily.
+    fileprivate func installBlockTable(_ s: Session, slot: Int) {
+        let btP = block_table.contents().bindMemory(to: UInt32.self,
+                    capacity: B * MAX_PAGES_PER_SLOT)
+        let base = slot * MAX_PAGES_PER_SLOT
+        let scratchGuard = UInt32(SCRATCH_PAGE_BASE)
+        for p in 0..<MAX_PAGES_PER_SLOT {
+            btP[base + p] = p < s.ownedPages.count ? UInt32(s.ownedPages[p]) : scratchGuard
+        }
     }
 
     // Open a new session on the first free slot. Returns nil if the engine
     // is at capacity (B active sessions) OR the page pool is exhausted.
     // Caller owns the Session and must call `closeSession` to free both
     // the slot and the allocated pages.
+    // Open a new resident session. Pages are claimed on-demand as the
+    // session accumulates KV; no up-front allocation. Slot is assigned by
+    // the scheduler on the next tick() call when the session is ready.
     func openSession(eosId: UInt32? = nil, maxNewTokens: Int = 128) -> Session? {
-        guard let slot = (0..<B).first(where: { sessionBySlot[$0] == nil }) else {
+        guard residentSessions.count < MAX_RESIDENT_SESSIONS else {
+            print("  openSession: residency cap \(MAX_RESIDENT_SESSIONS) reached")
             return nil
         }
         let sessionId = nextId; nextId += 1
-        // Allocate this session's MAX_PAGES_PER_SLOT pages via PageManager.
-        // Up front allocation matches the old strip behaviour and guarantees
-        // contiguous available capacity; on exhaustion we fail fast instead
-        // of corrupting some other session's KV.
-        var ownedPages: [Int] = []
-        ownedPages.reserveCapacity(MAX_PAGES_PER_SLOT)
-        for _ in 0..<MAX_PAGES_PER_SLOT {
-            do {
-                ownedPages.append(try pageManager.allocFresh(sessionId: sessionId))
-            } catch PageManagerError.outOfPages(let needed, let available) {
-                print("  openSession: pool exhausted (needed \(needed), have \(available))")
-                // Roll back partial allocation.
-                pageManager.releaseAllForSession(sessionId)
-                return nil
-            } catch {
-                print("  openSession: unexpected PageManager error: \(error)")
-                pageManager.releaseAllForSession(sessionId)
-                return nil
-            }
-        }
-        let s = Session(id: sessionId, slot: slot,
+        let s = Session(id: sessionId,
                         eosId: eosId ?? weights.eosTokenId,
                         maxNewTokens: maxNewTokens, engine: self)
-        sessionBySlot[slot] = s
-        // Populate block_table[slot][p] = this session's p-th phys page.
-        // The AR and prefill kernels both read block_table[slot * max_pages + p]
-        // to resolve logical page p into a physical cache page.
-        let btP = block_table.contents().bindMemory(to: UInt32.self,
-                    capacity: B * MAX_PAGES_PER_SLOT)
-        for p in 0..<MAX_PAGES_PER_SLOT {
-            btP[slot * MAX_PAGES_PER_SLOT + p] = UInt32(ownedPages[p])
-        }
+        residentSessions[sessionId] = s
         return s
     }
 
-    // Close a session, free its slot, and return its pages to the pool. A
-    // subsequent openSession can reuse those phys pages. This is the exit
-    // from the "you have to manage resource lifetimes" responsibility the
-    // caller inherits when they take a session handle.
+    // Close: release slot (if any), return pages, drop from residency.
     func closeSession(_ s: Session) {
-        guard sessionBySlot[s.slot]?.id == s.id else { return }
         s.state = .done
+        if let slot = s.slot {
+            slotAssignment[slot] = nil
+            s.slot = nil
+        }
         pageManager.releaseAllForSession(s.id)
-        sessionBySlot[s.slot] = nil
+        s.ownedPages.removeAll()
+        residentSessions.removeValue(forKey: s.id)
     }
 
-    // Diagnostic — useful for scheduler tests + debugging "why did openSession fail".
     func poolStats() -> PageManager.Stats { return pageManager.stats() }
 
-    var activeSessions: [Session] { sessionBySlot.compactMap { $0 } }
-    var hasWork: Bool { activeSessions.contains { $0.state.isBusy } }
+    // Sessions currently occupying active batch slots (length ≤ B).
+    var activeSessions: [Session] {
+        return slotAssignment.compactMap { $0.flatMap { residentSessions[$0] } }
+    }
+    // Resident sessions that want a slot (priming or generating).
+    var readyResidents: [Session] {
+        return residentSessions.values.filter { $0.state.wantsSlot }
+    }
+    var hasWork: Bool { readyResidents.count > 0 }
+
+    // Admission pass: evict slots whose session no longer wants one, admit
+    // ready-but-unslotted residents into free slots round-robin. Grows
+    // owned pages + installs block_table entries for freshly-admitted sessions.
+    private func runAdmissionPass() {
+        for slot in 0..<B {
+            if let sid = slotAssignment[slot],
+               let s = residentSessions[sid], !s.state.wantsSlot {
+                s.slot = nil
+                slotAssignment[slot] = nil
+            }
+        }
+        let ready = readyResidents.filter { $0.slot == nil }.sorted { $0.id < $1.id }
+        if ready.isEmpty { return }
+        var cursor = admissionCursor % ready.count
+        for slot in 0..<B where slotAssignment[slot] == nil {
+            let pick = ready[cursor % ready.count]
+            if pick.slot != nil { cursor += 1; continue }
+            pick.slot = slot
+            slotAssignment[slot] = pick.id
+            // Pre-grow pages. Use the max of (current prefill/gen tail) and a
+            // baseline window so short-prompt runs don't keep re-growing one
+            // page at a time during AR priming. 1024 tokens (= 64 slide pages)
+            // is a reasonable floor — cheap relative to the pool, and matches
+            // the size of a typical chat turn's KV residency.
+            let pendingPrime = pick.pendingPrimingCount
+            let lookahead = max(pick.position + pendingPrime + pick.maxNewTokens + 8, 1024)
+            _ = ensurePages(pick, forKLen: lookahead)
+            installBlockTable(pick, slot: slot)
+            cursor += 1
+        }
+        admissionCursor = (admissionCursor + 1) % max(ready.count, 1)
+    }
 
     // Take one token off the head chunk if it's a .tokens chunk. Returns
     // nil if the head is .softTokens (that chunk needs fast prefill, not
@@ -288,6 +346,7 @@ final class LmEngine {
     // `step()` directly in the multimodal case.
     @discardableResult
     func step() -> Int {
+        runAdmissionPass()
         let busy = activeSessions.filter { $0.state.isBusy }
         if busy.isEmpty { return 0 }
 
@@ -299,17 +358,19 @@ final class LmEngine {
         let npsP = num_pages_slide.contents().bindMemory(to: UInt32.self, capacity: B)
         let npfP = num_pages_full.contents().bindMemory(to: UInt32.self, capacity: B)
 
-        // Track which slots run REAL work this step — used downstream when
-        // we read logits to decide whether to emit a sampled token.
+        // Track which slots run REAL work this step.
         var realSlot = [Bool](repeating: false, count: B)
 
         for slot in 0..<B {
-            if let s = sessionBySlot[slot], s.state.isBusy {
+            if let sid = slotAssignment[slot],
+               let s = residentSessions[sid], s.state.isBusy {
+                // Grow pages if needed for the step that's about to run.
+                _ = ensurePages(s, forKLen: s.position + 2)
+                installBlockTable(s, slot: slot)
+
                 let inputTok: UInt32?
                 if s.state == .priming {
                     inputTok = popArPrimingToken(s)
-                    // If nil, head chunk is .softTokens — can't AR-prime
-                    // here. Park this slot; caller should run fast prefill.
                 } else {
                     inputTok = s.nextGeneratedInput
                 }
@@ -324,13 +385,21 @@ final class LmEngine {
                     continue
                 }
             }
-            // Park: BOS at position 0, k_len=1, 1 page. Writes land in the
-            // slot's own dedicated page strip and can't disturb any other
-            // session's KV.
+            // Park: BOS at position 0, k_len=1, 1 page. The park slot writes
+            // to whatever phys page is installed in block_table[slot][0] —
+            // which for an unassigned slot is the scratch strip via the
+            // guard-page fallback in installBlockTable. Safe no-op.
             tokP[slot] = weights.bosTokenId
             posP[slot] = 0
             klsP[slot] = 1; klfP[slot] = 1
             npsP[slot] = 1; npfP[slot] = 1
+            if slotAssignment[slot] == nil {
+                // No session here; redirect block_table[slot][0] to scratch
+                // so this park step's KV write can't corrupt someone else.
+                let btP = block_table.contents().bindMemory(to: UInt32.self,
+                            capacity: B * MAX_PAGES_PER_SLOT)
+                btP[slot * MAX_PAGES_PER_SLOT + 0] = UInt32(SCRATCH_PAGE_BASE)
+            }
         }
 
         if USE_FLEX_ATTN {
@@ -348,8 +417,9 @@ final class LmEngine {
         let logP = logits.contents().assumingMemoryBound(to: Float16.self)
         var emitted = 0
         for slot in 0..<B where realSlot[slot] {
-            guard let s = sessionBySlot[slot], s.state.isBusy else { continue }
-            let base = s.slot * VOCAB
+            guard let sid = slotAssignment[slot],
+                  let s = residentSessions[sid], s.state.isBusy else { continue }
+            let base = slot * VOCAB
             var bestI = 0; var bestV: Float = -.infinity
             for v in 0..<VOCAB {
                 let x = Float(logP[base + v])
@@ -391,24 +461,31 @@ final class LmEngine {
     @discardableResult
     func stepPrefillForSession(_ s: Session) -> Bool {
         guard s.state == .priming, let head = s.chunkQueue.first else { return false }
+        // Ensure the session owns an active slot. If not, run admission first.
+        if s.slot == nil { runAdmissionPass() }
+        guard let sslot = s.slot else { return false }
         let qLen = head.count
         precondition(qLen >= 1)
-        // Current prefill kernel supports Q_BLOCK=8 (one tile). If the chunk
-        // is larger, process the first MAX_Q_LEN tokens here and leave the
-        // tail for subsequent calls.
         let thisTile = min(qLen, MAX_Q_LEN)
         let remaining = qLen - thisTile
         let positionStart = s.position
+
+        // Ensure pages cover positionStart..positionStart+thisTile.
+        if !ensurePages(s, forKLen: positionStart + thisTile + 1) { return false }
+        installBlockTable(s, slot: sslot)
 
         // --- Save block_table; redirect non-target slots to scratch strip ---
         let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
         var savedBT = [UInt32](repeating: 0, count: B * MAX_PAGES_PER_SLOT)
         for i in 0..<(B * MAX_PAGES_PER_SLOT) { savedBT[i] = btP[i] }
-        for slot in 0..<B where slot != s.slot {
+        for slot in 0..<B where slot != sslot {
+            // All silenced slots redirect every logical page to the scratch
+            // strip. Silenced slots write garbage that gets discarded; same
+            // scratch pages serve all silenced slots (writes race, reads
+            // are ignored). Wrapping via % keeps us inside the strip.
             for p in 0..<MAX_PAGES_PER_SLOT {
-                // All silenced slots redirect to the single scratch strip;
-                // their KV writes race but nobody reads the outputs.
-                btP[slot * MAX_PAGES_PER_SLOT + p] = UInt32(SCRATCH_PAGE_BASE + p)
+                btP[slot * MAX_PAGES_PER_SLOT + p] =
+                    UInt32(SCRATCH_PAGE_BASE + (p % SCRATCH_STRIP))
             }
         }
         defer {
@@ -439,7 +516,7 @@ final class LmEngine {
         case .tokens(let ts):
             // Real text tokens go in s.slot's row.
             for i in 0..<thisTile {
-                tokP[s.slot * thisTile + i] = ts[i]
+                tokP[sslot * thisTile + i] = ts[i]
             }
         case let .softTokens(buf, _, isFp32, byteOffset):
             // Vision tower output. Copy the thisTile-row window starting
@@ -448,7 +525,7 @@ final class LmEngine {
             // Other slots' rows are untouched (they'll compute junk that
             // gets discarded via block_table redirect to scratch).
             let dstPtr = pre_hidden.contents().assumingMemoryBound(to: Float16.self)
-            let dstBase = (s.slot * thisTile) * HIDDEN
+            let dstBase = (sslot * thisTile) * HIDDEN
             let srcRaw = buf.contents().advanced(by: byteOffset)
             if isFp32 {
                 let srcPtr = srcRaw.assumingMemoryBound(to: Float.self)
@@ -485,8 +562,8 @@ final class LmEngine {
         s.position += thisTile
         let srcPtr = pre_logits.contents().assumingMemoryBound(to: Float16.self)
         let dstPtr = logits.contents().assumingMemoryBound(to: Float16.self)
-        let src = srcPtr.advanced(by: (s.slot * thisTile + (thisTile - 1)) * VOCAB)
-        let dst = dstPtr.advanced(by: s.slot * VOCAB)
+        let src = srcPtr.advanced(by: (sslot * thisTile + (thisTile - 1)) * VOCAB)
+        let dst = dstPtr.advanced(by: sslot * VOCAB)
         memcpy(dst, src, VOCAB * 2)
 
         // Pop / trim the head chunk.
@@ -511,7 +588,7 @@ final class LmEngine {
         // If the queue is now empty, sample the post-prefill logit as the
         // first generated token so callers don't see a stall step.
         if s.chunkQueue.isEmpty {
-            let base = s.slot * VOCAB
+            let base = sslot * VOCAB
             let logP = logits.contents().assumingMemoryBound(to: Float16.self)
             var bestI = 0; var bestV: Float = -.infinity
             for v in 0..<VOCAB {
@@ -548,6 +625,9 @@ final class LmEngine {
     // drained and we sampled the first generated token).
     @discardableResult
     func tick() -> Int {
+        // Run admission first so we don't decide "no busy slots" while ready
+        // residents are still unslotted (→ infinite spin in the scheduler loop).
+        runAdmissionPass()
         let busy = activeSessions.filter { $0.state.isBusy }
         if busy.isEmpty { return 0 }
         // 1. Soft-tokens forced prefill.
@@ -640,7 +720,8 @@ func runLmMultisession(ggufPath: String, promptsStr: String, maxNewPerSession: I
     for (i, p) in active.enumerated() {
         guard let s = engine.openSession(maxNewTokens: maxNewPerSession) else { break }
         let toks = engine.tokenize(p, addBos: addBosEnv)
-        print("  session \(s.id) on slot \(s.slot): prompt=\(p.debugDescription) (\(toks.count) tokens)")
+        let slotStr = s.slot.map(String.init) ?? "pending"
+        print("  session \(s.id) (slot \(slotStr)): prompt=\(p.debugDescription) (\(toks.count) tokens)")
         s.submit(toks)
         sessions.append(s)
         _ = i
@@ -677,7 +758,8 @@ func runLmMultisession(ggufPath: String, promptsStr: String, maxNewPerSession: I
     print("")
     print("  --- final outputs ---")
     for s in sessions {
-        print("  s\(s.id) (slot \(s.slot), state=\(s.state)): \(allOutputs[s.id]!.debugDescription)")
+        let slotStr = s.slot.map(String.init) ?? "released"
+        print("  s\(s.id) (slot \(slotStr), state=\(s.state)): \(allOutputs[s.id]!.debugDescription)")
         engine.closeSession(s)
     }
 }

@@ -109,7 +109,14 @@ let FULL_H = 16
 let FULL_HD = 512
 let FULL_KV_H = 2
 
-let MAX_PAGES_PER_SLOT = 128   // enough for K_len=1024 at either PAGE=16 or PAGE=8
+// Unified phys-page pool parameters. At 8192 pages:
+//   slide coverage: 128k positions / slot (SW=1024 clamps real usage)
+//   full coverage:  64k positions / slot — the binding constraint for
+//                    max per-user context until we split slide/full pools.
+// KV-cache memory at 8192 pages, Gemma-4 (25 slide + 5 full):
+//   slide 25×64KB×8192×2 ≈ 26 GB  +  full 5×16KB×8192×2 ≈ 1.3 GB  = 27 GB
+// Fits comfortably alongside the 10 GB Q4_K_M weights on a 128 GB M5.
+let MAX_PAGES_PER_SLOT = 8192   // per-session max context (full-cache-bound at 64k tokens)
 
 // Physical page pool must be large enough that every slot gets a disjoint set
 // of phys pages, so parallel batch items cannot clobber each other's KV cache.
@@ -231,8 +238,17 @@ let logits      = emptyHalf(B * VOCAB)
 // One shared scratch strip is enough because silenced slots all write
 // ignored garbage; concurrent writes may race per-cell, but nothing reads
 // the result. Cuts KV-cache memory overhead from 2× to 1.25×.
-let SCRATCH_PAGE_BASE = B * MAX_PAGES_PER_SLOT
-let TOTAL_PAGES = (B + 1) * MAX_PAGES_PER_SLOT   // 640 at B=4 (was 512)
+// TOTAL_PAGES is the shared phys-page pool for up to MAX_RESIDENT_SESSIONS
+// sessions (not B — sessions and active-slot occupancy are decoupled by
+// the scheduler). Per-layer KV cache is sized to this; scratch strip
+// sits at the very end for silencing inactive slots during prefill.
+//
+// With 8192 pages + 256 scratch = 8448 total. Slide K/V at 64 KB/page ×
+// 25 layers × 2 ≈ 27 GB. Full K/V tiny in comparison.
+let MAX_RESIDENT_SESSIONS = 16                    // logical users held in KV
+let SCRATCH_STRIP = 256                           // silenced-slot scratch (shared)
+let SCRATCH_PAGE_BASE = 8192                      // pool starts here; scratch at [8192, 8192+256)
+let TOTAL_PAGES = SCRATCH_PAGE_BASE + SCRATCH_STRIP
 // Load-time assert: if this ever drops below B*MAX_PAGES_PER_SLOT, default
 // initLmState's `(b*MAX + p) % TOTAL_PAGES` routing will alias batches.
 let PAGE_SLIDE = 16
