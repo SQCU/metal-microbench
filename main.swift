@@ -963,9 +963,15 @@ enum MaskMod {
 func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
                                  slideMask: MaskMod = .causalSliding(SLIDING_WINDOW),
                                  fullMask: MaskMod = .causal) {
+    // Per-slot q positions live in pre_q_positions[b * qLen + i]. We still
+    // take a positionStart arg for back-compat with single-slot callers;
+    // when multi-slot prefill is active (slots have different positionStarts)
+    // each slot's q_first/q_last is read from pre_q_positions instead, so
+    // the masks classify FULL/PARTIAL/EMPTY for each slot's own Q range.
     let qBlock = 8
     let qBlocks = (qLen + qBlock - 1) / qBlock
     precondition(qBlocks == 1, "v1 prefill assumes single q_block per slot")
+    let qPosP = pre_q_positions.contents().assumingMemoryBound(to: UInt32.self)
 
     // ---- Slide (PAGE_SLIDE=16) ----
     do {
@@ -978,8 +984,12 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
         fullOff[0] = 0; partOff[0] = 0
         for b in 0..<B {
             let k_len = Int(pre_k_len_slide.contents().assumingMemoryBound(to: UInt32.self)[b])
-            let q_first = positionStart
-            let q_last  = positionStart + qLen - 1
+            // Read per-slot q positions; fall back to positionStart-based when
+            // pre_q_positions[b*qLen] is 0 AND positionStart > 0 (single-slot
+            // path that didn't populate silenced slots' positions).
+            let slotPos = Int(qPosP[b * qLen])
+            let q_first = (slotPos != 0 || positionStart == 0) ? slotPos : positionStart
+            let q_last  = q_first + qLen - 1
             let ctx = MaskModContext(kLen: k_len, slidingWindow: SLIDING_WINDOW)
             let kBlocks = (k_len + PAGE_SLIDE - 1) / PAGE_SLIDE
             for K in 0..<kBlocks {
@@ -1032,8 +1042,9 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
         fullOff[0] = 0; partOff[0] = 0
         for b in 0..<B {
             let k_len = Int(pre_k_len_full.contents().assumingMemoryBound(to: UInt32.self)[b])
-            let q_first = positionStart
-            let q_last  = positionStart + qLen - 1
+            let slotPos = Int(qPosP[b * qLen])
+            let q_first = (slotPos != 0 || positionStart == 0) ? slotPos : positionStart
+            let q_last  = q_first + qLen - 1
             let ctx = MaskModContext(kLen: k_len, slidingWindow: 0)
             let kBlocks = (k_len + PAGE_FULL - 1) / PAGE_FULL
             for K in 0..<kBlocks {

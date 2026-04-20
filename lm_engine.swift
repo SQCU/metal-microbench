@@ -823,25 +823,24 @@ final class LmEngine {
     }
 
     // Unified scheduler tick. Picks between fast prefill and AR batch each
-    // call. Policy for v1 — mostly AR-batch, use prefill only when it's
-    // strictly better or strictly required:
+    // call:
     //
     //   1. Any session has a .softTokens head chunk  →  single-slot fast
-    //      prefill for that session (image tokens can't go through AR;
-    //      paused AR work for other sessions is unavoidable here).
-    //   2. Exactly one session busy AND its head is tokens-chunk ≥ 2  →
-    //      fast prefill (no AR-batch advantage to forfeit since it's the
-    //      only busy slot anyway).
-    //   3. Otherwise  →  AR step across all busy sessions. Even for many
-    //      long prompts, parallel AR-prime beats serial fast prefill:
-    //      prefill wastes (B-1)/B of each CB, AR doesn't.
+    //      prefill for that session (image tokens can't go through AR).
+    //   2. ALL busy sessions are .priming with .tokens chunks of ≥2 remaining
+    //      → multi-slot fast prefill in ONE CB, all slots active. This is
+    //      the simultaneous-submission case: 4 users POST-ing at once should
+    //      settle into peak throughput, not 16 AR-steps of zero emits.
+    //   3. Exactly one session busy AND its head is tokens-chunk ≥ 2  →
+    //      single-slot fast prefill.
+    //   4. Otherwise  →  AR step across all busy sessions. Handles mixed
+    //      prime+gen naturally: priming slots consume priming tokens, gen
+    //      slots emit — so staggered submissions pipeline automatically.
     //
-    // Returns tokens emitted this tick (0 during prefill unless the chunk
-    // drained and we sampled the first generated token).
+    // Returns tokens emitted this tick (usually 0 during prefill unless the
+    // chunk drained and we sampled the first generated token).
     @discardableResult
     func tick() -> Int {
-        // Run admission first so we don't decide "no busy slots" while ready
-        // residents are still unslotted (→ infinite spin in the scheduler loop).
         runAdmissionPass()
         let busy = activeSessions.filter { $0.state.isBusy }
         if busy.isEmpty { return 0 }
@@ -854,14 +853,158 @@ final class LmEngine {
             _ = stepPrefillForSession(s)
             return s.outputQueue.count - before
         }
-        // 2. Single-session fast prefill.
+        // 2. Multi-slot prefill: all busy sessions priming with ≥2 prefill
+        //    tokens remaining. Peak aggregate throughput for cold-start of
+        //    many concurrent users — each slot primes its own tokens in the
+        //    same buildPrefillCB call, no AR-stepping zero-emit steps.
+        if busy.count > 1, allPrimeReady(busy, minTokensThreshold: 2) {
+            let beforeCounts = busy.map { $0.outputQueue.count }
+            _ = stepMultiSlotPrefill(busy)
+            return zip(busy, beforeCounts).reduce(0) { $0 + ($1.0.outputQueue.count - $1.1) }
+        }
+        // 3. Single-session fast prefill.
         if busy.count == 1, hasPrefillChunk(busy[0], minTokensThreshold: 2) {
             let before = busy[0].outputQueue.count
             _ = stepPrefillForSession(busy[0])
             return busy[0].outputQueue.count - before
         }
-        // 3. AR batch across all busy sessions.
+        // 4. AR batch across all busy sessions.
         return step()
+    }
+
+    // True if every session in `sessions` is priming with a .tokens head
+    // chunk of at least `minTokensThreshold` tokens remaining. Gate for
+    // multi-slot fast prefill; single-token tails fall through to AR step
+    // where 1-token priming is nearly free (~34 ms vs ~133 ms for fast prefill).
+    private func allPrimeReady(_ sessions: [Session], minTokensThreshold: Int) -> Bool {
+        for s in sessions {
+            guard s.state == .priming else { return false }
+            guard let head = s.chunkQueue.first else { return false }
+            guard case .tokens(let ts) = head, ts.count >= minTokensThreshold else { return false }
+        }
+        return true
+    }
+
+    // Multi-slot fast prefill: one buildPrefillCB dispatch that primes every
+    // slot's own session simultaneously. Every slot's block_table points to
+    // its session's real phys pages; each slot writes K/V at its own position
+    // range via multi-position kv_write_multi + per-slot CSR.
+    //
+    // qLen is min(MAX_Q_LEN, min(remaining prefill tokens across sessions))
+    // so no slot reads past the end of its chunk. Sessions with more tokens
+    // than qLen stay in .priming; the next tick processes the next tile.
+    @discardableResult
+    func stepMultiSlotPrefill(_ sessions: [Session]) -> Bool {
+        runAdmissionPass()
+        // Gather each busy slot's priming session + chunk.
+        var slotSession: [Session?] = Array(repeating: nil, count: B)
+        var slotTokens: [[UInt32]] = Array(repeating: [], count: B)
+        for s in sessions {
+            guard let sslot = s.slot else { continue }
+            guard case .tokens(let ts) = s.chunkQueue.first, !ts.isEmpty else { continue }
+            slotSession[sslot] = s
+            slotTokens[sslot] = ts
+        }
+        // min remaining across active slots; cap at MAX_Q_LEN.
+        var qLen = MAX_Q_LEN
+        var any = false
+        for b in 0..<B {
+            if let _ = slotSession[b] {
+                any = true
+                qLen = min(qLen, slotTokens[b].count)
+            }
+        }
+        guard any, qLen >= 1 else { return false }
+
+        // Each participating slot: ensure pages + install real block_table.
+        let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
+        var savedBT = [UInt32](repeating: 0, count: B * MAX_PAGES_PER_SLOT)
+        for i in 0..<(B * MAX_PAGES_PER_SLOT) { savedBT[i] = btP[i] }
+        for b in 0..<B {
+            if let s = slotSession[b] {
+                if !ensurePages(s, forKLen: s.position + qLen + 1) { return false }
+                installBlockTable(s, slot: b)
+            } else {
+                // Silence: point at scratch strip. Guards against stale K from
+                // a prior single-slot prefill leaving real-page pointers here.
+                for p in 0..<MAX_PAGES_PER_SLOT {
+                    btP[b * MAX_PAGES_PER_SLOT + p] =
+                        UInt32(SCRATCH_PAGE_BASE + (p % SCRATCH_STRIP))
+                }
+            }
+        }
+        defer { for i in 0..<(B * MAX_PAGES_PER_SLOT) { btP[i] = savedBT[i] } }
+
+        // Populate pre_input_tokens, pre_q_positions, pre_k_len_*.
+        let tokP = pre_input_tokens.contents().bindMemory(to: UInt32.self, capacity: B * MAX_Q_LEN)
+        let posP = pre_q_positions.contents().bindMemory(to: UInt32.self, capacity: B * MAX_Q_LEN)
+        let klsP = pre_k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
+        let klfP = pre_k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
+        for b in 0..<B {
+            if let s = slotSession[b] {
+                let ts = slotTokens[b]
+                for i in 0..<qLen {
+                    tokP[b * qLen + i] = ts[i]
+                    posP[b * qLen + i] = UInt32(s.position + i)
+                }
+                klsP[b] = UInt32(s.position + qLen)
+                klfP[b] = UInt32(s.position + qLen)
+            } else {
+                for i in 0..<qLen {
+                    tokP[b * qLen + i] = weights.bosTokenId
+                    posP[b * qLen + i] = 0
+                }
+                klsP[b] = 1
+                klfP[b] = 1
+            }
+        }
+
+        // precomputeFlexPrefillMasks reads per-slot q_first from pre_q_positions.
+        precomputeFlexPrefillMasks(qLen: qLen, positionStart: 0)
+        let cb = buildPrefillCB(weights, qLen: qLen, skipEmbed: false)
+        cb.commit(); cb.waitUntilCompleted()
+        totalSteps += 1
+        if let err = cb.error { print("  GPU multi-prefill error: \(err)"); return false }
+
+        // Per-slot: advance position, pop chunk, promote pages, copy logit,
+        // and if the chunk drained, transition to .generating + sample first
+        // gen token from the slot's last-position logit.
+        let srcPtr = pre_logits.contents().assumingMemoryBound(to: Float16.self)
+        let dstPtr = logits.contents().assumingMemoryBound(to: Float16.self)
+        for b in 0..<B {
+            guard let s = slotSession[b] else { continue }
+            s.position += qLen
+            promoteFinishedPages(s)
+            // Copy this slot's final-Q-row logit into AR logits for downstream.
+            let src = srcPtr.advanced(by: (b * qLen + (qLen - 1)) * VOCAB)
+            let dst = dstPtr.advanced(by: b * VOCAB)
+            memcpy(dst, src, VOCAB * 2)
+            // Pop qLen tokens from the session's chunk head.
+            var ts = slotTokens[b]
+            ts.removeFirst(qLen)
+            if ts.isEmpty { s.chunkQueue.removeFirst() }
+            else          { s.chunkQueue[0] = .tokens(ts) }
+            // Transition if chunk is drained.
+            if s.chunkQueue.isEmpty {
+                let base = b * VOCAB
+                let logP = logits.contents().assumingMemoryBound(to: Float16.self)
+                var bestI = 0; var bestV: Float = -.infinity
+                for v in 0..<VOCAB {
+                    let x = Float(logP[base + v])
+                    if x > bestV { bestV = x; bestI = v }
+                }
+                let sampled = UInt32(bestI)
+                s.state = .generating
+                s.outputQueue.append(sampled)
+                s.consumedTokens.append(sampled)
+                s.nextGeneratedInput = sampled
+                s.numGenerated += 1; totalTokensGenerated += 1
+                if sampled == s.eosId || s.numGenerated >= s.maxNewTokens {
+                    s.state = .done
+                }
+            }
+        }
+        return true
     }
 
     // Pump the scheduler until all sessions hit .done or a budget elapses.
