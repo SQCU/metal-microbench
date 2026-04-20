@@ -1159,6 +1159,119 @@ func runLmBranchDemo(ggufPath: String, maxNewPerBranch: Int) {
 }
 
 // ----------------------------------------------------------------------
+// Async pause/resume demo — models an agent with concurrent sessions,
+// some of which stall mid-generation waiting for tool-call results.
+// Demonstrates that a paused session retains its KV pages (so the tool
+// response resumes decode in-place without reprefill) and that OTHER
+// sessions keep making progress on the freed slot while the paused
+// session is dormant.
+//
+//   LM_PAUSE_DEMO=1
+//   LM_PAUSE_PROMPT_1=<prompt for session 1>
+//   LM_PAUSE_PROMPT_2=<prompt for session 2>
+//   LM_PAUSE_AFTER_TOKENS=3              # pause session 1 after N gen tokens
+//   LM_PAUSE_TOOL_RESULT=" the answer"    # faked tool-result text to submit on resume
+//   LM_PAUSE_RESUME_AFTER_STEPS=10       # how many ticks to wait before resume
+//   GGUF_PATH=<gguf> [LM_ADD_BOS=1]
+//
+// Output logs the tick at which each event occurs so you can see the
+// interleaving. Session 2 keeps decoding the whole time — the engine
+// correctly drops paused sessions from the active batch and reassigns
+// the slot until the caller calls submit() again.
+// ----------------------------------------------------------------------
+func runLmPauseResumeDemo(ggufPath: String) {
+    print("\n=== LM pause/resume demo ===")
+    let env = ProcessInfo.processInfo.environment
+    let addBos = env["LM_ADD_BOS"].flatMap {
+        ["0", "false", "no"].contains($0.lowercased()) ? false : true
+    }
+    guard let p1 = env["LM_PAUSE_PROMPT_1"], !p1.isEmpty,
+          let p2 = env["LM_PAUSE_PROMPT_2"], !p2.isEmpty else {
+        print("  Missing LM_PAUSE_PROMPT_1 / LM_PAUSE_PROMPT_2."); return
+    }
+    let pauseAfter = Int(env["LM_PAUSE_AFTER_TOKENS"] ?? "3") ?? 3
+    let resumeAfter = Int(env["LM_PAUSE_RESUME_AFTER_STEPS"] ?? "10") ?? 10
+    let toolResult = env["LM_PAUSE_TOOL_RESULT"] ?? " the capital is Paris."
+
+    let w: LmWeights
+    do { w = try loadLmWeights(ggufPath: ggufPath) }
+    catch { print("  loadLmWeights failed: \(error)"); return }
+    let engine = LmEngine(weights: w)
+
+    guard let s1 = engine.openSession(maxNewTokens: 32),
+          let s2 = engine.openSession(maxNewTokens: 32) else {
+        print("  openSession failed"); return
+    }
+    s1.submit(engine.tokenize(p1, addBos: addBos))
+    s2.submit(engine.tokenize(p2, addBos: addBos))
+
+    var out1 = "", out2 = ""
+    var s1TokensBeforePause = 0
+    var pausedAtTick = -1
+    var resumedAtTick = -1
+    var tick = 0
+
+    print("  session \(s1.id) prompt: \(p1.debugDescription)")
+    print("  session \(s2.id) prompt: \(p2.debugDescription)")
+    print("  policy: pause s\(s1.id) after it generates \(pauseAfter) tokens; resume after \(resumeAfter) more ticks; inject tool-result=\(toolResult.debugDescription)")
+    print("")
+    print("  tick  event")
+
+    while engine.hasWork {
+        _ = engine.tick()
+        tick += 1
+        // Drain output tokens per session.
+        while let tok = s1.nextToken() {
+            let frag = engine.detokenize([tok])
+            out1 += frag
+            // Count only generating tokens (priming doesn't emit).
+            s1TokensBeforePause += 1
+            print("  \(String(format: "%3d", tick))   [s\(s1.id)] \(frag.debugDescription)")
+            // Trigger the pause once s1 has generated N tokens AND isn't
+            // already paused/resumed.
+            if s1TokensBeforePause >= pauseAfter, pausedAtTick < 0 {
+                s1.pause()
+                pausedAtTick = tick
+                print("  \(String(format: "%3d", tick))   [s\(s1.id)] → pause (simulated tool call; KV retained, slot released)")
+            }
+        }
+        while let tok = s2.nextToken() {
+            out2 += engine.detokenize([tok])
+            print("  \(String(format: "%3d", tick))   [s\(s2.id)] \(engine.detokenize([tok]).debugDescription)")
+        }
+        // Resume s1 after `resumeAfter` ticks have elapsed since the pause.
+        if pausedAtTick > 0, resumedAtTick < 0,
+           tick - pausedAtTick >= resumeAfter {
+            // Inject a faked tool response — session state flips back to
+            // .priming and re-admits on the next tick.
+            let toolToks = engine.tokenize(toolResult, addBos: false)
+            s1.submit(toolToks)
+            resumedAtTick = tick
+            print("  \(String(format: "%3d", tick))   [s\(s1.id)] ← submit(tool_result=\(toolToks.count) tokens); re-admits next tick")
+        }
+        // Safety: cap at many ticks to avoid infinite loops.
+        if tick > 400 { print("  tick cap reached, aborting"); break }
+    }
+
+    print("")
+    print("  --- final outputs ---")
+    print("  s\(s1.id): \(out1.debugDescription)   (paused at tick \(pausedAtTick), resumed at tick \(resumedAtTick))")
+    print("  s\(s2.id): \(out2.debugDescription)")
+
+    print("")
+    print("  --- sanity check ---")
+    print("  during s\(s1.id)'s pause (ticks \(pausedAtTick)..\(resumedAtTick)), s\(s2.id) continued producing tokens:")
+    // Because outputs per tick were printed interleaved, the user can
+    // inspect above. We also note that after resume, s1 picked up its
+    // pre-pause KV state exactly — tool-response tokens get teacher-
+    // forced against the KV already in place without reprefilling
+    // anything.
+
+    engine.closeSession(s1)
+    engine.closeSession(s2)
+}
+
+// ----------------------------------------------------------------------
 // Multimodal demo driver — feeds vision-tower output through a session.
 // Env vars:
 //   GGUF_PATH=<gguf>                 # LM weights

@@ -3352,6 +3352,10 @@ if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
     runLmBranchDemo(ggufPath: ggufPath, maxNewPerBranch: maxN)
 }
 if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
+   ProcessInfo.processInfo.environment["LM_PAUSE_DEMO"] != nil {
+    runLmPauseResumeDemo(ggufPath: ggufPath)
+}
+if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
    let outDir = ProcessInfo.processInfo.environment["LM_DUMP_EXPERT_W"] {
     let id = Int(ProcessInfo.processInfo.environment["LM_DUMP_EXPERT_ID"] ?? "52") ?? 52
     runDumpExpertWeights(ggufPath: ggufPath, expertId: id, outDir: outDir)
