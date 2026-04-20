@@ -2,58 +2,114 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>gemma metal bridge — side-by-side streaming demo</title>
+<title>gemma metal bridge — tetraplex</title>
 <style>
-  :root { color-scheme: dark; }
+  :root {
+    color-scheme: dark;
+    --colorA: #5cf; /* cyan */
+    --colorB: #fa3; /* orange */
+    --colorC: #8f5; /* lime */
+    --colorD: #f69; /* pink */
+    --colorAgg: #ccc; /* aggregate line */
+  }
   html, body { margin: 0; padding: 0; background: #0a0a0a; color: #d4d4d4; font-family: ui-monospace, 'SF Mono', Monaco, monospace; }
-  header { padding: 0.8em 1.2em; border-bottom: 1px solid #222; display: flex; justify-content: space-between; align-items: center; }
+  header { padding: 0.7em 1.2em; border-bottom: 1px solid #222; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.6em; }
   header h1 { margin: 0; font-size: 1rem; font-weight: 500; color: #6a9; }
-  header .status { font-size: 0.8rem; color: #888; }
-  main { display: grid; grid-template-columns: 1fr 1fr; gap: 1em; padding: 1em; height: calc(100vh - 4em); box-sizing: border-box; }
-  .pane { display: flex; flex-direction: column; gap: 0.6em; background: #111; border: 1px solid #222; border-radius: 4px; padding: 0.8em; min-height: 0; }
-  .pane h2 { margin: 0; font-size: 0.85rem; color: #9af; font-weight: 500; }
+  header .status { font-size: 0.78rem; color: #888; }
+  .launcher {
+    display: flex; gap: 0.8em; align-items: center;
+    padding: 0.6em 1em; border-bottom: 1px solid #222;
+  }
+  .launcher button.launchAll {
+    background: #5cf; color: #002; border: 0; padding: 0.5em 1.2em;
+    font: inherit; font-weight: 700; border-radius: 3px; cursor: pointer;
+  }
+  .launcher button.launchAll:disabled { background: #444; color: #888; cursor: not-allowed; }
+  .launcher .hint { font-size: 0.78rem; color: #888; }
+
+  main.grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1fr 1fr;
+    gap: 0.7em;
+    padding: 0.7em;
+  }
+  .pane {
+    display: flex; flex-direction: column; gap: 0.4em;
+    background: #111; border: 1px solid #222; border-radius: 4px;
+    padding: 0.6em; min-height: 0;
+  }
+  .pane h2 {
+    margin: 0; font-size: 0.82rem; font-weight: 500;
+    display: flex; align-items: center; gap: 0.5em;
+  }
+  .pane h2 .dot { width: 0.6em; height: 0.6em; border-radius: 50%; display: inline-block; }
+  .pane#paneA h2 .dot { background: var(--colorA); }
+  .pane#paneB h2 .dot { background: var(--colorB); }
+  .pane#paneC h2 .dot { background: var(--colorC); }
+  .pane#paneD h2 .dot { background: var(--colorD); }
   textarea {
-    width: 100%; min-height: 4em; resize: vertical; box-sizing: border-box;
+    width: 100%; min-height: 3.5em; resize: vertical; box-sizing: border-box;
     background: #0a0a0a; color: #d4d4d4; border: 1px solid #333; border-radius: 3px;
-    font: inherit; padding: 0.5em;
+    font: inherit; padding: 0.4em;
   }
+  .imgrow { display: flex; align-items: center; gap: 0.4em; font-size: 0.72rem; color: #888; }
+  .imgrow input[type=file] { font-size: 0.68rem; color: #888; width: 11em; }
+  .imgrow .thumb { max-height: 2.5em; max-width: 2.5em; border: 1px solid #333; border-radius: 2px; }
+  .imgrow .clear { background: none; border: 1px solid #444; color: #888; padding: 0.1em 0.35em; font-size: 0.68rem; cursor: pointer; }
   .row { display: flex; gap: 0.5em; align-items: center; }
-  button {
-    padding: 0.4em 1em; background: #1a5; color: #000; border: 0; border-radius: 3px;
-    font: inherit; font-weight: 600; cursor: pointer;
+  button.ask {
+    padding: 0.3em 0.8em; background: #1a5; color: #000; border: 0; border-radius: 3px;
+    font: inherit; font-weight: 600; font-size: 0.85rem; cursor: pointer;
   }
-  button:disabled { background: #333; color: #888; cursor: not-allowed; }
-  .meta { font-size: 0.75rem; color: #888; margin-left: auto; }
+  button.ask:disabled { background: #333; color: #888; cursor: not-allowed; }
+  .meta { font-size: 0.7rem; color: #888; margin-left: auto; }
   .output {
     flex: 1; overflow-y: auto; background: #0a0a0a; border: 1px solid #222; border-radius: 3px;
-    padding: 0.6em; white-space: pre-wrap; word-wrap: break-word;
-    font-size: 0.9rem; line-height: 1.4;
+    padding: 0.5em; white-space: pre-wrap; word-wrap: break-word;
+    font-size: 0.8rem; line-height: 1.35; min-height: 6em;
   }
   .output:empty::before { content: '(output streams here)'; color: #444; }
-  .imgrow { display: flex; align-items: center; gap: 0.5em; font-size: 0.75rem; color: #888; }
-  .imgrow input[type=file] { font-size: 0.7rem; color: #888; }
-  .imgrow .thumb { max-height: 3em; max-width: 3em; border: 1px solid #333; border-radius: 2px; }
-  .imgrow .clear { background: none; border: 1px solid #444; color: #888; padding: 0.15em 0.4em; font-size: 0.7rem; cursor: pointer; }
-  .kvstrip { display: flex; flex-wrap: wrap; gap: 2px; margin-top: 0.4em; padding: 0.4em; background: #0a0a0a; border: 1px solid #222; border-radius: 3px; min-height: 2em; }
-  .kvstrip .label { font-size: 0.7rem; color: #666; margin-right: 0.5em; align-self: center; }
+  .kvstrip { display: flex; flex-wrap: wrap; gap: 2px; padding: 0.3em; background: #0a0a0a; border: 1px solid #222; border-radius: 3px; min-height: 1.6em; font-size: 0.7rem; }
+  .kvstrip .label { color: #666; margin-right: 0.4em; align-self: center; }
   .kvstrip .cell {
-    width: 0.9em; height: 0.9em; border-radius: 2px; background: #222;
-    flex: none; cursor: default;
+    width: 0.7em; height: 0.7em; border-radius: 2px; background: #222; flex: none;
   }
-  .kvstrip .cell.own   { background: #2a5; }    /* private — unique to this session */
-  .kvstrip .cell.shr2  { background: #fa3; }    /* shared with exactly 1 other — hot prefix */
-  .kvstrip .cell.shr3p { background: #f36; }    /* shared with 2+ others — truly hot */
-  .kvstrip:empty::after { content: '(no pages yet)'; color: #444; font-size: 0.75rem; }
+  .kvstrip .cell.own   { background: #2a5; }
+  .kvstrip .cell.shr2  { background: #fa3; }
+  .kvstrip .cell.shr3p { background: #f36; }
+  .kvstrip:empty::after { content: '(no pages yet)'; color: #444; }
+
+  .bwpanel {
+    padding: 0.6em 1em 1em; border-top: 1px solid #222;
+  }
+  .bwpanel h3 {
+    margin: 0 0 0.4em; font-size: 0.82rem; color: #6a9; font-weight: 500;
+    display: flex; align-items: center; gap: 1em;
+  }
+  .bwpanel h3 .legend { display: flex; gap: 0.7em; font-size: 0.72rem; color: #888; font-weight: 400; }
+  .bwpanel h3 .legend .swatch { display: inline-block; width: 0.8em; height: 0.8em; vertical-align: middle; margin-right: 0.2em; border-radius: 1px; }
+  .bwpanel canvas { width: 100%; height: 200px; display: block; background: #050505; border: 1px solid #222; border-radius: 3px; }
+  .bwpanel .counters {
+    display: grid; grid-template-columns: repeat(5, 1fr); gap: 0.5em;
+    margin-top: 0.4em; font-size: 0.75rem; color: #888;
+  }
+  .bwpanel .counters div { padding: 0.25em 0.5em; background: #0a0a0a; border: 1px solid #222; border-radius: 3px; }
+  .bwpanel .counters strong { color: #d4d4d4; }
 </style>
 </head>
 <body>
 <header>
-  <h1>gemma metal bridge — two streams, one GPU</h1>
+  <h1>gemma metal bridge — tetraplex (4 streams, 1 GPU)</h1>
   <div class="status" id="status">checking…</div>
 </header>
-<main>
-  <div class="pane">
-    <h2>stream A</h2>
+<div class="launcher">
+  <button class="launchAll" id="launchAll" onclick="launchAll()">launch all 4</button>
+  <span class="hint">fires every pane simultaneously — watch the bandwidth chart ramp as they settle into the B=4 batched AR step</span>
+</div>
+<main class="grid">
+  <div class="pane" id="paneA">
+    <h2><span class="dot"></span>stream A</h2>
     <textarea id="qA">What is the capital of France?</textarea>
     <div class="imgrow">
       <label>image:</label>
@@ -62,14 +118,14 @@
       <button class="clear" onclick="clearImg('A')" id="clearA" style="display:none">×</button>
     </div>
     <div class="row">
-      <button id="askA" onclick="ask('A')">ask</button>
+      <button class="ask" id="askA" onclick="ask('A')">ask</button>
       <span class="meta" id="metaA"></span>
     </div>
     <div class="output" id="oA"></div>
     <div class="kvstrip" id="kvA"><span class="label">kv pages:</span></div>
   </div>
-  <div class="pane">
-    <h2>stream B</h2>
+  <div class="pane" id="paneB">
+    <h2><span class="dot"></span>stream B</h2>
     <textarea id="qB">Write a one-sentence haiku about compilers.</textarea>
     <div class="imgrow">
       <label>image:</label>
@@ -78,117 +134,104 @@
       <button class="clear" onclick="clearImg('B')" id="clearB" style="display:none">×</button>
     </div>
     <div class="row">
-      <button id="askB" onclick="ask('B')">ask</button>
+      <button class="ask" id="askB" onclick="ask('B')">ask</button>
       <span class="meta" id="metaB"></span>
     </div>
     <div class="output" id="oB"></div>
     <div class="kvstrip" id="kvB"><span class="label">kv pages:</span></div>
   </div>
+  <div class="pane" id="paneC">
+    <h2><span class="dot"></span>stream C</h2>
+    <textarea id="qC">List three colors and their hex codes.</textarea>
+    <div class="imgrow">
+      <label>image:</label>
+      <input type="file" id="imgC" accept="image/*" onchange="onPick('C')">
+      <img class="thumb" id="thumbC" style="display:none">
+      <button class="clear" onclick="clearImg('C')" id="clearC" style="display:none">×</button>
+    </div>
+    <div class="row">
+      <button class="ask" id="askC" onclick="ask('C')">ask</button>
+      <span class="meta" id="metaC"></span>
+    </div>
+    <div class="output" id="oC"></div>
+    <div class="kvstrip" id="kvC"><span class="label">kv pages:</span></div>
+  </div>
+  <div class="pane" id="paneD">
+    <h2><span class="dot"></span>stream D</h2>
+    <textarea id="qD">Count from 1 to 10.</textarea>
+    <div class="imgrow">
+      <label>image:</label>
+      <input type="file" id="imgD" accept="image/*" onchange="onPick('D')">
+      <img class="thumb" id="thumbD" style="display:none">
+      <button class="clear" onclick="clearImg('D')" id="clearD" style="display:none">×</button>
+    </div>
+    <div class="row">
+      <button class="ask" id="askD" onclick="ask('D')">ask</button>
+      <span class="meta" id="metaD"></span>
+    </div>
+    <div class="output" id="oD"></div>
+    <div class="kvstrip" id="kvD"><span class="label">kv pages:</span></div>
+  </div>
 </main>
 
+<div class="bwpanel">
+  <h3>
+    bandwidth — tokens/sec (client-observed, sliding 500 ms)
+    <span class="legend">
+      <span><span class="swatch" style="background:var(--colorA)"></span>A</span>
+      <span><span class="swatch" style="background:var(--colorB)"></span>B</span>
+      <span><span class="swatch" style="background:var(--colorC)"></span>C</span>
+      <span><span class="swatch" style="background:var(--colorD)"></span>D</span>
+      <span><span class="swatch" style="background:var(--colorAgg)"></span>aggregate</span>
+    </span>
+  </h3>
+  <canvas id="bwChart" width="1600" height="400"></canvas>
+  <div class="counters">
+    <div>A: <strong id="ctrA">0 tok @ 0.0 tok/s</strong></div>
+    <div>B: <strong id="ctrB">0 tok @ 0.0 tok/s</strong></div>
+    <div>C: <strong id="ctrC">0 tok @ 0.0 tok/s</strong></div>
+    <div>D: <strong id="ctrD">0 tok @ 0.0 tok/s</strong></div>
+    <div>Σ: <strong id="ctrAgg">0 tok @ 0.0 tok/s</strong></div>
+  </div>
+</div>
+
 <script>
-// Health poll — demonstrates / documents the /health endpoint from JS.
+// --- per-pane state ---
+const PANES = ['A', 'B', 'C', 'D'];
+const paneColor = {A: '#5cf', B: '#fa3', C: '#8f5', D: '#f69'};
+const imgData = {A: null, B: null, C: null, D: null};
+const paneSid = {A: null, B: null, C: null, D: null};
+// Each pane records per-chunk arrival times + token counts. We derive
+// tokens/sec via a sliding window (500 ms) during render.
+const arrivals = {A: [], B: [], C: [], D: []};   // {t: performance.now(), n: int}
+
+// --- health poll ---
 async function pollHealth() {
   try {
     const r = await fetch('/health');
     const j = await r.json();
+    const cache = j.vision_cache || {entries:0, hits:0, misses:0};
     document.getElementById('status').textContent =
-      `${j.status} · ${j.model} · ${j.active_sessions} active session${j.active_sessions === 1 ? '' : 's'}`;
+      `${j.status} · ${j.model} · ${j.active_sessions} session${j.active_sessions===1?'':'s'} · cache ${cache.entries}e/${cache.hits}h/${cache.misses}m`;
   } catch (e) {
     document.getElementById('status').textContent = `down: ${e.message}`;
   }
 }
-pollHealth();
-setInterval(pollHealth, 1500);
+pollHealth(); setInterval(pollHealth, 1500);
 
-// Per-pane attached image state (data URL or null) + pane → session-id map.
-const imgData = {A: null, B: null};
-const paneSid = {A: null, B: null};
-
-// KV snapshot poll loop. Runs while any pane's session is still alive in
-// the engine (i.e. appears in /v1/kv/snapshot). paneSid[pane] is set when
-// the pane fires a request and stays set forever after — we only use its
-// presence in the snapshot (not the ask-finish timing) to decide when to
-// stop polling. That way the strip keeps rendering during the server-side
-// linger after SSE ends, and the final page-count is visible instead of
-// flickering empty the moment the HTTP response closes.
-let kvPolling = false;
-async function kvPoll() {
-  if (kvPolling) return;
-  kvPolling = true;
-  try {
-    while (true) {
-      let snap;
-      try {
-        const r = await fetch('/v1/kv/snapshot');
-        snap = await r.json();
-      } catch (e) {
-        await new Promise(r => setTimeout(r, 300));
-        continue;
-      }
-      renderKv(snap);
-      // Exit when none of our tracked pane sids still exist in the engine.
-      // Whatever we last rendered stays on screen until the next ask().
-      const anyAlive = ['A', 'B'].some(
-        pane => paneSid[pane] !== null &&
-                snap.sessions.some(s => s.sid === paneSid[pane]));
-      if (!anyAlive) break;
-      await new Promise(r => setTimeout(r, 300));
-    }
-  } finally {
-    kvPolling = false;
-  }
-}
-
-function renderKv(snapshot) {
-  for (const pane of ['A', 'B']) {
-    const strip = document.getElementById(`kv${pane}`);
-    const sid = paneSid[pane];
-    if (sid === null) {
-      // This pane never asked anything — keep the strip empty.
-      strip.innerHTML = '<span class="label">kv pages:</span>';
-      continue;
-    }
-    const sess = snapshot.sessions.find(s => s.sid === sid);
-    if (!sess) {
-      // Session closed (past linger). Leave the strip alone so the last
-      // rendered state stays visible until the user asks again — don't
-      // overwrite with an empty placeholder.
-      continue;
-    }
-    strip.innerHTML = '<span class="label">kv pages:</span>';
-    const tokensLabel = document.createElement('span');
-    tokensLabel.className = 'label';
-    tokensLabel.textContent = `s${sid} · ${sess.state} · ${sess.position} tok · ${sess.page_count} pages (${sess.shared_count} shared)`;
-    strip.appendChild(tokensLabel);
-    for (const p of sess.pages) {
-      const cell = document.createElement('div');
-      cell.className = 'cell';
-      if (p.refcount >= 3) cell.classList.add('shr3p');
-      else if (p.refcount >= 2) cell.classList.add('shr2');
-      else cell.classList.add('own');
-      const others = p.shared_with.length
-        ? ` · shared with s${p.shared_with.join(',s')}`
-        : '';
-      cell.title = `phys ${p.phys}${others}`;
-      strip.appendChild(cell);
-    }
-  }
-}
-
+// --- image attach ---
 function onPick(which) {
   const f = document.getElementById(`img${which}`).files[0];
   if (!f) return;
   const reader = new FileReader();
   reader.onload = e => {
-    imgData[which] = e.target.result;  // data:image/...;base64,...
+    imgData[which] = e.target.result;
     const t = document.getElementById(`thumb${which}`);
     t.src = e.target.result; t.style.display = 'inline-block';
     document.getElementById(`clear${which}`).style.display = 'inline-block';
   };
   reader.readAsDataURL(f);
 }
-
 function clearImg(which) {
   imgData[which] = null;
   document.getElementById(`img${which}`).value = '';
@@ -196,22 +239,23 @@ function clearImg(which) {
   document.getElementById(`clear${which}`).style.display = 'none';
 }
 
+// --- ask + stream ---
 async function ask(which) {
-  const qEl = document.getElementById(`q${which}`);
+  const q = document.getElementById(`q${which}`).value.trim();
+  if (!q && !imgData[which]) return;
+
   const oEl = document.getElementById(`o${which}`);
   const btn = document.getElementById(`ask${which}`);
   const meta = document.getElementById(`meta${which}`);
-  const q = qEl.value.trim();
-  if (!q && !imgData[which]) return;
-
   oEl.textContent = '';
   btn.disabled = true;
   meta.textContent = 'streaming…';
+  arrivals[which] = [];  // reset per-stream timeline
 
   const t0 = performance.now();
   let firstTokAt = null, tokenCount = 0;
 
-  // Build content: text + optional image_url (OpenAI-compatible).
+  // Build OpenAI-compatible content.
   let content;
   if (imgData[which]) {
     content = [];
@@ -236,11 +280,10 @@ async function ask(which) {
       oEl.textContent = `(http ${res.status}) ${await res.text()}`;
       return;
     }
-    // Pick up the sid from the response header and start polling the KV
-    // snapshot endpoint so the tenancy strip updates live for this pane.
     const sidHeader = res.headers.get('X-Gemma-Session-Id');
     paneSid[which] = sidHeader ? parseInt(sidHeader, 10) : null;
     if (paneSid[which] !== null) kvPoll();
+
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
@@ -248,7 +291,6 @@ async function ask(which) {
       const {done, value} = await reader.read();
       if (done) break;
       buf += decoder.decode(value, {stream: true});
-      // SSE frames split by blank lines.
       let idx;
       while ((idx = buf.indexOf('\n\n')) !== -1) {
         const frame = buf.slice(0, idx);
@@ -263,10 +305,11 @@ async function ask(which) {
             if (delta) {
               if (firstTokAt === null) firstTokAt = performance.now();
               tokenCount++;
+              arrivals[which].push({t: performance.now(), n: 1});
               oEl.textContent += delta;
               oEl.scrollTop = oEl.scrollHeight;
             }
-          } catch (e) { /* ignore partial json */ }
+          } catch (e) { /* partial json */ }
         }
       }
     }
@@ -275,12 +318,179 @@ async function ask(which) {
     meta.textContent = `ttft=${ttft}s · ${tokenCount} chunks in ${wall.toFixed(2)}s`;
   } finally {
     btn.disabled = false;
-    // Note: intentionally NOT clearing paneSid[which] here. kvPoll keeps
-    // rendering against the server's lingering session; when the server
-    // finally closes it (after LINGER_SECONDS), the session disappears
-    // from the snapshot and kvPoll exits with the last render intact.
   }
 }
+
+// --- launch all 4 simultaneously ---
+async function launchAll() {
+  const btn = document.getElementById('launchAll');
+  btn.disabled = true;
+  // Reset the global timeline anchor for the chart.
+  chartStart = performance.now();
+  try {
+    await Promise.allSettled(PANES.map(p => ask(p)));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// --- KV snapshot poll loop (unchanged from 2-pane version) ---
+let kvPolling = false;
+async function kvPoll() {
+  if (kvPolling) return;
+  kvPolling = true;
+  try {
+    while (true) {
+      let snap;
+      try {
+        snap = await (await fetch('/v1/kv/snapshot')).json();
+      } catch (e) {
+        await new Promise(r => setTimeout(r, 300)); continue;
+      }
+      renderKv(snap);
+      const anyAlive = PANES.some(
+        p => paneSid[p] !== null && snap.sessions.some(s => s.sid === paneSid[p]));
+      if (!anyAlive) break;
+      await new Promise(r => setTimeout(r, 300));
+    }
+  } finally {
+    kvPolling = false;
+  }
+}
+
+function renderKv(snapshot) {
+  for (const pane of PANES) {
+    const strip = document.getElementById(`kv${pane}`);
+    const sid = paneSid[pane];
+    if (sid === null) { strip.innerHTML = '<span class="label">kv pages:</span>'; continue; }
+    const sess = snapshot.sessions.find(s => s.sid === sid);
+    if (!sess) continue;  // keep last render during session gap
+    strip.innerHTML = '<span class="label">kv pages:</span>';
+    const label = document.createElement('span');
+    label.className = 'label';
+    label.textContent = `s${sid} · ${sess.state} · ${sess.position} tok · ${sess.page_count} pages (${sess.shared_count} shared)`;
+    strip.appendChild(label);
+    for (const p of sess.pages) {
+      const cell = document.createElement('div');
+      cell.className = 'cell';
+      if (p.refcount >= 3) cell.classList.add('shr3p');
+      else if (p.refcount >= 2) cell.classList.add('shr2');
+      else cell.classList.add('own');
+      const others = p.shared_with.length ? ` · shared with s${p.shared_with.join(',s')}` : '';
+      cell.title = `phys ${p.phys}${others}`;
+      strip.appendChild(cell);
+    }
+  }
+}
+
+// --- bandwidth chart ---
+let chartStart = performance.now();
+const chart = document.getElementById('bwChart');
+const cctx = chart.getContext('2d');
+
+function bandwidthAt(pane, now, windowMs = 500) {
+  // Count tokens arrived in [now - windowMs, now]. Rate = count / (windowMs/1000).
+  const arr = arrivals[pane];
+  let n = 0;
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (arr[i].t < now - windowMs) break;
+    n += arr[i].n;
+  }
+  return n / (windowMs / 1000);
+}
+function totalTokens(pane) {
+  let n = 0;
+  for (const a of arrivals[pane]) n += a.n;
+  return n;
+}
+
+function drawChart() {
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = chart.clientWidth, cssH = chart.clientHeight;
+  if (chart.width !== cssW * dpr || chart.height !== cssH * dpr) {
+    chart.width = cssW * dpr; chart.height = cssH * dpr;
+    cctx.setTransform(1, 0, 0, 1, 0, 0);
+    cctx.scale(dpr, dpr);
+  }
+  const W = cssW, H = cssH;
+  cctx.clearRect(0, 0, W, H);
+
+  // X axis: 0 .. historyMs ms. History slides if elapsed > historyMs.
+  const now = performance.now();
+  const historyMs = 30000;
+  const elapsedMs = now - chartStart;
+  const xStart = Math.max(0, elapsedMs - historyMs);
+  const xEnd = Math.max(historyMs, elapsedMs);
+  // Y axis: 0 .. yMax tok/s. Auto-scale by highest recent rate; min 60.
+  let yMax = 60;
+  for (let tMs = Math.max(0, elapsedMs - 5000); tMs <= elapsedMs; tMs += 100) {
+    const tAbs = chartStart + tMs;
+    let agg = 0;
+    for (const p of PANES) agg += bandwidthAt(p, tAbs);
+    if (agg > yMax) yMax = agg;
+  }
+  yMax = Math.ceil(yMax / 20) * 20;  // round up to nearest 20
+
+  // Grid.
+  cctx.strokeStyle = '#1a1a1a'; cctx.lineWidth = 1;
+  for (let y = 0; y <= yMax; y += yMax / 4) {
+    const py = H - (y / yMax) * H;
+    cctx.beginPath(); cctx.moveTo(0, py); cctx.lineTo(W, py); cctx.stroke();
+    cctx.fillStyle = '#444'; cctx.font = '10px ui-monospace';
+    cctx.fillText(y + ' tok/s', 4, py - 2);
+  }
+
+  // Sample resolution: 1 pixel = one x sample.
+  const samples = W;
+  function tMsFor(i) { return xStart + (i / (samples - 1)) * (xEnd - xStart); }
+
+  function plot(paneKey, color) {
+    cctx.beginPath();
+    cctx.strokeStyle = color;
+    cctx.lineWidth = 1.5;
+    for (let i = 0; i < samples; i++) {
+      const tAbs = chartStart + tMsFor(i);
+      const r = (tAbs > now) ? 0 : bandwidthAt(paneKey, tAbs);
+      const x = (i / (samples - 1)) * W;
+      const y = H - (r / yMax) * H;
+      if (i === 0) cctx.moveTo(x, y); else cctx.lineTo(x, y);
+    }
+    cctx.stroke();
+  }
+
+  // Aggregate (sum of all 4) first, behind.
+  cctx.beginPath();
+  cctx.strokeStyle = 'rgba(204,204,204,0.35)';
+  cctx.lineWidth = 2;
+  for (let i = 0; i < samples; i++) {
+    const tAbs = chartStart + tMsFor(i);
+    let agg = 0;
+    if (tAbs <= now) for (const p of PANES) agg += bandwidthAt(p, tAbs);
+    const x = (i / (samples - 1)) * W;
+    const y = H - (agg / yMax) * H;
+    if (i === 0) cctx.moveTo(x, y); else cctx.lineTo(x, y);
+  }
+  cctx.stroke();
+
+  // Individual lines.
+  plot('A', paneColor.A);
+  plot('B', paneColor.B);
+  plot('C', paneColor.C);
+  plot('D', paneColor.D);
+
+  // Update counters.
+  let aggTok = 0, aggRate = 0;
+  for (const p of PANES) {
+    const tok = totalTokens(p);
+    const rate = bandwidthAt(p, now);
+    document.getElementById(`ctr${p}`).textContent = `${tok} tok @ ${rate.toFixed(1)} tok/s`;
+    aggTok += tok; aggRate += rate;
+  }
+  document.getElementById('ctrAgg').textContent = `${aggTok} tok @ ${aggRate.toFixed(1)} tok/s`;
+
+  requestAnimationFrame(drawChart);
+}
+requestAnimationFrame(drawChart);
 </script>
 </body>
 </html>
