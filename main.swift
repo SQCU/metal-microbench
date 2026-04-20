@@ -3300,6 +3300,12 @@ if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
     runLmMultisession(ggufPath: ggufPath, promptsStr: prompts, maxNewPerSession: maxN)
 }
 if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
+   ProcessInfo.processInfo.environment["LM_MULTITURN_DEMO"] != nil {
+    let turnsStr = ProcessInfo.processInfo.environment["LM_MULTITURN_TURNS"]
+    let maxN = Int(ProcessInfo.processInfo.environment["LM_MULTITURN_MAX_PER_TURN"] ?? "24") ?? 24
+    runLmMultiturnDemo(ggufPath: ggufPath, turnsStr: turnsStr, maxPerTurn: maxN)
+}
+if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
    let stPath = ProcessInfo.processInfo.environment["VISION_ST"],
    let imagePath = ProcessInfo.processInfo.environment["LM_MULTIMODAL"] {
     let prefix = ProcessInfo.processInfo.environment["LM_MULTIMODAL_PREFIX"]

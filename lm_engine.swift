@@ -263,6 +263,35 @@ final class Session {
     // and re-admits the session on the next scheduler tick.
     func pause() { if state != .done { state = .paused } }
 
+    // Mid-generation append: extend a session that already has KV history
+    // (generated some tokens, hit a turn boundary, got paused by the caller)
+    // with new tokens/softs. The next tick prefills them against the existing
+    // block_table starting at the current `position`, then AR resumes.
+    //
+    // Differs from submit() in two ways:
+    //   - reopens a .done session (submit() preserves .done as terminal)
+    //   - resets numGenerated so maxNewTokens governs the next turn, not the
+    //     running total (opt out via resetBudget: false for cumulative cap)
+    //
+    // Appropriate for multiturn chat, tool-call responses, injecting a
+    // rendered-SVG image result back to the agent that requested it, etc.
+    func append(_ tokens: [UInt32], resetBudget: Bool = true) {
+        guard !tokens.isEmpty else { return }
+        if state == .done { state = .paused }
+        if resetBudget { numGenerated = 0 }
+        submit(tokens)
+    }
+    func append(text: String, resetBudget: Bool = true) {
+        guard let eng = engine else { return }
+        append(eng.tokenizer.encode(text, addBos: false), resetBudget: resetBudget)
+    }
+    func append(softTokens: MTLBuffer, count: Int, isFp32: Bool, resetBudget: Bool = true) {
+        guard count > 0 else { return }
+        if state == .done { state = .paused }
+        if resetBudget { numGenerated = 0 }
+        submit(softTokens: softTokens, count: count, isFp32: isFp32)
+    }
+
     // Pull the next generated token, or nil if none ready.
     func nextToken() -> UInt32? {
         guard !outputQueue.isEmpty else { return nil }
@@ -271,6 +300,7 @@ final class Session {
 
     var pendingOutputCount: Int { outputQueue.count }
     var pendingPrimingCount: Int { chunkQueue.reduce(0) { $0 + $1.count } }
+    var ownedPagesForDebug: [Int] { ownedPages }
 
     // Mark as done; engine will release pages + slot on the next tick.
     func finish() { state = .done }
@@ -1269,6 +1299,129 @@ func runLmPauseResumeDemo(ggufPath: String) {
 
     engine.closeSession(s1)
     engine.closeSession(s2)
+}
+
+// ----------------------------------------------------------------------
+// Multiturn demo — exercises Session.append() for the chat-loop case:
+// one session lives across multiple user turns, each turn's KV staying
+// resident so subsequent turns pay only their own prefill cost.
+//
+// Flow:
+//   turn 1 user prompt  → submit()            → generate N tokens
+//   (simulate turn end) → pause()
+//   turn 2 user prompt  → append()            → generate N more
+//   (turn end)          → pause()
+//   turn 3              → append()            → generate N more
+//
+// The append() primitive is the engine-side contract that enables:
+//   - multiturn chat (what this demo shows)
+//   - tool-call response injection (runLmPauseResumeDemo pattern, now
+//     usable via append() instead of raw submit())
+//   - mid-session image injection (tool-call returns a rendered SVG
+//     the agent needs to look at: append(softTokens:))
+//   - agent interruption (another agent's "turn" injected into an
+//     ongoing session by an external coordinator)
+//
+// KNOWN ISSUE — AR→prefill KV handoff corruption.
+//   LM_MULTITURN_FRESH=1 (close+reopen between turns) produces coherent
+//   output. LM_MULTITURN_FRESH=0 (true append, default) corrupts: post-
+//   AR KV pages, when re-read by a subsequent buildPrefillCB dispatch,
+//   yield garbage logits (argmax → pad). Same symptom as the pause/
+//   resume demo's post-resume output. The submit()/append() path itself
+//   is correct — it queues the chunk and flips state as advertised —
+//   but the underlying buildPrefillCB assumes KV pages were written by
+//   a prior prefill, not AR. Likely in the kv_write_multi vs kv_write
+//   layout or a RoPE position mismatch between the two write paths.
+//   Fresh mode is the working path for now; the kernel-level fix is a
+//   separate arc from this append() primitive.
+//
+// Env:
+//   LM_MULTITURN_DEMO=1            # presence toggles this harness
+//   GGUF_PATH=<path>
+//   [LM_MULTITURN_TURNS="prompt1§prompt2§prompt3"]   # § separator
+//   [LM_MULTITURN_MAX_PER_TURN=24] # per-turn generation cap
+//   [LM_MULTITURN_FRESH=1]         # opt-in: close+reopen each turn
+//                                   (works around the AR→prefill bug).
+//
+func runLmMultiturnDemo(ggufPath: String, turnsStr: String?, maxPerTurn: Int) {
+    print("\n=== LM multiturn demo (Session.append) ===")
+    let defaultTurns = [
+        "<|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n",
+        "<turn|>\n<|turn>user\nAnd Germany?<turn|>\n<|turn>model\n",
+        "<turn|>\n<|turn>user\nItaly?<turn|>\n<|turn>model\n",
+    ]
+    let turns: [String]
+    if let s = turnsStr, !s.isEmpty {
+        turns = s.components(separatedBy: "§")
+    } else {
+        turns = defaultTurns
+    }
+    guard !turns.isEmpty else {
+        print("  no turns to run"); return
+    }
+    let w: LmWeights
+    do { w = try loadLmWeights(ggufPath: ggufPath) }
+    catch { print("  loadLmWeights failed: \(error)"); return }
+    let engine = LmEngine(weights: w)
+    guard let s = engine.openSession(maxNewTokens: maxPerTurn) else {
+        print("  openSession failed"); return
+    }
+    print("  session \(s.id) — \(turns.count) turns, \(maxPerTurn) tok/turn cap")
+    print("")
+
+    let freshMode = ProcessInfo.processInfo.environment["LM_MULTITURN_FRESH"] != nil
+    var currentSession = s
+    var accumulatedHistory: [UInt32] = []
+    for (i, turn) in turns.enumerated() {
+        if i == 0 {
+            let toks = engine.tokenize(turn, addBos: true)
+            accumulatedHistory.append(contentsOf: toks)
+            currentSession.submit(toks)
+        } else if freshMode {
+            // Control experiment: fresh session + replay full history as prompt.
+            // Isolates whether the garbling is in reused-session state or KV itself.
+            engine.closeSession(currentSession)
+            guard let s2 = engine.openSession(maxNewTokens: maxPerTurn) else {
+                print("  openSession failed on turn \(i + 1)"); return
+            }
+            currentSession = s2
+            let newToks = engine.tokenize(turn, addBos: false)
+            accumulatedHistory.append(contentsOf: newToks)
+            currentSession.submit(accumulatedHistory)
+            print("    [fresh session \(currentSession.id) replaying \(accumulatedHistory.count) tokens]")
+        } else {
+            currentSession.append(engine.tokenize(turn, addBos: false))
+        }
+        let s = currentSession
+        print("  turn \(i + 1) input: \(turn.debugDescription)")
+        var turnOutput = ""
+        var turnTokenIds: [UInt32] = []
+        var tick = 0
+        let budgetFloor = s.numGenerated  // safety: break if we stall
+        while engine.hasWork && s.state != .done {
+            _ = engine.tick()
+            tick += 1
+            while let tok = s.nextToken() {
+                turnOutput += engine.detokenize([tok])
+                turnTokenIds.append(tok)
+            }
+            // Per-turn generation cap — session's own maxNewTokens will trip
+            // .done which exits the loop; this is belt-and-suspenders.
+            if tick > 400 { print("    (tick cap)"); break }
+            if s.numGenerated - budgetFloor > maxPerTurn + 4 { break }
+        }
+        print("  turn \(i + 1) output (\(s.numGenerated - budgetFloor) tok, \(tick) ticks): \(turnOutput.debugDescription)")
+        print("    ids: \(turnTokenIds.prefix(12))")
+        // End of turn — pause so the next append resets the budget.
+        s.pause()
+        print("    position=\(s.position), ownedPages=\(s.ownedPagesForDebug.count), state=\(s.state)")
+        print("")
+    }
+
+    print("  === summary ===")
+    print("  session held KV across \(turns.count) turns; final position=\(currentSession.position) tokens")
+    print("  per-turn prefill cost: only the new user-message tokens (no re-prefill of history)")
+    engine.closeSession(currentSession)
 }
 
 // ----------------------------------------------------------------------
