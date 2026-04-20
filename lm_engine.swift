@@ -1557,6 +1557,171 @@ func runLmMultiturnDemo(ggufPath: String, turnsStr: String?, maxPerTurn: Int) {
 }
 
 // ----------------------------------------------------------------------
+// Composite benchmark — the headline multiuser/multiturn workload.
+//
+// N concurrent users. Shared system prompt (exercises content-hash cache:
+// user 1 primes the system prompt, users 2..N hit-and-adopt its pages). K
+// turns per user. All users submit each turn simultaneously — the scheduler
+// must handle that cold-start gracefully (multi-slot prefill, not AR-prime).
+//
+// Measures per-user per-turn:
+//   - TTFT (submit → first emitted token)
+//   - gen rate (tokens / last_tok_time - first_tok_time)
+// And aggregate: total tokens / total wall.
+//
+// This is what we'd use to pitch the engine: "4 users × 3 turns, X tok/s
+// sustained throughput, Y ms median TTFT, Z page-cache hits."
+//
+// Env:
+//   LM_COMPOSITE_DEMO=1           # presence toggles
+//   GGUF_PATH=<path>
+//   [LM_COMPOSITE_N=4]            # concurrent users (≤ MAX_RESIDENT_SESSIONS)
+//   [LM_COMPOSITE_MAX_PER_TURN=24]
+//
+func runLmCompositeDemo(ggufPath: String, nUsers: Int, maxPerTurn: Int) {
+    print("\n=== LM composite benchmark: N=\(nUsers) users × 3 turns, shared system prompt ===")
+    let w: LmWeights
+    do { w = try loadLmWeights(ggufPath: ggufPath) }
+    catch { print("  loadLmWeights failed: \(error)"); return }
+    let engine = LmEngine(weights: w)
+
+    // Shared system prompt. Same bytes for every user → content-hash cache
+    // gives user 1's filled pages to users 2..N read-only.
+    let system = "<|turn>system\nYou are a concise assistant. Give one-sentence answers.<turn|>\n"
+    // Per-user, per-turn user message. All users get the same turn sequence
+    // for the benchmark; a real server would have different messages.
+    let userTurns = [
+        "<|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+        "<turn|>\n<|turn>user\nWhat about Germany?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+        "<turn|>\n<|turn>user\nAnd Italy?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+    ]
+
+    struct TurnMetrics {
+        var submitTime: Date = Date()
+        var firstTokenTime: Date?
+        var lastTokenTime: Date?
+        var tokenCount: Int = 0
+        var text: String = ""
+    }
+
+    // Warmup: the first buildStepCB / buildPrefillCB pair pays ~5s of
+    // Metal pipeline compilation. That cost is one-time per process, not
+    // per-request, but naively-measured TTFT eats it on turn 1. Run one
+    // tiny throwaway decode first so the real measurement reflects steady
+    // state.
+    do {
+        print("  (warmup: one-session 3-token decode to compile pipelines)")
+        let wStart = Date()
+        guard let ws = engine.openSession(maxNewTokens: 3) else { return }
+        ws.submit(engine.tokenize("<|turn>user\nhi<turn|>\n<|turn>model\n", addBos: true))
+        while engine.hasWork { _ = engine.tick() }
+        while let _ = ws.nextToken() {}
+        engine.closeSession(ws)
+        print(String(format: "  warmup took %.2fs", Date().timeIntervalSince(wStart)))
+    }
+
+    // Open N sessions up front.
+    var sessions: [Session] = []
+    for _ in 0..<nUsers {
+        guard let s = engine.openSession(maxNewTokens: maxPerTurn) else {
+            print("  openSession failed at user \(sessions.count)"); return
+        }
+        sessions.append(s)
+    }
+    var metrics: [[TurnMetrics]] = Array(repeating: [], count: nUsers)
+
+    let benchStart = Date()
+    let preStats = engine.poolStats()
+
+    for turnIdx in 0..<userTurns.count {
+        let text = userTurns[turnIdx]
+        // Simultaneous submit — this is the case multi-slot prefill targets.
+        for i in 0..<nUsers {
+            metrics[i].append(TurnMetrics(submitTime: Date()))
+            let payload = (turnIdx == 0 ? system + text : text)
+            if turnIdx == 0 {
+                sessions[i].submit(engine.tokenize(payload, addBos: true))
+            } else {
+                sessions[i].append(engine.tokenize(payload, addBos: false))
+            }
+        }
+
+        // Pump until every session finishes this turn (.done) or we hit a cap.
+        var ticks = 0
+        while engine.hasWork {
+            _ = engine.tick()
+            ticks += 1
+            for i in 0..<nUsers {
+                while let tok = sessions[i].nextToken() {
+                    let now = Date()
+                    if metrics[i][turnIdx].firstTokenTime == nil {
+                        metrics[i][turnIdx].firstTokenTime = now
+                    }
+                    metrics[i][turnIdx].lastTokenTime = now
+                    metrics[i][turnIdx].tokenCount += 1
+                    metrics[i][turnIdx].text += engine.detokenize([tok])
+                }
+            }
+            if ticks > 2000 { print("  tick cap reached on turn \(turnIdx+1)"); break }
+        }
+        // Pause for next turn so append() reopens.
+        for s in sessions { s.pause() }
+    }
+
+    let benchEnd = Date()
+    let postStats = engine.poolStats()
+    let wall = benchEnd.timeIntervalSince(benchStart)
+
+    // Report.
+    print("")
+    print("  --- per-user × per-turn ---")
+    var totalTokens = 0
+    for i in 0..<nUsers {
+        print("  user \(i + 1):")
+        for (t, tm) in metrics[i].enumerated() {
+            totalTokens += tm.tokenCount
+            let ttft = tm.firstTokenTime.map { $0.timeIntervalSince(tm.submitTime) * 1000 } ?? -1
+            let genSecs = (tm.lastTokenTime != nil && tm.firstTokenTime != nil)
+                ? tm.lastTokenTime!.timeIntervalSince(tm.firstTokenTime!) : 0
+            let tokps = genSecs > 0.001 ? Double(tm.tokenCount) / genSecs : 0
+            let preview = tm.text.replacingOccurrences(of: "\n", with: "\\n").prefix(64)
+            print(String(format: "    turn %d: TTFT=%.0fms, gen=%d tok @ %.1f tok/s → %@",
+                         t + 1, ttft, tm.tokenCount, tokps, String(preview)))
+        }
+    }
+    print("")
+    print("  --- aggregate ---")
+    let agg = wall > 0.001 ? Double(totalTokens) / wall : 0
+    // Peak batched rate: average per-user gen rate × min(nUsers, B). Taken
+    // from gen-only time per turn (first→last token interval). This is what
+    // the GPU can sustain once everyone is past priming.
+    var perUserRates: [Double] = []
+    for userM in metrics {
+        for tm in userM {
+            if let ft = tm.firstTokenTime, let lt = tm.lastTokenTime, tm.tokenCount > 1 {
+                let dt = lt.timeIntervalSince(ft)
+                if dt > 0.001 { perUserRates.append(Double(tm.tokenCount) / dt) }
+            }
+        }
+    }
+    let meanPerUser = perUserRates.isEmpty ? 0 : perUserRates.reduce(0, +) / Double(perUserRates.count)
+    let peakBatched = meanPerUser * Double(min(nUsers, B))
+    print(String(format: "  wall: %.2fs, tokens: %d", wall, totalTokens))
+    print(String(format: "  aggregate: %.1f tok/s   (observed over the whole benchmark, prefill included)", agg))
+    print(String(format: "  per-stream: %.1f tok/s  (mean across users × turns, gen-only)", meanPerUser))
+    print(String(format: "  peak batched: %.1f tok/s  (per-stream × min(N, B=%d) — what the GPU sustains during pure-gen)", peakBatched, B))
+    let headroom = peakBatched > 0.1 ? (1.0 - agg / peakBatched) * 100 : 0
+    print(String(format: "  headroom: %.0f%% (the gap between aggregate and peak is prefill wall time; shrinks as prompt:gen ratio falls)", headroom))
+    print("  pages: " +
+          "used before \(preStats.totalPages - preStats.freePages), " +
+          "used after \(postStats.totalPages - postStats.freePages), " +
+          "shared content-hashes: \(postStats.cachedHashes - preStats.cachedHashes)")
+    print("  note: simultaneous submission → no same-turn cache hits (nothing promoted yet when siblings probe); cache kicks in for later sessions submitting against a fresh engine with the same prefix — see LM_SHARED_PREFIX_DEMO.")
+
+    for s in sessions { engine.closeSession(s) }
+}
+
+// ----------------------------------------------------------------------
 // Multimodal demo driver — feeds vision-tower output through a session.
 //
 // STATUS NOTE: generation quality through this path is currently poor.
