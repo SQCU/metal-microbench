@@ -9,6 +9,10 @@
 /gguf_loader
 /microbench
 /libgemma_metal.dylib
+/tetraplex_recorder
+
+# Demo captures written by tetraplex_recorder.
+/recordings/
 
 # Python bridge
 server/__pycache__/

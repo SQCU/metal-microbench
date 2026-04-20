@@ -538,6 +538,27 @@ final class RecordingDriver: ObservableObject {
 
     init(demo: DemoState) { self.demo = demo }
 
+    /// Resolve where to write the mp4. Preference order:
+    ///   1. $TETRAPLEX_OUT if set (absolute or relative — whatever you give).
+    ///   2. `./recordings/tetraplex-<yyyymmdd-hhmmss>.mp4` next to the binary.
+    /// `recordings/` is gitignored so rapid iteration doesn't pollute `git status`.
+    /// Finder CAN open /tmp but it's hidden and wiped at reboot — keeping
+    /// outputs inside the repo tree is just friendlier.
+    static func resolveOutputURL() -> URL {
+        if let explicit = ProcessInfo.processInfo.environment["TETRAPLEX_OUT"], !explicit.isEmpty {
+            return URL(fileURLWithPath: explicit)
+        }
+        let fm = FileManager.default
+        let cwd = URL(fileURLWithPath: fm.currentDirectoryPath)
+        let dir = cwd.appendingPathComponent("recordings", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyyMMdd-HHmmss"
+        fmt.timeZone = TimeZone.current
+        let stamp = fmt.string(from: Date())
+        return dir.appendingPathComponent("tetraplex-\(stamp).mp4")
+    }
+
     func begin() {
         // 10 Hz rate-sampling timer is always on — the chart history needs to
         // fill even before the recorder is armed so the first frames already
@@ -560,11 +581,11 @@ final class RecordingDriver: ObservableObject {
         if !recorderStarted {
             let allHaveSession = demo.streams.allSatisfy { $0.session != nil }
             if !allHaveSession { return }
-            let url = URL(fileURLWithPath: ProcessInfo.processInfo.environment["TETRAPLEX_OUT"]
-                          ?? "tetraplex-demo.mp4")
+            let url = Self.resolveOutputURL()
             recorder = FrameRecorder(url: url, width: width, height: height, fps: fps)
             recorder?.start()
             recorderStarted = true
+            print("[recorder] writing to \(url.path)")
         }
 
         let view = TetraplexView(demo: self.demo)
