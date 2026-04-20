@@ -76,6 +76,7 @@ let pagedFullSgmmPSO   = pso("paged_attn_full_sgmm_compute")
 let pagedFullGqaPSO    = pso("paged_attn_full_gqa_compute")
 let pagedSlideGqaPSO   = pso("paged_attn_slide_gqa_compute")
 let flexAttnSlideV0PSO = pso("flex_attn_slide_v0")
+let pagedAttnSlideArSharedPSO = pso("paged_attn_slide_ar_shared")
 let flexAttnFullV0PSO  = pso("flex_attn_full_v0")
 let flexAttnSlideV1Q8PSO = pso("flex_attn_slide_v1_q8")
 let flexAttnFullPrefillPSO = pso("flex_attn_full_prefill")
@@ -1048,6 +1049,48 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
 
 // Prefill attention dispatchers (slide + full). Called from buildPrefillCB;
 // dispatch the flex v1 kernels with (B*H_KV or B*H_Q, q_blocks, N_SPLITS).
+// Dispatcher for the cross-slot broadcast AR shared-prefix attention.
+// Caller supplies:
+//   Q:                [B, H_Q, D] — AR-step Qs for every active slot
+//   K_cache, V_cache: [phys_pages, PAGE*H_KV, D]
+//   sharedPhysPages:  fp32 UInt32[prefix_pages] — one phys-page list used by ALL slots
+//   kLenBuf:          UInt32[B] — each slot's k_len (for per-slot SW mask)
+//   mPart/lPart/OPart: partials buffers sized [B, H_Q, N_SPLITS, …]; kernel
+//                      writes split=0 only. Caller runs a tail kernel into
+//                      split=1, then paged_attn_split_reduce to merge.
+// N_SPLITS must be 2 (one for shared, one for tail).
+func encPagedAttnSlideArShared(_ cb: MTLCommandBuffer,
+                                Q: MTLBuffer, Kc: MTLBuffer, Vc: MTLBuffer,
+                                sharedPhysPages: MTLBuffer,
+                                mPart: MTLBuffer, lPart: MTLBuffer, OPart: MTLBuffer,
+                                kLenBuf: MTLBuffer,
+                                H_Q: Int, H_KV: Int,
+                                prefixPages: Int, slidingWindow: Int, bBatch: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(pagedAttnSlideArSharedPSO)
+    enc.setBuffer(Q,  offset: 0, index: 0)
+    enc.setBuffer(Kc, offset: 0, index: 1)
+    enc.setBuffer(Vc, offset: 0, index: 2)
+    enc.setBuffer(sharedPhysPages, offset: 0, index: 3)
+    enc.setBuffer(mPart, offset: 0, index: 4)
+    enc.setBuffer(lPart, offset: 0, index: 5)
+    enc.setBuffer(OPart, offset: 0, index: 6)
+    enc.setBuffer(kLenBuf, offset: 0, index: 7)
+    var sc: Float = 1.0
+    var hq = UInt32(H_Q), hkv = UInt32(H_KV), ns = UInt32(2)
+    var pp = UInt32(prefixPages), sw = UInt32(slidingWindow), bb = UInt32(bBatch)
+    enc.setBytes(&sc, length: 4, index: 8)
+    enc.setBytes(&hq, length: 4, index: 9)
+    enc.setBytes(&hkv, length: 4, index: 10)
+    enc.setBytes(&ns, length: 4, index: 11)
+    enc.setBytes(&pp, length: 4, index: 12)
+    enc.setBytes(&sw, length: 4, index: 13)
+    enc.setBytes(&bb, length: 4, index: 14)
+    enc.dispatchThreadgroups(MTLSize(width: H_KV, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
 func encFlexAttnSlidePrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
                               Kc: MTLBuffer, Vc: MTLBuffer,
                               kLenBuf: MTLBuffer, qPositions: MTLBuffer,
@@ -3033,6 +3076,9 @@ if let outDir = ProcessInfo.processInfo.environment["FLEX_ATTN_TEST"] {
 }
 if ProcessInfo.processInfo.environment["ATTN_BENCH"] != nil {
     runAttnBench()
+}
+if ProcessInfo.processInfo.environment["SHARED_PREFIX_SMOKE"] != nil {
+    runSharedPrefixSmoke()
 }
 if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
    let outDir = ProcessInfo.processInfo.environment["LM_DUMP_EXPERT_W"] {

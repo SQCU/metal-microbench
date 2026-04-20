@@ -1640,6 +1640,82 @@ func runLmLayerDump(ggufPath: String, refDir: String, tag: String, outDir: Strin
     }
 }
 
+// Smoke test for the cross-slot shared-prefix broadcast kernel.
+// Synthesizes per-layer scratch (small: a single layer's worth of KV at
+// H_KV=8, D=256, PAGE=16), populates B slots' Qs + 2 shared pages of K/V,
+// dispatches paged_attn_slide_ar_shared, then reads back the (m, l, O)
+// partials at split=0. Verifies:
+//   - m_partials[slot, h, 0] is finite
+//   - l_partials[slot, h, 0] > 0
+//   - O_partials[slot, h, 0, :] has non-trivial magnitude
+// Doesn't yet cross-check against flex_attn_slide_v0 (full correctness
+// parity pending next session's tail-kernel variant + split_reduce merge).
+//
+// Env: SHARED_PREFIX_SMOKE=1 (no args).
+func runSharedPrefixSmoke() {
+    print("\n=== Shared-prefix broadcast smoke test ===")
+    let H_Q = 16, H_KV = 8, D = 256, PAGE = 16
+    let B_batch = 4
+    let N_SPLITS = 2
+    let prefixPages = 2
+
+    // Q: [B, H_Q, D] fp16
+    let Qbuf = halfBuf(B_batch * H_Q * D, seed: 0x11)
+    // K/V cache: [phys_pages, PAGE*H_KV, D] — we only need the first
+    // prefix_pages phys pages populated.
+    let Kcache = halfBuf(prefixPages * PAGE * H_KV * D, seed: 0x22)
+    let Vcache = halfBuf(prefixPages * PAGE * H_KV * D, seed: 0x33)
+
+    let sharedPages = device.makeBuffer(length: prefixPages * 4, options: .storageModeShared)!
+    let spp = sharedPages.contents().assumingMemoryBound(to: UInt32.self)
+    for i in 0..<prefixPages { spp[i] = UInt32(i) }
+
+    let kLens = device.makeBuffer(length: B_batch * 4, options: .storageModeShared)!
+    let klp = kLens.contents().assumingMemoryBound(to: UInt32.self)
+    for b in 0..<B_batch { klp[b] = UInt32(prefixPages * PAGE) }
+
+    // Partials: split=0 only; [B, H_Q, N_SPLITS, D] for O; [B, H_Q, N_SPLITS] for m/l.
+    let mPart = device.makeBuffer(length: B_batch * H_Q * N_SPLITS * 4, options: .storageModeShared)!
+    let lPart = device.makeBuffer(length: B_batch * H_Q * N_SPLITS * 4, options: .storageModeShared)!
+    let OPart = device.makeBuffer(length: B_batch * H_Q * N_SPLITS * D * 4, options: .storageModeShared)!
+
+    let cb = queue.makeCommandBuffer()!
+    encPagedAttnSlideArShared(cb, Q: Qbuf, Kc: Kcache, Vc: Vcache,
+                               sharedPhysPages: sharedPages,
+                               mPart: mPart, lPart: lPart, OPart: OPart,
+                               kLenBuf: kLens,
+                               H_Q: H_Q, H_KV: H_KV,
+                               prefixPages: prefixPages,
+                               slidingWindow: 0, bBatch: B_batch)
+    let t0 = Date()
+    cb.commit(); cb.waitUntilCompleted()
+    let dtMs = Date().timeIntervalSince(t0) * 1000
+    if let err = cb.error { print("  GPU: \(err)"); return }
+
+    let mP = mPart.contents().assumingMemoryBound(to: Float.self)
+    let lP = lPart.contents().assumingMemoryBound(to: Float.self)
+    let oP = OPart.contents().assumingMemoryBound(to: Float.self)
+    var okM = true, okL = true, okO = true
+    for b in 0..<B_batch {
+        for h in 0..<H_Q {
+            let pidx = (b * H_Q + h) * N_SPLITS + 0
+            if !mP[pidx].isFinite { okM = false }
+            if lP[pidx] <= 0 { okL = false }
+            var oMag: Float = 0
+            for d in 0..<D { oMag += abs(oP[pidx * D + d]) }
+            if oMag < 1e-6 { okO = false }
+        }
+    }
+    print(String(format: "  wall: %.2f ms  (B=%d, H_KV=%d, prefix_pages=%d)",
+                 dtMs, B_batch, H_KV, prefixPages))
+    print("  m_partials finite: \(okM ? "✓" : "✗")")
+    print("  l_partials > 0   : \(okL ? "✓" : "✗")")
+    print("  O_partials nonzero: \(okO ? "✓" : "✗")")
+    if okM && okL && okO {
+        print("  ✓ broadcast kernel dispatches correctly; correctness-vs-v0 parity pending")
+    }
+}
+
 // ====================================================================
 // Prefill validation harness — drives `buildPrefillCB` against the same
 // lm_<tag>_tokens / lm_<tag>_logits oracle as runLmKLHarness, but in a

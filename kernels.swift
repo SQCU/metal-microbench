@@ -3433,6 +3433,194 @@ kernel void flex_attn_slide_v0(
     }
 }
 
+// Cross-slot K/V broadcast kernel for AR decode over a SHARED PREFIX.
+//
+// Problem it solves: when B sessions share a KV prefix (same system prompt,
+// same multi-turn history, same cached tool-call result), every slot's AR
+// attention step independently re-reads the same K/V from DRAM. For a 1000-
+// token shared prefix at D=256, that's 1000 × 256 × 2 B × B reads per layer.
+// This kernel loads each shared page's K/V ONCE into threadgroup memory, then
+// runs Q@K for every slot's Q against that single staged K. Saves (B-1)/B of
+// the K/V bandwidth on the shared range (75% at B=4).
+//
+// Grid: (H_KV, 1, 1) — one TG per kv_head, fans out to all B slots in-TG.
+// Output: partials at (slot, q_head, split=0). Paired with a tail-only kernel
+// (the standard per-slot kernel called with a starting page offset) writing
+// split=1, then paged_attn_split_reduce with N_SPLITS=2 merges them into the
+// final per-slot attention output.
+//
+// Scope for v1: slide layers only (D=256, PAGE=16, Q_PER_TG=2). Full-attn has
+// the same pattern at D=512, PAGE=8 but different tg-mem math; left for a
+// follow-up. Causal + sliding-window applied per-slot in softmax using
+// per-slot k_len from `k_len_per_slot`. Each slot's SW horizon can differ,
+// so the mask is still per-slot even though K/V loads are shared.
+kernel void paged_attn_slide_ar_shared(
+    device const half* Q                    [[buffer(0)]],   // [B, H_Q, D]
+    device const half* K_cache              [[buffer(1)]],
+    device const half* V_cache              [[buffer(2)]],
+    device const uint* shared_pages         [[buffer(3)]],   // [prefix_pages] phys-page list
+    device float* m_partials                [[buffer(4)]],   // [B, H_Q, N_SPLITS]
+    device float* l_partials                [[buffer(5)]],
+    device float* O_partials                [[buffer(6)]],   // [B, H_Q, N_SPLITS, D]
+    device const uint* k_len_per_slot       [[buffer(7)]],
+    constant float& qk_scale                [[buffer(8)]],
+    constant uint& H_Q                      [[buffer(9)]],
+    constant uint& H_KV                     [[buffer(10)]],
+    constant uint& N_SPLITS                 [[buffer(11)]],
+    constant uint& prefix_pages             [[buffer(12)]],
+    constant uint& sliding_window           [[buffer(13)]],
+    constant uint& B_batch                  [[buffer(14)]],
+    uint3 tg_pos                            [[threadgroup_position_in_grid]],
+    uint3 lid3                              [[thread_position_in_threadgroup]])
+{
+    constexpr uint D = 256;
+    constexpr uint PAGE = 16;
+    constexpr uint THREADS = 128;       // 4 simdgroups
+    constexpr uint Q_PER_TG = 2;
+    constexpr uint MAX_B = 4;            // cap; B_batch runtime arg picks actual
+    constexpr uint D8 = D / 8;
+
+    const uint kv_head = tg_pos.x;
+    const uint q_head_base = kv_head * Q_PER_TG;
+    const uint lid = lid3.x;
+
+    // Threadgroup state. See kernel header for tg-mem budget.
+    threadgroup half  Q_tile[MAX_B * Q_PER_TG * D];       // 4*2*256*2 = 4KB
+    threadgroup half  K_stage[PAGE * D];                  // 16*256*2 = 8KB
+    threadgroup half  V_stage[PAGE * D];                  // 16*256*2 = 8KB
+    threadgroup half  scores_tile[MAX_B * Q_PER_TG * PAGE]; // 4*2*16*2 = 256B
+    threadgroup float O_acc[MAX_B * Q_PER_TG * D];        // 4*2*256*4 = 8KB
+    threadgroup float m_state[MAX_B * Q_PER_TG];
+    threadgroup float l_state[MAX_B * Q_PER_TG];
+    threadgroup float scale_tile[MAX_B * Q_PER_TG];
+
+    // Load all active slots' Q for this kv_head's Q_PER_TG grouping.
+    for (uint i = lid; i < B_batch * Q_PER_TG * D; i += THREADS) {
+        uint b = i / (Q_PER_TG * D);
+        uint r = (i / D) % Q_PER_TG;
+        uint d = i % D;
+        uint q_head = q_head_base + r;
+        Q_tile[i] = Q[(b * H_Q + q_head) * D + d];
+    }
+    // Clear O_acc for all active slots.
+    for (uint i = lid; i < B_batch * Q_PER_TG * D; i += THREADS) O_acc[i] = 0.0f;
+    if (lid < B_batch * Q_PER_TG) {
+        m_state[lid] = -INFINITY;
+        l_state[lid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint kv_row_stride = H_KV * D;
+
+    // Iterate over SHARED pages. Each page's K/V is loaded once and reused
+    // across all active slots' Q@K + score@V computations.
+    for (uint p = 0; p < prefix_pages; ++p) {
+        const uint phys = shared_pages[p];
+        device const half* Kbase = K_cache + (phys * PAGE * H_KV + kv_head) * D;
+        device const half* Vbase = V_cache + (phys * PAGE * H_KV + kv_head) * D;
+
+        // Stage K into tg-mem. Layout: K_stage[k * D + d].
+        for (uint i = lid; i < PAGE * D; i += THREADS) {
+            uint k = i / D;
+            uint d = i % D;
+            K_stage[i] = Kbase[k * kv_row_stride + d];
+        }
+        // Stage V into tg-mem. Same layout.
+        for (uint i = lid; i < PAGE * D; i += THREADS) {
+            uint k = i / D;
+            uint d = i % D;
+            V_stage[i] = Vbase[k * kv_row_stride + d];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Q@K for every slot's Q, against the shared K. Each slot's Q_PER_TG
+        // rows share a K column (PAGE=16 → 2 passes of 8 K cols each).
+        for (uint b = 0; b < B_batch; ++b) {
+            for (uint pb = 0; pb < PAGE / 8; ++pb) {
+                simdgroup_half8x8 mqk = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+                threadgroup const half* pk = K_stage + (pb * 8) * D;
+                for (uint dt = 0; dt < D8; ++dt) {
+                    simdgroup_half8x8 mq, mk;
+                    simdgroup_load(mq, Q_tile + b * Q_PER_TG * D + dt * 8, D);
+                    simdgroup_load(mk, pk + dt * 8, D, ulong2(0, 0), true);
+                    simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+                }
+                simdgroup_store(mqk, scores_tile + (b * Q_PER_TG) * PAGE + pb * 8, PAGE);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Per-row online softmax with PER-SLOT mask (k_len and SW may differ
+        // across slots even when the prefix pages themselves are shared).
+        if (lid < B_batch * Q_PER_TG) {
+            uint b = lid / Q_PER_TG;
+            uint row_idx = lid;
+            uint k_len = k_len_per_slot[b];
+            uint window_lo = (sliding_window > 0 && k_len > sliding_window)
+                             ? (k_len - sliding_window) : 0u;
+
+            float row_max = -INFINITY;
+            float s_loc[PAGE];
+            for (uint k = 0; k < PAGE; ++k) {
+                float sv = float(scores_tile[row_idx * PAGE + k]) * qk_scale;
+                uint k_pos = p * PAGE + k;
+                if (k_pos >= k_len || k_pos < window_lo) sv = -INFINITY;
+                s_loc[k] = sv;
+                row_max = max(row_max, sv);
+            }
+            float m_old = m_state[row_idx];
+            float m_new = max(m_old, row_max);
+            float scale = exp(m_old - m_new);
+            float sum = 0.0f;
+            for (uint k = 0; k < PAGE; ++k) {
+                float e = exp(s_loc[k] - m_new);
+                scores_tile[row_idx * PAGE + k] = half(e);
+                sum += e;
+            }
+            m_state[row_idx] = m_new;
+            l_state[row_idx] = l_state[row_idx] * scale + sum;
+            scale_tile[row_idx] = scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // AV: each lane owns D/THREADS dims; for each (slot, q_head) row,
+        // multiply by rescale then accumulate scores @ V.
+        for (uint sqd = lid; sqd < B_batch * Q_PER_TG * D; sqd += THREADS) {
+            uint b = sqd / (Q_PER_TG * D);
+            uint q = (sqd / D) % Q_PER_TG;
+            uint d = sqd % D;
+            uint row_idx = b * Q_PER_TG + q;
+            float acc = O_acc[row_idx * D + d] * scale_tile[row_idx];
+            for (uint k = 0; k < PAGE; ++k) {
+                acc += float(scores_tile[row_idx * PAGE + k])
+                     * float(V_stage[k * D + d]);
+            }
+            O_acc[row_idx * D + d] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Write partials at split=0 per (slot, q_head). Empty-prefix edge case:
+    // if prefix_pages==0 we never entered the loop; m_state is still -INF
+    // (correctly signalling "nothing seen") and O_acc is zero.
+    if (lid < B_batch * Q_PER_TG) {
+        uint b = lid / Q_PER_TG;
+        uint q = lid % Q_PER_TG;
+        uint q_head = q_head_base + q;
+        uint pidx = (b * H_Q + q_head) * N_SPLITS + 0;
+        m_partials[pidx] = m_state[lid];
+        l_partials[pidx] = l_state[lid];
+    }
+    for (uint sqd = lid; sqd < B_batch * Q_PER_TG * D; sqd += THREADS) {
+        uint b = sqd / (Q_PER_TG * D);
+        uint q = (sqd / D) % Q_PER_TG;
+        uint d = sqd % D;
+        uint q_head = q_head_base + q;
+        uint pidx = (b * H_Q + q_head) * N_SPLITS + 0;
+        O_partials[pidx * D + d] = O_acc[(b * Q_PER_TG + q) * D + d];
+    }
+}
+
 // Flex attention v1 — slide layer with Q_BLOCK=8 (prefill).
 // Each TG covers 8 consecutive Q positions × Q_PER_TG=2 Q-heads → 16 real Q rows.
 // MMA runs in 2 passes of 8 rows each. Per-Q-row softmax applies a per-row
