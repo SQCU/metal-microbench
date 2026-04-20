@@ -1838,6 +1838,95 @@ func runSharedPrefixParity() {
     }
 }
 
+// Same shape as runSharedPrefixParity but for full-attn layers: D=512,
+// PAGE=8, H_KV=2, Q_PER_TG=1 (one q_head per TG in the broadcast kernel).
+// Env: SHARED_PREFIX_PARITY_FULL=1
+func runSharedPrefixParityFull() {
+    print("\n=== Shared-prefix broadcast vs v0 parity (FULL attn) ===")
+    let H_Q = 16, H_KV = 2, D = 512, PAGE = 8
+    let B_batch = 4
+    let prefixPages = 3
+
+    let Kcache = halfBuf(prefixPages * PAGE * H_KV * D, seed: 0xD4)
+    let Vcache = halfBuf(prefixPages * PAGE * H_KV * D, seed: 0xE5)
+    let Qbuf = halfBuf(B_batch * H_Q * D, seed: 0xF6)
+
+    // All slots map logical page p → phys p (same phys across slots).
+    let btGlobal = block_table.contents().bindMemory(to: UInt32.self,
+                    capacity: B_batch * MAX_PAGES_PER_SLOT)
+    for b in 0..<B_batch {
+        for p in 0..<MAX_PAGES_PER_SLOT {
+            btGlobal[b * MAX_PAGES_PER_SLOT + p] = UInt32(p % prefixPages)
+        }
+    }
+    let klGlobal = k_len_full.contents().bindMemory(to: UInt32.self, capacity: B_batch)
+    for b in 0..<B_batch { klGlobal[b] = UInt32(prefixPages * PAGE) }
+    let npGlobal = num_pages_full.contents().bindMemory(to: UInt32.self, capacity: B_batch)
+    for b in 0..<B_batch { npGlobal[b] = UInt32(prefixPages) }
+    precomputeFlexBlockMaskFull()
+
+    let O_v0    = emptyHalf(B_batch * H_Q * D)
+    let O_split = emptyHalf(B_batch * H_Q * D)
+
+    // Path A: v0 full alone.
+    let cbA = queue.makeCommandBuffer()!
+    encFlexAttnFullV0(cbA, Q: Qbuf, O: O_v0, Kc: Kcache, Vc: Vcache,
+                       kLenBuf: k_len_full, H_Q: H_Q, H_KV: H_KV, D: D)
+    cbA.commit(); cbA.waitUntilCompleted()
+    if let e = cbA.error { print("  v0: \(e)"); return }
+
+    // Path B: shared + tail + reduce with N_SPLITS=2.
+    let mP = device.makeBuffer(length: B_batch * H_Q * 2 * 4, options: .storageModeShared)!
+    let lP = device.makeBuffer(length: B_batch * H_Q * 2 * 4, options: .storageModeShared)!
+    let OP = device.makeBuffer(length: B_batch * H_Q * 2 * D * 4, options: .storageModeShared)!
+    let mPp = mP.contents().assumingMemoryBound(to: Float.self)
+    let lPp = lP.contents().assumingMemoryBound(to: Float.self)
+    let OPp = OP.contents().assumingMemoryBound(to: Float.self)
+    for i in 0..<(B_batch * H_Q * 2) { mPp[i] = -.infinity; lPp[i] = 0 }
+    for i in 0..<(B_batch * H_Q * 2 * D) { OPp[i] = 0 }
+
+    let sharedPages = device.makeBuffer(length: prefixPages * 4, options: .storageModeShared)!
+    let spp = sharedPages.contents().assumingMemoryBound(to: UInt32.self)
+    for i in 0..<prefixPages { spp[i] = UInt32(i) }
+
+    let cbB = queue.makeCommandBuffer()!
+    encPagedAttnFullArSharedAndTail(cbB, Q: Qbuf, O: O_split,
+                                     Kc: Kcache, Vc: Vcache,
+                                     sharedPhysPages: sharedPages,
+                                     mPart: mP, lPart: lP, OPart: OP,
+                                     kLenBuf: k_len_full,
+                                     H_Q: H_Q, H_KV: H_KV, D: D,
+                                     prefixPages: prefixPages,
+                                     bBatch: B_batch)
+    cbB.commit(); cbB.waitUntilCompleted()
+    if let e = cbB.error { print("  split path: \(e)"); return }
+
+    let A = O_v0.contents().assumingMemoryBound(to: Float16.self)
+    let Bp = O_split.contents().assumingMemoryBound(to: Float16.self)
+    var maxAbsDiff: Float = 0
+    var sumAbsDiff: Double = 0
+    var l2A: Double = 0, l2B: Double = 0, dot: Double = 0
+    let N = B_batch * H_Q * D
+    for i in 0..<N {
+        let a = Float(A[i]); let b = Float(Bp[i])
+        let d = abs(a - b)
+        if d > maxAbsDiff { maxAbsDiff = d }
+        sumAbsDiff += Double(d)
+        l2A += Double(a * a); l2B += Double(b * b)
+        dot += Double(a) * Double(b)
+    }
+    let cos = dot / (l2A.squareRoot() * l2B.squareRoot() + 1e-12)
+    print(String(format: "  max|diff|: %.6f   mean|diff|: %.6f",
+                 maxAbsDiff, Float(sumAbsDiff / Double(N))))
+    print(String(format: "  ‖v0‖₂=%.3f   ‖split‖₂=%.3f   cos-sim=%.9f",
+                 l2A.squareRoot(), l2B.squareRoot(), cos))
+    if maxAbsDiff < 1e-2 && cos > 0.999999 {
+        print("  ✓ full split path matches v0 within FP tolerance")
+    } else {
+        print("  ✗ full split path diverges from v0")
+    }
+}
+
 // ====================================================================
 // Prefill validation harness — drives `buildPrefillCB` against the same
 // lm_<tag>_tokens / lm_<tag>_logits oracle as runLmKLHarness, but in a

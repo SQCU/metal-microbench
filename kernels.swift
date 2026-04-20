@@ -4040,6 +4040,162 @@ kernel void flex_attn_full_prefill(
     }
 }
 
+// Full-attention cross-slot K/V broadcast kernel (shared-prefix AR).
+// Mirrors paged_attn_slide_ar_shared but for D=512, PAGE=8 full-attn
+// layers. tg-mem budget forces Q_PER_TG=1 (one q_head per TG); grid is
+// (H_Q, 1, 1) = 16 TGs per layer, each broadcasting its q_head across
+// all B active slots. Q_heads sharing a kv_head will all issue the same
+// K/V load pattern — on Apple Silicon these hit L2 after the first load,
+// so we still get most of the bandwidth benefit of true broadcast.
+//
+// tg-mem ≈ 28 KB at B=4: Q_tile 4 KB + K_stage 8 KB + V_stage 8 KB +
+// O_acc 8 KB + small m/l state.
+kernel void paged_attn_full_ar_shared(
+    device const half* Q                    [[buffer(0)]],   // [B, H_Q, D]
+    device const half* K_cache              [[buffer(1)]],
+    device const half* V_cache              [[buffer(2)]],
+    device const uint* shared_pages         [[buffer(3)]],   // [prefix_pages]
+    device float* m_partials                [[buffer(4)]],
+    device float* l_partials                [[buffer(5)]],
+    device float* O_partials                [[buffer(6)]],
+    device const uint* k_len_per_slot       [[buffer(7)]],
+    constant float& qk_scale                [[buffer(8)]],
+    constant uint& H_Q                      [[buffer(9)]],
+    constant uint& H_KV                     [[buffer(10)]],
+    constant uint& N_SPLITS                 [[buffer(11)]],
+    constant uint& prefix_pages             [[buffer(12)]],
+    constant uint& B_batch                  [[buffer(13)]],
+    uint3 tg_pos                            [[threadgroup_position_in_grid]],
+    uint3 lid3                              [[thread_position_in_threadgroup]])
+{
+    constexpr uint D = 512;
+    constexpr uint PAGE = 8;
+    constexpr uint THREADS = 128;
+    constexpr uint MAX_B = 4;
+    constexpr uint D8 = D / 8;
+
+    const uint q_head = tg_pos.x;
+    const uint kv_head = (q_head * H_KV) / H_Q;   // per GQA grouping
+    const uint lid = lid3.x;
+
+    threadgroup half  Q_tile[MAX_B * D];          // 4*512*2 = 4 KB
+    threadgroup half  K_stage[PAGE * D];          // 8*512*2 = 8 KB
+    threadgroup half  V_stage[PAGE * D];          // 8*512*2 = 8 KB
+    threadgroup half  scores_tile[MAX_B * PAGE];  // 4*8*2 = 64 B
+    threadgroup float O_acc[MAX_B * D];           // 4*512*4 = 8 KB
+    threadgroup float m_state[MAX_B];
+    threadgroup float l_state[MAX_B];
+    threadgroup float scale_tile[MAX_B];
+
+    // Load all active slots' Q[this q_head] into Q_tile
+    for (uint i = lid; i < B_batch * D; i += THREADS) {
+        uint b = i / D;
+        uint d = i % D;
+        Q_tile[i] = Q[(b * H_Q + q_head) * D + d];
+    }
+    for (uint i = lid; i < B_batch * D; i += THREADS) O_acc[i] = 0.0f;
+    if (lid < B_batch) {
+        m_state[lid] = -INFINITY;
+        l_state[lid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint kv_row_stride = H_KV * D;
+
+    for (uint p = 0; p < prefix_pages; ++p) {
+        const uint phys = shared_pages[p];
+        device const half* Kbase = K_cache + (phys * PAGE * H_KV + kv_head) * D;
+        device const half* Vbase = V_cache + (phys * PAGE * H_KV + kv_head) * D;
+
+        // Stage K & V into tg-mem (shared by all slots' compute below).
+        for (uint i = lid; i < PAGE * D; i += THREADS) {
+            uint k = i / D; uint d = i % D;
+            K_stage[i] = Kbase[k * kv_row_stride + d];
+        }
+        for (uint i = lid; i < PAGE * D; i += THREADS) {
+            uint k = i / D; uint d = i % D;
+            V_stage[i] = Vbase[k * kv_row_stride + d];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Q@K for every slot. MAX_B=4 slots, each one 1×D × D×8 = 1×8 score row.
+        // Pad Q to 8 rows for 8×8 MMA (slots beyond B_batch get all-zero Q).
+        for (uint b = 0; b < B_batch; ++b) {
+            simdgroup_half8x8 mqk = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+            for (uint dt = 0; dt < D8; ++dt) {
+                simdgroup_half8x8 mq, mk;
+                simdgroup_load(mq, Q_tile + b * D + dt * 8, D);
+                simdgroup_load(mk, K_stage + dt * 8, D, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+            }
+            // Only row 0 of the 8x8 MMA matters (Q_PER_TG=1 → 1 real Q row);
+            // store full 8×8 to scores buffer and ignore rows 1..7.
+            threadgroup half row_buf[8 * PAGE];
+            simdgroup_store(mqk, row_buf, PAGE);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint k = lid; k < PAGE; k += THREADS) {
+                scores_tile[b * PAGE + k] = row_buf[k];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // Per-slot softmax with per-slot k_len mask.
+        if (lid < B_batch) {
+            uint b = lid;
+            uint k_len = k_len_per_slot[b];
+            float row_max = -INFINITY;
+            float s_loc[PAGE];
+            for (uint k = 0; k < PAGE; ++k) {
+                float sv = float(scores_tile[b * PAGE + k]) * qk_scale;
+                uint k_pos = p * PAGE + k;
+                if (k_pos >= k_len) sv = -INFINITY;
+                s_loc[k] = sv;
+                row_max = max(row_max, sv);
+            }
+            float m_old = m_state[b];
+            float m_new = max(m_old, row_max);
+            float scale = exp(m_old - m_new);
+            float sum = 0.0f;
+            for (uint k = 0; k < PAGE; ++k) {
+                float e = exp(s_loc[k] - m_new);
+                scores_tile[b * PAGE + k] = half(e);
+                sum += e;
+            }
+            m_state[b] = m_new;
+            l_state[b] = l_state[b] * scale + sum;
+            scale_tile[b] = scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // AV: each lane owns D/THREADS dims per slot.
+        for (uint bd = lid; bd < B_batch * D; bd += THREADS) {
+            uint b = bd / D;
+            uint d = bd % D;
+            float acc = O_acc[b * D + d] * scale_tile[b];
+            for (uint k = 0; k < PAGE; ++k) {
+                acc += float(scores_tile[b * PAGE + k])
+                     * float(V_stage[k * D + d]);
+            }
+            O_acc[b * D + d] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Write partials at split=0 for each active slot.
+    if (lid < B_batch) {
+        uint b = lid;
+        uint pidx = (b * H_Q + q_head) * N_SPLITS + 0;
+        m_partials[pidx] = m_state[b];
+        l_partials[pidx] = l_state[b];
+    }
+    for (uint bd = lid; bd < B_batch * D; bd += THREADS) {
+        uint b = bd / D;
+        uint d = bd % D;
+        uint pidx = (b * H_Q + q_head) * N_SPLITS + 0;
+        O_partials[pidx * D + d] = O_acc[b * D + d];
+    }
+}
+
 // Flex attention v0 for full-attention layers: D=512, PAGE=8, Q_PER_TG=8,
 // Q_BLOCK=1, mask_mod = causal (no sliding window — full layers are global).
 // Same list-driven structure as the slide variant.
@@ -4061,6 +4217,9 @@ kernel void flex_attn_full_v0(
     constant uint& H_Q                      [[buffer(14)]],
     constant uint& H_KV                     [[buffer(15)]],
     constant uint& N_SPLITS                 [[buffer(16)]],
+    constant uint& prefix_pages             [[buffer(17)]],    // skip pages < this (tail mode)
+    constant uint& split_offset             [[buffer(18)]],    // write at split_offset+tg.y in output layout
+    constant uint& total_splits_out         [[buffer(19)]],    // output layout stride (0 → fallback to N_SPLITS)
     uint3 tg_pos                            [[threadgroup_position_in_grid]],
     uint3 lid3                              [[thread_position_in_threadgroup]])
 {
@@ -4118,6 +4277,8 @@ kernel void flex_attn_full_v0(
             p = partial_kv_indices[part_lo + (ix - n_full)];
             is_partial = true;
         }
+        // Tail mode: skip logical pages owned by the full-attn shared-prefix kernel.
+        if (p < prefix_pages) continue;
 
         const uint phys = bt_s[p];
         device const half* Kbase = K_cache + (phys * PAGE * H_KV + kv_head) * D;
@@ -4186,10 +4347,11 @@ kernel void flex_attn_full_v0(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
+    const uint out_stride = (total_splits_out > 0) ? total_splits_out : N_SPLITS;
     const bool empty_split = (ix_begin >= ix_end);
     for (uint q = 0; q < Q_PER_TG; ++q) {
         const uint q_head = q_head_base + q;
-        const uint pidx = (slot * H_Q + q_head) * N_SPLITS + split;
+        const uint pidx = (slot * H_Q + q_head) * out_stride + split_offset + split;
         if (lid == 0) {
             m_partials[pidx] = empty_split ? -INFINITY : m_state[q];
             l_partials[pidx] = empty_split ? 0.0f : l_state[q];
