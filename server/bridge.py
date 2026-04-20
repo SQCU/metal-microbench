@@ -190,6 +190,17 @@ def _render_user_content_to_chunks(content) -> list[tuple[str, Any]]:
                 if isinstance(url, dict):
                     url = url.get("url", "")
                 out.append(('image_bytes', _decode_image_url(url)))
+            elif t == "softs":
+                # Client is replaying soft tokens it received from a
+                # previous /v1/media/extract response. Skips the vision
+                # tower entirely — the server is pure function of its
+                # inputs. {"type":"softs", "softs_b64":..., "n_tokens":N,
+                # "is_fp32": true}
+                out.append(('softs', {
+                    "bytes": base64.b64decode(part.get("softs_b64", "")),
+                    "n_tokens": int(part.get("n_tokens", 0)),
+                    "is_fp32": bool(part.get("is_fp32", True)),
+                }))
             # Unknown types silently dropped; could also 400 here.
         return out
     return [('text', str(content))]
@@ -241,6 +252,15 @@ def submit_messages(sid: int, messages: list[dict]) -> None:
                 finally:
                     try: os.unlink(tmp)
                     except OSError: pass
+            elif kind == 'softs':
+                # Client-provided softs from a prior extract call. Same
+                # flush-text-first invariant as image_bytes.
+                flush_text()
+                n = g.submit_softs(sid, payload["bytes"],
+                                   payload["n_tokens"], payload["is_fp32"])
+                first_submit = False
+                if n <= 0:
+                    raise HTTPException(500, "submit_softs returned no soft tokens")
         pending_text.append(f"{GEMMA_TURN_CLOSE}\n")
     pending_text.append(f"{GEMMA_TURN_OPEN}model\n")
     flush_text()
@@ -380,6 +400,52 @@ async def prewarm_image(req: Request) -> JSONResponse:
         "cache_key": g.vision_last_cache_key(),
         "elapsed_ms": int(dt * 1000),
         "stats": g.vision_cache_stats(),
+    })
+
+
+@app.post("/v1/media/extract")
+async def media_extract(req: Request) -> JSONResponse:
+    """Run the vision tower on an image and return the soft tokens as a
+    base64 blob the client can persist. Pair with the "softs" content
+    item in /v1/chat/completions to replay the result across turns
+    without the server re-running vision.
+
+    Body: {"image_url": "data:image/png;base64,..."} or {"url": "..."}
+    Response: {"cache_key": hex, "n_tokens": int, "is_fp32": bool,
+               "softs_b64": str, "bytes": int, "elapsed_ms": int}
+    """
+    body = await req.json()
+    url = body.get("image_url") or body.get("url") or ""
+    if isinstance(url, dict):
+        url = url.get("url", "")
+    if not url:
+        raise HTTPException(400, "image_url is required")
+    if not g.vision_is_ready():
+        raise HTTPException(503, "vision not initialized")
+
+    png = _decode_image_url(url)
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        f.write(png)
+        tmp = f.name
+    try:
+        t0 = time.time()
+        n = g.vision_prewarm_path(tmp)
+        dt = time.time() - t0
+    finally:
+        try: os.unlink(tmp)
+        except OSError: pass
+
+    key = g.vision_last_cache_key()
+    blob = g.vision_fetch_softs_by_key(key) if key else None
+    if blob is None:
+        raise HTTPException(500, "softs vanished from cache before fetch")
+    return JSONResponse({
+        "cache_key": key,
+        "n_tokens": int(n),
+        "is_fp32": True,
+        "softs_b64": base64.b64encode(blob).decode("ascii"),
+        "bytes": len(blob),
+        "elapsed_ms": int(dt * 1000),
     })
 
 

@@ -128,6 +128,12 @@ _lib.gemma_vision_prewarm_path.restype = C.c_int32
 _lib.gemma_vision_last_cache_key.argtypes = [C.c_char_p, C.c_int32]
 _lib.gemma_vision_last_cache_key.restype = C.c_int32
 
+_lib.gemma_vision_fetch_softs_by_key.argtypes = [C.c_char_p, C.POINTER(C.c_uint8), C.c_int32]
+_lib.gemma_vision_fetch_softs_by_key.restype = C.c_int32
+
+_lib.gemma_submit_softs.argtypes = [C.c_int32, C.POINTER(C.c_uint8), C.c_int32, C.c_int32, C.c_int32]
+_lib.gemma_submit_softs.restype = C.c_int32
+
 _lib.gemma_vision_cache_entries.argtypes = []
 _lib.gemma_vision_cache_entries.restype = C.c_int32
 
@@ -345,6 +351,38 @@ def vision_last_cache_key() -> str:
     if n <= 0:
         return ""
     return buf.raw[:n].decode("ascii", errors="replace")
+
+
+def vision_fetch_softs_by_key(hex_key: str) -> bytes | None:
+    """Copy soft tokens out of the cache for a given SHA-256 hex key.
+    Returns None on cache miss. Lets clients round-trip softs across
+    turns: run vision once, persist the blob locally, re-submit it
+    on later turns via submit_softs() without re-running the tower."""
+    if len(hex_key) != 64:
+        return None
+    key = hex_key.encode("ascii")
+    need = _lib.gemma_vision_fetch_softs_by_key(key, None, 0)
+    if need <= 0:
+        return None
+    buf = (C.c_uint8 * need)()
+    n = _lib.gemma_vision_fetch_softs_by_key(key, buf, need)
+    if n <= 0:
+        return None
+    return bytes(buf[:n])
+
+
+def submit_softs(sid: int, softs: bytes, n_tokens: int, is_fp32: bool = True) -> int:
+    """Submit pre-computed soft tokens to a session. `softs` is the raw
+    byte blob previously returned by vision_fetch_softs_by_key (or an
+    equivalent client-side cache). Brackets with BOI/EOI server-side;
+    no vision tower runs. Returns n_tokens on success."""
+    if not softs or n_tokens <= 0:
+        raise ValueError("softs bytes and n_tokens required")
+    buf = (C.c_uint8 * len(softs)).from_buffer_copy(softs)
+    r = _lib.gemma_submit_softs(int(sid), buf, len(softs), int(n_tokens), 1 if is_fp32 else 0)
+    if r < 0:
+        raise RuntimeError(f"gemma_submit_softs failed (session={sid}, bytes={len(softs)}, n_tokens={n_tokens}, fp32={is_fp32})")
+    return r
 
 
 def vision_cache_stats() -> dict:

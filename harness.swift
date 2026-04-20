@@ -202,6 +202,74 @@ func runVisionEndToEndForward(framePath: String, stPath: String) {
     }
 }
 
+// VISION_BATCH_DIR=<dir> — run the batched forward over the first 4
+// PNGs in the directory, compare per-image soft-tokens to the serial
+// runVisionTowerForward path. Validates numerical equivalence + measures
+// wall-clock speedup (batch vs sum of serial).
+func runVisionBatchForward(batchDir: String, stPath: String) {
+    print("\n=== Vision batched forward (B=4) ===")
+    do {
+        let st = try SafetensorsFile(stPath)
+        let weights = try loadVisionWeights(st, device: device)
+        let fm = FileManager.default
+        let pngs = (try fm.contentsOfDirectory(atPath: batchDir))
+            .filter { $0.hasSuffix(".png") }.sorted().prefix(4)
+        precondition(pngs.count >= 2, "need ≥2 PNGs in VISION_BATCH_DIR")
+
+        var batches: [PatchBatch] = []
+        for p in pngs {
+            let b = try gemma4ImagePreprocess(path: "\(batchDir)/\(p)", device: device)
+            batches.append(b)
+            print(String(format: "  %@ → %d×%d grid, %d patches",
+                         p, b.gridH, b.gridW, b.numRealPatches))
+        }
+        let B = batches.count
+
+        // Serial baseline — run each image through runVisionTowerForward.
+        let tSerial0 = Date()
+        var serialOut: [(MTLBuffer, Int)] = []
+        for b in batches {
+            serialOut.append(runVisionTowerForward(batch: b, weights: weights,
+                                                    device: device, queue: queue))
+        }
+        let tSerial = Date().timeIntervalSince(tSerial0) * 1000
+        print(String(format: "  serial (B×1): %.1f ms (sum across %d images)", tSerial, B))
+
+        // Batched forward.
+        let tBatch0 = Date()
+        let batchOut = runVisionTowerBatchForward(batches: batches, weights: weights,
+                                                    device: device, queue: queue)
+        let tBatch = Date().timeIntervalSince(tBatch0) * 1000
+        print(String(format: "  batched B=%d: %.1f ms  (%.2fx speedup)",
+                     B, tBatch, tSerial / tBatch))
+
+        // Per-image bit-equivalence check.
+        precondition(serialOut.count == batchOut.count)
+        for i in 0..<B {
+            precondition(serialOut[i].1 == batchOut[i].1, "nPooled mismatch for image \(i)")
+            let nPooled = serialOut[i].1
+            let total = nPooled * weights.textHidden
+            let sp = serialOut[i].0.contents().assumingMemoryBound(to: Float.self)
+            let bp = batchOut[i].0.contents().assumingMemoryBound(to: Float.self)
+            var maxAbsDiff: Float = 0
+            var sumSqDiff: Double = 0, sumSqRef: Double = 0
+            for k in 0..<total {
+                let d = sp[k] - bp[k]
+                maxAbsDiff = max(maxAbsDiff, abs(d))
+                sumSqDiff += Double(d * d)
+                sumSqRef  += Double(sp[k] * sp[k])
+            }
+            let mse = sumSqDiff / Double(total)
+            let relRms = (sumSqDiff / max(sumSqRef, 1e-9)).squareRoot()
+            print(String(format: "  image %d: serial first8=[%.4f,%.4f,%.4f,%.4f,...] batch first8=[%.4f,%.4f,%.4f,%.4f,...] max|Δ|=%.3e MSE=%.3e rel_rms=%.3e",
+                         i, sp[0], sp[1], sp[2], sp[3], bp[0], bp[1], bp[2], bp[3],
+                         maxAbsDiff, mse, relRms))
+        }
+    } catch {
+        print("  batched forward failed: \(error)")
+    }
+}
+
 // Env-var driver: VISION_ASPECT_DIR+VISION_ST
 func runVisionAspectSweep(aspectDir: String, stPath: String) {
     print("\n=== Vision aspect-ratio sweep ===")

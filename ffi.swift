@@ -28,17 +28,32 @@ private var gNextHandle: Int32 = 1
 // per repeated image on M5) and just reuse the already-padded MTLBuffer.
 // The same MTLBuffer can back N concurrent sessions: Session.submit(softTokens:)
 // stores it in a .softTokens chunk which is read-only from the kernel side.
-private struct CachedSofts {
+// Cache entry. `pendingCB` is the in-flight vision CB that produced this
+// buffer; it gets cleared after the first .waitUntilCompleted(). Subsequent
+// users of the same cache entry see pendingCB == nil and skip the wait.
+// Under the async pipeline, LM decode can already be running by the time
+// this wait happens — the CB has usually already completed on the GPU.
+private class CachedSofts {
     let buffer: MTLBuffer       // padded to targetSoft rows, fp32
     let count: Int              // always targetSoft=280 currently
     var lastUsed: UInt64        // monotonic tick counter for LRU
     let bytes: Int              // buffer.length, for stats
+    var pendingCB: MTLCommandBuffer?   // non-nil until the vision CB is waited on
+    init(buffer: MTLBuffer, count: Int, lastUsed: UInt64, bytes: Int, pendingCB: MTLCommandBuffer?) {
+        self.buffer = buffer; self.count = count; self.lastUsed = lastUsed
+        self.bytes = bytes; self.pendingCB = pendingCB
+    }
 }
 private var gVisionCache: [Data: CachedSofts] = [:]
 private var gVisionCacheHits: UInt64 = 0
 private var gVisionCacheMisses: UInt64 = 0
 private var gVisionCacheTick: UInt64 = 0
 private let gVisionCacheMaxEntries = 64    // ~200 MB at 280 × 2816 × 4 B each
+
+// Dedicated command queue for vision tower work. Runs concurrently with
+// the main LM queue on M5 Max — two queues can share ALU partitions,
+// enabling vision(image N+1) ∥ LM.decode(label N) pipelining.
+var gVisionQueue: MTLCommandQueue?
 
 // --- Initialization ---
 
@@ -337,6 +352,7 @@ public func gemma_vision_init(_ safetensorsPath: UnsafePointer<CChar>?) -> Int32
     do {
         let st = try SafetensorsFile(pathStr)
         gVisionResidency = VisionResidency(file: st)
+        if gVisionQueue == nil { gVisionQueue = device.makeCommandQueue() }
         return 0
     } catch {
         print("gemma_vision_init failed: \(error)")
@@ -409,12 +425,18 @@ public func gemma_submit_image_path(_ sid: Int32,
 
     guard let padded = ensureCachedSofts(pngPath: pathStr) else { return -1 }
 
-    // Bracket with BOI + EOI the same way runLmMultimodal does.
+    // Bracket with BOI + EOI the same way runLmMultimodal does. The softs
+    // chunk carries `pendingCB` so the LM tick can wait on the vision CB
+    // lazily — vision computation overlaps with LM decode on other sessions.
     let BOI: UInt32 = 255999
     let EOI: UInt32 = 258882
     s.submit([BOI])
-    s.submit(softTokens: padded.buffer, count: padded.count, isFp32: true)
+    s.submit(softTokens: padded.buffer, count: padded.count, isFp32: true,
+             pendingCB: padded.pendingCB)
     s.submit([EOI])
+    // After the first handoff, clear pendingCB from the cache entry so the
+    // next cache hit on the same image doesn't wait again.
+    padded.pendingCB = nil
     return Int32(padded.count)
 }
 
@@ -445,6 +467,71 @@ public func gemma_vision_last_cache_key(_ outHex: UnsafeMutablePointer<CChar>?,
     let n = min(data.count, Int(maxBytes))
     for i in 0..<n { outHex![i] = CChar(bitPattern: data[i]) }
     return Int32(n)
+}
+
+// Copy soft tokens out of the cache by SHA-256 hex key. Lets the client
+// round-trip vision tower outputs: run an image once, receive the softs,
+// hand them back on future turns without the server re-running anything.
+//
+// If outPtr is nil, returns the number of bytes required (so the caller
+// can size its buffer). Otherwise copies min(required, maxBytes) bytes
+// and returns the number copied. Returns -1 on cache miss or bad key.
+@_cdecl("gemma_vision_fetch_softs_by_key")
+public func gemma_vision_fetch_softs_by_key(_ hexKey: UnsafePointer<CChar>?,
+                                             _ outPtr: UnsafeMutablePointer<UInt8>?,
+                                             _ maxBytes: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let k = hexKey else { return -1 }
+    let hex = String(cString: k)
+    guard hex.count == 64 else { return -1 }
+    var bytes = [UInt8](); bytes.reserveCapacity(32)
+    var idx = hex.startIndex
+    for _ in 0..<32 {
+        let next = hex.index(idx, offsetBy: 2)
+        guard let b = UInt8(hex[idx..<next], radix: 16) else { return -1 }
+        bytes.append(b); idx = next
+    }
+    let hashData = Data(bytes)
+    guard let entry = gVisionCache[hashData] else { return -1 }
+    let need = entry.buffer.length
+    if outPtr == nil { return Int32(need) }
+    let n = min(need, Int(maxBytes))
+    memcpy(outPtr!, entry.buffer.contents(), n)
+    return Int32(n)
+}
+
+// Submit pre-computed soft tokens to a session. The client is handing
+// back softs they received from a previous image submission — the server
+// brackets with BOI/EOI and appends to the chunk queue without running
+// the vision tower. This is the inverse of gemma_vision_fetch_softs_by_key.
+//
+// `byteCount` must equal `nTokens * HIDDEN * (isFp32 ? 4 : 2)`.
+// Returns nTokens on success, -1 on error.
+@_cdecl("gemma_submit_softs")
+public func gemma_submit_softs(_ sid: Int32,
+                                _ ptr: UnsafePointer<UInt8>?,
+                                _ byteCount: Int32,
+                                _ nTokens: Int32,
+                                _ isFp32: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let s = gSessions[sid] else { return -1 }
+    guard let src = ptr, nTokens > 0 else { return -1 }
+    let fp32 = isFp32 != 0
+    let bpe = fp32 ? 4 : 2
+    let expected = Int(nTokens) * HIDDEN * bpe
+    guard Int(byteCount) == expected else {
+        print("gemma_submit_softs: size mismatch (got \(byteCount), expected \(expected) for \(nTokens) tokens at hidden=\(HIDDEN), fp32=\(fp32))")
+        return -1
+    }
+    guard let buf = device.makeBuffer(length: expected, options: .storageModeShared) else { return -1 }
+    memcpy(buf.contents(), src, expected)
+
+    let BOI: UInt32 = 255999
+    let EOI: UInt32 = 258882
+    s.submit([BOI])
+    s.submit(softTokens: buf, count: Int(nTokens), isFp32: fp32)
+    s.submit([EOI])
+    return nTokens
 }
 
 // Internal: hash the file, check/populate the cache. Shared by submit + prewarm.
@@ -492,20 +579,39 @@ private func ensureCachedSofts(pngPath: String) -> CachedSofts? {
         print("ensureCachedSofts: preprocess failed: \(error)")
         return nil
     }
-    let (rawSoftTokens, rawNPooled) = runVisionTowerForward(
-        batch: batch, weights: visWeights, device: device, queue: queue)
+    // Submit vision work on the dedicated vision queue so LM-queue CBs
+    // (running concurrently from other sessions) aren't serialized behind it.
+    let vq = gVisionQueue ?? queue
+    let (rawSoftTokens, rawNPooled, cb) = runVisionTowerForwardAsync(
+        batch: batch, weights: visWeights, device: device, queue: vq)
     if rawNPooled == 0 { return nil }
 
-    // Pad to image_seq_length=280, fp32.
+    // Allocate the padded [image_seq_length=280, HIDDEN] fp32 target and
+    // zero-init on CPU (trivial — 3 MB memset). The GPU blit below copies
+    // rawSoftTokens' computed rows into the head. This keeps the padded
+    // tail bytes quietly at zero, matching what the old sync memcpy did.
     let targetSoft = 280
     let padded = device.makeBuffer(length: targetSoft * HIDDEN * 4,
                                     options: .storageModeShared)!
     memset(padded.contents(), 0, padded.length)
     let copyRows = min(rawNPooled, targetSoft)
-    memcpy(padded.contents(), rawSoftTokens.contents(), copyRows * HIDDEN * 4)
+
+    // Blit on the vision queue — runs after `cb` completes (same queue,
+    // serialized). When `padCB` completes, `padded` is fully materialized.
+    // The consumer (LM tick softTokens reader) waits on `padCB` before
+    // reading, so vision work pipelines against LM decode: the LM queue
+    // can process other sessions while vision's two CBs churn on vq.
+    let padCB = vq.makeCommandBuffer()!
+    let blit = padCB.makeBlitCommandEncoder()!
+    blit.copy(from: rawSoftTokens, sourceOffset: 0,
+              to: padded, destinationOffset: 0,
+              size: copyRows * HIDDEN * 4)
+    blit.endEncoding()
+    padCB.commit()
 
     let entry = CachedSofts(buffer: padded, count: targetSoft,
-                             lastUsed: gVisionCacheTick, bytes: padded.length)
+                             lastUsed: gVisionCacheTick, bytes: padded.length,
+                             pendingCB: padCB)
     gVisionCache[hashData] = entry
 
     // LRU evict if over cap.

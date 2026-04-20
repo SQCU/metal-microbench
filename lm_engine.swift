@@ -71,12 +71,16 @@ enum PrimingChunk {
     // `byteOffset` lets a chunk point at a sub-range of the same buffer,
     // which is how multi-tile soft-token prefills walk through a big
     // image one MAX_Q_LEN-sized chunk per tick.
-    case softTokens(buffer: MTLBuffer, count: Int, isFp32: Bool, byteOffset: Int)
+    // `pendingCB` is the vision CB that produced `buffer` — the tick-loop
+    // consumer calls .waitUntilCompleted() on it before reading, allowing
+    // vision work to pipeline against LM decode on the main queue.
+    case softTokens(buffer: MTLBuffer, count: Int, isFp32: Bool, byteOffset: Int,
+                    pendingCB: MTLCommandBuffer?)
 
     var count: Int {
         switch self {
         case .tokens(let ts): return ts.count
-        case .softTokens(_, let c, _, _): return c
+        case .softTokens(_, let c, _, _, _): return c
         }
     }
 }
@@ -250,10 +254,12 @@ final class Session {
         }
         return adopted
     }
-    func submit(softTokens: MTLBuffer, count: Int, isFp32: Bool) {
+    func submit(softTokens: MTLBuffer, count: Int, isFp32: Bool,
+                  pendingCB: MTLCommandBuffer? = nil) {
         guard count > 0 else { return }
         chunkQueue.append(.softTokens(buffer: softTokens, count: count,
-                                       isFp32: isFp32, byteOffset: 0))
+                                       isFp32: isFp32, byteOffset: 0,
+                                       pendingCB: pendingCB))
         if state != .done { state = .priming }
     }
 
@@ -285,11 +291,12 @@ final class Session {
         guard let eng = engine else { return }
         append(eng.tokenizer.encode(text, addBos: false), resetBudget: resetBudget)
     }
-    func append(softTokens: MTLBuffer, count: Int, isFp32: Bool, resetBudget: Bool = true) {
+    func append(softTokens: MTLBuffer, count: Int, isFp32: Bool,
+                  pendingCB: MTLCommandBuffer? = nil, resetBudget: Bool = true) {
         guard count > 0 else { return }
         if state == .done { state = .paused }
         if resetBudget { numGenerated = 0 }
-        submit(softTokens: softTokens, count: count, isFp32: isFp32)
+        submit(softTokens: softTokens, count: count, isFp32: isFp32, pendingCB: pendingCB)
     }
 
     // Pull the next generated token, or nil if none ready.
@@ -729,12 +736,20 @@ final class LmEngine {
             for i in 0..<thisTile {
                 tokP[sslot * thisTile + i] = ts[i]
             }
-        case let .softTokens(buf, _, isFp32, byteOffset):
+        case let .softTokens(buf, _, isFp32, byteOffset, pendingCB):
             // Vision tower output. Copy the thisTile-row window starting
             // at `byteOffset` into pre_hidden at rows [s.slot*thisTile,
             // s.slot*thisTile+thisTile), downcasting fp32→fp16 if needed.
             // Other slots' rows are untouched (they'll compute junk that
             // gets discarded via block_table redirect to scratch).
+            //
+            // Wait on the in-flight vision CB — under the async pipeline
+            // this usually no-ops (GPU already finished), but it's the
+            // correctness barrier that lets us overlap vision with LM decode.
+            pendingCB?.waitUntilCompleted()
+            if let err = pendingCB?.error {
+                print("  [softTokens] pending vision CB error: \(err)")
+            }
             let dstPtr = pre_hidden.contents().assumingMemoryBound(to: Float16.self)
             let dstBase = (sslot * thisTile) * HIDDEN
             let srcRaw = buf.contents().advanced(by: byteOffset)
@@ -787,16 +802,18 @@ final class LmEngine {
             ts.removeFirst(thisTile)
             if ts.isEmpty { s.chunkQueue.removeFirst() }
             else          { s.chunkQueue[0] = .tokens(ts) }
-        case let .softTokens(buf, _, isFp32, byteOffset):
+        case let .softTokens(buf, _, isFp32, byteOffset, _):
             if remaining == 0 {
                 s.chunkQueue.removeFirst()
             } else {
                 // Leave the chunk in the queue with its offset advanced
                 // by thisTile rows; next tick picks up where we left off.
+                // pendingCB is dropped — we already waited on it above.
                 let bpe = isFp32 ? 4 : 2
                 let newOffset = byteOffset + thisTile * HIDDEN * bpe
                 s.chunkQueue[0] = .softTokens(buffer: buf, count: remaining,
-                                               isFp32: isFp32, byteOffset: newOffset)
+                                               isFp32: isFp32, byteOffset: newOffset,
+                                               pendingCB: nil)
             }
         }
 
@@ -1043,14 +1060,25 @@ final class LmEngine {
             let remainingCount: Int
             let isFp32: Bool
             let byteOffset: Int
+            let pendingCB: MTLCommandBuffer?
         }
         var slotSoft: [Int: SoftRef] = [:]
         for s in sessions {
             guard let sslot = s.slot else { continue }
-            guard case let .softTokens(buf, count, isFp32, byteOffset) = s.chunkQueue.first
+            guard case let .softTokens(buf, count, isFp32, byteOffset, pendingCB) = s.chunkQueue.first
             else { continue }
             slotSoft[sslot] = SoftRef(session: s, buffer: buf, remainingCount: count,
-                                       isFp32: isFp32, byteOffset: byteOffset)
+                                       isFp32: isFp32, byteOffset: byteOffset,
+                                       pendingCB: pendingCB)
+        }
+        // Wait on all participating slots' vision CBs before reading their
+        // soft-token buffers. Under the async pipeline the CBs have usually
+        // already completed by this point — this is the correctness barrier.
+        for (_, sr) in slotSoft {
+            sr.pendingCB?.waitUntilCompleted()
+            if let err = sr.pendingCB?.error {
+                print("  [softTokens multi] pending vision CB error: \(err)")
+            }
         }
         guard !slotSoft.isEmpty else { return false }
         // qLen = min over slots of remaining rows, clamped to MAX_Q_LEN.
@@ -1135,7 +1163,8 @@ final class LmEngine {
                 let bpe = sr.isFp32 ? 4 : 2
                 let newOffset = sr.byteOffset + qLen * HIDDEN * bpe
                 s.chunkQueue[0] = .softTokens(buffer: sr.buffer, count: remaining,
-                                               isFp32: sr.isFp32, byteOffset: newOffset)
+                                               isFp32: sr.isFp32, byteOffset: newOffset,
+                                               pendingCB: nil)
             }
             // If this was the last chunk of the session's priming queue,
             // transition to .generating + sample the first token from the

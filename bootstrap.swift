@@ -3572,6 +3572,10 @@ if let framePath = ProcessInfo.processInfo.environment["VISION_FORWARD"],
    let stPath = ProcessInfo.processInfo.environment["VISION_ST"] {
     runVisionEndToEndForward(framePath: framePath, stPath: stPath)
 }
+if let batchDir = ProcessInfo.processInfo.environment["VISION_BATCH_DIR"],
+   let stPath = ProcessInfo.processInfo.environment["VISION_ST"] {
+    runVisionBatchForward(batchDir: batchDir, stPath: stPath)
+}
 if let aspectDir = ProcessInfo.processInfo.environment["VISION_ASPECT_DIR"],
    let stPath = ProcessInfo.processInfo.environment["VISION_ST"] {
     runVisionAspectSweep(aspectDir: aspectDir, stPath: stPath)

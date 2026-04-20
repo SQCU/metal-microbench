@@ -4610,6 +4610,7 @@ kernel void vision_gemm_fp32_mma(
     constant uint& B_count              [[buffer(3)]],
     constant uint& D_in                 [[buffer(4)]],
     constant uint& D_out                [[buffer(5)]],
+    constant uint& quant_out            [[buffer(6)]],   // 0=fp32, 1=bf16-rounded fp32
     uint2 tg                            [[threadgroup_position_in_grid]],
     uint2 lid                           [[thread_position_in_threadgroup]])
 {
@@ -4665,7 +4666,119 @@ kernel void vision_gemm_fp32_mma(
         uint q_abs = q_start + q;
         uint o_abs = o_start + oo;
         if (q_abs < B_count && o_abs < D_out) {
-            Y[q_abs * D_out + o_abs] = y_stage[i];
+            float v = y_stage[i];
+            if (quant_out != 0u) {
+                uint bits = as_type<uint>(v);
+                uint lsb  = (bits >> 16) & 1u;
+                v = as_type<float>((bits + 0x7FFFu + lsb) & 0xFFFF0000u);
+            }
+            Y[q_abs * D_out + o_abs] = v;
+        }
+    }
+}
+
+// 16×16 variant of vision_gemm_fp32_mma with four simdgroup_float8x8
+// accumulators per TG. Quadruples the work per barrier/stage pair and
+// doubles arithmetic intensity over v1 (staging cost 2× but arithmetic
+// 4×). Target: close the 0.93→≥3 TFLOPS gap measured on the v1 kernel.
+//
+// Layout: each TG owns a 16-token × 16-output output tile, computed as
+// a 2×2 grid of 8×8 fp32 accumulators. X staged at [16, 8] half; W
+// staged at [8, 16] half. Same K_TILE=8 stride as v1.
+//
+// Grid: (ceil(D_out/16), ceil(B/16)). 32 threads per TG (single simdgroup).
+// D_in and D_out should be multiples of 8 (tail-safe at 16-boundary via
+// the B_count/D_out checks at store time; unused tile entries zero out
+// during staging).
+kernel void vision_gemm_fp32_mma_v2(
+    device const float* X               [[buffer(0)]],   // [B, D_in]
+    device const half*  W               [[buffer(1)]],   // [D_out, D_in]
+    device float*       Y               [[buffer(2)]],   // [B, D_out]
+    constant uint& B_count              [[buffer(3)]],
+    constant uint& D_in                 [[buffer(4)]],
+    constant uint& D_out                [[buffer(5)]],
+    constant uint& quant_out            [[buffer(6)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    constexpr uint Q_TILE  = 16;
+    constexpr uint K_TILE  = 8;
+    constexpr uint O_TILE  = 16;
+    constexpr uint THREADS = 32;
+
+    const uint o_block = tg.x;
+    const uint q_block = tg.y;
+    const uint o_start = o_block * O_TILE;
+    const uint q_start = q_block * Q_TILE;
+    const uint lid0    = lid.x;
+
+    threadgroup half  x_stage[Q_TILE * K_TILE];   // 256 B (16×8 half)
+    threadgroup half  w_stage[K_TILE * O_TILE];   // 256 B (8×16 half)
+    threadgroup float y_stage[Q_TILE * O_TILE];   // 1024 B (16×16 fp32)
+
+    // Four 8×8 fp32 accumulators arranged as a 2×2 grid:
+    //   acc[qi][oi] corresponds to output tile rows [qi*8..qi*8+8),
+    //   cols [oi*8..oi*8+8).
+    simdgroup_float8x8 acc00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k = 0; k < D_in; k += K_TILE) {
+        // Stage X[q_start..q_start+16, k..k+8] as half.
+        for (uint i = lid0; i < Q_TILE * K_TILE; i += THREADS) {
+            uint q = i / K_TILE; uint kk = i % K_TILE;
+            uint q_abs = q_start + q;
+            uint k_abs = k + kk;
+            x_stage[i] = (q_abs < B_count && k_abs < D_in)
+                ? half(X[q_abs * D_in + k_abs]) : half(0);
+        }
+        // Stage W[o_start..o_start+16, k..k+8] transposed to [kk, oo] for
+        // simdgroup_multiply_accumulate(C = A @ B^T).
+        for (uint i = lid0; i < K_TILE * O_TILE; i += THREADS) {
+            uint kk = i / O_TILE; uint oo = i % O_TILE;
+            uint o_abs = o_start + oo;
+            uint k_abs = k + kk;
+            w_stage[i] = (o_abs < D_out && k_abs < D_in)
+                ? W[o_abs * D_in + k_abs] : half(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Load 2 Q tiles (rows 0-7, 8-15) × 2 W tiles (cols 0-7, 8-15).
+        simdgroup_half8x8 mx0, mx1, mw0, mw1;
+        simdgroup_load(mx0, x_stage,               K_TILE);
+        simdgroup_load(mx1, x_stage + 8 * K_TILE,  K_TILE);
+        simdgroup_load(mw0, w_stage,               O_TILE);
+        simdgroup_load(mw1, w_stage + 8,           O_TILE);
+
+        // Four MMAs — 2× arithmetic per barrier relative to v1's single MMA.
+        simdgroup_multiply_accumulate(acc00, mx0, mw0, acc00);
+        simdgroup_multiply_accumulate(acc01, mx0, mw1, acc01);
+        simdgroup_multiply_accumulate(acc10, mx1, mw0, acc10);
+        simdgroup_multiply_accumulate(acc11, mx1, mw1, acc11);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store 4 accumulators into the 16×16 y_stage.
+    simdgroup_store(acc00, y_stage,                         O_TILE);
+    simdgroup_store(acc01, y_stage + 8,                     O_TILE);
+    simdgroup_store(acc10, y_stage + 8 * O_TILE,            O_TILE);
+    simdgroup_store(acc11, y_stage + 8 * O_TILE + 8,        O_TILE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Write 16×16 tile to Y with bounds check + optional bf16 quant fold.
+    for (uint i = lid0; i < Q_TILE * O_TILE; i += THREADS) {
+        uint q = i / O_TILE; uint oo = i % O_TILE;
+        uint q_abs = q_start + q;
+        uint o_abs = o_start + oo;
+        if (q_abs < B_count && o_abs < D_out) {
+            float v = y_stage[i];
+            if (quant_out != 0u) {
+                uint bits = as_type<uint>(v);
+                uint lsb  = (bits >> 16) & 1u;
+                v = as_type<float>((bits + 0x7FFFu + lsb) & 0xFFFF0000u);
+            }
+            Y[q_abs * D_out + o_abs] = v;
         }
     }
 }
@@ -4686,18 +4799,18 @@ kernel void vision_gemm_fp32_mma(
 // Grid: (H, ceil(N/8)). THREADS per TG: 32 (one simdgroup).
 // HD must equal 72 (vision head dim). N can be up to 2520.
 kernel void vision_attn_flash_fp32(
-    device const float* Q               [[buffer(0)]],   // [N, H, D]
-    device const float* K               [[buffer(1)]],   // [N, H, D]
-    device const float* V               [[buffer(2)]],   // [N, H, D]
-    device float* O                     [[buffer(3)]],   // [N, H, D]
+    device const float* Q               [[buffer(0)]],   // [B, N, H, D]
+    device const float* K               [[buffer(1)]],   // [B, N, H, D]
+    device const float* V               [[buffer(2)]],   // [B, N, H, D]
+    device float* O                     [[buffer(3)]],   // [B, N, H, D]
     constant uint& N                    [[buffer(4)]],
     constant uint& H                    [[buffer(5)]],
     constant uint& HD                   [[buffer(6)]],
     constant float& qk_scale            [[buffer(7)]],
-    device const uchar* padding_mask    [[buffer(8)]],
+    device const uchar* padding_mask    [[buffer(8)]],   // [B, N]
     constant uint& use_padding_mask     [[buffer(9)]],
-    uint2 tg_in                         [[threadgroup_position_in_grid]],
-    uint2 lid_in                        [[thread_position_in_threadgroup]])
+    uint3 tg_in                         [[threadgroup_position_in_grid]],
+    uint3 lid_in                        [[thread_position_in_threadgroup]])
 {
     constexpr uint Q_BLOCK = 8;
     constexpr uint K_BLOCK = 8;
@@ -4707,8 +4820,19 @@ kernel void vision_attn_flash_fp32(
 
     const uint head    = tg_in.x;
     const uint q_block = tg_in.y;
+    const uint b       = tg_in.z;              // batch slot
     const uint q_start = q_block * Q_BLOCK;
     const uint lid     = lid_in.x;
+
+    // Offset to this batch slot's Q/K/V/O and padding mask.
+    // Slot-parallel pattern: each slot's K/V lives in its own [N,H,D] region
+    // so cross-slot attention is impossible by construction (no mask needed).
+    const uint slot_stride = N * H * D;
+    device const float* Qb = Q + b * slot_stride;
+    device const float* Kb = K + b * slot_stride;
+    device const float* Vb = V + b * slot_stride;
+    device       float* Ob = O + b * slot_stride;
+    device const uchar* maskb = padding_mask + b * N;
 
     // tg-mem budget: 1152 + 576 + 576 + 128 + 2304 + 32 + 32 + 256 = ~5 KB.
     threadgroup half  Q_tile[Q_BLOCK * D];
@@ -4725,7 +4849,7 @@ kernel void vision_attn_flash_fp32(
     for (uint i = lid; i < Q_BLOCK * D; i += THREADS) {
         uint q = i / D; uint d = i % D;
         uint q_abs = q_start + q;
-        Q_tile[i] = half(q_abs < N ? Q[(q_abs * H + head) * D + d] : 0.0f);
+        Q_tile[i] = half(q_abs < N ? Qb[(q_abs * H + head) * D + d] : 0.0f);
     }
     for (uint i = lid; i < Q_BLOCK * D; i += THREADS) O_acc[i] = 0.0f;
     if (lid < Q_BLOCK) { m_state[lid] = -INFINITY; l_state[lid] = 0.0f; }
@@ -4739,8 +4863,8 @@ kernel void vision_attn_flash_fp32(
             uint k_abs = k_start + kr;
             float kv = 0.0f, vv = 0.0f;
             if (k_abs < N) {
-                kv = K[(k_abs * H + head) * D + d];
-                vv = V[(k_abs * H + head) * D + d];
+                kv = Kb[(k_abs * H + head) * D + d];
+                vv = Vb[(k_abs * H + head) * D + d];
             }
             K_stage[i] = half(kv);
             V_stage[i] = half(vv);
@@ -4768,7 +4892,7 @@ kernel void vision_attn_flash_fp32(
                 uint k_abs = k_start + k;
                 float sv = scores_raw[r * K_BLOCK + k] * qk_scale;
                 bool masked = (k_abs >= N) ||
-                              (use_padding_mask != 0u && padding_mask[k_abs] != 0u);
+                              (use_padding_mask != 0u && maskb[k_abs] != 0u);
                 if (masked) sv = -INFINITY;
                 s_loc[k] = sv;
                 row_max = max(row_max, sv);
@@ -4816,7 +4940,7 @@ kernel void vision_attn_flash_fp32(
         uint q_abs = q_start + q;
         if (q_abs < N) {
             float inv_l = (l_state[q] > 0.0f) ? (1.0f / l_state[q]) : 0.0f;
-            O[(q_abs * H + head) * D + d] = O_acc[i] * inv_l;
+            Ob[(q_abs * H + head) * D + d] = O_acc[i] * inv_l;
         }
     }
 }
@@ -4860,6 +4984,213 @@ kernel void quantize_fp32_to_bf16_inplace(
         uint lsb = (bits >> 16) & 1u;
         uint rounded = (bits + 0x7FFFu + lsb) & 0xFFFF0000u;
         x[idx] = as_type<float>(rounded);
+    }
+}
+
+// Fused vision FFN: gate_proj + up_proj + gelu(bf16(gate))*bf16(up), output
+// bf16-rounded. Replaces 6 dispatches (gate GEMM, q, up GEMM, q, gelu*up, q)
+// with 1. Preserves HF's bf16 rounding trajectory: gate_raw and up_raw are
+// each bf16-rounded before the gelu-combine, and the final product is
+// bf16-rounded on write. Grid: (D_out/8, ceil(B/8)); 32 threads per TG.
+kernel void vision_ffn_gate_up_gelu_fp32_mma(
+    device const float* X                [[buffer(0)]],   // [B, D_in]
+    device const half*  W_gate           [[buffer(1)]],   // [D_out, D_in]
+    device const half*  W_up             [[buffer(2)]],   // [D_out, D_in]
+    device float*       Y                [[buffer(3)]],   // [B, D_out] bf16-rounded
+    constant uint& B_count               [[buffer(4)]],
+    constant uint& D_in                  [[buffer(5)]],
+    constant uint& D_out                 [[buffer(6)]],
+    uint2 tg                             [[threadgroup_position_in_grid]],
+    uint2 lid                            [[thread_position_in_threadgroup]])
+{
+    constexpr uint Q_TILE  = 8;
+    constexpr uint K_TILE  = 8;
+    constexpr uint O_TILE  = 8;
+    constexpr uint THREADS = 32;
+
+    const uint o_block = tg.x;
+    const uint q_block = tg.y;
+    const uint o_start = o_block * O_TILE;
+    const uint q_start = q_block * Q_TILE;
+    const uint lid0    = lid.x;
+
+    threadgroup half  x_stage[Q_TILE * K_TILE];
+    threadgroup half  wg_stage[K_TILE * O_TILE];
+    threadgroup half  wu_stage[K_TILE * O_TILE];
+    threadgroup float yg_stage[Q_TILE * O_TILE];
+    threadgroup float yu_stage[Q_TILE * O_TILE];
+
+    simdgroup_float8x8 acc_g = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc_u = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k = 0; k < D_in; k += K_TILE) {
+        for (uint i = lid0; i < Q_TILE * K_TILE; i += THREADS) {
+            uint q = i / K_TILE; uint kk = i % K_TILE;
+            uint q_abs = q_start + q;
+            uint k_abs = k + kk;
+            x_stage[i] = (q_abs < B_count && k_abs < D_in)
+                ? half(X[q_abs * D_in + k_abs]) : half(0);
+        }
+        for (uint i = lid0; i < K_TILE * O_TILE; i += THREADS) {
+            uint kk = i / O_TILE; uint oo = i % O_TILE;
+            uint o_abs = o_start + oo;
+            uint k_abs = k + kk;
+            bool ok = (o_abs < D_out && k_abs < D_in);
+            wg_stage[i] = ok ? W_gate[o_abs * D_in + k_abs] : half(0);
+            wu_stage[i] = ok ? W_up  [o_abs * D_in + k_abs] : half(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_half8x8 mx, mwg, mwu;
+        simdgroup_load(mx,  x_stage,  K_TILE);
+        simdgroup_load(mwg, wg_stage, O_TILE);
+        simdgroup_load(mwu, wu_stage, O_TILE);
+        simdgroup_multiply_accumulate(acc_g, mx, mwg, acc_g);
+        simdgroup_multiply_accumulate(acc_u, mx, mwu, acc_u);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(acc_g, yg_stage, O_TILE);
+    simdgroup_store(acc_u, yu_stage, O_TILE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = lid0; i < Q_TILE * O_TILE; i += THREADS) {
+        uint q = i / O_TILE; uint oo = i % O_TILE;
+        uint q_abs = q_start + q;
+        uint o_abs = o_start + oo;
+        if (q_abs >= B_count || o_abs >= D_out) continue;
+
+        // bf16-round gate_raw and up_raw to match HF's bf16 residual trajectory.
+        uint gbits = as_type<uint>(yg_stage[i]);
+        uint glsb  = (gbits >> 16) & 1u;
+        float g    = as_type<float>((gbits + 0x7FFFu + glsb) & 0xFFFF0000u);
+        uint ubits = as_type<uint>(yu_stage[i]);
+        uint ulsb  = (ubits >> 16) & 1u;
+        float u    = as_type<float>((ubits + 0x7FFFu + ulsb) & 0xFFFF0000u);
+
+        // GELU-tanh with clamp (match gelu_mul_fp32 + tanh-overflow guard).
+        float arg = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+        if (arg > 20.0f) arg = 20.0f; else if (arg < -20.0f) arg = -20.0f;
+        float gelu_g = 0.5f * g * (1.0f + tanh(arg));
+        float out    = gelu_g * u;
+
+        // bf16-round the final product on write (folds q_geluMul).
+        uint obits   = as_type<uint>(out);
+        uint olsb    = (obits >> 16) & 1u;
+        Y[q_abs * D_out + o_abs] = as_type<float>((obits + 0x7FFFu + olsb) & 0xFFFF0000u);
+    }
+}
+
+// v2: 16×16 output tile with 8 fp32 accumulators (4 for gate, 4 for up).
+// Same fused semantics + bf16 trajectory as vision_ffn_gate_up_gelu_fp32_mma,
+// but 4× arithmetic per stage-barrier pair. Grid: (ceil(D_out/16), ceil(B/16)).
+kernel void vision_ffn_gate_up_gelu_fp32_mma_v2(
+    device const float* X                [[buffer(0)]],
+    device const half*  W_gate           [[buffer(1)]],
+    device const half*  W_up             [[buffer(2)]],
+    device float*       Y                [[buffer(3)]],
+    constant uint& B_count               [[buffer(4)]],
+    constant uint& D_in                  [[buffer(5)]],
+    constant uint& D_out                 [[buffer(6)]],
+    uint2 tg                             [[threadgroup_position_in_grid]],
+    uint2 lid                            [[thread_position_in_threadgroup]])
+{
+    constexpr uint Q_TILE  = 16;
+    constexpr uint K_TILE  = 8;
+    constexpr uint O_TILE  = 16;
+    constexpr uint THREADS = 32;
+
+    const uint o_block = tg.x;
+    const uint q_block = tg.y;
+    const uint o_start = o_block * O_TILE;
+    const uint q_start = q_block * Q_TILE;
+    const uint lid0    = lid.x;
+
+    threadgroup half  x_stage[Q_TILE * K_TILE];    // 16×8 half = 256 B
+    threadgroup half  wg_stage[K_TILE * O_TILE];   // 8×16 half = 256 B
+    threadgroup half  wu_stage[K_TILE * O_TILE];   // 8×16 half = 256 B
+    threadgroup float yg_stage[Q_TILE * O_TILE];   // 16×16 fp32 = 1024 B
+    threadgroup float yu_stage[Q_TILE * O_TILE];   // 16×16 fp32 = 1024 B
+
+    simdgroup_float8x8 acc_g00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc_g01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc_g10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc_g11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc_u00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc_u01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc_u10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc_u11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k = 0; k < D_in; k += K_TILE) {
+        for (uint i = lid0; i < Q_TILE * K_TILE; i += THREADS) {
+            uint q = i / K_TILE; uint kk = i % K_TILE;
+            uint q_abs = q_start + q;
+            uint k_abs = k + kk;
+            x_stage[i] = (q_abs < B_count && k_abs < D_in)
+                ? half(X[q_abs * D_in + k_abs]) : half(0);
+        }
+        for (uint i = lid0; i < K_TILE * O_TILE; i += THREADS) {
+            uint kk = i / O_TILE; uint oo = i % O_TILE;
+            uint o_abs = o_start + oo;
+            uint k_abs = k + kk;
+            bool ok = (o_abs < D_out && k_abs < D_in);
+            wg_stage[i] = ok ? W_gate[o_abs * D_in + k_abs] : half(0);
+            wu_stage[i] = ok ? W_up  [o_abs * D_in + k_abs] : half(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_half8x8 mx0, mx1, mwg0, mwg1, mwu0, mwu1;
+        simdgroup_load(mx0,  x_stage,               K_TILE);
+        simdgroup_load(mx1,  x_stage + 8 * K_TILE,  K_TILE);
+        simdgroup_load(mwg0, wg_stage,              O_TILE);
+        simdgroup_load(mwg1, wg_stage + 8,          O_TILE);
+        simdgroup_load(mwu0, wu_stage,              O_TILE);
+        simdgroup_load(mwu1, wu_stage + 8,          O_TILE);
+
+        // 8 MMAs: (2 Q tiles) × (2 O tiles) × (gate/up). 8× arithmetic per
+        // barrier vs v1's 2 MMAs.
+        simdgroup_multiply_accumulate(acc_g00, mx0, mwg0, acc_g00);
+        simdgroup_multiply_accumulate(acc_g01, mx0, mwg1, acc_g01);
+        simdgroup_multiply_accumulate(acc_g10, mx1, mwg0, acc_g10);
+        simdgroup_multiply_accumulate(acc_g11, mx1, mwg1, acc_g11);
+        simdgroup_multiply_accumulate(acc_u00, mx0, mwu0, acc_u00);
+        simdgroup_multiply_accumulate(acc_u01, mx0, mwu1, acc_u01);
+        simdgroup_multiply_accumulate(acc_u10, mx1, mwu0, acc_u10);
+        simdgroup_multiply_accumulate(acc_u11, mx1, mwu1, acc_u11);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(acc_g00, yg_stage,                     O_TILE);
+    simdgroup_store(acc_g01, yg_stage + 8,                 O_TILE);
+    simdgroup_store(acc_g10, yg_stage + 8 * O_TILE,        O_TILE);
+    simdgroup_store(acc_g11, yg_stage + 8 * O_TILE + 8,    O_TILE);
+    simdgroup_store(acc_u00, yu_stage,                     O_TILE);
+    simdgroup_store(acc_u01, yu_stage + 8,                 O_TILE);
+    simdgroup_store(acc_u10, yu_stage + 8 * O_TILE,        O_TILE);
+    simdgroup_store(acc_u11, yu_stage + 8 * O_TILE + 8,    O_TILE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = lid0; i < Q_TILE * O_TILE; i += THREADS) {
+        uint q = i / O_TILE; uint oo = i % O_TILE;
+        uint q_abs = q_start + q;
+        uint o_abs = o_start + oo;
+        if (q_abs >= B_count || o_abs >= D_out) continue;
+
+        uint gbits = as_type<uint>(yg_stage[i]);
+        uint glsb  = (gbits >> 16) & 1u;
+        float g    = as_type<float>((gbits + 0x7FFFu + glsb) & 0xFFFF0000u);
+        uint ubits = as_type<uint>(yu_stage[i]);
+        uint ulsb  = (ubits >> 16) & 1u;
+        float u    = as_type<float>((ubits + 0x7FFFu + ulsb) & 0xFFFF0000u);
+
+        float arg = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+        if (arg > 20.0f) arg = 20.0f; else if (arg < -20.0f) arg = -20.0f;
+        float gelu_g = 0.5f * g * (1.0f + tanh(arg));
+        float out    = gelu_g * u;
+
+        uint obits   = as_type<uint>(out);
+        uint olsb    = (obits >> 16) & 1u;
+        Y[q_abs * D_out + o_abs] = as_type<float>((obits + 0x7FFFu + olsb) & 0xFFFF0000u);
     }
 }
 
