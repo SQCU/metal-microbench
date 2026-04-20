@@ -12,13 +12,14 @@
     --colorD: #f69; /* pink */
     --colorAgg: #ccc; /* aggregate line */
   }
-  html, body { margin: 0; padding: 0; background: #0a0a0a; color: #d4d4d4; font-family: ui-monospace, 'SF Mono', Monaco, monospace; }
-  header { padding: 0.7em 1.2em; border-bottom: 1px solid #222; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.6em; }
+  html, body { margin: 0; padding: 0; background: #0a0a0a; color: #d4d4d4; font-family: ui-monospace, 'SF Mono', Monaco, monospace; height: 100%; }
+  body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+  header { padding: 0.7em 1.2em; border-bottom: 1px solid #222; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.6em; flex: none; }
   header h1 { margin: 0; font-size: 1rem; font-weight: 500; color: #6a9; }
   header .status { font-size: 0.78rem; color: #888; }
   .launcher {
     display: flex; gap: 0.8em; align-items: center;
-    padding: 0.6em 1em; border-bottom: 1px solid #222;
+    padding: 0.6em 1em; border-bottom: 1px solid #222; flex: none;
   }
   .launcher button.launchAll {
     background: #5cf; color: #002; border: 0; padding: 0.5em 1.2em;
@@ -31,13 +32,14 @@
     display: grid;
     grid-template-columns: 1fr 1fr;
     grid-template-rows: 1fr 1fr;
-    gap: 0.7em;
-    padding: 0.7em;
+    gap: 0.6em;
+    padding: 0.6em;
+    flex: 1; min-height: 0; overflow: hidden;
   }
   .pane {
-    display: flex; flex-direction: column; gap: 0.4em;
+    display: flex; flex-direction: column; gap: 0.3em;
     background: #111; border: 1px solid #222; border-radius: 4px;
-    padding: 0.6em; min-height: 0;
+    padding: 0.5em; min-height: 0; min-width: 0;
   }
   .pane h2 {
     margin: 0; font-size: 0.82rem; font-weight: 500;
@@ -49,9 +51,10 @@
   .pane#paneC h2 .dot { background: var(--colorC); }
   .pane#paneD h2 .dot { background: var(--colorD); }
   textarea {
-    width: 100%; min-height: 3.5em; resize: vertical; box-sizing: border-box;
+    width: 100%; height: 2.6em; min-height: 1.8em; max-height: 8em;
+    resize: vertical; box-sizing: border-box;
     background: #0a0a0a; color: #d4d4d4; border: 1px solid #333; border-radius: 3px;
-    font: inherit; padding: 0.4em;
+    font: inherit; font-size: 0.85rem; padding: 0.3em 0.4em;
   }
   .imgrow { display: flex; align-items: center; gap: 0.4em; font-size: 0.72rem; color: #888; }
   .imgrow input[type=file] { font-size: 0.68rem; color: #888; width: 11em; }
@@ -64,11 +67,22 @@
   }
   button.ask:disabled { background: #333; color: #888; cursor: not-allowed; }
   .meta { font-size: 0.7rem; color: #888; margin-left: auto; }
+  /* Output scrolls internally; fade gradients at top/bottom hint there's
+     more text above/below when the pane is tall enough to overflow. We
+     set min-height:0 on flex parents so this div's flex:1 actually shrinks
+     rather than forcing the pane to grow past the viewport. */
   .output {
-    flex: 1; overflow-y: auto; background: #0a0a0a; border: 1px solid #222; border-radius: 3px;
+    position: relative;
+    flex: 1 1 0; min-height: 0; overflow-y: auto;
+    background: #0a0a0a; border: 1px solid #222; border-radius: 3px;
     padding: 0.5em; white-space: pre-wrap; word-wrap: break-word;
-    font-size: 0.8rem; line-height: 1.35; min-height: 6em;
+    font-size: 0.8rem; line-height: 1.35;
+    /* CSS mask: fade the top/bottom 1em of visible area so long outputs
+       feel "shimmery" — communicates overflow without chrome. */
+    mask-image: linear-gradient(to bottom, transparent 0, #000 1em, #000 calc(100% - 1em), transparent 100%);
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 1em, #000 calc(100% - 1em), transparent 100%);
   }
+  .output:empty { mask-image: none; -webkit-mask-image: none; }
   .output:empty::before { content: '(output streams here)'; color: #444; }
   .kvstrip { display: flex; flex-wrap: wrap; gap: 2px; padding: 0.3em; background: #0a0a0a; border: 1px solid #222; border-radius: 3px; min-height: 1.6em; font-size: 0.7rem; }
   .kvstrip .label { color: #666; margin-right: 0.4em; align-self: center; }
@@ -81,7 +95,8 @@
   .kvstrip:empty::after { content: '(no pages yet)'; color: #444; }
 
   .bwpanel {
-    padding: 0.6em 1em 1em; border-top: 1px solid #222;
+    padding: 0.5em 1em 0.8em; border-top: 1px solid #222;
+    flex: none;
   }
   .bwpanel h3 {
     margin: 0 0 0.4em; font-size: 0.82rem; color: #6a9; font-weight: 500;
@@ -89,7 +104,7 @@
   }
   .bwpanel h3 .legend { display: flex; gap: 0.7em; font-size: 0.72rem; color: #888; font-weight: 400; }
   .bwpanel h3 .legend .swatch { display: inline-block; width: 0.8em; height: 0.8em; vertical-align: middle; margin-right: 0.2em; border-radius: 1px; }
-  .bwpanel canvas { width: 100%; height: 200px; display: block; background: #050505; border: 1px solid #222; border-radius: 3px; }
+  .bwpanel canvas { width: 100%; height: 140px; display: block; background: #050505; border: 1px solid #222; border-radius: 3px; }
   .bwpanel .counters {
     display: grid; grid-template-columns: repeat(5, 1fr); gap: 0.5em;
     margin-top: 0.4em; font-size: 0.75rem; color: #888;
@@ -325,8 +340,10 @@ async function ask(which) {
 async function launchAll() {
   const btn = document.getElementById('launchAll');
   btn.disabled = true;
-  // Reset the global timeline anchor for the chart.
+  // Reset the global timeline anchor + y-axis high-water so each run starts
+  // with a fresh frame of reference.
   chartStart = performance.now();
+  yMaxHigh = 60;
   try {
     await Promise.allSettled(PANES.map(p => ask(p)));
   } finally {
@@ -385,6 +402,12 @@ function renderKv(snapshot) {
 
 // --- bandwidth chart ---
 let chartStart = performance.now();
+// High-water mark for the y-axis: grows with instantaneous peaks, decays
+// slowly after streams finish so the plateau stays visible instead of
+// collapsing to the floor the moment every stream hits .done. Re-set to
+// 60 when the user relaunches from zero so an idle reset doesn't keep
+// old peaks around indefinitely.
+let yMaxHigh = 60;
 const chart = document.getElementById('bwChart');
 const cctx = chart.getContext('2d');
 
@@ -421,15 +444,21 @@ function drawChart() {
   const elapsedMs = now - chartStart;
   const xStart = Math.max(0, elapsedMs - historyMs);
   const xEnd = Math.max(historyMs, elapsedMs);
-  // Y axis: 0 .. yMax tok/s. Auto-scale by highest recent rate; min 60.
-  let yMax = 60;
-  for (let tMs = Math.max(0, elapsedMs - 5000); tMs <= elapsedMs; tMs += 100) {
+  // Y axis: grows with the peak aggregate rate across the whole visible
+  // window, and decays slowly (~0.4%/frame ≈ 25%/sec at 60fps) once the
+  // streams finish and rates fall. Without the decay floor, the chart
+  // would re-scale to ~60 the moment gen ends and the historical plateau
+  // would be invisible. With it, the shape of "ramp → plateau → fall"
+  // stays readable for the full 30-second window.
+  let peak = 60;
+  for (let tMs = xStart; tMs <= elapsedMs; tMs += 250) {
     const tAbs = chartStart + tMs;
     let agg = 0;
     for (const p of PANES) agg += bandwidthAt(p, tAbs);
-    if (agg > yMax) yMax = agg;
+    if (agg > peak) peak = agg;
   }
-  yMax = Math.ceil(yMax / 20) * 20;  // round up to nearest 20
+  yMaxHigh = Math.max(peak, yMaxHigh * 0.996);
+  const yMax = Math.ceil(yMaxHigh / 20) * 20;
 
   // Grid.
   cctx.strokeStyle = '#1a1a1a'; cctx.lineWidth = 1;

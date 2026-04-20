@@ -168,10 +168,60 @@ Measured win on M5 (amongus frame):
 - cold chat (miss): **13.2 s**
 - warm chat (hit):  **5.7 s**  — same image, second request
 
-### `GET /`
+### `GET /`  — the tetraplex demo
 
-The side-by-side streaming demo. Two textareas, two response panes, a file
-picker per pane for optional image attachment, one GPU.
+Four streams, one GPU. The web page at the root is a live demonstration of
+everything the engine does: multi-slot batched decode, prefix cache sharing,
+multimodal input, per-session KV tenancy.
+
+Layout:
+
+```
+  ┌───────────────────────────── header ─────────────────────────────┐
+  │ [ launch all 4 ]  fires every pane at once                        │
+  ├──────────────────────┬───────────────────────────────────────────┤
+  │ stream A             │ stream B                                   │
+  │  textarea + optional │                                            │
+  │  image upload        │                                            │
+  │  ask button          │                                            │
+  │  (streaming output)  │                                            │
+  │  [kv pages strip]    │   ← colored cells: green=private,          │
+  ├──────────────────────┼───────────────────────────────────────────┤      orange=shared with 1 other,
+  │ stream C             │ stream D                                   │       red=shared with ≥2 others
+  │                      │                                            │
+  ├──────────────────────┴───────────────────────────────────────────┤
+  │  bandwidth chart (4 lines + aggregate, 30-second rolling window)  │
+  │  A: tok/s · B: tok/s · C: tok/s · D: tok/s · Σ: total             │
+  └───────────────────────────────────────────────────────────────────┘
+```
+
+**What to look for during a recording:**
+
+1. *Cold-start burst*: hit **launch all 4** with four different short prompts. All
+   four bandwidth lines sit at zero for ~0.5 s (multi-slot prefill), then the
+   aggregate rockets to ~120 tok/s while each individual stream settles around
+   30 tok/s. The Σ counter stays pinned near peak until the first stream finishes.
+
+2. *Prefix sharing*: give A and C the same system prompt (e.g. *"You are a concise
+   assistant."*). After A's prefill completes, the content-hash cache has its pages
+   indexed — C's submit probes, finds the hit, and adopts A's filled pages read-only.
+   A's kv-strip and C's kv-strip now both have orange cells at the same `phys` ids.
+   Hover a cell for the exact sharing tuple.
+
+3. *Multimodal*: attach an image to any pane, ask something about it. Vision tower
+   runs once on first submission (~7 s TTFT on M5); subsequent identical images hit
+   the SHA-256 soft-tokens cache and skip vision entirely (~5 s saved per repeat).
+
+4. *Introspection moment*: attach a screenshot of the running demo to one pane and
+   ask "what is happening in this image?". Gemma-4 will describe your dashboard
+   (the four streams, the telemetry fields, the fact that two panes are duplicates
+   if you set them that way) — a small but surprisingly sharp example of the
+   model reading its own interface.
+
+**Curl-equivalence**: every button in the demo hits an endpoint documented above.
+`launch all 4` is four parallel `POST /v1/chat/completions` with `stream:true`. The
+kv tenancy strip polls `GET /v1/kv/snapshot` every 300 ms. The bandwidth chart is
+pure client-side (counts SSE delta arrivals over a 500 ms sliding window).
 
 ```bash
 open http://localhost:8000/    # macOS
