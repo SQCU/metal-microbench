@@ -331,8 +331,10 @@ let visionAttnPrefillFp32PSO = pso("vision_attn_prefill_fp32")
 let visionAttnFlashFp32PSO   = pso("vision_attn_flash_fp32")
 let visionGemmFp32MmaPSO     = pso("vision_gemm_fp32_mma")
 let visionGemmFp32MmaV2PSO   = pso("vision_gemm_fp32_mma_v2")
+let visionGemmFp32MmaV3PSO   = pso("vision_gemm_fp32_mma_v3")
 let visionFfnGateUpGeluFp32MmaPSO   = pso("vision_ffn_gate_up_gelu_fp32_mma")
 let visionFfnGateUpGeluFp32MmaV2PSO = pso("vision_ffn_gate_up_gelu_fp32_mma_v2")
+let visionFfnGateUpGeluFp32MmaV3PSO = pso("vision_ffn_gate_up_gelu_fp32_mma_v3")
 let geluMulFp32PSO       = pso("gelu_mul_fp32")
 let visionPool2DFp32InFp32OutPSO = pso("vision_pool_2d_fp32in_fp32out")
 let visionStdNormFp32PSO = pso("vision_scaled_std_normalize_fp32")
@@ -495,17 +497,32 @@ func encGemvFp32V5(_ cb: MTLCommandBuffer, x: MTLBuffer, W: MTLBuffer, out: MTLB
     if quantOut { encQuantizeFp32ToBf16(cb, x: out, N: Dout, numVecs: B) }
 }
 
-// Batched MMA GEMM dispatcher. Grid size depends on the variant:
-//   v2 (default): (ceil(D_out/16), ceil(B/16)) — 16×16 output tile, 4 accums/TG.
-//   v1 (VISION_GEMM_V1=1): (ceil(D_out/8), ceil(B/8)) — 8×8, 1 accum/TG.
+// Batched MMA GEMM dispatcher. Kernel picked by env:
+//   default:        v2 — 16×16 tile, 4 accums (best measured on M5 Max).
+//   VISION_GEMM_V3: v3 — v2 + K-unroll=2. Halves barriers but MMA issue
+//                        rate is the actual ceiling on this hardware, so
+//                        it doesn't improve on v2 (kept reachable for A/B
+//                        on future targets where barriers are the bottleneck).
+//   VISION_GEMM_V1: v1 — 8×8 tile, 1 accum (legacy baseline, 1.25× slower).
 // quantOut=true folds the following bf16-quantize dispatch into the output store.
 func encVisionGemmMmaFp32(_ cb: MTLCommandBuffer, x: MTLBuffer, W: MTLBuffer, out: MTLBuffer,
                            B: Int, Din: Int, Dout: Int, quantOut: Bool = false) {
     precondition(Din % 8 == 0 && Dout % 8 == 0,
                  "vision_gemm_fp32_mma requires Din and Dout multiples of 8 (got \(Din), \(Dout))")
-    let useV1 = ProcessInfo.processInfo.environment["VISION_GEMM_V1"] != nil
+    let env = ProcessInfo.processInfo.environment
+    let useV1 = env["VISION_GEMM_V1"] != nil
+    let useV3 = env["VISION_GEMM_V3"] != nil && (Din % 16 == 0)
+    let pso: MTLComputePipelineState
+    let tile: Int
+    if useV1 {
+        pso = visionGemmFp32MmaPSO; tile = 8
+    } else if useV3 {
+        pso = visionGemmFp32MmaV3PSO; tile = 16
+    } else {
+        pso = visionGemmFp32MmaV2PSO; tile = 16
+    }
     let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(useV1 ? visionGemmFp32MmaPSO : visionGemmFp32MmaV2PSO)
+    enc.setComputePipelineState(pso)
     enc.setBuffer(x, offset: 0, index: 0); enc.setBuffer(W, offset: 0, index: 1)
     enc.setBuffer(out, offset: 0, index: 2)
     var Bv = UInt32(B), Dv = UInt32(Din), Ov = UInt32(Dout), Qv = UInt32(quantOut ? 1 : 0)
@@ -513,10 +530,8 @@ func encVisionGemmMmaFp32(_ cb: MTLCommandBuffer, x: MTLBuffer, W: MTLBuffer, ou
     enc.setBytes(&Dv, length: 4, index: 4)
     enc.setBytes(&Ov, length: 4, index: 5)
     enc.setBytes(&Qv, length: 4, index: 6)
-    let tileQ = useV1 ? 8 : 16
-    let tileO = useV1 ? 8 : 16
-    let qBlocks = (B + tileQ - 1) / tileQ
-    let oBlocks = (Dout + tileO - 1) / tileO
+    let qBlocks = (B + tile - 1) / tile
+    let oBlocks = (Dout + tile - 1) / tile
     enc.dispatchThreadgroups(MTLSize(width: oBlocks, height: qBlocks, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
@@ -530,9 +545,20 @@ func encVisionFfnGateUpGeluFp32(_ cb: MTLCommandBuffer,
                                  out: MTLBuffer, B: Int, Din: Int, Dout: Int) {
     precondition(Din % 8 == 0 && Dout % 8 == 0,
                  "vision_ffn_gate_up_gelu requires Din and Dout multiples of 8 (got \(Din), \(Dout))")
-    let useV1 = ProcessInfo.processInfo.environment["VISION_GEMM_V1"] != nil
+    let env = ProcessInfo.processInfo.environment
+    let useV1 = env["VISION_GEMM_V1"] != nil
+    let useV3 = env["VISION_GEMM_V3"] != nil && (Din % 16 == 0)
+    let pso: MTLComputePipelineState
+    let tile: Int
+    if useV1 {
+        pso = visionFfnGateUpGeluFp32MmaPSO; tile = 8
+    } else if useV3 {
+        pso = visionFfnGateUpGeluFp32MmaV3PSO; tile = 16
+    } else {
+        pso = visionFfnGateUpGeluFp32MmaV2PSO; tile = 16
+    }
     let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(useV1 ? visionFfnGateUpGeluFp32MmaPSO : visionFfnGateUpGeluFp32MmaV2PSO)
+    enc.setComputePipelineState(pso)
     enc.setBuffer(x,     offset: 0, index: 0)
     enc.setBuffer(Wgate, offset: 0, index: 1)
     enc.setBuffer(Wup,   offset: 0, index: 2)
@@ -541,7 +567,6 @@ func encVisionFfnGateUpGeluFp32(_ cb: MTLCommandBuffer,
     enc.setBytes(&Bv, length: 4, index: 4)
     enc.setBytes(&Dv, length: 4, index: 5)
     enc.setBytes(&Ov, length: 4, index: 6)
-    let tile = useV1 ? 8 : 16
     let qBlocks = (B + tile - 1) / tile
     let oBlocks = (Dout + tile - 1) / tile
     enc.dispatchThreadgroups(MTLSize(width: oBlocks, height: qBlocks, depth: 1),

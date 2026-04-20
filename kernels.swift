@@ -4783,6 +4783,108 @@ kernel void vision_gemm_fp32_mma_v2(
     }
 }
 
+// v3: 16×16 output tile with K-unroll=2. Stages a 16×16 X-tile and a
+// 16×16 W-tile per outer iteration (32 K elements in each direction
+// doubled: Q×K_CHUNK for X, K_CHUNK×O for W), then issues 2 inner
+// MMA passes (8 MMAs total) before the next barrier. Halves the
+// barrier count vs v2 (1152/16 = 72 barriers vs 144) while keeping
+// the same 1-simdgroup / 32-thread shape.
+//
+// D_in must be a multiple of K_CHUNK=16. For vision this holds for all
+// projections (1152 and 4304 both divisible by 16).
+kernel void vision_gemm_fp32_mma_v3(
+    device const float* X               [[buffer(0)]],
+    device const half*  W               [[buffer(1)]],
+    device float*       Y               [[buffer(2)]],
+    constant uint& B_count              [[buffer(3)]],
+    constant uint& D_in                 [[buffer(4)]],
+    constant uint& D_out                [[buffer(5)]],
+    constant uint& quant_out            [[buffer(6)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    constexpr uint Q_TILE  = 16;
+    constexpr uint K_TILE  = 8;
+    constexpr uint K_UNROLL = 2;
+    constexpr uint K_CHUNK = K_TILE * K_UNROLL;   // 16
+    constexpr uint O_TILE  = 16;
+    constexpr uint THREADS = 32;
+
+    const uint o_block = tg.x;
+    const uint q_block = tg.y;
+    const uint o_start = o_block * O_TILE;
+    const uint q_start = q_block * Q_TILE;
+    const uint lid0    = lid.x;
+
+    threadgroup half  x_stage[Q_TILE * K_CHUNK];   // 16×16 half = 512 B
+    threadgroup half  w_stage[K_CHUNK * O_TILE];   // 16×16 half = 512 B
+    threadgroup float y_stage[Q_TILE * O_TILE];    // 16×16 fp32 = 1024 B
+
+    simdgroup_float8x8 acc00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k = 0; k < D_in; k += K_CHUNK) {
+        // Stage X[q_start..q_start+16, k..k+16] as half (256 halves).
+        for (uint i = lid0; i < Q_TILE * K_CHUNK; i += THREADS) {
+            uint q = i / K_CHUNK; uint kk = i % K_CHUNK;
+            uint q_abs = q_start + q;
+            uint k_abs = k + kk;
+            x_stage[i] = (q_abs < B_count && k_abs < D_in)
+                ? half(X[q_abs * D_in + k_abs]) : half(0);
+        }
+        // Stage W transposed: w_stage[kk, oo] = W[o_start+oo, k+kk].
+        for (uint i = lid0; i < K_CHUNK * O_TILE; i += THREADS) {
+            uint kk = i / O_TILE; uint oo = i % O_TILE;
+            uint o_abs = o_start + oo;
+            uint k_abs = k + kk;
+            w_stage[i] = (o_abs < D_out && k_abs < D_in)
+                ? W[o_abs * D_in + k_abs] : half(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Inner K-loop: K_UNROLL=2 passes, 4 MMAs each = 8 MMAs per barrier.
+        #pragma unroll
+        for (uint kk = 0; kk < K_UNROLL; ++kk) {
+            simdgroup_half8x8 mx0, mx1, mw0, mw1;
+            // X leading-dim = K_CHUNK; step 8 along K per inner pass.
+            simdgroup_load(mx0, x_stage + kk * 8,                   K_CHUNK);
+            simdgroup_load(mx1, x_stage + 8 * K_CHUNK + kk * 8,     K_CHUNK);
+            // W leading-dim = O_TILE; step (8 * O_TILE) rows per inner pass.
+            simdgroup_load(mw0, w_stage + kk * 8 * O_TILE,          O_TILE);
+            simdgroup_load(mw1, w_stage + kk * 8 * O_TILE + 8,      O_TILE);
+
+            simdgroup_multiply_accumulate(acc00, mx0, mw0, acc00);
+            simdgroup_multiply_accumulate(acc01, mx0, mw1, acc01);
+            simdgroup_multiply_accumulate(acc10, mx1, mw0, acc10);
+            simdgroup_multiply_accumulate(acc11, mx1, mw1, acc11);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(acc00, y_stage,                         O_TILE);
+    simdgroup_store(acc01, y_stage + 8,                     O_TILE);
+    simdgroup_store(acc10, y_stage + 8 * O_TILE,            O_TILE);
+    simdgroup_store(acc11, y_stage + 8 * O_TILE + 8,        O_TILE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = lid0; i < Q_TILE * O_TILE; i += THREADS) {
+        uint q = i / O_TILE; uint oo = i % O_TILE;
+        uint q_abs = q_start + q;
+        uint o_abs = o_start + oo;
+        if (q_abs < B_count && o_abs < D_out) {
+            float v = y_stage[i];
+            if (quant_out != 0u) {
+                uint bits = as_type<uint>(v);
+                uint lsb  = (bits >> 16) & 1u;
+                v = as_type<float>((bits + 0x7FFFu + lsb) & 0xFFFF0000u);
+            }
+            Y[q_abs * D_out + o_abs] = v;
+        }
+    }
+}
+
 // Flash-attention variant of vision_attn_prefill_fp32. Bidirectional (no
 // causal mask), optional padding mask, per-(head, q_block=8) threadgroup,
 // online softmax, simdgroup_matrix<half, 8, 8> MMA for QK accumulated into
@@ -5157,6 +5259,122 @@ kernel void vision_ffn_gate_up_gelu_fp32_mma_v2(
         simdgroup_multiply_accumulate(acc_u01, mx0, mwu1, acc_u01);
         simdgroup_multiply_accumulate(acc_u10, mx1, mwu0, acc_u10);
         simdgroup_multiply_accumulate(acc_u11, mx1, mwu1, acc_u11);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(acc_g00, yg_stage,                     O_TILE);
+    simdgroup_store(acc_g01, yg_stage + 8,                 O_TILE);
+    simdgroup_store(acc_g10, yg_stage + 8 * O_TILE,        O_TILE);
+    simdgroup_store(acc_g11, yg_stage + 8 * O_TILE + 8,    O_TILE);
+    simdgroup_store(acc_u00, yu_stage,                     O_TILE);
+    simdgroup_store(acc_u01, yu_stage + 8,                 O_TILE);
+    simdgroup_store(acc_u10, yu_stage + 8 * O_TILE,        O_TILE);
+    simdgroup_store(acc_u11, yu_stage + 8 * O_TILE + 8,    O_TILE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = lid0; i < Q_TILE * O_TILE; i += THREADS) {
+        uint q = i / O_TILE; uint oo = i % O_TILE;
+        uint q_abs = q_start + q;
+        uint o_abs = o_start + oo;
+        if (q_abs >= B_count || o_abs >= D_out) continue;
+
+        uint gbits = as_type<uint>(yg_stage[i]);
+        uint glsb  = (gbits >> 16) & 1u;
+        float g    = as_type<float>((gbits + 0x7FFFu + glsb) & 0xFFFF0000u);
+        uint ubits = as_type<uint>(yu_stage[i]);
+        uint ulsb  = (ubits >> 16) & 1u;
+        float u    = as_type<float>((ubits + 0x7FFFu + ulsb) & 0xFFFF0000u);
+
+        float arg = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+        if (arg > 20.0f) arg = 20.0f; else if (arg < -20.0f) arg = -20.0f;
+        float gelu_g = 0.5f * g * (1.0f + tanh(arg));
+        float out    = gelu_g * u;
+
+        uint obits   = as_type<uint>(out);
+        uint olsb    = (obits >> 16) & 1u;
+        Y[q_abs * D_out + o_abs] = as_type<float>((obits + 0x7FFFu + olsb) & 0xFFFF0000u);
+    }
+}
+
+// v3 fused FFN: 16×16 output tile + K-unroll=2. 16 MMAs per barrier pair
+// (8 gate + 8 up), halves the barrier count vs v2 for the D_in=1152 → 4304
+// gate/up projection pair. Same bf16 trajectory as earlier variants.
+kernel void vision_ffn_gate_up_gelu_fp32_mma_v3(
+    device const float* X                [[buffer(0)]],
+    device const half*  W_gate           [[buffer(1)]],
+    device const half*  W_up             [[buffer(2)]],
+    device float*       Y                [[buffer(3)]],
+    constant uint& B_count               [[buffer(4)]],
+    constant uint& D_in                  [[buffer(5)]],
+    constant uint& D_out                 [[buffer(6)]],
+    uint2 tg                             [[threadgroup_position_in_grid]],
+    uint2 lid                            [[thread_position_in_threadgroup]])
+{
+    constexpr uint Q_TILE   = 16;
+    constexpr uint K_TILE   = 8;
+    constexpr uint K_UNROLL = 2;
+    constexpr uint K_CHUNK  = K_TILE * K_UNROLL;   // 16
+    constexpr uint O_TILE   = 16;
+    constexpr uint THREADS  = 32;
+
+    const uint o_block = tg.x;
+    const uint q_block = tg.y;
+    const uint o_start = o_block * O_TILE;
+    const uint q_start = q_block * Q_TILE;
+    const uint lid0    = lid.x;
+
+    threadgroup half  x_stage[Q_TILE * K_CHUNK];     // 512 B
+    threadgroup half  wg_stage[K_CHUNK * O_TILE];    // 512 B
+    threadgroup half  wu_stage[K_CHUNK * O_TILE];    // 512 B
+    threadgroup float yg_stage[Q_TILE * O_TILE];     // 1024 B
+    threadgroup float yu_stage[Q_TILE * O_TILE];     // 1024 B
+
+    simdgroup_float8x8 acc_g00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc_g01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc_g10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc_g11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc_u00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc_u01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc_u10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc_u11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k = 0; k < D_in; k += K_CHUNK) {
+        for (uint i = lid0; i < Q_TILE * K_CHUNK; i += THREADS) {
+            uint q = i / K_CHUNK; uint kk = i % K_CHUNK;
+            uint q_abs = q_start + q;
+            uint k_abs = k + kk;
+            x_stage[i] = (q_abs < B_count && k_abs < D_in)
+                ? half(X[q_abs * D_in + k_abs]) : half(0);
+        }
+        for (uint i = lid0; i < K_CHUNK * O_TILE; i += THREADS) {
+            uint kk = i / O_TILE; uint oo = i % O_TILE;
+            uint o_abs = o_start + oo;
+            uint k_abs = k + kk;
+            bool ok = (o_abs < D_out && k_abs < D_in);
+            wg_stage[i] = ok ? W_gate[o_abs * D_in + k_abs] : half(0);
+            wu_stage[i] = ok ? W_up  [o_abs * D_in + k_abs] : half(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll
+        for (uint kk = 0; kk < K_UNROLL; ++kk) {
+            simdgroup_half8x8 mx0, mx1, mwg0, mwg1, mwu0, mwu1;
+            simdgroup_load(mx0,  x_stage + kk * 8,                  K_CHUNK);
+            simdgroup_load(mx1,  x_stage + 8 * K_CHUNK + kk * 8,    K_CHUNK);
+            simdgroup_load(mwg0, wg_stage + kk * 8 * O_TILE,        O_TILE);
+            simdgroup_load(mwg1, wg_stage + kk * 8 * O_TILE + 8,    O_TILE);
+            simdgroup_load(mwu0, wu_stage + kk * 8 * O_TILE,        O_TILE);
+            simdgroup_load(mwu1, wu_stage + kk * 8 * O_TILE + 8,    O_TILE);
+
+            simdgroup_multiply_accumulate(acc_g00, mx0, mwg0, acc_g00);
+            simdgroup_multiply_accumulate(acc_g01, mx0, mwg1, acc_g01);
+            simdgroup_multiply_accumulate(acc_g10, mx1, mwg0, acc_g10);
+            simdgroup_multiply_accumulate(acc_g11, mx1, mwg1, acc_g11);
+            simdgroup_multiply_accumulate(acc_u00, mx0, mwu0, acc_u00);
+            simdgroup_multiply_accumulate(acc_u01, mx0, mwu1, acc_u01);
+            simdgroup_multiply_accumulate(acc_u10, mx1, mwu0, acc_u10);
+            simdgroup_multiply_accumulate(acc_u11, mx1, mwu1, acc_u11);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
