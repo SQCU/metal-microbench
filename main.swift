@@ -273,6 +273,23 @@ let pre_v_full_out   = emptyHalf(B * MAX_Q_LEN * FULL_KV_H * FULL_HD)
 let pre_attn_out     = emptyHalf(B * MAX_Q_LEN * max(SLIDE_H * SLIDE_HD, FULL_H * FULL_HD))
 let pre_input_tokens = device.makeBuffer(length: B * MAX_Q_LEN * 4, options: .storageModeShared)!
 let pre_q_positions  = device.makeBuffer(length: B * MAX_Q_LEN * 4, options: .storageModeShared)!
+
+// Staging buffers for multi-tile-in-one-CB prefill. CPU populates the wide
+// staging buffers with every tile's input in one shot before committing,
+// and each tile's per-CB encoding starts with a blit from the staging
+// region for THAT tile into the compact working buffers above. This lets
+// N tiles share one commit (~100 μs saved per tile) without needing to
+// widen every single pre_* residual buffer — the residual buffers stay
+// at MAX_Q_LEN capacity and get overwritten tile-by-tile.
+//
+// MAX_PREFILL_TILES sets the cap on tiles-per-single-CB. A 280-soft-token
+// image rounds up to 35 tiles, so 64 is a comfortable headroom.
+let MAX_PREFILL_TILES = 64
+let MAX_PREFILL_TOKENS = MAX_PREFILL_TILES * MAX_Q_LEN   // 512
+let pre_input_tokens_wide = device.makeBuffer(length: B * MAX_PREFILL_TOKENS * 4, options: .storageModeShared)!
+let pre_q_positions_wide  = device.makeBuffer(length: B * MAX_PREFILL_TOKENS * 4, options: .storageModeShared)!
+// Soft-token staging: fp16 rows ready to copy into pre_hidden slot-s' range.
+let pre_hidden_wide       = emptyHalf(B * MAX_PREFILL_TOKENS * HIDDEN)
 let pre_logits       = emptyHalf(B * MAX_Q_LEN * VOCAB)
 
 // Prefill MoE state. TOTAL_PREFILL_SLOTS = B * MAX_Q_LEN * TOPK = 256 at Q_LEN=8.
@@ -1758,12 +1775,21 @@ func buildStepCB(_ w: LmWeights) -> MTLCommandBuffer {
 //
 // Returns the built (uncommitted) CB. After commit+wait, pre_logits is
 // populated with [B, qLen, VOCAB] fp16 logits.
-func buildPrefillCB(_ w: LmWeights, qLen: Int, skipEmbed: Bool = false) -> MTLCommandBuffer {
+// Encode the prefill pipeline (embed/scale or skip → 30 layers → optional
+// unembed+softcap) into a caller-provided CB. Factored out so multi-tile
+// drivers can chain several tiles into one CB with one commit.
+//   skipEmbed=true  → caller pre-populated pre_hidden (e.g. image soft
+//                     tokens already in text hidden space); kernel skips
+//                     embed_lookup + embed-scale.
+//   skipUnembed=true→ intermediate tiles whose logits we don't use —
+//                     saves the HIDDEN→VOCAB=262144 GEMV + softcap per
+//                     skipped tile.
+func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
+                            qLen: Int, skipEmbed: Bool = false,
+                            skipUnembed: Bool = false) {
     precondition(qLen <= MAX_Q_LEN, "qLen \(qLen) exceeds MAX_Q_LEN=\(MAX_Q_LEN)")
     let N = B * qLen               // total token rows
     let NS = B * qLen * TOPK       // total MoE slots
-
-    let cb = queue.makeCommandBuffer()!
 
     if !skipEmbed {
         // Embed + Gemma-4 sqrt(hidden) scale, now over N = B*qLen tokens.
@@ -1883,11 +1909,20 @@ func buildPrefillCB(_ w: LmWeights, qLen: Int, skipEmbed: Bool = false) -> MTLCo
     // Final output norm + unembed + softcap. v4 softcap's accumulator is
     // MAX_B=8 wide — prefill's N = B*qLen can exceed that, so split into a
     // numVecs-generic GEMV followed by an in-place softcap pass.
-    encRMSNormG(cb, x: pre_hidden, gammaBuf: w.outputNorm, out: pre_hidden_norm,
-                D: HIDDEN, numVecs: N)
-    encGemvV5(cb, pre_hidden_norm, w.unembedW, pre_logits,
-              Din: HIDDEN, Dout: VOCAB, numVecs: N)
-    encSoftcapInto(cb, buf: pre_logits, N: VOCAB, numVecs: N, cap: 30.0)
+    if !skipUnembed {
+        encRMSNormG(cb, x: pre_hidden, gammaBuf: w.outputNorm, out: pre_hidden_norm,
+                    D: HIDDEN, numVecs: N)
+        encGemvV5(cb, pre_hidden_norm, w.unembedW, pre_logits,
+                  Din: HIDDEN, Dout: VOCAB, numVecs: N)
+        encSoftcapInto(cb, buf: pre_logits, N: VOCAB, numVecs: N, cap: 30.0)
+    }
+}
+
+// Back-compat wrapper for callers (LmSession, runLmPrefillValidate) that
+// want a single-tile CB handed to them ready to commit.
+func buildPrefillCB(_ w: LmWeights, qLen: Int, skipEmbed: Bool = false) -> MTLCommandBuffer {
+    let cb = queue.makeCommandBuffer()!
+    encodePrefillTileInto(cb, w, qLen: qLen, skipEmbed: skipEmbed, skipUnembed: false)
     return cb
 }
 
