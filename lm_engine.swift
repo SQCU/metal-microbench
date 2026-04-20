@@ -1329,8 +1329,35 @@ func runLmMultimodal(ggufPath: String, stPath: String, imagePath: String,
     catch { print("  gemma4ImagePreprocess failed: \(error)"); return }
     print("  image preprocessed: \(batch.numRealPatches) real patches, grid \(batch.gridH)×\(batch.gridW)")
 
-    let (rawSoftTokens, rawNPooled) = runVisionTowerForward(batch: batch, weights: visWeights,
-                                                             device: device, queue: queue)
+    // LM_MM_FORCE_SOFTS=<path.bin> — skip the vision tower and feed the
+    // given binary as soft-token input. Binary is fp16 row-major [N, HIDDEN].
+    // Use for isolating LM-side multimodal bugs from vision-tower bugs:
+    // dump HF's reference softs for a frame, feed them here, and if output
+    // is STILL garbage the bug is downstream in LM (not in vision).
+    let forceSoftsPath = ProcessInfo.processInfo.environment["LM_MM_FORCE_SOFTS"]
+    let rawSoftTokens: MTLBuffer
+    let rawNPooled: Int
+    let forceIsFp32: Bool
+    if let path = forceSoftsPath,
+       let data = try? Data(contentsOf: URL(fileURLWithPath: path)) {
+        let bytesPerElem = 2   // fp16
+        let elements = data.count / bytesPerElem
+        precondition(elements % HIDDEN == 0, "force-softs file size must be a multiple of HIDDEN*2 bytes")
+        let n = elements / HIDDEN
+        let buf = device.makeBuffer(length: data.count, options: .storageModeShared)!
+        data.withUnsafeBytes { src in
+            memcpy(buf.contents(), src.baseAddress, data.count)
+        }
+        rawSoftTokens = buf
+        rawNPooled = n
+        forceIsFp32 = false
+        print("  LM_MM_FORCE_SOFTS: skipping vision tower, loaded \(n) fp16 soft tokens from \(path)")
+    } else {
+        forceIsFp32 = true
+        let (st, np) = runVisionTowerForward(batch: batch, weights: visWeights,
+                                              device: device, queue: queue)
+        rawSoftTokens = st; rawNPooled = np
+    }
     if rawNPooled == 0 {
         print("  0 soft tokens — image too small? aborting"); return
     }
@@ -1345,28 +1372,37 @@ func runLmMultimodal(ggufPath: String, stPath: String, imagePath: String,
     // softmax, scaling corrects it. LM_MM_SOFT_SCALE=<float> to override;
     // default 1.0 (no scaling).
     let softScale: Float = Float(ProcessInfo.processInfo.environment["LM_MM_SOFT_SCALE"] ?? "") ?? 1.0
+    // With LM_MM_FORCE_SOFTS the raw buffer is fp16; otherwise (vision
+    // tower path) it's fp32. Pipe through the padding/scale helpers accordingly.
     let softTokens: MTLBuffer
     let nPooled: Int
+    let softTokensIsFp32: Bool
     if noPad && softScale == 1.0 {
         softTokens = rawSoftTokens; nPooled = rawNPooled
-        print("  vision tower → \(nPooled) soft tokens (fp32; padding + scale skipped)")
+        softTokensIsFp32 = forceIsFp32
+        print("  soft tokens: \(nPooled) (isFp32=\(forceIsFp32); padding + scale skipped)")
     } else {
         let outN = noPad ? rawNPooled : targetSoft
-        let buf = device.makeBuffer(length: outN * HIDDEN * 4, options: .storageModeShared)!
+        let bytesPerElem = forceIsFp32 ? 4 : 2
+        let buf = device.makeBuffer(length: outN * HIDDEN * bytesPerElem, options: .storageModeShared)!
         memset(buf.contents(), 0, buf.length)
         let copyRows = min(rawNPooled, outN)
         if softScale == 1.0 {
-            memcpy(buf.contents(), rawSoftTokens.contents(), copyRows * HIDDEN * 4)
-        } else {
-            // CPU scale — O(copyRows * HIDDEN) fp32 ops, tiny.
+            memcpy(buf.contents(), rawSoftTokens.contents(), copyRows * HIDDEN * bytesPerElem)
+        } else if forceIsFp32 {
             let src = rawSoftTokens.contents().assumingMemoryBound(to: Float.self)
             let dst = buf.contents().assumingMemoryBound(to: Float.self)
             for i in 0..<(copyRows * HIDDEN) { dst[i] = src[i] * softScale }
+        } else {
+            let src = rawSoftTokens.contents().assumingMemoryBound(to: Float16.self)
+            let dst = buf.contents().assumingMemoryBound(to: Float16.self)
+            for i in 0..<(copyRows * HIDDEN) { dst[i] = Float16(Float(src[i]) * softScale) }
         }
         softTokens = buf
         nPooled = outN
-        print(String(format: "  vision tower → %d raw soft tokens; padded to %d, scale=%.3f",
-                     rawNPooled, outN, softScale))
+        softTokensIsFp32 = forceIsFp32
+        print(String(format: "  soft tokens: %d raw → %d (isFp32=%@, scale=%.3f)",
+                     rawNPooled, outN, forceIsFp32 ? "true" : "false", softScale))
     }
 
     let addBosEnv = ProcessInfo.processInfo.environment["LM_ADD_BOS"]
@@ -1390,7 +1426,7 @@ func runLmMultimodal(ggufPath: String, stPath: String, imagePath: String,
     let BOI: UInt32 = 255999
     let EOI: UInt32 = 258882
     sess.submit([BOI])
-    sess.submit(softTokens: softTokens, count: nPooled, isFp32: true)
+    sess.submit(softTokens: softTokens, count: nPooled, isFp32: softTokensIsFp32)
     sess.submit([EOI])
 
     print("")
