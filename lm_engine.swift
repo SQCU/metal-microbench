@@ -405,6 +405,26 @@ final class LmEngine {
 
     func poolStats() -> PageManager.Stats { return pageManager.stats() }
 
+    // Longest common prefix (in pages) across ALL currently-slotted busy
+    // sessions. Used by the AR scheduler to decide whether to route
+    // attention through the K/V-broadcast shared+tail+reduce path. Zero
+    // when there's only one active session (no broadcast benefit) or
+    // when slots' block_tables disagree at page 0.
+    func detectSharedPrefix() -> Int {
+        let busy = activeSessions.filter { $0.state.wantsSlot }
+        if busy.count < 2 { return 0 }
+        let minPages = busy.map { $0.ownedPages.count }.min() ?? 0
+        if minPages == 0 { return 0 }
+        var p = 0
+        while p < minPages {
+            let first = busy[0].ownedPages[p]
+            if busy.dropFirst().allSatisfy({ $0.ownedPages[p] == first }) {
+                p += 1
+            } else { break }
+        }
+        return p
+    }
+
     // Sessions currently occupying active batch slots (length ≤ B).
     var activeSessions: [Session] {
         return slotAssignment.compactMap { $0.flatMap { residentSessions[$0] } }
@@ -554,8 +574,20 @@ final class LmEngine {
             precomputeFlexBlockMaskFull()
         }
 
+        // Detect cross-slot shared-prefix length and populate the shared
+        // phys-pages buffer. Below threshold, buildStepCB's default path
+        // runs (fast at low batch, fast at no-sharing).
+        let sharedPrefix = detectSharedPrefix()
+        if sharedPrefix >= SHARED_PREFIX_THRESHOLD_PAGES,
+           let reference = activeSessions.filter({ $0.state.wantsSlot }).first {
+            let spp = shared_phys_pages.contents().assumingMemoryBound(to: UInt32.self)
+            for p in 0..<sharedPrefix {
+                spp[p] = UInt32(reference.ownedPages[p])
+            }
+        }
+
         let t0 = Date()
-        let cb = buildStepCB(weights)
+        let cb = buildStepCB(weights, sharedPrefixPages: sharedPrefix)
         cb.commit(); cb.waitUntilCompleted()
         lastStepMs = Date().timeIntervalSince(t0) * 1000
         totalSteps += 1

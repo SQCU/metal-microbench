@@ -379,6 +379,13 @@ let USE_FLEX_ATTN = ProcessInfo.processInfo.environment["LEGACY_ATTN"] == nil
 // Dynamic routing/control buffers (populated by the forward pass every step).
 let positions    = device.makeBuffer(length: B * 4, options: .storageModeShared)!
 let block_table  = device.makeBuffer(length: B * MAX_PAGES_PER_SLOT * 4, options: .storageModeShared)!
+
+// Populated per-step by the scheduler when active slots share a leading
+// prefix in their block_tables. `shared_phys_pages[p]` = the (single)
+// phys page ID that all active slots agree on for logical page p.
+// Read by paged_attn_{slide,full}_ar_shared during AR broadcast.
+let shared_phys_pages = device.makeBuffer(length: MAX_PAGES_PER_SLOT * 4,
+                                           options: .storageModeShared)!
 let active_exp   = device.makeBuffer(length: E_EXP * 4, options: .storageModeShared)!
 let group_start  = device.makeBuffer(length: (E_EXP + 1) * 4, options: .storageModeShared)!
 let slot_token   = device.makeBuffer(length: TOTAL_SLOTS * 4, options: .storageModeShared)!
@@ -1896,8 +1903,18 @@ let LM_DUMP_L0_MOE_SLOTS: MTLBuffer? = {
     return device.makeBuffer(length: size, options: .storageModeShared)!
 }()
 
-func buildStepCB(_ w: LmWeights) -> MTLCommandBuffer {
+// Threshold (in pages) below which broadcast attention isn't worth the
+// overhead — per-slot v0 stays faster at tiny shared regions. Env-
+// tunable: SHARED_PREFIX_THRESHOLD=<pages>. Default 4 (=64 tokens).
+let SHARED_PREFIX_THRESHOLD_PAGES =
+    Int(ProcessInfo.processInfo.environment["SHARED_PREFIX_THRESHOLD"] ?? "4") ?? 4
+
+func buildStepCB(_ w: LmWeights, sharedPrefixPages: Int = 0) -> MTLCommandBuffer {
     let cb = queue.makeCommandBuffer()!
+    // Decide once per build whether the broadcast path applies. Above
+    // threshold, each layer's attention routes through the shared+tail
+    // kernel pair; below, we stay on the standard per-slot v0 path.
+    let useBroadcast = sharedPrefixPages >= SHARED_PREFIX_THRESHOLD_PAGES
 
     // Embed lookup + Gemma-4 sqrt(hidden) scale on token embeddings.
     encEmbed(cb, embedTable: w.embedTable)
@@ -1945,7 +1962,32 @@ func buildStepCB(_ w: LmWeights) -> MTLCommandBuffer {
 
         let npBuf = isFull ? num_pages_full : num_pages_slide
         let klBuf = isFull ? k_len_full : k_len_slide
-        if isFull && USE_FLEX_ATTN {
+        if useBroadcast && isFull {
+            // Broadcast shared-prefix K/V across all B slots, then per-slot
+            // tail kernel writes split=1, split_reduce merges.
+            encPagedAttnFullArSharedAndTail(cb, Q: q_out, O: attn_out,
+                                             Kc: Kc, Vc: Vc,
+                                             sharedPhysPages: shared_phys_pages,
+                                             mPart: m_partials,
+                                             lPart: l_partials,
+                                             OPart: O_partials,
+                                             kLenBuf: klBuf,
+                                             H_Q: H, H_KV: KV_H, D: HD,
+                                             prefixPages: sharedPrefixPages,
+                                             bBatch: B)
+        } else if useBroadcast {
+            encPagedAttnSlideArSharedAndTail(cb, Q: q_out, O: attn_out,
+                                              Kc: Kc, Vc: Vc,
+                                              sharedPhysPages: shared_phys_pages,
+                                              mPart: m_partials,
+                                              lPart: l_partials,
+                                              OPart: O_partials,
+                                              kLenBuf: klBuf,
+                                              H_Q: H, H_KV: KV_H, D: HD,
+                                              prefixPages: sharedPrefixPages,
+                                              slidingWindow: SLIDING_WINDOW,
+                                              bBatch: B)
+        } else if isFull && USE_FLEX_ATTN {
             encFlexAttnFullV0(cb, Q: q_out, O: attn_out, Kc: Kc, Vc: Vc,
                               kLenBuf: klBuf, H_Q: H, H_KV: KV_H, D: HD)
         } else if isFull {
