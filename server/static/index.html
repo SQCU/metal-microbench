@@ -105,22 +105,36 @@ setInterval(pollHealth, 1500);
 const imgData = {A: null, B: null};
 const paneSid = {A: null, B: null};
 
-// KV snapshot poll loop (active while any pane has a live session).
+// KV snapshot poll loop. Runs while any pane's session is still alive in
+// the engine (i.e. appears in /v1/kv/snapshot). paneSid[pane] is set when
+// the pane fires a request and stays set forever after — we only use its
+// presence in the snapshot (not the ask-finish timing) to decide when to
+// stop polling. That way the strip keeps rendering during the server-side
+// linger after SSE ends, and the final page-count is visible instead of
+// flickering empty the moment the HTTP response closes.
 let kvPolling = false;
 async function kvPoll() {
   if (kvPolling) return;
   kvPolling = true;
   try {
-    while (Object.values(paneSid).some(v => v !== null)) {
+    while (true) {
+      let snap;
       try {
         const r = await fetch('/v1/kv/snapshot');
-        const j = await r.json();
-        renderKv(j);
-      } catch (e) { /* server may be briefly unavailable — keep polling */ }
+        snap = await r.json();
+      } catch (e) {
+        await new Promise(r => setTimeout(r, 300));
+        continue;
+      }
+      renderKv(snap);
+      // Exit when none of our tracked pane sids still exist in the engine.
+      // Whatever we last rendered stays on screen until the next ask().
+      const anyAlive = ['A', 'B'].some(
+        pane => paneSid[pane] !== null &&
+                snap.sessions.some(s => s.sid === paneSid[pane]));
+      if (!anyAlive) break;
       await new Promise(r => setTimeout(r, 300));
     }
-    // One final refresh so the strip shows the end-state before fading.
-    try { renderKv(await (await fetch('/v1/kv/snapshot')).json()); } catch (e) {}
   } finally {
     kvPolling = false;
   }
@@ -130,11 +144,19 @@ function renderKv(snapshot) {
   for (const pane of ['A', 'B']) {
     const strip = document.getElementById(`kv${pane}`);
     const sid = paneSid[pane];
-    // Clear everything except the leading label span.
-    strip.innerHTML = '<span class="label">kv pages:</span>';
-    if (sid === null) continue;
+    if (sid === null) {
+      // This pane never asked anything — keep the strip empty.
+      strip.innerHTML = '<span class="label">kv pages:</span>';
+      continue;
+    }
     const sess = snapshot.sessions.find(s => s.sid === sid);
-    if (!sess) continue;
+    if (!sess) {
+      // Session closed (past linger). Leave the strip alone so the last
+      // rendered state stays visible until the user asks again — don't
+      // overwrite with an empty placeholder.
+      continue;
+    }
+    strip.innerHTML = '<span class="label">kv pages:</span>';
     const tokensLabel = document.createElement('span');
     tokensLabel.className = 'label';
     tokensLabel.textContent = `s${sid} · ${sess.state} · ${sess.position} tok · ${sess.page_count} pages (${sess.shared_count} shared)`;
@@ -253,10 +275,10 @@ async function ask(which) {
     meta.textContent = `ttft=${ttft}s · ${tokenCount} chunks in ${wall.toFixed(2)}s`;
   } finally {
     btn.disabled = false;
-    // Clear this pane's sid so the KV poll loop can terminate when both
-    // panes are idle. Leave the strip rendered (snapshot still shows the
-    // session as 'done' briefly, then disappears on next poll).
-    paneSid[which] = null;
+    // Note: intentionally NOT clearing paneSid[which] here. kvPoll keeps
+    // rendering against the server's lingering session; when the server
+    // finally closes it (after LINGER_SECONDS), the session disappears
+    // from the snapshot and kvPoll exits with the last render intact.
   }
 }
 </script>
