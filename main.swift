@@ -3300,6 +3300,11 @@ if ProcessInfo.processInfo.environment["KV_VIZ"] != nil {
     runKvVisualizer()
 }
 if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
+   ProcessInfo.processInfo.environment["LM_SHARED_PREFIX_DEMO"] != nil {
+    let maxN = Int(ProcessInfo.processInfo.environment["LM_SHARED_PREFIX_MAX"] ?? "16") ?? 16
+    runLmSharedPrefixDemo(ggufPath: ggufPath, maxNewPerSession: maxN)
+}
+if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
    let outDir = ProcessInfo.processInfo.environment["LM_DUMP_EXPERT_W"] {
     let id = Int(ProcessInfo.processInfo.environment["LM_DUMP_EXPERT_ID"] ?? "52") ?? 52
     runDumpExpertWeights(ggufPath: ggufPath, expertId: id, outDir: outDir)

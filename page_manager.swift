@@ -102,33 +102,47 @@ final class PageManager {
     }
 
     // Grab a fresh phys page for `sessionId`. Fails with `outOfPages` if
-    // the free list is empty (caller should close sessions or evict —
-    // we'll add eviction when we need it). The page is single-owner,
-    // not content-indexed yet (caller can promote it to the content cache
-    // after the KV has been written via `promoteToShared`).
+    // the free list is empty. The page is single-owner and its content
+    // hash is invalidated at alloc time (we're about to overwrite the KV).
+    //
+    // Released pages keep their content hash until they're re-allocated
+    // here — that's how we let a later session probe findByHash and
+    // adopt an already-computed prefix without prefilling it. Only at
+    // the moment a fresh allocation *commits to overwriting* do we drop
+    // the cached hash.
     func allocFresh(sessionId: Int) throws -> Int {
         guard let phys = freeList.popLast() else {
             throw PageManagerError.outOfPages(needed: 1, available: 0)
         }
         clockTick += 1
         var p = pages[phys]
+        // Invalidate stale content hash — the KV is about to be rewritten.
+        if let h = p.contentHash {
+            if contentIndex[h] == phys { contentIndex.removeValue(forKey: h) }
+            p.contentHash = nil
+        }
         p.owners = [sessionId]
-        p.contentHash = nil
         p.lastAccessTick = clockTick
         pages[phys] = p
         sessionPages[sessionId, default: []].append(phys)
         return phys
     }
 
-    // Adopt an existing cached page for `sessionId` — bumps its owner set
-    // and refcount. Caller has verified via `findByHash` that this page's
-    // content matches what the session would have produced for the same
-    // input tokens. Read-only sharing; diverging writes would need CoW
-    // (not supported yet — the engine currently never writes to pages it
-    // didn't allocate fresh).
+    // Adopt an existing cached page for `sessionId`. If the page was
+    // released-but-not-yet-overwritten (owners.isEmpty, still on free
+    // list), resurrect it: remove from the free list, set sessionId as
+    // the sole owner. Otherwise just add sessionId to the owner set.
+    // Either way, content hash is preserved (read-only sharing).
     func shareExisting(physPage: Int, sessionId: Int) {
         clockTick += 1
         var p = pages[physPage]
+        if p.owners.isEmpty {
+            // Page is in free list but still has valid content. Pull it
+            // back out before handing out to this session.
+            if let idx = freeList.firstIndex(of: physPage) {
+                freeList.remove(at: idx)
+            }
+        }
         p.owners.insert(sessionId)
         p.lastAccessTick = clockTick
         pages[physPage] = p
@@ -154,10 +168,13 @@ final class PageManager {
         }
     }
 
-    // Release this session's claim on the page. If refcount drops to zero,
-    // the page goes back on the free list and its content-index entry (if
-    // any) is invalidated — the next allocator would give out the page
-    // with undefined KV content, so cached sharing must be revoked.
+    // Release this session's claim on the page. If refcount drops to zero
+    // the page goes on the free list BUT its content-index entry stays —
+    // the KV data is still valid until something actually overwrites it
+    // (which only happens at allocFresh time). This enables cache hits
+    // across session lifetimes: close session A, open session B with the
+    // same prefix, B's probe finds A's cached pages and resurrects them
+    // via shareExisting without any prefill work.
     func releasePage(physPage: Int, sessionId: Int) throws {
         var p = pages[physPage]
         guard p.owners.contains(sessionId) else {
@@ -165,11 +182,8 @@ final class PageManager {
         }
         p.owners.remove(sessionId)
         if p.owners.isEmpty {
-            if let h = p.contentHash {
-                if contentIndex[h] == physPage { contentIndex.removeValue(forKey: h) }
-                p.contentHash = nil
-            }
             freeList.append(physPage)
+            // Do NOT drop contentHash here — leave it for potential reuse.
         }
         pages[physPage] = p
     }

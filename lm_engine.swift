@@ -99,6 +99,17 @@ final class Session {
     //   can reach without growing. Pages are allocated on-demand as the
     //   session's position advances (see growPagesFor(kLen:)).
     fileprivate var ownedPages: [Int] = []
+    // Full token history for per-page prefix hashing. Append-only —
+    // submit() extends it, and hash(consumedTokens[0..(P+1)*PAGE]) is
+    // the content identity of logical page P. Used for:
+    //   (a) cache probe at first-submit: find shared pages in the global
+    //       PageManager content index and adopt them read-only
+    //   (b) post-prefill promotion: announce newly-written pages to the
+    //       content index so the NEXT session with the same prefix hits.
+    fileprivate var consumedTokens: [UInt32] = []
+    // Logical pages already promoted to PageManager.contentIndex. Kept
+    // so we don't re-promote on every prefill tile commit.
+    fileprivate var promotedPageCount: Int = 0
     // Ordered chunks to teacher-force (text tokens or image soft tokens).
     fileprivate var chunkQueue: [PrimingChunk] = []
     // When state == .generating, the last-sampled token becomes the next
@@ -119,14 +130,71 @@ final class Session {
 
     // Queue more input tokens to be teacher-forced. Valid in any state:
     // calling while .generating/.paused/.idle flips back to .priming.
+    //
+    // At the *first* submit (session still at position=0, no owned pages),
+    // we probe the PageManager's content index for cache hits on the
+    // leading pages. Any hit is adopted read-only — ownedPages gets the
+    // shared phys page, position advances by PAGE_SLIDE, and the queued
+    // chunk only covers the un-cached tail. This is what makes multiple
+    // sessions with the same system prompt / same image prefix skip the
+    // redundant prefill work.
+    //
+    // Subsequent submits (tool-call returns, continuations) don't probe —
+    // they always prefill fresh, since mid-conversation tails are unique.
     func submit(_ tokens: [UInt32]) {
         guard !tokens.isEmpty else { return }
-        chunkQueue.append(.tokens(tokens))
+        guard let eng = engine else {
+            chunkQueue.append(.tokens(tokens))
+            if state != .done { state = .priming }
+            return
+        }
+        // Extend the canonical history (used for hashing).
+        consumedTokens.append(contentsOf: tokens)
+        // First-submit cache probe.
+        let firstSubmit = (position == 0 && ownedPages.isEmpty)
+        var skipPrefix = 0
+        if firstSubmit {
+            skipPrefix = adoptSharedPrefixPages(engine: eng)
+            position = skipPrefix * PAGE_SLIDE
+        }
+        // Queue the un-cached tail for prefill.
+        let tailStart = skipPrefix * PAGE_SLIDE
+        if tailStart < tokens.count {
+            // tokens held by THIS submit call; cached pages came from the
+            // head of this same tokens array (or the very-start of
+            // consumedTokens, which at first-submit is identical).
+            let tail = Array(tokens[tailStart...])
+            if !tail.isEmpty { chunkQueue.append(.tokens(tail)) }
+        }
         if state != .done { state = .priming }
     }
     func submit(text: String, addBos: Bool? = nil) {
         guard let eng = engine else { return }
         submit(eng.tokenizer.encode(text, addBos: addBos))
+    }
+
+    // Walk the PageManager's content index for leading pages of
+    // consumedTokens. Returns the number of pages successfully adopted.
+    // Idempotent-ish: safe to call, just returns 0 if none match.
+    private func adoptSharedPrefixPages(engine: LmEngine) -> Int {
+        var adopted = 0
+        while (adopted + 1) * PAGE_SLIDE <= consumedTokens.count {
+            let end = (adopted + 1) * PAGE_SLIDE
+            let prefixHash = PageManager.hashPage(consumedTokens[0..<end])
+            guard let phys = engine.pageManager.findByHash(prefixHash) else { break }
+            engine.pageManager.shareExisting(physPage: phys, sessionId: id)
+            ownedPages.append(phys)
+            adopted += 1
+        }
+        // Adopted pages are already content-indexed — don't re-promote.
+        if adopted > 0 {
+            promotedPageCount = adopted
+            if ProcessInfo.processInfo.environment["LM_CACHE_DEBUG"] != nil {
+                print("  [cache] session \(id) adopted \(adopted) shared prefix pages "
+                      + "(= \(adopted * PAGE_SLIDE) tokens cached)")
+            }
+        }
+        return adopted
     }
     func submit(softTokens: MTLBuffer, count: Int, isFp32: Bool) {
         guard count > 0 else { return }
@@ -253,7 +321,32 @@ final class LmEngine {
         }
         pageManager.releaseAllForSession(s.id)
         s.ownedPages.removeAll()
+        s.consumedTokens.removeAll()
+        s.promotedPageCount = 0
         residentSessions.removeValue(forKey: s.id)
+    }
+
+    // After a prefill tile commits, walk any fully-written logical pages
+    // that haven't been promoted yet and publish them to the content
+    // index so the next session with the same prefix can findByHash.
+    // Called at the end of stepPrefillForSession.
+    fileprivate func promoteFinishedPages(_ s: Session) {
+        let fullyWritten = s.position / PAGE_SLIDE
+        while s.promotedPageCount < fullyWritten {
+            let p = s.promotedPageCount
+            // We need the first (p+1)*PAGE_SLIDE tokens of this session's
+            // submitted history to form the page's prefix hash. If the
+            // session's consumedTokens hasn't caught up (unusual — happens
+            // only when a submit staged tokens in chunkQueue that were
+            // consumed without being added to consumedTokens), skip.
+            let end = (p + 1) * PAGE_SLIDE
+            guard end <= s.consumedTokens.count, p < s.ownedPages.count else {
+                break
+            }
+            let hash = PageManager.hashPage(s.consumedTokens[0..<end])
+            pageManager.promoteToShared(physPage: s.ownedPages[p], contentHash: hash)
+            s.promotedPageCount += 1
+        }
     }
 
     func poolStats() -> PageManager.Stats { return pageManager.stats() }
@@ -435,6 +528,7 @@ final class LmEngine {
                 if s.chunkQueue.isEmpty {
                     s.state = .generating
                     s.outputQueue.append(sampled)
+                    s.consumedTokens.append(sampled)
                     s.nextGeneratedInput = sampled
                     s.numGenerated += 1; emitted += 1; totalTokensGenerated += 1
                     if sampled == s.eosId || s.numGenerated >= s.maxNewTokens {
@@ -560,6 +654,10 @@ final class LmEngine {
         // last-position logit into the AR `logits` buffer so that the next
         // .step() or sampling sees a coherent post-prefill state.
         s.position += thisTile
+        // Publish fully-written pages to the global content index so a
+        // later session that submits the same prefix will findByHash this
+        // page and share it read-only.
+        promoteFinishedPages(s)
         let srcPtr = pre_logits.contents().assumingMemoryBound(to: Float16.self)
         let dstPtr = logits.contents().assumingMemoryBound(to: Float16.self)
         let src = srcPtr.advanced(by: (sslot * thisTile + (thisTile - 1)) * VOCAB)
@@ -598,6 +696,7 @@ final class LmEngine {
             let sampled = UInt32(bestI)
             s.state = .generating
             s.outputQueue.append(sampled)
+            s.consumedTokens.append(sampled)
             s.nextGeneratedInput = sampled
             s.numGenerated += 1; totalTokensGenerated += 1
             if sampled == s.eosId || s.numGenerated >= s.maxNewTokens {
@@ -764,6 +863,101 @@ func runLmMultisession(ggufPath: String, promptsStr: String, maxNewPerSession: I
         let slotStr = s.slot.map(String.init) ?? "released"
         print("  s\(s.id) (slot \(slotStr), state=\(s.state)): \(allOutputs[s.id]!.debugDescription)")
         engine.closeSession(s)
+    }
+}
+
+// ----------------------------------------------------------------------
+// Shared-prefix demo driver. Opens N sessions sequentially (wait for each
+// to finish before submitting the next) so the post-prefill page promotion
+// from session i populates the content index that session i+1 probes at
+// submit. Expected: session 1 does full work, sessions 2..N show
+// "[cache] adopted P shared prefix pages" in the log and finish much
+// faster since their prefill tails are tiny.
+//
+//   LM_SHARED_PREFIX_DEMO=1
+//   LM_SHARED_PREFIX=<common prompt prefix>
+//   LM_SUFFIX_1=<q1>, LM_SUFFIX_2=<q2>, ...  (distinguishes sessions)
+//   [LM_SHARED_PREFIX_MAX=16]    # max new per session
+//   GGUF_PATH=<gguf>
+//   [LM_ADD_BOS=1]
+//   [LM_CACHE_DEBUG=1]           # show per-session adoption counts
+// ----------------------------------------------------------------------
+func runLmSharedPrefixDemo(ggufPath: String, maxNewPerSession: Int) {
+    print("\n=== LM shared-prefix demo ===")
+    let env = ProcessInfo.processInfo.environment
+    let addBos = env["LM_ADD_BOS"].flatMap {
+        ["0", "false", "no"].contains($0.lowercased()) ? false : true
+    }
+    guard let prefix = env["LM_SHARED_PREFIX"], !prefix.isEmpty else {
+        print("  Missing LM_SHARED_PREFIX. See the header comment in lm_engine.swift for usage.")
+        return
+    }
+    var suffixes: [String] = []
+    for i in 1...16 {
+        if let s = env["LM_SUFFIX_\(i)"], !s.isEmpty { suffixes.append(s) }
+    }
+    if suffixes.isEmpty {
+        print("  No LM_SUFFIX_N env vars — using defaults.")
+        suffixes = ["What is the capital of France? One word.",
+                    "What is the capital of Germany? One word.",
+                    "What is the capital of Japan? One word."]
+    }
+
+    let w: LmWeights
+    do { w = try loadLmWeights(ggufPath: ggufPath) }
+    catch { print("  loadLmWeights failed: \(error)"); return }
+    let engine = LmEngine(weights: w)
+
+    // Build the shared-prefix token sequence once.
+    let prefixToks = engine.tokenize(prefix, addBos: addBos)
+    print("  shared prefix: \(prefix.debugDescription) (\(prefixToks.count) tokens ≈ \((prefixToks.count + PAGE_SLIDE - 1) / PAGE_SLIDE) pages)")
+    print("  running \(suffixes.count) sessions SEQUENTIALLY (each completes before next submits)")
+    print("")
+
+    var sessionWalls: [Double] = []
+    var sessionOutputs: [String] = []
+    var sessionStats: [(adopted: Int, totalPages: Int)] = []
+
+    for (i, suffix) in suffixes.enumerated() {
+        let tag = "s\(i+1)"
+        let fullPromptToks = prefixToks + engine.tokenize(suffix, addBos: false)
+        guard let session = engine.openSession(maxNewTokens: maxNewPerSession) else {
+            print("  [\(tag)] openSession failed"); continue
+        }
+        session.submit(fullPromptToks)
+
+        let adoptedAtSubmit = session.ownedPages.count
+        let totalPages = (fullPromptToks.count + PAGE_SLIDE - 1) / PAGE_SLIDE
+        sessionStats.append((adopted: adoptedAtSubmit, totalPages: totalPages))
+
+        let t0 = Date()
+        var output = ""
+        while engine.hasWork {
+            _ = engine.tick()
+            while let tok = session.nextToken() {
+                output += engine.detokenize([tok])
+            }
+        }
+        let dtMs = Date().timeIntervalSince(t0) * 1000
+        sessionWalls.append(dtMs)
+        sessionOutputs.append(output)
+
+        let pct = totalPages > 0 ? 100 * adoptedAtSubmit / totalPages : 0
+        print(String(format: "  [\(tag)] prompt=%d toks / %d pages  adopted=%d (%d%%)  wall=%.1f ms  answer=%@",
+                     fullPromptToks.count, totalPages, adoptedAtSubmit, pct, dtMs, output.debugDescription))
+        engine.closeSession(session)
+    }
+
+    // Summary
+    print("")
+    print("  --- sharing effectiveness ---")
+    let firstWall = sessionWalls.first ?? 0
+    for (i, wall) in sessionWalls.enumerated() {
+        let stats = sessionStats[i]
+        let speedup = firstWall > 0 ? firstWall / wall : 1.0
+        let cachedPct = stats.totalPages > 0 ? 100 * stats.adopted / stats.totalPages : 0
+        print(String(format: "  s%d: %.1f ms  (%.2f× vs s1 baseline)  — %d%% of pages cache-adopted",
+                     i + 1, wall, speedup, cachedPct))
     }
 }
 
