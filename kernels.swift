@@ -4492,6 +4492,8 @@ kernel void vision_attn_prefill_fp32(
     constant uint& H                    [[buffer(5)]],
     constant uint& HD                   [[buffer(6)]],
     constant float& qk_scale            [[buffer(7)]],
+    device const uchar* padding_mask    [[buffer(8)]],   // 1 byte per K pos; 1 = padded, mask out of softmax
+    constant uint& use_padding_mask     [[buffer(9)]],   // non-zero → consult padding_mask
     uint2 tg                            [[threadgroup_position_in_grid]],
     uint2 lid                           [[thread_position_in_threadgroup]])
 {
@@ -4506,11 +4508,16 @@ kernel void vision_attn_prefill_fp32(
     device const float* V_h  = V + head * HD;
     uint K_stride = H * HD;
 
+    // Pass 1: Q@K with optional -INF for masked-out K positions.
     for (uint k = t; k < N; k += THREADS) {
         float s = 0;
         device const float* K_k = K_h + k * K_stride;
         for (uint d = 0; d < HD; ++d) { s += Q_qh[d] * K_k[d]; }
-        scores[k] = s * qk_scale;
+        float score = s * qk_scale;
+        if (use_padding_mask != 0u && padding_mask[k] != 0u) {
+            score = -INFINITY;
+        }
+        scores[k] = score;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -4558,6 +4565,27 @@ kernel void gelu_mul_fp32(
         if (arg > 20.0f) arg = 20.0f; else if (arg < -20.0f) arg = -20.0f;
         float gelu_x = 0.5f * x * (1.0f + tanh(arg));
         g[i] = gelu_x * u[i];
+    }
+}
+
+// Quantize an fp32 buffer to bf16 precision in-place (round mantissa to
+// 7 bits, keep fp32 exponent). Used at vision encoder layer boundaries
+// to match HF's bf16 residual stream. Each fp32 is 1+8+23 bits; bf16 is
+// 1+8+7; we drop the low 16 bits (round-to-nearest-even via add-then-mask).
+kernel void quantize_fp32_to_bf16_inplace(
+    device float* x                     [[buffer(0)]],
+    constant uint& N                    [[buffer(1)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    uint b = tg.x; uint t = lid.x;
+    for (uint i = t; i < N; i += 32) {
+        uint idx = b * N + i;
+        // Round-to-nearest-even: add 0x7FFF + ((bits >> 16) & 1) before mask.
+        uint bits = as_type<uint>(x[idx]);
+        uint lsb = (bits >> 16) & 1u;
+        uint rounded = (bits + 0x7FFFu + lsb) & 0xFFFF0000u;
+        x[idx] = as_type<float>(rounded);
     }
 }
 

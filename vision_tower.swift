@@ -34,9 +34,10 @@ import Accelerate
 // ===========================================================================
 
 struct PatchBatch {
-    let patches: MTLBuffer       // [maxPatches, 768] fp16
-    let positions: [(Int32, Int32)]   // per-patch (y, x) positions; (-1, -1) for pad
+    let patches: MTLBuffer       // [maxPatches, 768] fp16, zero-padded past numRealPatches
+    let positions: [(Int32, Int32)]   // per-patch (y, x); real patches first, then (0,0) for pad
     let numRealPatches: Int
+    let maxPatches: Int          // total slots including zero-padded tail
     let gridH: Int               // patch grid after resize
     let gridW: Int
     let resizedH: Int
@@ -284,8 +285,11 @@ func gemma4ImagePreprocess(path: String,
         }
     }
 
-    // Positions: (y, x) for real, (-1, -1) for padding.
-    var positions = [(Int32, Int32)](repeating: (-1, -1), count: maxPatches)
+    // Positions: real patches get (y, x); padding slots get (0, 0) so kernels
+    // don't index OOB when we let them run over the full max_patches range.
+    // The attention padding mask (separate buffer) is what actually silences
+    // these slots — the (0,0) pos value is just a safe default.
+    var positions = [(Int32, Int32)](repeating: (0, 0), count: maxPatches)
     for py in 0..<gridH {
         for px in 0..<gridW {
             positions[py * gridW + px] = (Int32(py), Int32(px))
@@ -293,7 +297,8 @@ func gemma4ImagePreprocess(path: String,
     }
 
     return PatchBatch(patches: patchBuf, positions: positions,
-                       numRealPatches: nReal, gridH: gridH, gridW: gridW,
+                       numRealPatches: nReal, maxPatches: maxPatches,
+                       gridH: gridH, gridW: gridW,
                        resizedH: targetH, resizedW: targetW)
 }
 
@@ -326,6 +331,7 @@ let visionAttnPrefillFp32PSO = pso("vision_attn_prefill_fp32")
 let geluMulFp32PSO       = pso("gelu_mul_fp32")
 let visionPool2DFp32InFp32OutPSO = pso("vision_pool_2d_fp32in_fp32out")
 let visionStdNormFp32PSO = pso("vision_scaled_std_normalize_fp32")
+let quantizeFp32ToBf16PSO = pso("quantize_fp32_to_bf16_inplace")
 
 // Vision tower: per-layer weight struct + loader.
 // Each of 27 encoder layers has the same tensor set; we load them from the
@@ -514,7 +520,8 @@ func encVision2DRopeFp32(_ cb: MTLCommandBuffer, x: MTLBuffer, posX: MTLBuffer, 
 }
 
 func encVisionAttnPrefillFp32(_ cb: MTLCommandBuffer, Q: MTLBuffer, K: MTLBuffer, V: MTLBuffer, O: MTLBuffer,
-                                N: Int, H: Int, HD: Int, qkScale: Float) {
+                                N: Int, H: Int, HD: Int, qkScale: Float,
+                                paddingMask: MTLBuffer? = nil) {
     let enc = cb.makeComputeCommandEncoder()!
     enc.setComputePipelineState(visionAttnPrefillFp32PSO)
     enc.setBuffer(Q, offset: 0, index: 0); enc.setBuffer(K, offset: 0, index: 1)
@@ -524,6 +531,14 @@ func encVisionAttnPrefillFp32(_ cb: MTLCommandBuffer, Q: MTLBuffer, K: MTLBuffer
     enc.setBytes(&Hv, length: 4, index: 5)
     enc.setBytes(&HDv, length: 4, index: 6)
     enc.setBytes(&sc, length: 4, index: 7)
+    // Padding-mask path: when a real mask buffer is supplied, the kernel
+    // sets K-positions flagged as padding to -INF before softmax, so they
+    // drop out of both the denominator and the weighted V sum. When nil,
+    // bind the buffer slot to the mask slot anyway (Metal needs SOMETHING
+    // at every declared buffer index) and flip use_padding_mask=0.
+    enc.setBuffer(paddingMask ?? Q, offset: 0, index: 8)
+    var use: UInt32 = (paddingMask != nil) ? 1 : 0
+    enc.setBytes(&use, length: 4, index: 9)
     enc.dispatchThreadgroups(MTLSize(width: N, height: H, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
@@ -549,6 +564,24 @@ func encVisionPool2DFp32InFp32Out(_ cb: MTLCommandBuffer, x: MTLBuffer, out: MTL
     enc.setBytes(&gw, length: 4, index: 2); enc.setBytes(&ow, length: 4, index: 3)
     enc.setBytes(&ks, length: 4, index: 4); enc.setBytes(&h, length: 4, index: 5)
     enc.dispatchThreadgroups(MTLSize(width: outH * outW, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// Round an fp32 buffer's values to bf16 precision in-place. Called at
+// vision encoder layer boundaries to match HF's bf16 residual stream —
+// HF runs `.type_as(bf16_hidden_states)` at the end of every RMSNorm,
+// so every layer's input and output is bf16-rounded. Without this step
+// our fp32 pipeline drifts from HF's reference by compounding rounding
+// noise over 27 layers (measured MSE 0.054 at ev_out, enough to break
+// LM image understanding downstream).
+func encQuantizeFp32ToBf16(_ cb: MTLCommandBuffer, x: MTLBuffer, N: Int, numVecs: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(quantizeFp32ToBf16PSO)
+    enc.setBuffer(x, offset: 0, index: 0)
+    var Nv = UInt32(N)
+    enc.setBytes(&Nv, length: 4, index: 1)
+    enc.dispatchThreadgroups(MTLSize(width: numVecs, height: 1, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
 }
@@ -717,21 +750,37 @@ func dumpFp16(_ buf: MTLBuffer, _ label: String, count: Int = 8, stride: Int = 0
 func runVisionTowerForward(batch: PatchBatch, weights: VisionWeights,
                              device: MTLDevice, queue: MTLCommandQueue) -> (MTLBuffer, Int) {
     let debug = ProcessInfo.processInfo.environment["VISION_DEBUG"] != nil
-    let N = batch.numRealPatches
+    // Run the full pipeline over all `maxPatches` slots — real patches plus
+    // the zero-padded tail — to match HF's batched image-processor flow.
+    // Attention softmax consumes a padding_mask that -INF's padded K slots.
+    // Pool still operates on the real grid only (outH*outW, independent of
+    // padding). An env flag LM_MM_NO_PAD_ATTN=1 forces the legacy N=nReal
+    // path for A/B comparison.
+    let useMaxPatches = ProcessInfo.processInfo.environment["LM_MM_NO_PAD_ATTN"] == nil
+    let N = useMaxPatches ? batch.maxPatches : batch.numRealPatches
     let gridH = batch.gridH, gridW = batch.gridW
     let h = weights.hidden, H = weights.numHeads, HD = weights.headDim
     let interm = weights.interm
     let outH = gridH / 3, outW = gridW / 3
     let nPooled = outH * outW
 
-    // Positions (per-patch). batch.positions[i] is (y, x) for real patches.
+    // Positions (per-patch). Real patches: (y, x). Padding: (0, 0) (safe
+    // default; the padding_mask is what actually silences these slots).
     let posYBuf = device.makeBuffer(length: N * 4, options: .storageModeShared)!
     let posXBuf = device.makeBuffer(length: N * 4, options: .storageModeShared)!
     let pyp = posYBuf.contents().assumingMemoryBound(to: UInt32.self)
     let pxp = posXBuf.contents().assumingMemoryBound(to: UInt32.self)
     for i in 0..<N {
-        pyp[i] = UInt32(batch.positions[i].0)
-        pxp[i] = UInt32(batch.positions[i].1)
+        pyp[i] = UInt32(max(batch.positions[i].0, 0))   // clamp -1 (legacy) to 0
+        pxp[i] = UInt32(max(batch.positions[i].1, 0))
+    }
+    // Padding mask: 1 at slots [numRealPatches, maxPatches), 0 elsewhere.
+    // One byte per slot; read by vision_attn_prefill_fp32 when
+    // use_padding_mask != 0.
+    let paddingMaskBuf = device.makeBuffer(length: N, options: .storageModeShared)!
+    let pmp = paddingMaskBuf.contents().assumingMemoryBound(to: UInt8.self)
+    for i in 0..<N {
+        pmp[i] = (i < batch.numRealPatches) ? 0 : 1
     }
 
     // Scratch buffers. The residual stream `x` is fp32 and — as of the
@@ -845,7 +894,7 @@ func runVisionTowerForward(batch: PatchBatch, weights: VisionWeights,
         step("vNorm",      { encRMSNormNoScaleFp32($0, x: vBuf, out: vBuf, D: HD, numVecs: N * H) }, dumpBuf: vBuf, sampleCount: total)
         step("qRoPE",      { encVision2DRopeFp32($0, x: qBuf, posX: posXBuf, posY: posYBuf, N: N, H: H, HD: HD, theta: 100.0) }, dumpBuf: qBuf, sampleCount: total)
         step("kRoPE",      { encVision2DRopeFp32($0, x: kBuf, posX: posXBuf, posY: posYBuf, N: N, H: H, HD: HD, theta: 100.0) }, dumpBuf: kBuf, sampleCount: total)
-        step("attn",       { encVisionAttnPrefillFp32($0, Q: qBuf, K: kBuf, V: vBuf, O: attnOut, N: N, H: H, HD: HD, qkScale: qkScale) }, dumpBuf: attnOut, sampleCount: total)
+        step("attn",       { encVisionAttnPrefillFp32($0, Q: qBuf, K: kBuf, V: vBuf, O: attnOut, N: N, H: H, HD: HD, qkScale: qkScale, paddingMask: useMaxPatches ? paddingMaskBuf : nil) }, dumpBuf: attnOut, sampleCount: total)
         step("oProj",      { encGemvFp32V5($0, x: attnOut, W: lw.oProj, out: tmp, B: N, Din: h, Dout: h) }, dumpBuf: tmp, sampleCount: total)
         step("postAttnNorm", { encRMSNormGFp32($0, x: tmp, gammaBuf: lw.postAttnNorm, out: postNormFp32, D: h, numVecs: N) }, dumpBuf: postNormFp32, sampleCount: total)
         step("resid1",     { encAddInplaceFp32Fp32($0, dst: x, src: postNormFp32, N: h, numVecs: N) }, dumpBuf: x, sampleCount: total)
