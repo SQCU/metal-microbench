@@ -256,6 +256,64 @@ def health() -> JSONResponse:
         "multimodal": g.vision_is_ready(),
         "active_sessions": g.active_session_count(),
         "pump_running": _pump_running,
+        "vision_cache": g.vision_cache_stats() if g.vision_is_ready() else None,
+    })
+
+
+@app.get("/v1/cache/stats")
+def cache_stats() -> JSONResponse:
+    """Inspect the vision-tower soft-tokens cache."""
+    stats = g.vision_cache_stats() if g.vision_is_ready() else {
+        "entries": 0, "hits": 0, "misses": 0, "bytes": 0,
+    }
+    total = stats["hits"] + stats["misses"]
+    stats["hit_rate"] = (stats["hits"] / total) if total > 0 else 0.0
+    return JSONResponse(stats)
+
+
+@app.post("/v1/cache/clear")
+def cache_clear() -> JSONResponse:
+    """Flush the vision cache. Returns the number of entries evicted."""
+    n = g.vision_cache_clear() if g.vision_is_ready() else 0
+    return JSONResponse({"evicted": n})
+
+
+@app.post("/v1/images/prewarm")
+async def prewarm_image(req: Request) -> JSONResponse:
+    """Accept the same image_url shape as chat content items and populate
+    the cache. First call pays the vision-tower cost; subsequent chat calls
+    using the same image bytes skip vision entirely.
+
+    Body: {"image_url": {"url": "data:image/png;base64,..."}}
+          or {"image_url": "data:..."}
+          or {"url": "..."}
+    """
+    body = await req.json()
+    url = body.get("image_url") or body.get("url") or ""
+    if isinstance(url, dict):
+        url = url.get("url", "")
+    if not url:
+        raise HTTPException(400, "image_url is required")
+    if not g.vision_is_ready():
+        raise HTTPException(503, "vision not initialized")
+
+    png = _decode_image_url(url)
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        f.write(png)
+        tmp = f.name
+    try:
+        t0 = time.time()
+        n = g.vision_prewarm_path(tmp)
+        dt = time.time() - t0
+    finally:
+        try: os.unlink(tmp)
+        except OSError: pass
+
+    return JSONResponse({
+        "soft_tokens": n,
+        "cache_key": g.vision_last_cache_key(),
+        "elapsed_ms": int(dt * 1000),
+        "stats": g.vision_cache_stats(),
     })
 
 

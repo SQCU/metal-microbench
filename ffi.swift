@@ -13,12 +13,31 @@
 //   - Session handles are Int32 (1-indexed, stable for the process lifetime).
 
 import Foundation
+import Metal
+import CryptoKit
 
 private let ffiLock = NSRecursiveLock()
 private var gEngine: LmEngine?
 private var gVisionWeights: VisionWeights?
 private var gSessions: [Int32: Session] = [:]
 private var gNextHandle: Int32 = 1
+
+// Vision soft-tokens cache — keyed by SHA-256 of the raw PNG/JPEG bytes.
+// On a cache hit we skip preprocessing + vision tower entirely (saves ~7 s
+// per repeated image on M5) and just reuse the already-padded MTLBuffer.
+// The same MTLBuffer can back N concurrent sessions: Session.submit(softTokens:)
+// stores it in a .softTokens chunk which is read-only from the kernel side.
+private struct CachedSofts {
+    let buffer: MTLBuffer       // padded to targetSoft rows, fp32
+    let count: Int              // always targetSoft=280 currently
+    var lastUsed: UInt64        // monotonic tick counter for LRU
+    let bytes: Int              // buffer.length, for stats
+}
+private var gVisionCache: [Data: CachedSofts] = [:]
+private var gVisionCacheHits: UInt64 = 0
+private var gVisionCacheMisses: UInt64 = 0
+private var gVisionCacheTick: UInt64 = 0
+private let gVisionCacheMaxEntries = 64    // ~200 MB at 280 × 2816 × 4 B each
 
 // --- Initialization ---
 
@@ -228,8 +247,13 @@ public func gemma_vision_is_ready() -> Int32 {
 // Preprocess + vision-tower + submit soft tokens to a session, bracketed
 // by BOI (255999) / EOI (258882) markers the way Gemma-4 expects for an
 // inline image in a user turn. PNG bytes are read from the given file path
-// (Python writes to tempfile, passes path, cleans up after). Pads to 280
-// soft tokens (Gemma's image_seq_length).
+// (Python writes to tempfile, passes path, cleans up after).
+//
+// Cache-aware: hashes the raw file bytes (SHA-256); on hit, reuses the
+// previously-padded soft-tokens MTLBuffer and skips preprocess + vision
+// entirely. The same buffer can back concurrent sessions safely since
+// Session.submit(softTokens:) treats the buffer as read-only. LRU-evicts
+// when gVisionCacheMaxEntries is exceeded.
 //
 // Returns number of soft tokens submitted (280 on success), or -1 on error.
 @_cdecl("gemma_submit_image_path")
@@ -237,26 +261,85 @@ public func gemma_submit_image_path(_ sid: Int32,
                                      _ pngPath: UnsafePointer<CChar>?) -> Int32 {
     ffiLock.lock(); defer { ffiLock.unlock() }
     guard let s = gSessions[sid] else { return -1 }
-    guard let visWeights = gVisionWeights else {
-        print("gemma_submit_image_path: vision not initialized (call gemma_vision_init first)")
-        return -1
-    }
     guard let p = pngPath else { return -1 }
     let pathStr = String(cString: p)
 
-    let batch: PatchBatch
-    do { batch = try gemma4ImagePreprocess(path: pathStr, device: device) }
-    catch {
-        print("gemma_submit_image_path: preprocess failed: \(error)")
-        return -1
-    }
+    guard let padded = ensureCachedSofts(pngPath: pathStr) else { return -1 }
 
+    // Bracket with BOI + EOI the same way runLmMultimodal does.
+    let BOI: UInt32 = 255999
+    let EOI: UInt32 = 258882
+    s.submit([BOI])
+    s.submit(softTokens: padded.buffer, count: padded.count, isFp32: true)
+    s.submit([EOI])
+    return Int32(padded.count)
+}
+
+// Pre-warm the cache without attaching to a session. Intended for
+// POST /v1/images/prewarm: an agent can pre-populate entries it expects
+// to re-reference later so the first "real" request sees a hit.
+//
+// Returns soft-token count on success (cache hit or miss), -1 on error.
+@_cdecl("gemma_vision_prewarm_path")
+public func gemma_vision_prewarm_path(_ pngPath: UnsafePointer<CChar>?) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let p = pngPath else { return -1 }
+    let pathStr = String(cString: p)
+    guard let padded = ensureCachedSofts(pngPath: pathStr) else { return -1 }
+    return Int32(padded.count)
+}
+
+// Fills out_hex (65 bytes minimum, includes null terminator) with the
+// SHA-256 hex of the last prewarm/submit. Useful for clients that want
+// to know the cache key.
+@_cdecl("gemma_vision_last_cache_key")
+public func gemma_vision_last_cache_key(_ outHex: UnsafeMutablePointer<CChar>?,
+                                         _ maxBytes: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let h = gLastCacheKeyHex else { return -1 }
+    let data = Array(h.utf8)
+    if outHex == nil { return Int32(data.count) }
+    let n = min(data.count, Int(maxBytes))
+    for i in 0..<n { outHex![i] = CChar(bitPattern: data[i]) }
+    return Int32(n)
+}
+
+// Internal: hash the file, check/populate the cache. Shared by submit + prewarm.
+private var gLastCacheKeyHex: String?
+private func ensureCachedSofts(pngPath: String) -> CachedSofts? {
+    guard let visWeights = gVisionWeights else {
+        print("ensureCachedSofts: vision not initialized")
+        return nil
+    }
+    guard let fileData = try? Data(contentsOf: URL(fileURLWithPath: pngPath)) else {
+        print("ensureCachedSofts: failed to read \(pngPath)")
+        return nil
+    }
+    let hash = SHA256.hash(data: fileData)
+    let hashData = Data(hash)
+    gLastCacheKeyHex = hash.map { String(format: "%02x", $0) }.joined()
+
+    gVisionCacheTick &+= 1
+    if var hit = gVisionCache[hashData] {
+        hit.lastUsed = gVisionCacheTick
+        gVisionCache[hashData] = hit
+        gVisionCacheHits &+= 1
+        return hit
+    }
+    gVisionCacheMisses &+= 1
+
+    // Miss: run preprocess + vision tower.
+    let batch: PatchBatch
+    do { batch = try gemma4ImagePreprocess(path: pngPath, device: device) }
+    catch {
+        print("ensureCachedSofts: preprocess failed: \(error)")
+        return nil
+    }
     let (rawSoftTokens, rawNPooled) = runVisionTowerForward(
         batch: batch, weights: visWeights, device: device, queue: queue)
-    if rawNPooled == 0 { return -1 }
+    if rawNPooled == 0 { return nil }
 
-    // Pad (or truncate) to 280 soft tokens. Soft tokens are fp32 from the
-    // vision tower; pad with zeros.
+    // Pad to image_seq_length=280, fp32.
     let targetSoft = 280
     let padded = device.makeBuffer(length: targetSoft * HIDDEN * 4,
                                     options: .storageModeShared)!
@@ -264,11 +347,48 @@ public func gemma_submit_image_path(_ sid: Int32,
     let copyRows = min(rawNPooled, targetSoft)
     memcpy(padded.contents(), rawSoftTokens.contents(), copyRows * HIDDEN * 4)
 
-    // Bracket with BOI + EOI the same way runLmMultimodal does.
-    let BOI: UInt32 = 255999
-    let EOI: UInt32 = 258882
-    s.submit([BOI])
-    s.submit(softTokens: padded, count: targetSoft, isFp32: true)
-    s.submit([EOI])
-    return Int32(targetSoft)
+    let entry = CachedSofts(buffer: padded, count: targetSoft,
+                             lastUsed: gVisionCacheTick, bytes: padded.length)
+    gVisionCache[hashData] = entry
+
+    // LRU evict if over cap.
+    if gVisionCache.count > gVisionCacheMaxEntries {
+        // Evict lowest lastUsed. O(N) at cap=64 so fine.
+        if let (oldKey, _) = gVisionCache.min(by: { $0.value.lastUsed < $1.value.lastUsed }) {
+            gVisionCache.removeValue(forKey: oldKey)
+        }
+    }
+    return entry
+}
+
+@_cdecl("gemma_vision_cache_entries")
+public func gemma_vision_cache_entries() -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    return Int32(gVisionCache.count)
+}
+
+@_cdecl("gemma_vision_cache_hits")
+public func gemma_vision_cache_hits() -> UInt64 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    return gVisionCacheHits
+}
+
+@_cdecl("gemma_vision_cache_misses")
+public func gemma_vision_cache_misses() -> UInt64 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    return gVisionCacheMisses
+}
+
+@_cdecl("gemma_vision_cache_bytes")
+public func gemma_vision_cache_bytes() -> UInt64 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    return gVisionCache.values.reduce(0) { $0 + UInt64($1.bytes) }
+}
+
+@_cdecl("gemma_vision_cache_clear")
+public func gemma_vision_cache_clear() -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    let n = gVisionCache.count
+    gVisionCache.removeAll()
+    return Int32(n)
 }

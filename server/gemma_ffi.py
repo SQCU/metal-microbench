@@ -110,6 +110,27 @@ _lib.gemma_vision_is_ready.restype = C.c_int32
 _lib.gemma_submit_image_path.argtypes = [C.c_int32, C.c_char_p]
 _lib.gemma_submit_image_path.restype = C.c_int32
 
+_lib.gemma_vision_prewarm_path.argtypes = [C.c_char_p]
+_lib.gemma_vision_prewarm_path.restype = C.c_int32
+
+_lib.gemma_vision_last_cache_key.argtypes = [C.c_char_p, C.c_int32]
+_lib.gemma_vision_last_cache_key.restype = C.c_int32
+
+_lib.gemma_vision_cache_entries.argtypes = []
+_lib.gemma_vision_cache_entries.restype = C.c_int32
+
+_lib.gemma_vision_cache_hits.argtypes = []
+_lib.gemma_vision_cache_hits.restype = C.c_uint64
+
+_lib.gemma_vision_cache_misses.argtypes = []
+_lib.gemma_vision_cache_misses.restype = C.c_uint64
+
+_lib.gemma_vision_cache_bytes.argtypes = []
+_lib.gemma_vision_cache_bytes.restype = C.c_uint64
+
+_lib.gemma_vision_cache_clear.argtypes = []
+_lib.gemma_vision_cache_clear.restype = C.c_int32
+
 
 # --- Public Python API ---
 
@@ -250,8 +271,40 @@ def vision_is_ready() -> bool:
 
 def submit_image_path(sid: int, png_path: str) -> int:
     """Preprocess PNG at path + run vision tower + submit BOI/softs/EOI
-    chunks to the session. Returns soft-token count submitted, or raises."""
+    chunks to the session. Cache-aware: SHA-256 of file bytes keys a soft-tokens
+    buffer; repeat submissions of the same image skip the vision tower.
+    Returns soft-token count submitted, or raises."""
     n = _lib.gemma_submit_image_path(int(sid), png_path.encode("utf-8"))
     if n < 0:
         raise RuntimeError(f"gemma_submit_image_path failed (session={sid}, path={png_path})")
     return n
+
+
+def vision_prewarm_path(png_path: str) -> int:
+    """Populate the cache for an image without attaching to any session."""
+    n = _lib.gemma_vision_prewarm_path(png_path.encode("utf-8"))
+    if n < 0:
+        raise RuntimeError(f"gemma_vision_prewarm_path failed (path={png_path})")
+    return n
+
+
+def vision_last_cache_key() -> str:
+    """Hex SHA-256 of the most recent image submitted / prewarmed."""
+    buf = C.create_string_buffer(65)
+    n = _lib.gemma_vision_last_cache_key(buf, len(buf))
+    if n <= 0:
+        return ""
+    return buf.raw[:n].decode("ascii", errors="replace")
+
+
+def vision_cache_stats() -> dict:
+    return {
+        "entries": _lib.gemma_vision_cache_entries(),
+        "hits": _lib.gemma_vision_cache_hits(),
+        "misses": _lib.gemma_vision_cache_misses(),
+        "bytes": _lib.gemma_vision_cache_bytes(),
+    }
+
+
+def vision_cache_clear() -> int:
+    return _lib.gemma_vision_cache_clear()

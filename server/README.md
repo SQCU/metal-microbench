@@ -130,8 +130,43 @@ via `gemma_submit_image_path`, brackets the soft tokens with BOI/EOI
 Multimodal status is reported in `/health`:
 
 ```json
-{"status":"ready", "multimodal":true, ...}
+{"status":"ready", "multimodal":true, "vision_cache":{"entries":0,"hits":0,"misses":0,"bytes":0}}
 ```
+
+### vision soft-tokens cache
+
+Repeat submissions of the same image byte-for-byte skip the vision tower
+entirely. The cache is keyed by SHA-256 of the raw image bytes and stores
+the already-padded (280-row fp32) soft-tokens MTLBuffer; LRU-evicts at
+64 entries (~200 MB).
+
+Inspect:
+
+```bash
+curl http://localhost:8000/v1/cache/stats
+# {"entries":1,"hits":7,"misses":1,"bytes":3153920,"hit_rate":0.875}
+```
+
+Flush:
+
+```bash
+curl -X POST http://localhost:8000/v1/cache/clear
+# {"evicted":1}
+```
+
+Pre-populate (skip the first-request TTFT hit for an image you know
+you'll reference soon):
+
+```bash
+curl -X POST http://localhost:8000/v1/images/prewarm \
+  -H 'Content-Type: application/json' \
+  -d '{"image_url": {"url": "data:image/png;base64,..."}}'
+# {"soft_tokens":280,"cache_key":"<sha256>","elapsed_ms":7073,"stats":{...}}
+```
+
+Measured win on M5 (amongus frame):
+- cold chat (miss): **13.2 s**
+- warm chat (hit):  **5.7 s**  — same image, second request
 
 ### `GET /`
 
