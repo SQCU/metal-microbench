@@ -884,25 +884,47 @@ func runVisionTowerForward(batch: PatchBatch, weights: VisionWeights,
         }
 
         // === Attention sub-block (fp32 intermediates throughout) ===
+        // bf16 emulation: quantize after every HF bf16 op boundary so our
+        // per-layer rounding trajectory matches the reference. Without this,
+        // our fp32 buffers carry mantissa bits HF truncates, and the resulting
+        // drift compounds to MSE ~0.05 at ev_out (enough to break LM image
+        // understanding). Each `q_*` step rounds fp32 → bf16 in place.
         let total = N * h
         step("input_norm", { encRMSNormGFp32($0, x: x, gammaBuf: lw.inputNorm, out: tmp, D: h, numVecs: N) }, dumpBuf: tmp, sampleCount: total)
+        step("q_inputNorm", { encQuantizeFp32ToBf16($0, x: tmp, N: h, numVecs: N) }, dumpBuf: tmp, sampleCount: total)
         step("qProj",      { encGemvFp32V5($0, x: tmp, W: lw.qProj, out: qBuf, B: N, Din: h, Dout: h) }, dumpBuf: qBuf, sampleCount: total)
+        step("q_qProj",    { encQuantizeFp32ToBf16($0, x: qBuf, N: h, numVecs: N) }, dumpBuf: qBuf, sampleCount: total)
         step("kProj",      { encGemvFp32V5($0, x: tmp, W: lw.kProj, out: kBuf, B: N, Din: h, Dout: h) }, dumpBuf: kBuf, sampleCount: total)
+        step("q_kProj",    { encQuantizeFp32ToBf16($0, x: kBuf, N: h, numVecs: N) }, dumpBuf: kBuf, sampleCount: total)
         step("vProj",      { encGemvFp32V5($0, x: tmp, W: lw.vProj, out: vBuf, B: N, Din: h, Dout: h) }, dumpBuf: vBuf, sampleCount: total)
+        step("q_vProj",    { encQuantizeFp32ToBf16($0, x: vBuf, N: h, numVecs: N) }, dumpBuf: vBuf, sampleCount: total)
         step("qNorm",      { encRMSNormGFp32($0, x: qBuf, gammaBuf: lw.qNorm, out: qBuf, D: HD, numVecs: N * H) }, dumpBuf: qBuf, sampleCount: total)
+        step("q_qNorm",    { encQuantizeFp32ToBf16($0, x: qBuf, N: h, numVecs: N) }, dumpBuf: qBuf, sampleCount: total)
         step("kNorm",      { encRMSNormGFp32($0, x: kBuf, gammaBuf: lw.kNorm, out: kBuf, D: HD, numVecs: N * H) }, dumpBuf: kBuf, sampleCount: total)
+        step("q_kNorm",    { encQuantizeFp32ToBf16($0, x: kBuf, N: h, numVecs: N) }, dumpBuf: kBuf, sampleCount: total)
         step("vNorm",      { encRMSNormNoScaleFp32($0, x: vBuf, out: vBuf, D: HD, numVecs: N * H) }, dumpBuf: vBuf, sampleCount: total)
+        step("q_vNorm",    { encQuantizeFp32ToBf16($0, x: vBuf, N: h, numVecs: N) }, dumpBuf: vBuf, sampleCount: total)
         step("qRoPE",      { encVision2DRopeFp32($0, x: qBuf, posX: posXBuf, posY: posYBuf, N: N, H: H, HD: HD, theta: 100.0) }, dumpBuf: qBuf, sampleCount: total)
+        step("q_qRoPE",    { encQuantizeFp32ToBf16($0, x: qBuf, N: h, numVecs: N) }, dumpBuf: qBuf, sampleCount: total)
         step("kRoPE",      { encVision2DRopeFp32($0, x: kBuf, posX: posXBuf, posY: posYBuf, N: N, H: H, HD: HD, theta: 100.0) }, dumpBuf: kBuf, sampleCount: total)
+        step("q_kRoPE",    { encQuantizeFp32ToBf16($0, x: kBuf, N: h, numVecs: N) }, dumpBuf: kBuf, sampleCount: total)
         step("attn",       { encVisionAttnPrefillFp32($0, Q: qBuf, K: kBuf, V: vBuf, O: attnOut, N: N, H: H, HD: HD, qkScale: qkScale, paddingMask: useMaxPatches ? paddingMaskBuf : nil) }, dumpBuf: attnOut, sampleCount: total)
+        step("q_attn",     { encQuantizeFp32ToBf16($0, x: attnOut, N: h, numVecs: N) }, dumpBuf: attnOut, sampleCount: total)
         step("oProj",      { encGemvFp32V5($0, x: attnOut, W: lw.oProj, out: tmp, B: N, Din: h, Dout: h) }, dumpBuf: tmp, sampleCount: total)
+        step("q_oProj",    { encQuantizeFp32ToBf16($0, x: tmp, N: h, numVecs: N) }, dumpBuf: tmp, sampleCount: total)
         step("postAttnNorm", { encRMSNormGFp32($0, x: tmp, gammaBuf: lw.postAttnNorm, out: postNormFp32, D: h, numVecs: N) }, dumpBuf: postNormFp32, sampleCount: total)
+        step("q_postAttnNorm", { encQuantizeFp32ToBf16($0, x: postNormFp32, N: h, numVecs: N) }, dumpBuf: postNormFp32, sampleCount: total)
         step("resid1",     { encAddInplaceFp32Fp32($0, dst: x, src: postNormFp32, N: h, numVecs: N) }, dumpBuf: x, sampleCount: total)
+        step("q_resid1",   { encQuantizeFp32ToBf16($0, x: x, N: h, numVecs: N) }, dumpBuf: x, sampleCount: total)
         // === FFN sub-block ===
         step("preFfnNorm", { encRMSNormGFp32($0, x: x, gammaBuf: lw.preFfnNorm, out: tmp, D: h, numVecs: N) }, dumpBuf: tmp, sampleCount: total)
+        step("q_preFfnNorm", { encQuantizeFp32ToBf16($0, x: tmp, N: h, numVecs: N) }, dumpBuf: tmp, sampleCount: total)
         step("gateProj",   { encGemvFp32V5($0, x: tmp, W: lw.gateProj, out: gateAct, B: N, Din: h, Dout: interm) }, dumpBuf: gateAct, sampleCount: N * interm)
+        step("q_gateProj", { encQuantizeFp32ToBf16($0, x: gateAct, N: interm, numVecs: N) }, dumpBuf: gateAct, sampleCount: N * interm)
         step("upProj",     { encGemvFp32V5($0, x: tmp, W: lw.upProj, out: upAct, B: N, Din: h, Dout: interm) }, dumpBuf: upAct, sampleCount: N * interm)
+        step("q_upProj",   { encQuantizeFp32ToBf16($0, x: upAct, N: interm, numVecs: N) }, dumpBuf: upAct, sampleCount: N * interm)
         step("geluMul",    { encGeluMulFp32($0, gate: gateAct, up: upAct, N: interm, numVecs: N) }, dumpBuf: gateAct, sampleCount: N * interm)
+        step("q_geluMul",  { encQuantizeFp32ToBf16($0, x: gateAct, N: interm, numVecs: N) }, dumpBuf: gateAct, sampleCount: N * interm)
         if splitCBs {
             let gp = gateAct.contents().assumingMemoryBound(to: Float16.self)
             let patchBad = 643, dimBad = 2040
@@ -920,8 +942,11 @@ func runVisionTowerForward(batch: PatchBatch, weights: VisionWeights,
             }
         }
         step("downProj",   { encGemvFp32V5($0, x: gateAct, W: lw.downProj, out: mlpOutB, B: N, Din: interm, Dout: h) }, dumpBuf: mlpOutB, sampleCount: total)
+        step("q_downProj", { encQuantizeFp32ToBf16($0, x: mlpOutB, N: h, numVecs: N) }, dumpBuf: mlpOutB, sampleCount: total)
         step("postFfnNorm",{ encRMSNormGFp32($0, x: mlpOutB, gammaBuf: lw.postFfnNorm, out: postNormFp32, D: h, numVecs: N) }, dumpBuf: postNormFp32, sampleCount: total)
+        step("q_postFfnNorm", { encQuantizeFp32ToBf16($0, x: postNormFp32, N: h, numVecs: N) }, dumpBuf: postNormFp32, sampleCount: total)
         step("resid2",     { encAddInplaceFp32Fp32($0, dst: x, src: postNormFp32, N: h, numVecs: N) }, dumpBuf: x, sampleCount: total)
+        step("q_resid2",   { encQuantizeFp32ToBf16($0, x: x, N: h, numVecs: N) }, dumpBuf: x, sampleCount: total)
 
         if !splitCBs && !fastPath {
             commitOne(layerCB)
