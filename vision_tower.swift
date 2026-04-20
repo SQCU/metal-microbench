@@ -328,6 +328,7 @@ let rmsNormNoScaleFp32PSO = pso("rms_norm_noscale_fp32")
 let denseGemvFp32In32OutPSO = pso("dense_gemv_fp32in_fp32out_v5")
 let vision2dRopeFp32PSO  = pso("vision_2d_rope_neox_fp32")
 let visionAttnPrefillFp32PSO = pso("vision_attn_prefill_fp32")
+let visionAttnFlashFp32PSO   = pso("vision_attn_flash_fp32")
 let geluMulFp32PSO       = pso("gelu_mul_fp32")
 let visionPool2DFp32InFp32OutPSO = pso("vision_pool_2d_fp32in_fp32out")
 let visionStdNormFp32PSO = pso("vision_scaled_std_normalize_fp32")
@@ -522,6 +523,16 @@ func encVision2DRopeFp32(_ cb: MTLCommandBuffer, x: MTLBuffer, posX: MTLBuffer, 
 func encVisionAttnPrefillFp32(_ cb: MTLCommandBuffer, Q: MTLBuffer, K: MTLBuffer, V: MTLBuffer, O: MTLBuffer,
                                 N: Int, H: Int, HD: Int, qkScale: Float,
                                 paddingMask: MTLBuffer? = nil) {
+    // Route through the flash-attention port unless explicitly disabled.
+    // Bidirectional (no causal) + optional byte-mask + fp32 I/O with half
+    // MMA inside the kernel. Vision HD is 72 = 9 × 8, a natural fit for
+    // simdgroup_matrix<T, 8, 8>. Falls back to the scalar kernel when
+    // VISION_ATTN_SCALAR=1 so the old path stays reachable for A/B.
+    if ProcessInfo.processInfo.environment["VISION_ATTN_SCALAR"] == nil {
+        return encVisionAttnFlashFp32(cb, Q: Q, K: K, V: V, O: O,
+                                        N: N, H: H, HD: HD, qkScale: qkScale,
+                                        paddingMask: paddingMask)
+    }
     let enc = cb.makeComputeCommandEncoder()!
     enc.setComputePipelineState(visionAttnPrefillFp32PSO)
     enc.setBuffer(Q, offset: 0, index: 0); enc.setBuffer(K, offset: 0, index: 1)
@@ -531,15 +542,34 @@ func encVisionAttnPrefillFp32(_ cb: MTLCommandBuffer, Q: MTLBuffer, K: MTLBuffer
     enc.setBytes(&Hv, length: 4, index: 5)
     enc.setBytes(&HDv, length: 4, index: 6)
     enc.setBytes(&sc, length: 4, index: 7)
-    // Padding-mask path: when a real mask buffer is supplied, the kernel
-    // sets K-positions flagged as padding to -INF before softmax, so they
-    // drop out of both the denominator and the weighted V sum. When nil,
-    // bind the buffer slot to the mask slot anyway (Metal needs SOMETHING
-    // at every declared buffer index) and flip use_padding_mask=0.
     enc.setBuffer(paddingMask ?? Q, offset: 0, index: 8)
     var use: UInt32 = (paddingMask != nil) ? 1 : 0
     enc.setBytes(&use, length: 4, index: 9)
     enc.dispatchThreadgroups(MTLSize(width: N, height: H, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// Flash-attention dispatch. Grid: (H, ceil(N/8)). 32 threads per TG.
+// Same I/O contract as the scalar variant, so it's a drop-in replacement.
+func encVisionAttnFlashFp32(_ cb: MTLCommandBuffer, Q: MTLBuffer, K: MTLBuffer, V: MTLBuffer, O: MTLBuffer,
+                             N: Int, H: Int, HD: Int, qkScale: Float,
+                             paddingMask: MTLBuffer? = nil) {
+    precondition(HD == 72, "vision_attn_flash_fp32 hardcodes D=72 for Gemma-4")
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(visionAttnFlashFp32PSO)
+    enc.setBuffer(Q, offset: 0, index: 0); enc.setBuffer(K, offset: 0, index: 1)
+    enc.setBuffer(V, offset: 0, index: 2); enc.setBuffer(O, offset: 0, index: 3)
+    var Nv = UInt32(N), Hv = UInt32(H), HDv = UInt32(HD), sc = qkScale
+    enc.setBytes(&Nv, length: 4, index: 4)
+    enc.setBytes(&Hv, length: 4, index: 5)
+    enc.setBytes(&HDv, length: 4, index: 6)
+    enc.setBytes(&sc, length: 4, index: 7)
+    enc.setBuffer(paddingMask ?? Q, offset: 0, index: 8)
+    var use: UInt32 = (paddingMask != nil) ? 1 : 0
+    enc.setBytes(&use, length: 4, index: 9)
+    let nBlocks = (N + 7) / 8
+    enc.dispatchThreadgroups(MTLSize(width: H, height: nBlocks, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
 }
