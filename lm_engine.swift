@@ -683,6 +683,9 @@ final class LmEngine {
 //   [LM_MULTISESSION_MAX=32]         # max new tokens per session
 //   [LM_ADD_BOS=1]                   # BOS on (default); =0 to match oracle
 //
+// Now that residency is decoupled from the active batch, you can submit
+// up to MAX_RESIDENT_SESSIONS prompts in one run — the scheduler cycles
+// them through the B active slots as earlier ones hit EOS and free up.
 // For convenience, LM_MULTISESSION="text1§text2§text3" (section-sign
 // separator, U+00A7) still works as a fallback since that character
 // doesn't appear in the Gemma chat template.
@@ -691,7 +694,7 @@ func runLmMultisession(ggufPath: String, promptsStr: String, maxNewPerSession: I
     print("\n=== LM multisession engine demo ===")
     var prompts: [String] = []
     // Numbered env-var path first (the robust one for chat templates).
-    for i in 1...B {
+    for i in 1...MAX_RESIDENT_SESSIONS {
         if let p = ProcessInfo.processInfo.environment["LM_SESSION_\(i)"], !p.isEmpty {
             prompts.append(p)
         }
@@ -702,10 +705,10 @@ func runLmMultisession(ggufPath: String, promptsStr: String, maxNewPerSession: I
         prompts = promptsStr.split(separator: "\u{00A7}", omittingEmptySubsequences: false).map(String.init)
     }
     guard !prompts.isEmpty else { print("  no prompts"); return }
-    if prompts.count > B {
-        print("  warning: \(prompts.count) prompts provided; engine capacity is B=\(B), extras truncated")
+    if prompts.count > MAX_RESIDENT_SESSIONS {
+        print("  warning: \(prompts.count) prompts provided; residency cap is \(MAX_RESIDENT_SESSIONS), extras truncated")
     }
-    let active = Array(prompts.prefix(B))
+    let active = Array(prompts.prefix(MAX_RESIDENT_SESSIONS))
 
     let w: LmWeights
     do { w = try loadLmWeights(ggufPath: ggufPath) }
