@@ -2315,6 +2315,316 @@ func buildPrefillCB(_ w: LmWeights, qLen: Int, skipEmbed: Bool = false) -> MTLCo
     return cb
 }
 
+// Diagnostic: split prefill into (first K layers) + (commit + NaN check on
+// pre_hidden) for each K in 0..<NUM_LAYERS, to locate where NaN first
+// appears when buildPrefillCB reads from a session whose KV cache was
+// partially written by AR.
+func debugPrefillLayerBisect(_ w: LmWeights, qLen: Int, sslot: Int) {
+    print("  [prefill-bisect qLen=\(qLen) sslot=\(sslot)]")
+    let N = B * qLen
+    // Embed once at the start (not re-entrant into this probe).
+    let cb0 = queue.makeCommandBuffer()!
+    encEmbedInto(cb0, tokens: pre_input_tokens, embedTable: w.embedTable,
+                 out: pre_hidden, numVecs: N)
+    encScaleByScalar(cb0, x: pre_hidden, scalar: w.embedScaleBuf, N: HIDDEN, numVecs: N)
+    cb0.commit(); cb0.waitUntilCompleted()
+    // Check pre_hidden post-embed
+    checkNanOne("post-embed", pre_hidden, count: N * HIDDEN, sslot: sslot, qLen: qLen)
+
+    for L in 0..<NUM_LAYERS {
+        if L == 0 || L == 1 {
+            encodeOnePrefillLayerSplit(w, L: L, qLen: qLen, sslot: sslot)
+        } else {
+            let cb = queue.makeCommandBuffer()!
+            encodeOnePrefillLayer(cb, w, L: L, qLen: qLen)
+            cb.commit(); cb.waitUntilCompleted()
+            checkNanOne("after layer \(L)", pre_hidden, count: N * HIDDEN, sslot: sslot, qLen: qLen)
+        }
+    }
+}
+
+// Fine-grained bisect: split a single prefill layer into sub-steps, commit
+// each, read back and print NaN stats. Used to localize NaN emergence.
+func encodeOnePrefillLayerSplit(_ w: LmWeights, L: Int, qLen: Int, sslot: Int) {
+    let N = B * qLen
+    let NS = B * qLen * TOPK
+    let lw = w.layers[L]
+    let isFull = lw.isFull
+    let H = isFull ? FULL_H : SLIDE_H
+    let KV_H = lw.KV_H
+    let HD = lw.HD
+    let theta: Float = isFull ? 1_000_000 : 10_000
+    let rotary = isFull ? (FULL_HD / 4) : SLIDE_HD
+    let q_out = isFull ? pre_q_full_out : pre_q_slide_out
+    let k_out = isFull ? pre_k_full_out : pre_k_slide_out
+    let v_out = isFull ? pre_v_full_out : pre_v_slide_out
+    let Kc = w.K_caches[L]
+    let Vc = w.V_caches[L]
+    let Wv = lw.attnV ?? lw.attnK
+
+    func commitAndCheck(_ tag: String, buf: MTLBuffer, count: Int, _ block: (MTLCommandBuffer) -> Void) {
+        let cb = queue.makeCommandBuffer()!
+        block(cb); cb.commit(); cb.waitUntilCompleted()
+        checkNanOne("L\(L) \(tag)", buf, count: count, sslot: sslot, qLen: qLen)
+    }
+
+    commitAndCheck("qkv_proj", buf: q_out, count: N * H * HD) { cb in
+        encGemvQ80V6RmsnormQKV(cb, x: pre_hidden, gammaBuf: lw.attnNorm,
+                                Wq: lw.attnQ, Wk: lw.attnK, Wv: Wv,
+                                outQ: q_out, outK: k_out, outV: v_out,
+                                Din: HIDDEN, DoutQ: H * HD, DoutK: KV_H * HD, DoutV: KV_H * HD,
+                                numVecs: N)
+    }
+    commitAndCheck("q_norm+rope", buf: q_out, count: N * H * HD) { cb in
+        encRMSNormG(cb, x: q_out, gammaBuf: lw.attnQNorm, out: q_out, D: HD, numVecs: N * H)
+        encRopeMulti(cb, q_out, q_positions: pre_q_positions, H: H, D: HD,
+                     rotary: rotary, theta: theta, qLen: qLen)
+    }
+    commitAndCheck("k_norm+rope", buf: k_out, count: N * KV_H * HD) { cb in
+        encRMSNormG(cb, x: k_out, gammaBuf: lw.attnKNorm, out: k_out, D: HD, numVecs: N * KV_H)
+        encRopeMulti(cb, k_out, q_positions: pre_q_positions, H: KV_H, D: HD,
+                     rotary: rotary, theta: theta, qLen: qLen)
+    }
+    commitAndCheck("v_norm", buf: v_out, count: N * KV_H * HD) { cb in
+        encRMSNormNoScale(cb, x: v_out, out: v_out, D: HD, numVecs: N * KV_H)
+    }
+    let pg = isFull ? PAGE_FULL : PAGE_SLIDE
+    commitAndCheck("kv_write", buf: Kc, count: min(N * KV_H * HD, 4096)) { cb in
+        encKVWriteMulti(cb, K: k_out, V: v_out, Kc: Kc, Vc: Vc,
+                        q_positions: pre_q_positions,
+                        H: KV_H, D: HD, page: pg, qLen: qLen)
+    }
+    // Sample K_cache[layer] at each valid position [0, positionStart + qLen)
+    // for sslot. Non-writes would be whatever the page was last left at.
+    // This finds the first position with NaN K.
+    do {
+        let positionStart = Int(pre_q_positions.contents().assumingMemoryBound(to: UInt32.self)[sslot * qLen])
+        let kLen = positionStart + qLen
+        let btP = block_table.contents().assumingMemoryBound(to: UInt32.self)
+        let Kp = Kc.contents().assumingMemoryBound(to: Float16.self)
+        var firstNaNPos = -1, firstInfPos = -1, sampledPositions = 0
+        var byRange = [0: (nan: 0, total: 0), 1: (nan: 0, total: 0), 2: (nan: 0, total: 0)]
+        for pos in 0..<kLen {
+            let lp = pos / pg
+            let off = pos % pg
+            let phys = Int(btP[sslot * MAX_PAGES_PER_SLOT + lp])
+            // K_cache layout: [phys * pg + off, kv_head, d]. Sample kv_head=0, all d.
+            let baseEl = (phys * pg + off) * KV_H * HD
+            var hasNan = false
+            for d in 0..<HD {
+                let v = Float(Kp[baseEl + d])
+                if v.isNaN { hasNan = true; if firstNaNPos < 0 { firstNaNPos = pos } }
+                else if v.isInfinite { if firstInfPos < 0 { firstInfPos = pos } }
+            }
+            sampledPositions += 1
+            let r = pos < positionStart - qLen ? 0 : (pos < positionStart ? 1 : 2)
+            var e = byRange[r]!
+            e.total += 1; if hasNan { e.nan += 1 }
+            byRange[r] = e
+        }
+        print(String(format: "    L\(L) K_cache[sslot=\(sslot), pos=0..\(kLen-1)] sampled=\(sampledPositions) firstNaN=\(firstNaNPos) firstInf=\(firstInfPos)"))
+        print("       by-range: prefill-early=\(byRange[0]!), AR-written=\(byRange[1]!), new-prefill=\(byRange[2]!)")
+    }
+    let klBuf = isFull ? pre_k_len_full : pre_k_len_slide
+    commitAndCheck("attention", buf: pre_attn_out, count: N * H * HD) { cb in
+        if isFull {
+            encFlexAttnFullPrefill(cb, Q: q_out, O: pre_attn_out, Kc: Kc, Vc: Vc,
+                                    kLenBuf: klBuf, qPositions: pre_q_positions,
+                                    H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
+        } else {
+            encFlexAttnSlidePrefill(cb, Q: q_out, O: pre_attn_out, Kc: Kc, Vc: Vc,
+                                     kLenBuf: klBuf, qPositions: pre_q_positions,
+                                     H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
+        }
+    }
+    // Per-Q-row breakdown of sslot's attention output (positionStart+i for i in 0..<qLen).
+    do {
+        let p = pre_attn_out.contents().assumingMemoryBound(to: Float16.self)
+        let perSlotAlloc = pre_attn_out.length / 2 / B
+        let sbase = sslot * perSlotAlloc
+        let rowStride = H * HD
+        let positionStart = Int(pre_q_positions.contents().assumingMemoryBound(to: UInt32.self)[sslot * qLen])
+        var rowReport: [String] = []
+        for q in 0..<qLen {
+            var rn = 0
+            for i in 0..<rowStride {
+                let v = Float(p[sbase + q * rowStride + i])
+                if v.isNaN { rn += 1 }
+            }
+            rowReport.append("Q=\(positionStart + q):\(rn == 0 ? "ok" : "NaN\(rn)")")
+        }
+        print("    L\(L) per-Q-row: " + rowReport.joined(separator: " "))
+    }
+    commitAndCheck("o_proj+resid1", buf: pre_hidden, count: N * HIDDEN) { cb in
+        encGemvQ80V6(cb, pre_attn_out, lw.attnOut, pre_mlp_out,
+                     Din: H * HD, Dout: HIDDEN, numVecs: N)
+        encRmsNormAdd(cb, x: pre_mlp_out, gammaBuf: lw.postAttnNorm,
+                      residual: pre_hidden, out: pre_hidden, N: HIDDEN, numVecs: N)
+    }
+    // Remaining (shared MLP + MoE) — as a single commit, probably not needed
+    // past the first NaN source.
+    commitAndCheck("ffn+moe+resid2", buf: pre_hidden, count: N * HIDDEN) { cb in
+        encGemvQ80V6RmsnormGateUp(cb, x: pre_hidden, gammaBuf: lw.ffnNorm,
+                                   Wg: lw.ffnGate, Wu: lw.ffnUp,
+                                   fusedOut: pre_shrd_gate_up_fused,
+                                   Din: HIDDEN, Dout: SHARED_INT, numVecs: N)
+        encMoeGeluMulFused(cb, fused: pre_shrd_gate_up_fused, out: pre_shrd_gate,
+                            N_half: SHARED_INT, numSlots: N)
+        encGemvQ80V6(cb, pre_shrd_gate, lw.ffnDown, pre_mlp_out,
+                     Din: SHARED_INT, Dout: HIDDEN, numVecs: N)
+        encRMSNormG(cb, x: pre_mlp_out, gammaBuf: lw.postFfn1Norm, out: pre_mlp_out,
+                    D: HIDDEN, numVecs: N)
+        encRouterPreNorm(cb, x: pre_hidden, per_dim_scale: lw.routerScale,
+                          out: pre_hidden_norm, numVecs: N)
+        encGemvV5(cb, pre_hidden_norm, lw.routerW, pre_router_lg,
+                  Din: HIDDEN, Dout: E_EXP, numVecs: N)
+        encSoftmaxTopkInto(cb, logits: pre_router_lg, expertIds: pre_expert_ids,
+                            gateW: pre_gate_w, expertScaleBuf: lw.expertScale, numVecs: N)
+        encRouteCompactInto(cb, expertIds: pre_expert_ids, groupStart: pre_group_start,
+                             slotToken: pre_slot_token, batchSlots: pre_batch_slots,
+                             numVecs: N)
+        encRMSNormG(cb, x: pre_hidden, gammaBuf: lw.preFfn2Norm, out: pre_hidden_norm,
+                    D: HIDDEN, numVecs: N)
+        encMoeGemvQ4K(cb, pre_hidden_norm, lw.moeGateUp, pre_gate_up_fused,
+                      Din: HIDDEN, Dout: MOE_FUSED_DOUT, numActive: E_EXP, useV6: true,
+                      slotTokenBuf: pre_slot_token, groupStartBuf: pre_group_start)
+        encMoeGeluMulFused(cb, fused: pre_gate_up_fused, out: pre_gate_proj,
+                            N_half: MOE_INT, numSlots: NS)
+        encMoeGemvQ51(cb, pre_gate_proj, lw.moeDown, pre_moe_down_out,
+                      Din: MOE_INT, Dout: HIDDEN, numActive: E_EXP, useV6: true,
+                      slotTokenBuf: pre_slot_token, groupStartBuf: pre_group_start)
+        encMoeCombineWriteInto(cb, moeOut: pre_moe_down_out, batchSlots: pre_batch_slots,
+                                gateW: pre_gate_w, outBuf: pre_moe_sum, numVecs: N)
+        encRMSNormG(cb, x: pre_moe_sum, gammaBuf: lw.postFfn2Norm, out: pre_moe_sum,
+                    D: HIDDEN, numVecs: N)
+        encBufferCopy(cb, src: pre_mlp_out, dst: pre_ffn_combined, bytes: N * HIDDEN * 2)
+        encAddInplace(cb, dst: pre_ffn_combined, src: pre_moe_sum, N: HIDDEN, numVecs: N)
+        encRmsNormAddScale(cb, x: pre_ffn_combined, gammaBuf: lw.postFfnNorm,
+                           residual: pre_hidden, scalar: lw.layerOutputScale,
+                           out: pre_hidden, N: HIDDEN, numVecs: N)
+    }
+}
+
+private func checkNanOne(_ tag: String, _ buf: MTLBuffer, count: Int, sslot: Int, qLen: Int) {
+    let p = buf.contents().assumingMemoryBound(to: Float16.self)
+    let fullCount = buf.length / 2
+    var nan = 0, inf = 0, maxAbs: Float = 0
+    for i in 0..<fullCount {
+        let v = Float(p[i])
+        if v.isNaN { nan += 1 }
+        else if v.isInfinite { inf += 1 }
+        else if abs(v) > maxAbs { maxAbs = abs(v) }
+    }
+    // Per-slot split: assume the buffer is [B, ...] row-major, so each slot
+    // owns fullCount/B halfs. Prints sslot's contribution vs others'.
+    let perSlot = fullCount / B
+    var snan = 0, smaxAbs: Float = 0, onan = 0, omaxAbs: Float = 0
+    for b in 0..<B {
+        for i in 0..<perSlot {
+            let v = Float(p[b * perSlot + i])
+            if b == sslot {
+                if v.isNaN { snan += 1 }
+                else if abs(v) > smaxAbs { smaxAbs = abs(v) }
+            } else {
+                if v.isNaN { onan += 1 }
+                else if abs(v) > omaxAbs { omaxAbs = abs(v) }
+            }
+        }
+    }
+    print(String(format: "    %-20@  ALL: NaN=%d max=%.3f | sslot=%d: NaN=%d max=%.3f | others: NaN=%d max=%.3f",
+                 tag as NSString, nan, maxAbs, sslot, snan, smaxAbs, onan, omaxAbs))
+}
+
+// Encode ONE prefill layer's work into `cb`. Used by debugPrefillLayerBisect
+// to commit per-layer and read back pre_hidden. Mirrors the layer body
+// inside encodePrefillTileInto.
+func encodeOnePrefillLayer(_ cb: MTLCommandBuffer, _ w: LmWeights, L: Int, qLen: Int) {
+    let N = B * qLen
+    let NS = B * qLen * TOPK
+    let lw = w.layers[L]
+    let isFull = lw.isFull
+    let H = isFull ? FULL_H : SLIDE_H
+    let KV_H = lw.KV_H
+    let HD = lw.HD
+    let theta: Float = isFull ? 1_000_000 : 10_000
+    let rotary = isFull ? (FULL_HD / 4) : SLIDE_HD
+    let q_out = isFull ? pre_q_full_out : pre_q_slide_out
+    let k_out = isFull ? pre_k_full_out : pre_k_slide_out
+    let v_out = isFull ? pre_v_full_out : pre_v_slide_out
+    let Kc = w.K_caches[L]
+    let Vc = w.V_caches[L]
+    let Wv = lw.attnV ?? lw.attnK
+    encGemvQ80V6RmsnormQKV(cb, x: pre_hidden, gammaBuf: lw.attnNorm,
+                            Wq: lw.attnQ, Wk: lw.attnK, Wv: Wv,
+                            outQ: q_out, outK: k_out, outV: v_out,
+                            Din: HIDDEN,
+                            DoutQ: H * HD, DoutK: KV_H * HD, DoutV: KV_H * HD,
+                            numVecs: N)
+    encRMSNormG(cb, x: q_out, gammaBuf: lw.attnQNorm, out: q_out, D: HD, numVecs: N * H)
+    encRopeMulti(cb, q_out, q_positions: pre_q_positions, H: H, D: HD,
+                 rotary: rotary, theta: theta, qLen: qLen)
+    encRMSNormG(cb, x: k_out, gammaBuf: lw.attnKNorm, out: k_out, D: HD, numVecs: N * KV_H)
+    encRopeMulti(cb, k_out, q_positions: pre_q_positions, H: KV_H, D: HD,
+                 rotary: rotary, theta: theta, qLen: qLen)
+    encRMSNormNoScale(cb, x: v_out, out: v_out, D: HD, numVecs: N * KV_H)
+    let pg = isFull ? PAGE_FULL : PAGE_SLIDE
+    encKVWriteMulti(cb, K: k_out, V: v_out, Kc: Kc, Vc: Vc,
+                    q_positions: pre_q_positions,
+                    H: KV_H, D: HD, page: pg, qLen: qLen)
+    let klBuf = isFull ? pre_k_len_full : pre_k_len_slide
+    if isFull {
+        encFlexAttnFullPrefill(cb, Q: q_out, O: pre_attn_out, Kc: Kc, Vc: Vc,
+                                kLenBuf: klBuf, qPositions: pre_q_positions,
+                                H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
+    } else {
+        encFlexAttnSlidePrefill(cb, Q: q_out, O: pre_attn_out, Kc: Kc, Vc: Vc,
+                                 kLenBuf: klBuf, qPositions: pre_q_positions,
+                                 H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
+    }
+    encGemvQ80V6(cb, pre_attn_out, lw.attnOut, pre_mlp_out,
+                 Din: H * HD, Dout: HIDDEN, numVecs: N)
+    encRmsNormAdd(cb, x: pre_mlp_out, gammaBuf: lw.postAttnNorm,
+                  residual: pre_hidden, out: pre_hidden, N: HIDDEN, numVecs: N)
+    encGemvQ80V6RmsnormGateUp(cb, x: pre_hidden, gammaBuf: lw.ffnNorm,
+                               Wg: lw.ffnGate, Wu: lw.ffnUp,
+                               fusedOut: pre_shrd_gate_up_fused,
+                               Din: HIDDEN, Dout: SHARED_INT, numVecs: N)
+    encMoeGeluMulFused(cb, fused: pre_shrd_gate_up_fused, out: pre_shrd_gate,
+                        N_half: SHARED_INT, numSlots: N)
+    encGemvQ80V6(cb, pre_shrd_gate, lw.ffnDown, pre_mlp_out,
+                 Din: SHARED_INT, Dout: HIDDEN, numVecs: N)
+    encRMSNormG(cb, x: pre_mlp_out, gammaBuf: lw.postFfn1Norm, out: pre_mlp_out,
+                D: HIDDEN, numVecs: N)
+    encRouterPreNorm(cb, x: pre_hidden, per_dim_scale: lw.routerScale,
+                      out: pre_hidden_norm, numVecs: N)
+    encGemvV5(cb, pre_hidden_norm, lw.routerW, pre_router_lg,
+              Din: HIDDEN, Dout: E_EXP, numVecs: N)
+    encSoftmaxTopkInto(cb, logits: pre_router_lg, expertIds: pre_expert_ids,
+                        gateW: pre_gate_w, expertScaleBuf: lw.expertScale, numVecs: N)
+    encRouteCompactInto(cb, expertIds: pre_expert_ids, groupStart: pre_group_start,
+                         slotToken: pre_slot_token, batchSlots: pre_batch_slots,
+                         numVecs: N)
+    encRMSNormG(cb, x: pre_hidden, gammaBuf: lw.preFfn2Norm, out: pre_hidden_norm,
+                D: HIDDEN, numVecs: N)
+    encMoeGemvQ4K(cb, pre_hidden_norm, lw.moeGateUp, pre_gate_up_fused,
+                  Din: HIDDEN, Dout: MOE_FUSED_DOUT, numActive: E_EXP, useV6: true,
+                  slotTokenBuf: pre_slot_token, groupStartBuf: pre_group_start)
+    encMoeGeluMulFused(cb, fused: pre_gate_up_fused, out: pre_gate_proj,
+                        N_half: MOE_INT, numSlots: NS)
+    encMoeGemvQ51(cb, pre_gate_proj, lw.moeDown, pre_moe_down_out,
+                  Din: MOE_INT, Dout: HIDDEN, numActive: E_EXP, useV6: true,
+                  slotTokenBuf: pre_slot_token, groupStartBuf: pre_group_start)
+    encMoeCombineWriteInto(cb, moeOut: pre_moe_down_out, batchSlots: pre_batch_slots,
+                            gateW: pre_gate_w, outBuf: pre_moe_sum, numVecs: N)
+    encRMSNormG(cb, x: pre_moe_sum, gammaBuf: lw.postFfn2Norm, out: pre_moe_sum,
+                D: HIDDEN, numVecs: N)
+    encBufferCopy(cb, src: pre_mlp_out, dst: pre_ffn_combined, bytes: N * HIDDEN * 2)
+    encAddInplace(cb, dst: pre_ffn_combined, src: pre_moe_sum, N: HIDDEN, numVecs: N)
+    encRmsNormAddScale(cb, x: pre_ffn_combined, gammaBuf: lw.postFfnNorm,
+                       residual: pre_hidden, scalar: lw.layerOutputScale,
+                       out: pre_hidden, N: HIDDEN, numVecs: N)
+}
+
 // ====================================================================
 // PrefixCache: FNV-1a hash → shared phys pages. On a new prompt, hash
 // the prefix tokens at PAGE-granularity and reuse existing phys pages

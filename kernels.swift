@@ -1203,18 +1203,26 @@ kernel void paged_attn_split_reduce(
     }
     float m_global = simd_max(my_m);
     float my_scale = (my_m == -INFINITY) ? 0.0f : exp(my_m - m_global);
-    float l_global = simd_sum(my_scale * my_l);
+    // Guard against my_l being NaN/Inf from a split that saw no kept K —
+    // the per-TG kernel now zeroes in that case, but belt-and-suspenders
+    // so a stale partial can't poison l_global via 0*NaN = NaN.
+    float my_contrib = (my_m == -INFINITY) ? 0.0f : (my_scale * my_l);
+    float l_global = simd_sum(my_contrib);
 
     threadgroup float scales_tg[32];
     if (lid < N_SPLITS) scales_tg[lid] = my_scale;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // If no split produced any kept K for this (slot, q_pos, q_head) — all
+    // partials were -INF — output zero rather than NaN (0/0). Won't happen
+    // with a valid causal mask + self-Q, but the guard costs nothing.
+    const bool all_empty = (l_global == 0.0f);
     for (uint d = lid; d < D; d += 32) {
         float acc = 0.0f;
         for (uint s = 0; s < N_SPLITS; ++s) {
             acc += scales_tg[s] * O_partials[(vs * N_SPLITS + s) * D + d];
         }
-        O[vs * D + d] = half(acc / l_global);
+        O[vs * D + d] = all_empty ? half(0) : half(acc / l_global);
     }
 }
 
@@ -3787,18 +3795,29 @@ kernel void flex_attn_slide_v1_q8(
                     s_loc[k] = sv;
                     row_max = max(row_max, sv);
                 }
-                float m_old = m_state[r];
-                float m_new = max(m_old, row_max);
-                float scale = exp(m_old - m_new);
-                float sum = 0.0f;
-                for (uint k = 0; k < PAGE; ++k) {
-                    float e = exp(s_loc[k] - m_new);
-                    scores_tile[r * PAGE + k] = half(e);
-                    sum += e;
+                // Skip the online-softmax update when this block contributes
+                // nothing for this Q row (all K masked). Otherwise we hit
+                // `exp(m_old - m_new)` with both = -INFINITY → exp(NaN) = NaN
+                // → poisons l_state → NaN in reduce. Happens for a Q row
+                // whose full causal horizon lies in earlier pages and the
+                // CSR split places a past-horizon partial page in this TG.
+                if (row_max == -INFINITY) {
+                    scale_tile[r] = 1.0f;
+                    for (uint k = 0; k < PAGE; ++k) scores_tile[r * PAGE + k] = half(0);
+                } else {
+                    float m_old = m_state[r];
+                    float m_new = max(m_old, row_max);
+                    float scale = exp(m_old - m_new);
+                    float sum = 0.0f;
+                    for (uint k = 0; k < PAGE; ++k) {
+                        float e = exp(s_loc[k] - m_new);
+                        scores_tile[r * PAGE + k] = half(e);
+                        sum += e;
+                    }
+                    m_state[r] = m_new;
+                    l_state[r] = l_state[r] * scale + sum;
+                    scale_tile[r] = scale;
                 }
-                m_state[r] = m_new;
-                l_state[r] = l_state[r] * scale + sum;
-                scale_tile[r] = scale;
             } else {
                 // zero out padding row's contribution this iteration
                 scale_tile[r] = 1.0f;
@@ -3990,18 +4009,26 @@ kernel void flex_attn_full_prefill(
                     s_loc[k] = sv;
                     row_max = max(row_max, sv);
                 }
-                float m_old = m_state[r];
-                float m_new = max(m_old, row_max);
-                float scale = exp(m_old - m_new);
-                float sum = 0.0f;
-                for (uint k = 0; k < PAGE; ++k) {
-                    float e = exp(s_loc[k] - m_new);
-                    scores_tile[r * PAGE + k] = half(e);
-                    sum += e;
+                // All-masked-this-block guard: skip online-softmax update so
+                // we don't hit `exp(-INF - -INF)` = NaN when m_state is still
+                // -INF from a split whose first page was fully past-horizon.
+                if (row_max == -INFINITY) {
+                    scale_tile[r] = 1.0f;
+                    for (uint k = 0; k < PAGE; ++k) scores_tile[r * PAGE + k] = half(0);
+                } else {
+                    float m_old = m_state[r];
+                    float m_new = max(m_old, row_max);
+                    float scale = exp(m_old - m_new);
+                    float sum = 0.0f;
+                    for (uint k = 0; k < PAGE; ++k) {
+                        float e = exp(s_loc[k] - m_new);
+                        scores_tile[r * PAGE + k] = half(e);
+                        sum += e;
+                    }
+                    m_state[r] = m_new;
+                    l_state[r] = l_state[r] * scale + sum;
+                    scale_tile[r] = scale;
                 }
-                m_state[r] = m_new;
-                l_state[r] = l_state[r] * scale + sum;
-                scale_tile[r] = scale;
             } else {
                 scale_tile[r] = 1.0f;
                 for (uint k = 0; k < PAGE; ++k) scores_tile[r * PAGE + k] = half(0);

@@ -1322,26 +1322,15 @@ func runLmPauseResumeDemo(ggufPath: String) {
 //   - agent interruption (another agent's "turn" injected into an
 //     ongoing session by an external coordinator)
 //
-// KNOWN ISSUE — AR→prefill KV handoff corruption.
-//   LM_MULTITURN_FRESH=1 (close+reopen between turns) produces coherent
-//   output. LM_MULTITURN_FRESH=0 (true append, default) corrupts: post-
-//   AR KV pages, when re-read by a subsequent buildPrefillCB dispatch,
-//   yield garbage logits (argmax → pad). Same symptom as the pause/
-//   resume demo's post-resume output. The submit()/append() path itself
-//   is correct — it queues the chunk and flips state as advertised —
-//   but the underlying buildPrefillCB assumes KV pages were written by
-//   a prior prefill, not AR. Likely in the kv_write_multi vs kv_write
-//   layout or a RoPE position mismatch between the two write paths.
-//   Fresh mode is the working path for now; the kernel-level fix is a
-//   separate arc from this append() primitive.
-//
 // Env:
 //   LM_MULTITURN_DEMO=1            # presence toggles this harness
 //   GGUF_PATH=<path>
 //   [LM_MULTITURN_TURNS="prompt1§prompt2§prompt3"]   # § separator
 //   [LM_MULTITURN_MAX_PER_TURN=24] # per-turn generation cap
 //   [LM_MULTITURN_FRESH=1]         # opt-in: close+reopen each turn
-//                                   (works around the AR→prefill bug).
+//                                   (alternative path: replay full history
+//                                    to a fresh session; not needed for
+//                                    correctness, but useful for A/B).
 //
 func runLmMultiturnDemo(ggufPath: String, turnsStr: String?, maxPerTurn: Int) {
     print("\n=== LM multiturn demo (Session.append) ===")
