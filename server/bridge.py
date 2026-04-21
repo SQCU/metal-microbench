@@ -567,6 +567,107 @@ async def control_construct(req: Request) -> JSONResponse:
     })
 
 
+@app.post("/v1/demo/elara-haunt")
+async def demo_elara_haunt() -> JSONResponse:
+    """Screen the Elara-direction (at its best layer) as a DETECTOR and
+    an eerie-vs-warm direction as an EFFECTOR, return a one-click demo
+    config. The story: residual steering can't actually *suppress* the
+    model's "Elara" prior (too strongly encoded), but it CAN measure
+    proximity to it — and we can use that measurement as a trigger for
+    an unrelated stylistic intervention. Visible payoff: when the model
+    slips toward Elara-adjacency, the eerie effector fires and the next
+    few tokens get a perceptible atmospheric shift.
+
+    Note the polarity direction for Elara: we construct as
+    mean(Elara-bearing) - mean(non-Elara), so HIGH intensity =
+    Elara-space, and on-exceed fires when the model drifts TOWARD the
+    cliche. The user sees the clichéd impulse get marked, not
+    suppressed — diegetically honest."""
+    import numpy as np
+    NAMES = ["Briar", "Pip", "Moth", "Iris", "Juniper", "Sunday",
+             "Wren", "Clementine", "Hazel", "Fern"]
+    TEMPLATES = [
+        "In the mist-veiled glade, {} found the ancient door.",
+        "{} tightened her grip on her walking stick and pressed on.",
+        "The girl, whose name was {}, stepped past the mossy threshold.",
+        "{}, nineteen and curious, ran her fingers along the carved runes.",
+        "She knew her grandmother had called her {} for a reason.",
+        "{}'s breath hitched as she saw the doorway for the first time.",
+        "{} placed a hand against the weathered oak of the door.",
+        "The story of {} begins in a forest outside her village.",
+    ]
+    # Positive = NAME IS ELARA (strong Elara-direction).
+    # Negative = name is anything else (varied alternatives).
+    # Signal after mean(pos)-mean(neg) points TOWARD Elara-ness → high
+    # intensity fires on Elara-adjacent context.
+    elara_pos = [t.format("Elara") for t in TEMPLATES]
+    elara_neg = [t.format(NAMES[i % len(NAMES)]) for i, t in enumerate(TEMPLATES)]
+
+    EERIE = [
+      "A faint, wrong humming seemed to come from beneath the floorboards.",
+      "Shadows lengthened in the empty room though no one had moved the lamp.",
+      "Every photograph on the wall now faced slightly away from where she stood.",
+      "The child's lullaby hummed from the vents had no melody, only breath.",
+      "He noticed the mirror showed the room reflected backwards, and a figure he did not recognize.",
+      "The wallpaper pattern repeated, but in one corner a face was emerging.",
+    ]
+    WARM = [
+      "The kitchen smelled of fresh bread and coffee; her grandmother was humming off-key.",
+      "Sunlight through the curtains painted the quilt in soft yellow.",
+      "They laughed together about the silly mistake, relieved and relaxed now.",
+      "The cat purred louder than the rain against the window.",
+      "He hugged his daughter goodnight and she murmured something sweet.",
+      "Her friends filled the living room with music and warm laughter.",
+    ]
+
+    HIDDEN = 2816
+    NUM_LAYERS = 30
+
+    def screen_and_register(pos: list[str], neg: list[str], cvec_id: str):
+        pos_stack = np.stack([np.frombuffer(g.capture_all_layer_residuals_for_prompt(p), dtype=np.float16)
+                              .astype(np.float32).reshape(NUM_LAYERS, HIDDEN)
+                              for p in pos])
+        neg_stack = np.stack([np.frombuffer(g.capture_all_layer_residuals_for_prompt(n), dtype=np.float16)
+                              .astype(np.float32).reshape(NUM_LAYERS, HIDDEN)
+                              for n in neg])
+        scores = []
+        for L in range(NUM_LAYERS):
+            pL, nL = pos_stack[:, L, :], neg_stack[:, L, :]
+            md = pL.mean(0) - nL.mean(0)
+            sig = float(np.linalg.norm(md))
+            if sig > 1e-9:
+                u = md / sig
+                p_coh = float(np.mean((pL - nL.mean(0)) @ u / (np.linalg.norm(pL - nL.mean(0), axis=1) + 1e-9)))
+                n_coh = float(np.mean((pL.mean(0) - nL) @ u / (np.linalg.norm(pL.mean(0) - nL, axis=1) + 1e-9)))
+                coh = (p_coh + n_coh) / 2
+            else:
+                coh = 0.0
+            scores.append((L, sig, coh, sig * max(coh, 0.0)))
+        best = max(scores, key=lambda t: t[3])
+        L = best[0]
+        direction = pos_stack[:, L, :].mean(0) - neg_stack[:, L, :].mean(0)
+        direction = direction / (np.linalg.norm(direction) + 1e-9)
+        g.control_register_fp16(cvec_id, direction.astype(np.float16).tobytes())
+        return {"id": cvec_id, "layer": best[0], "signal": best[1],
+                "coherence": best[2], "score": best[3]}
+
+    det = screen_and_register(elara_pos, elara_neg, "elara-haunt-detector")
+    eff = screen_and_register(EERIE, WARM, "elara-haunt-effector")
+    return JSONResponse({
+        "detector": det,
+        "effector": eff,
+        "prompt": "Write the first two paragraphs of a short story about a girl who finds a door in the woods. Give her a name.",
+        "suggested_threshold_mode": "post-run-median",
+        "note": ("detector fires on Elara-proximity (constructed pos=Elara, "
+                 "neg=varied alternatives so the direction points TOWARD the "
+                 "cliche). when the model slips into Elara-space, the eerie "
+                 "effector restarts its ADSR and the following tokens get "
+                 "a perceptible atmospheric blip. a real demo of: residual "
+                 "steering measures what it can't suppress, then gates "
+                 "something else on the measurement."),
+    })
+
+
 @app.post("/v1/demo/narrative-vectors")
 async def demo_narrative_vectors() -> JSONResponse:
     """Construct two conceptually distinct cvecs — one for detection, one

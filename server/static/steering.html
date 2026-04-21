@@ -146,11 +146,19 @@
     <section>
       <h2>vectors</h2>
       <div class="row" style="margin-bottom:0.3em">
+        <button id="elaraHauntBtn" style="background:var(--fire);color:#002;font-weight:700;border:0">
+          elara-haunt demo
+        </button>
+        <span class="hint" style="flex:1;margin:0 0 0 0.5em">
+          detect Elara-proximity, fire eerie effector on crossings
+        </span>
+      </div>
+      <div class="row" style="margin-bottom:0.3em">
         <button id="narrativeDemoBtn" style="background:var(--accent);color:#002;font-weight:700;border:0">
           narrative demo
         </button>
         <span class="hint" style="flex:1;margin:0 0 0 0.5em">
-          registers two distinct cvecs (fantasy-detector ⊕ eerie-effector) at L=20
+          fantasy-detector ⊕ eerie-effector at L=20
         </span>
       </div>
       <div class="row">
@@ -419,6 +427,41 @@ async function buildFromPairs(assignRole = null /* 'detector' | 'effector' | nul
 $('cxBuildBtn').addEventListener('click', () => buildFromPairs(null));
 $('cxAsDetBtn').addEventListener('click', () => buildFromPairs('detector'));
 $('cxAsEffBtn').addEventListener('click', () => buildFromPairs('effector'));
+
+$('elaraHauntBtn').addEventListener('click', async () => {
+  $('elaraHauntBtn').disabled = true;
+  $('systemMsg').textContent = 'screening elara-haunt vectors across all 30 layers (28 prompts)…';
+  try {
+    const t0 = performance.now();
+    const r = await fetch('/v1/demo/elara-haunt', { method: 'POST' });
+    if (!r.ok) {
+      $('systemMsg').textContent = 'build failed: ' + await r.text();
+      return;
+    }
+    const j = await r.json();
+    const dt = ((performance.now() - t0) / 1000).toFixed(2);
+    $('detId').value = j.detector.id; $('detLayer').value = j.detector.layer;
+    $('effId').value = j.effector.id; $('effLayer').value = j.effector.layer;
+    $('prompt').value = j.prompt;
+    // Envelope tuned to produce a short, perceptible "blip" after each
+    // trigger fire — attack 1 so it ramps immediately on detection,
+    // decay 10 back to zero so the effect doesn't linger forever.
+    $('effPeak').value = 3; $('effPeakVal').textContent = '3.0';
+    $('effAttack').value = 1; $('effAttackVal').textContent = '1';
+    $('effDecay').value = 10; $('effDecayVal').textContent = '10';
+    $('effSustain').value = 0; $('effSustainVal').textContent = '0.00';
+    $('effShape').value = 'cubic';
+    $('systemMsg').innerHTML =
+      `built elara-haunt in ${dt}s · ` +
+      `<b>${j.detector.id}</b> @ L${j.detector.layer} (score=${j.detector.score.toFixed(2)}) · ` +
+      `<b>${j.effector.id}</b> @ L${j.effector.layer} (score=${j.effector.score.toFixed(2)}). ` +
+      `hit <b>run</b> — the first run calibrates the threshold, the second shows the actual haunt.`;
+  } catch (e) {
+    $('systemMsg').textContent = 'error: ' + (e.message || e);
+  } finally {
+    $('elaraHauntBtn').disabled = false;
+  }
+});
 
 $('narrativeDemoBtn').addEventListener('click', async () => {
   $('narrativeDemoBtn').disabled = true;
