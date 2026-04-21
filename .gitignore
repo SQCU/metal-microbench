@@ -11,7 +11,9 @@
 /libgemma_metal.dylib
 /tetraplex_recorder
 
-# Demo captures written by tetraplex_recorder.
+# Demo captures written by tetraplex_recorder. Specific recordings that
+# are embedded in docs/ live at docs/media/ and are tracked there — the
+# general-ignore below only applies to the ad-hoc capture directory.
 /recordings/
 
 # Python bridge
