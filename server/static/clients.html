@@ -162,6 +162,23 @@
       </div>
     </a>
 
+    <a class="card" href="/steering" data-color="0">
+      <div class="name">residual-stream steering <span class="path">/steering</span></div>
+      <div class="desc">
+        Wire up a detector vector + an effector vector + a gated trigger
+        with an ADSR envelope, watch per-token detector intensity as a
+        background heatmap on the streamed output. Below, a time-series
+        plot of detector intensity vs effector magnitude with yellow
+        markers at trigger-fire events.
+      </div>
+      <div class="chips">
+        <span class="chip">cvec write kernel</span>
+        <span class="chip">detector read kernel</span>
+        <span class="chip">cross-tick side-chain</span>
+        <span class="chip">ADSR envelope</span>
+      </div>
+    </a>
+
   </div>
 
   <section class="endpoints">

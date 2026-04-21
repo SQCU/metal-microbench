@@ -666,6 +666,33 @@ public func gemma_session_read_intensity(_ sid: Int32,
     return s.detectors.first(where: { $0.name == name })?.lastIntensity ?? 0
 }
 
+// Drain per-token samples as a JSON array and copy into caller-provided
+// buffer. Returns bytes written (truncated if buffer too small — caller
+// should size generously, ~200 bytes per sample is a safe upper bound).
+// If outPtr is nil, returns the number of bytes that WOULD be written
+// without draining — use this to size your buffer. Otherwise the queue
+// IS drained (consumed) on each call.
+@_cdecl("gemma_session_poll_samples_json")
+public func gemma_session_poll_samples_json(_ sid: Int32,
+                                             _ outPtr: UnsafeMutablePointer<CChar>?,
+                                             _ maxBytes: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let s = gSessions[sid] else { return -1 }
+    // When asked for a size only (outPtr == nil), don't drain — serialize
+    // a snapshot of the current queue without consuming it. A subsequent
+    // call with a buffer drains for real.
+    if outPtr == nil {
+        // Quick upper bound: each sample serializes to O(150 bytes)
+        // typical; give the caller enough headroom.
+        return Int32(s.pendingSamplesCount * 256 + 4)
+    }
+    let json = s.drainSamplesJson()
+    let bytes = Array(json.utf8)
+    let n = min(bytes.count, Int(maxBytes))
+    for i in 0..<n { outPtr![i] = CChar(bitPattern: bytes[i]) }
+    return Int32(n)
+}
+
 // Submit pre-computed soft tokens to a session. The client is handing
 // back softs they received from a previous image submission — the server
 // brackets with BOI/EOI and appends to the chunk queue without running

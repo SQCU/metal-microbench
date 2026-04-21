@@ -283,6 +283,20 @@ final class Session {
     fileprivate(set) var detectors: [DetectorAttachment] = []
     fileprivate(set) var triggers: [SessionTrigger] = []
 
+    // Per-emitted-token telemetry for the steering UI. One sample per
+    // token, captured at emit time with that step's detector intensities
+    // and effector magnitudes. Drained by gemma_session_poll_samples_json
+    // between pump cycles — same pattern as the output token queue.
+    struct TokenSample {
+        let token: UInt32
+        let position: Int
+        // Keep as ordered pairs so the JSON serializer has a stable order
+        // and clients can correlate sample[i].name with their UI list.
+        let detectors: [(name: String, intensity: Float)]
+        let effectors: [(cvecId: String, magnitude: Float)]
+    }
+    fileprivate var pendingSamples: [TokenSample] = []
+
     func addControl(_ c: ActiveControl) { activeControls.append(c) }
     func removeControls(cvecId: String) {
         activeControls.removeAll { $0.cvecId == cvecId }
@@ -305,6 +319,47 @@ final class Session {
     // Read-only accessors for the pump (intensity readback, trigger eval).
     var detectorCount: Int { detectors.count }
     func detectorAt(_ i: Int) -> DetectorAttachment { detectors[i] }
+    var pendingSamplesCount: Int { pendingSamples.count }
+    // Record a per-token sample at emit time. Skips the work entirely
+    // when the session has neither detectors nor controls — cost is zero
+    // for non-steered sessions. Called once per emitted token from step().
+    func recordSample(token: UInt32) {
+        if detectors.isEmpty && activeControls.isEmpty { return }
+        var dets: [(name: String, intensity: Float)] = []
+        dets.reserveCapacity(detectors.count)
+        for d in detectors { dets.append((name: d.name, intensity: d.lastIntensity)) }
+        var effs: [(cvecId: String, magnitude: Float)] = []
+        effs.reserveCapacity(activeControls.count)
+        for c in activeControls {
+            let m = c.magnitudeAt(position: position, turn: turnIndex)
+            effs.append((cvecId: c.cvecId, magnitude: m))
+        }
+        pendingSamples.append(TokenSample(token: token, position: position,
+                                           detectors: dets, effectors: effs))
+    }
+    // Drain pending samples into a JSON string. Called by the FFI; the
+    // bridge polls this alongside the token queue and streams the JSON
+    // into an SSE side-channel frame the UI consumes for its heatmap.
+    func drainSamplesJson() -> String {
+        if pendingSamples.isEmpty { return "[]" }
+        var out = "["
+        for (i, s) in pendingSamples.enumerated() {
+            if i > 0 { out += "," }
+            let dets = s.detectors.map { "\"\(jsonEscape($0.name))\":\($0.intensity)" }.joined(separator: ",")
+            let effs = s.effectors.map { "\"\(jsonEscape($0.cvecId))\":\($0.magnitude)" }.joined(separator: ",")
+            out += "{\"token\":\(s.token),\"position\":\(s.position),"
+            out += "\"detectors\":{\(dets)},\"effectors\":{\(effs)}}"
+        }
+        out += "]"
+        pendingSamples.removeAll(keepingCapacity: true)
+        return out
+    }
+    private func jsonEscape(_ s: String) -> String {
+        // Escape only what matters for identifiers (backslash + quote);
+        // names can't contain control chars in practice.
+        return s.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+    }
     // Evaluate every trigger against current detector state, firing
     // effector restarts as edges cross. Called by step() AFTER intensity
     // readback and BEFORE the next tick's dispatch, so restarts affect
@@ -909,6 +964,7 @@ final class LmEngine {
                     s.outputQueue.append(sampled)
                     s.consumedTokens.append(sampled)
                     s.nextGeneratedInput = sampled
+                    s.recordSample(token: sampled)
                     s.numGenerated += 1; emitted += 1; totalTokensGenerated += 1
                     if sampled == s.eosId || s.numGenerated >= s.maxNewTokens {
                         s.state = .done
@@ -918,6 +974,7 @@ final class LmEngine {
             } else {
                 s.outputQueue.append(sampled)
                 s.nextGeneratedInput = sampled
+                s.recordSample(token: sampled)
                 s.numGenerated += 1; emitted += 1; totalTokensGenerated += 1
                 if sampled == s.eosId || s.numGenerated >= s.maxNewTokens {
                     s.state = .done

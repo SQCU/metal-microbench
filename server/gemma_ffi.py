@@ -524,3 +524,23 @@ def session_clear_detectors(sid: int) -> None:
 
 def session_read_intensity(sid: int, name: str) -> float:
     return float(_lib.gemma_session_read_intensity(int(sid), name.encode("utf-8")))
+
+
+_lib.gemma_session_poll_samples_json.argtypes = [C.c_int32, C.c_char_p, C.c_int32]
+_lib.gemma_session_poll_samples_json.restype = C.c_int32
+
+def session_poll_samples_json(sid: int) -> str:
+    """Drain the session's per-token sample queue as a JSON array string.
+    Returns "[]" when empty. Each array element is:
+      {"token": int, "position": int,
+       "detectors": {name: intensity, ...},
+       "effectors": {cvec_id: magnitude, ...}}"""
+    # Size the buffer conservatively: 256 bytes per sample + envelope.
+    needed = _lib.gemma_session_poll_samples_json(int(sid), None, 0)
+    if needed <= 0:
+        return "[]"
+    buf = C.create_string_buffer(max(needed, 64))
+    n = _lib.gemma_session_poll_samples_json(int(sid), buf, len(buf))
+    if n <= 0:
+        return "[]"
+    return buf.raw[:n].decode("utf-8", errors="replace")

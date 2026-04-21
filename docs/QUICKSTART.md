@@ -27,6 +27,7 @@ Open <http://localhost:8000> for the client index; pick one of the three demo cl
 | `/labeler` | drop a folder of PNGs, get JSONL labels back; 4 live-decoding ribbons drain a queue | vision cache + shared-schema prefix + multi-slot soft prefill |
 | `/loom` | tree-of-thoughts with SVG-woven branches forked from a shared root | content-hash prefix cache + fork-from-node |
 | `/compare` | prompt A/B harness — one system prompt, K user-prompt variants side-by-side | prefix cache load-bearing across concurrent sessions |
+| `/steering` | residual-stream control-vector steering — detector + effector + ADSR + gated triggers, per-token heatmap | cvec write/read kernels + cross-tick side-chain + envelope evaluator |
 
 ---
 

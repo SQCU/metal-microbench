@@ -403,6 +403,41 @@ async def prewarm_image(req: Request) -> JSONResponse:
     })
 
 
+@app.post("/v1/demo/steering-vectors")
+def demo_steering_vectors() -> JSONResponse:
+    """Register a deterministic pair of orthogonal unit-norm random
+    cvectors under ids "demo-detector" and "demo-effector", for the
+    /steering client's "load demo vectors" button. Deterministic so
+    repeated calls idempotently overwrite with the same bytes.
+    Pure-stdlib implementation — no numpy dependency."""
+    import random, struct, math
+    HIDDEN = 2816
+    rng = random.Random(0xC00C1EC)
+    def rand_unit() -> list[float]:
+        v = [rng.gauss(0.0, 1.0) for _ in range(HIDDEN)]
+        n = math.sqrt(sum(x * x for x in v))
+        return [x / n for x in v]
+    vd = rand_unit()
+    ve = rand_unit()
+    # Gram–Schmidt: ve -= (ve · vd) vd, then renormalize.
+    proj = sum(a * b for a, b in zip(ve, vd))
+    ve = [a - proj * b for a, b in zip(ve, vd)]
+    n = math.sqrt(sum(x * x for x in ve))
+    ve = [x / n for x in ve]
+    # struct 'e' = IEEE-754 binary16 (fp16), little-endian. HIDDEN halves.
+    fmt = f"<{HIDDEN}e"
+    g.control_register_fp16("demo-detector", struct.pack(fmt, *vd))
+    g.control_register_fp16("demo-effector", struct.pack(fmt, *ve))
+    inner = sum(a * b for a, b in zip(vd, ve))
+    return JSONResponse({
+        "registered": ["demo-detector", "demo-effector"],
+        "hidden": HIDDEN,
+        "inner_product": inner,   # ~0 confirms orthogonalization worked
+        "note": ("orthogonal unit-norm fp16 vectors; use 'demo-detector' as a "
+                 "detector cvec_id and 'demo-effector' as an effector cvec_id"),
+    })
+
+
 @app.post("/v1/control/vectors")
 async def control_register(req: Request) -> JSONResponse:
     """Register a control vector by caller-assigned id. Body JSON:
@@ -553,6 +588,27 @@ def _attach_controls(sid: int, controls: list[dict]) -> None:
         )
 
 
+def _attach_detectors(sid: int, detectors: list[dict]) -> None:
+    """Schema: {name, cvec_id, layer}. Attached before the first tick
+    so intensities are available from token 0 onward."""
+    for d in detectors or []:
+        g.session_add_detector(sid, str(d["name"]), str(d["cvec_id"]),
+                                int(d.get("layer", 0)))
+
+
+def _attach_triggers(sid: int, triggers: list[dict]) -> None:
+    """Schema: {detector_name, condition: 'on-exceed'|'on-fall',
+                threshold: float, effector_cvec_id: str}.
+    Triggers ride on top of detectors+controls already attached to the
+    same session; they gate the named control's envelope restart at
+    each edge crossing of the detector's intensity."""
+    for t in triggers or []:
+        g.session_add_trigger(sid, str(t["detector_name"]),
+                                str(t.get("condition", "on-exceed")),
+                                float(t.get("threshold", 0)),
+                                str(t["effector_cvec_id"]))
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request) -> Any:
     body = await req.json()
@@ -560,22 +616,27 @@ async def chat_completions(req: Request) -> Any:
     max_tokens = int(body.get("max_tokens", 256))
     stream = bool(body.get("stream", False))
     controls = body.get("controls", []) or []
+    detectors = body.get("detectors", []) or []
+    triggers = body.get("triggers", []) or []
     if not messages:
         raise HTTPException(400, "messages is required")
 
-    # Attach controls BEFORE submit_messages so we capture the session's
-    # envelope-start position at 0 — otherwise the pump thread could tick
-    # between open and attach and advance `position` ahead of us.
+    # Attach controls / detectors / triggers BEFORE submit_messages so we
+    # capture the session's envelope-start position at 0 — otherwise the
+    # pump thread could tick between open and attach and advance
+    # `position` ahead of us.
     sid = g.open_session(max_new_tokens=max_tokens)
     state = SessionState(sid=sid)
     with _sessions_lock:
         _sessions[sid] = state
-    if controls:
+    if controls or detectors or triggers:
         try:
             _attach_controls(sid, controls)
+            _attach_detectors(sid, detectors)
+            _attach_triggers(sid, triggers)
         except Exception as e:
             _close_session(sid)
-            raise HTTPException(400, f"control attachment failed: {e}")
+            raise HTTPException(400, f"steering attachment failed: {e}")
     submit_messages(sid, messages)
     created = int(time.time())
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
@@ -624,6 +685,31 @@ async def chat_completions(req: Request) -> Any:
                     "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
                 }
                 yield f"data: {json.dumps(delta)}\n\n"
+                # Side-channel: drain any per-token steering samples the
+                # engine recorded and emit them as their own SSE frame.
+                # "samples" frames carry detector intensities + effector
+                # magnitudes per-token; clients that don't care about
+                # steering just ignore the non-standard payload shape.
+                # Each sample carries its OWN token id; detokenize it
+                # individually rather than trying to align with `chunk`
+                # (samples can accumulate faster than the chunk iterator
+                # consumes under heavy load).
+                samples_raw = g.session_poll_samples_json(sid)
+                if samples_raw and samples_raw != "[]":
+                    try:
+                        samples = json.loads(samples_raw)
+                    except Exception:
+                        samples = []
+                    for s in samples:
+                        s["text"] = g.detokenize([int(s.get("token", 0))])
+                    frame = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": MODEL_NAME,
+                        "samples": samples,
+                    }
+                    yield f"data: {json.dumps(frame)}\n\n"
         finally:
             tail = {
                 "id": completion_id,
@@ -723,6 +809,11 @@ def loom_page() -> FileResponse:
 @app.get("/compare")
 def compare_page() -> FileResponse:
     return FileResponse(str(_STATIC_DIR / "compare.html"))
+
+
+@app.get("/steering")
+def steering_page() -> FileResponse:
+    return FileResponse(str(_STATIC_DIR / "steering.html"))
 
 
 @app.get("/v1/demo/frames")

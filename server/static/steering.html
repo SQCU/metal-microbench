@@ -1,0 +1,557 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>gemma metal bridge — steering</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0a0a0a; --panel: #121212; --border: #222;
+    --text: #d4d4d4; --mute: #888; --accent: #6a9;
+    --det: #5cf;          /* detector blue */
+    --eff: #fa3;          /* effector orange */
+    --fire: #ffde47;      /* trigger-fire yellow */
+    --pos: #3a7;          /* positive intensity */
+    --neg: #d46;          /* negative intensity */
+  }
+  html, body { margin:0; padding:0; background:var(--bg); color:var(--text);
+    font-family: ui-monospace, 'SF Mono', Monaco, monospace; height:100%; }
+  body { display:flex; flex-direction:column; height:100vh; overflow:hidden; }
+  header {
+    padding:0.7em 1.2em; border-bottom:1px solid var(--border);
+    display:flex; justify-content:space-between; align-items:center;
+    flex-wrap:wrap; gap:0.6em; flex:none;
+  }
+  header h1 { margin:0; font-size:1rem; font-weight:500; color:var(--accent); }
+  header .status { font-size:0.78rem; color:var(--mute); }
+  header a { color:var(--accent); text-decoration:none; margin-left:0.8em; }
+
+  main.viewport {
+    flex:1; min-height:0; overflow:auto; display:grid;
+    grid-template-columns: 340px 1fr;
+    grid-template-rows: 1fr auto;
+    grid-template-areas: "config output" "config chart";
+    gap: 0; min-width:fit-content;
+  }
+
+  .config {
+    grid-area: config; padding:0.9em; border-right:1px solid var(--border);
+    overflow:auto; background: #0c0c0c;
+  }
+  .config h2 {
+    margin:0 0 0.5em 0; font-size:0.75rem; color:var(--mute);
+    text-transform:uppercase; letter-spacing:0.05em; font-weight:500;
+  }
+  .config h2.detector { color: var(--det); }
+  .config h2.effector { color: var(--eff); }
+  .config h2.trigger  { color: var(--fire); }
+  .config section { margin-bottom:1.2em; padding-bottom:0.8em;
+    border-bottom:1px solid #1a1a1a; }
+  .config .row { display:flex; gap:0.4em; align-items:center; margin:0.3em 0; }
+  .config label { color:var(--mute); font-size:0.72rem; flex:0 0 6.5em; }
+  .config input, .config select, .config textarea {
+    background:var(--panel); color:var(--text); border:1px solid var(--border);
+    border-radius:3px; padding:0.3em 0.4em; font:inherit; font-size:0.78rem;
+    flex:1; min-width:0;
+  }
+  .config textarea { width:100%; box-sizing:border-box; min-height:3.5em;
+    resize:vertical; font-size:0.82rem; }
+  .config .slider-row { display:flex; gap:0.3em; align-items:center; margin:0.25em 0; }
+  .config .slider-row label { flex:0 0 5em; }
+  .config .slider-row input[type=range] { flex:1; }
+  .config .slider-row .val { flex:0 0 3.5em; text-align:right; color:var(--text); font-size:0.75rem; }
+  .config button {
+    background:#1a2030; color:var(--text); border:1px solid var(--border);
+    border-radius:3px; padding:0.35em 0.7em; font:inherit; font-size:0.8rem;
+    cursor:pointer;
+  }
+  .config button.primary {
+    background:var(--det); color:#002; font-weight:700; border:0; padding:0.5em 1em;
+  }
+  .config button.primary:disabled { background:#444; color:var(--mute); cursor:not-allowed; }
+  .config .hint { font-size:0.68rem; color:var(--mute); margin-top:0.2em; line-height:1.4; }
+
+  .output {
+    grid-area: output; overflow:auto; padding:0.9em 1.2em;
+    font-size:0.92rem; line-height:1.8;
+  }
+  .output .system {
+    font-size:0.74rem; color:var(--mute); margin-bottom:0.6em;
+    padding:0.3em 0.5em; background:var(--panel); border-left:3px solid var(--accent);
+    border-radius:2px;
+  }
+  .output .tokens {
+    font-family: ui-monospace, 'SF Mono', Monaco, monospace;
+    white-space:pre-wrap; word-break:break-word;
+  }
+  .output .tok {
+    padding: 1px 2px; border-radius: 2px; position:relative;
+    transition: background 0.15s;
+  }
+  .output .tok.fire {
+    border-bottom: 2px solid var(--fire);
+  }
+  .output .tok:hover {
+    outline: 1px solid var(--accent);
+  }
+
+  .chart {
+    grid-area: chart; border-top:1px solid var(--border);
+    background:#0c0c0c; padding:0.5em 1em 0.8em 1em; height: 220px;
+    overflow:hidden;
+  }
+  .chart h2 {
+    margin:0 0 0.3em 0; font-size:0.72rem; color:var(--mute);
+    text-transform:uppercase; letter-spacing:0.05em; font-weight:500;
+  }
+  .chart canvas { width:100%; height: calc(100% - 1.6em); display:block; }
+
+  footer {
+    padding:0.4em 1em; border-top:1px solid var(--border); flex:none;
+    font-size:0.72rem; color:var(--mute); display:flex; gap:1.4em;
+    flex-wrap:wrap; align-items:center;
+  }
+  footer .stat b { color:var(--text); font-weight:500; }
+  footer .stat.det b { color: var(--det); }
+  footer .stat.eff b { color: var(--eff); }
+  footer .stat.fire b { color: var(--fire); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>gemma-4 · residual-stream steering</h1>
+  <div>
+    <span class="status" id="statusText">checking…</span>
+    <a href="/">← clients</a>
+    <a href="/tetraplex">tetraplex</a>
+    <a href="/labeler">labeler</a>
+    <a href="/loom">loom</a>
+    <a href="/compare">compare</a>
+  </div>
+</header>
+
+<main class="viewport">
+
+  <aside class="config">
+    <section>
+      <h2>prompt</h2>
+      <textarea id="prompt">Describe a cat in three sentences.</textarea>
+      <div class="row" style="margin-top:0.3em">
+        <label for="maxTok">max tokens</label>
+        <input type="number" id="maxTok" min="20" max="240" value="80">
+      </div>
+    </section>
+
+    <section>
+      <h2>vectors</h2>
+      <div class="row">
+        <button id="loadDemoBtn">load demo vectors</button>
+        <span class="hint" style="flex:1;margin:0 0 0 0.5em">
+          registers orthogonal demo-detector + demo-effector
+        </span>
+      </div>
+      <div class="hint">or <code>POST /v1/control/vectors</code> with your own <code>{id, fp16_b64}</code>.</div>
+    </section>
+
+    <section>
+      <h2 class="detector">detector</h2>
+      <div class="row">
+        <label for="detEnabled">enabled</label>
+        <input type="checkbox" id="detEnabled" checked style="flex:0 0 auto">
+      </div>
+      <div class="row">
+        <label for="detName">name</label>
+        <input type="text" id="detName" value="d">
+      </div>
+      <div class="row">
+        <label for="detId">cvec id</label>
+        <input type="text" id="detId" value="demo-detector">
+      </div>
+      <div class="row">
+        <label for="detLayer">layer</label>
+        <input type="number" id="detLayer" min="0" max="29" value="15">
+      </div>
+    </section>
+
+    <section>
+      <h2 class="effector">effector (ADSR)</h2>
+      <div class="row">
+        <label for="effEnabled">enabled</label>
+        <input type="checkbox" id="effEnabled" checked style="flex:0 0 auto">
+      </div>
+      <div class="row">
+        <label for="effId">cvec id</label>
+        <input type="text" id="effId" value="demo-effector">
+      </div>
+      <div class="row">
+        <label for="effLayer">layer</label>
+        <input type="number" id="effLayer" min="0" max="29" value="15">
+      </div>
+      <div class="slider-row">
+        <label>peak</label>
+        <input type="range" id="effPeak" min="0" max="5" step="0.1" value="2.0">
+        <span class="val" id="effPeakVal">2.0</span>
+      </div>
+      <div class="slider-row">
+        <label>polarity</label>
+        <input type="range" id="effPol" min="-1" max="1" step="1" value="1">
+        <span class="val" id="effPolVal">+1</span>
+      </div>
+      <div class="slider-row">
+        <label>attack</label>
+        <input type="range" id="effAttack" min="0" max="40" step="1" value="3">
+        <span class="val" id="effAttackVal">3</span>
+      </div>
+      <div class="slider-row">
+        <label>decay</label>
+        <input type="range" id="effDecay" min="0" max="40" step="1" value="8">
+        <span class="val" id="effDecayVal">8</span>
+      </div>
+      <div class="slider-row">
+        <label>sustain</label>
+        <input type="range" id="effSustain" min="0" max="1" step="0.05" value="0">
+        <span class="val" id="effSustainVal">0.00</span>
+      </div>
+      <div class="slider-row">
+        <label>release</label>
+        <input type="range" id="effRelease" min="0" max="40" step="1" value="0">
+        <span class="val" id="effReleaseVal">0</span>
+      </div>
+      <div class="row">
+        <label for="effShape">shape</label>
+        <select id="effShape">
+          <option value="linear">linear</option>
+          <option value="exp-in">exp-in</option>
+          <option value="exp-out">exp-out</option>
+          <option value="cubic" selected>cubic</option>
+        </select>
+      </div>
+    </section>
+
+    <section>
+      <h2 class="trigger">trigger (detector → effector)</h2>
+      <div class="row">
+        <label for="trigEnabled">enabled</label>
+        <input type="checkbox" id="trigEnabled" checked style="flex:0 0 auto">
+      </div>
+      <div class="row">
+        <label for="trigCond">condition</label>
+        <select id="trigCond">
+          <option value="on-exceed" selected>on-exceed</option>
+          <option value="on-fall">on-fall</option>
+        </select>
+      </div>
+      <div class="slider-row">
+        <label>threshold</label>
+        <input type="range" id="trigTh" min="-3" max="3" step="0.05" value="1.0">
+        <span class="val" id="trigThVal">+1.00</span>
+      </div>
+      <div class="hint">
+        edge-triggered: fires once per rising/falling threshold crossing,
+        restarts the effector's ADSR from attack=0.
+      </div>
+    </section>
+
+    <button class="primary" id="runBtn">run</button>
+  </aside>
+
+  <div class="output">
+    <div class="system" id="systemMsg">
+      hit <b>load demo vectors</b> first, then <b>run</b>. each token gets a
+      background tint proportional to detector intensity (red = negative
+      projection, green = positive). yellow underline = trigger fired at
+      that token. the chart below shows the per-token time series.
+    </div>
+    <div class="tokens" id="tokens"></div>
+  </div>
+
+  <div class="chart">
+    <h2>detector intensity (blue) · effector magnitude (orange) · triggers (yellow markers)</h2>
+    <canvas id="plot"></canvas>
+  </div>
+
+</main>
+
+<footer>
+  <span class="stat">tokens: <b id="fTokens">0</b></span>
+  <span class="stat det">detector range: <b id="fDetRange">—</b></span>
+  <span class="stat eff">effector range: <b id="fEffRange">—</b></span>
+  <span class="stat fire">trigger fires: <b id="fFires">0</b></span>
+  <span class="stat">wall: <b id="fWall">—</b></span>
+  <span style="flex:1"></span>
+  <span class="stat">raw JSON per-token: hover a token to see its (token, intensity, magnitude) triple</span>
+</footer>
+
+<script>
+// --- server health ---
+async function checkHealth() {
+  try {
+    const r = await (await fetch('/health')).json();
+    statusText.textContent = r.status === 'ready' ? `ready · ${r.model}` : 'loading…';
+  } catch { statusText.textContent = 'bridge unreachable'; }
+}
+const statusText = document.getElementById('statusText');
+setInterval(checkHealth, 3000); checkHealth();
+
+// --- UI wiring ---
+const $ = id => document.getElementById(id);
+for (const id of ['effPeak','effAttack','effDecay','effRelease']) {
+  $(id).addEventListener('input', () => { $(id + 'Val').textContent = $(id).value; });
+}
+$('effSustain').addEventListener('input', () => {
+  $('effSustainVal').textContent = parseFloat($('effSustain').value).toFixed(2);
+});
+$('effPol').addEventListener('input', () => {
+  const v = parseInt($('effPol').value);
+  $('effPolVal').textContent = v > 0 ? '+1' : (v < 0 ? '-1' : '0');
+});
+$('trigTh').addEventListener('input', () => {
+  const v = parseFloat($('trigTh').value);
+  $('trigThVal').textContent = (v >= 0 ? '+' : '') + v.toFixed(2);
+});
+
+$('loadDemoBtn').addEventListener('click', async () => {
+  const r = await fetch('/v1/demo/steering-vectors', { method: 'POST' });
+  if (r.ok) {
+    $('systemMsg').innerHTML = '<b>demo vectors registered.</b> now hit <b>run</b>.';
+  } else {
+    $('systemMsg').textContent = 'failed to register demo vectors';
+  }
+});
+
+// --- run ---
+const state = {
+  samples: [],       // array of {token, text, position, detectors:{}, effectors:{}, fired:bool}
+  running: false,
+  tStart: null,
+};
+
+$('runBtn').addEventListener('click', async () => {
+  if (state.running) return;
+  state.running = true; state.tStart = performance.now();
+  $('runBtn').disabled = true;
+  state.samples = [];
+  $('tokens').innerHTML = '';
+  $('fFires').textContent = '0';
+
+  const detName = $('detName').value || 'd';
+  const effId   = $('effId').value || 'demo-effector';
+  const detId   = $('detId').value || 'demo-detector';
+
+  const body = {
+    model: 'gemma-4-a4b-q4km',
+    max_tokens: parseInt($('maxTok').value) || 80,
+    stream: true,
+    messages: [{ role: 'user', content: $('prompt').value }],
+    controls: [],
+    detectors: [],
+    triggers: [],
+  };
+  if ($('detEnabled').checked) {
+    body.detectors.push({ name: detName, cvec_id: detId, layer: parseInt($('detLayer').value) });
+  }
+  if ($('effEnabled').checked) {
+    body.controls.push({
+      cvec_id: effId,
+      layer: parseInt($('effLayer').value),
+      polarity: parseInt($('effPol').value),
+      peak_magnitude: parseFloat($('effPeak').value),
+      attack: parseFloat($('effAttack').value),
+      decay:  parseFloat($('effDecay').value),
+      sustain_level: parseFloat($('effSustain').value),
+      release: parseFloat($('effRelease').value),
+      shape: $('effShape').value,
+      units: 'tokens',
+    });
+  }
+  if ($('trigEnabled').checked && $('detEnabled').checked && $('effEnabled').checked) {
+    body.triggers.push({
+      detector_name: detName,
+      condition: $('trigCond').value,
+      threshold: parseFloat($('trigTh').value),
+      effector_cvec_id: effId,
+    });
+  }
+
+  try {
+    const resp = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    let prevDet = null;
+    const trigTh = parseFloat($('trigTh').value);
+    const trigCond = $('trigCond').value;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n\n')) !== -1) {
+        const frame = buf.slice(0, i); buf = buf.slice(i+2);
+        if (!frame.startsWith('data: ')) continue;
+        const payload = frame.slice(6);
+        if (payload === '[DONE]') break;
+        let j; try { j = JSON.parse(payload); } catch { continue; }
+        if (j.samples) {
+          for (const s of j.samples) {
+            const det = s.detectors?.[detName] ?? 0;
+            let fired = false;
+            if (prevDet !== null) {
+              if (trigCond === 'on-exceed' && prevDet <= trigTh && det > trigTh) fired = true;
+              if (trigCond === 'on-fall'   && prevDet >= trigTh && det < trigTh) fired = true;
+            }
+            prevDet = det;
+            state.samples.push({
+              token: s.token,
+              text: s.text ?? '?',
+              position: s.position,
+              detectors: s.detectors || {},
+              effectors: s.effectors || {},
+              fired,
+            });
+          }
+          renderTokens();
+          drawChart();
+          updateFooter();
+        }
+      }
+    }
+  } catch (e) {
+    $('systemMsg').textContent = 'error: ' + (e.message || e);
+  } finally {
+    state.running = false;
+    $('runBtn').disabled = false;
+    updateFooter();
+  }
+});
+
+function renderTokens() {
+  const host = $('tokens');
+  host.innerHTML = '';
+  const detName = $('detName').value || 'd';
+  // scale intensity to a 0-1 brightness via soft-tanh
+  for (const s of state.samples) {
+    const det = s.detectors[detName] ?? 0;
+    const sigmoid = Math.tanh(det / 2);  // [-1, 1]
+    const bg = sigmoid > 0
+      ? `rgba(${0x3a}, ${0x77}, ${0x4a}, ${Math.min(0.6, sigmoid)})`
+      : `rgba(${0xd4}, ${0x40}, ${0x60}, ${Math.min(0.6, -sigmoid)})`;
+    const span = document.createElement('span');
+    span.className = 'tok' + (s.fired ? ' fire' : '');
+    span.style.background = bg;
+    span.textContent = s.text;
+    const effNames = Object.keys(s.effectors);
+    const effStr = effNames.length
+      ? effNames.map(k => `${k}=${s.effectors[k].toFixed(2)}`).join(' ')
+      : '';
+    span.title = `pos ${s.position} · ${detName}=${det.toFixed(3)}${effStr ? ' · ' + effStr : ''}${s.fired ? ' · TRIGGER' : ''}`;
+    host.appendChild(span);
+  }
+}
+
+// --- chart ---
+const plot = $('plot');
+const pctx = plot.getContext('2d');
+function drawChart() {
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = plot.clientWidth, cssH = plot.clientHeight;
+  if (plot.width !== cssW * dpr || plot.height !== cssH * dpr) {
+    plot.width = cssW * dpr; plot.height = cssH * dpr;
+    pctx.setTransform(1, 0, 0, 1, 0, 0);
+    pctx.scale(dpr, dpr);
+  }
+  pctx.clearRect(0, 0, cssW, cssH);
+  if (state.samples.length === 0) return;
+  const detName = $('detName').value || 'd';
+  const effId = $('effId').value || 'demo-effector';
+  const n = state.samples.length;
+  const padL = 40, padR = 12, padT = 12, padB = 20;
+  const w = cssW - padL - padR, h = cssH - padT - padB;
+  // y-axis — combined range over det intensities and eff magnitudes, symmetric about 0
+  let maxAbs = 0.5;
+  for (const s of state.samples) {
+    maxAbs = Math.max(maxAbs, Math.abs(s.detectors[detName] ?? 0));
+    maxAbs = Math.max(maxAbs, Math.abs(s.effectors[effId] ?? 0));
+  }
+  const y0 = padT + h / 2;
+  // horizontal zero-line
+  pctx.strokeStyle = '#222'; pctx.beginPath();
+  pctx.moveTo(padL, y0); pctx.lineTo(cssW - padR, y0); pctx.stroke();
+  // threshold line (if trigger enabled)
+  if ($('trigEnabled').checked) {
+    const th = parseFloat($('trigTh').value);
+    const yT = y0 - (th / maxAbs) * (h / 2);
+    pctx.strokeStyle = 'rgba(255,222,71,0.4)';
+    pctx.setLineDash([4, 3]);
+    pctx.beginPath(); pctx.moveTo(padL, yT); pctx.lineTo(cssW - padR, yT); pctx.stroke();
+    pctx.setLineDash([]);
+  }
+  // detector line
+  pctx.strokeStyle = '#5cf'; pctx.lineWidth = 1.5;
+  pctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = padL + (i / Math.max(n - 1, 1)) * w;
+    const y = y0 - ((state.samples[i].detectors[detName] ?? 0) / maxAbs) * (h / 2);
+    if (i === 0) pctx.moveTo(x, y); else pctx.lineTo(x, y);
+  }
+  pctx.stroke();
+  // effector line
+  pctx.strokeStyle = '#fa3'; pctx.lineWidth = 1.5;
+  pctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = padL + (i / Math.max(n - 1, 1)) * w;
+    const y = y0 - ((state.samples[i].effectors[effId] ?? 0) / maxAbs) * (h / 2);
+    if (i === 0) pctx.moveTo(x, y); else pctx.lineTo(x, y);
+  }
+  pctx.stroke();
+  // trigger-fire markers
+  pctx.fillStyle = '#ffde47';
+  for (let i = 0; i < n; i++) {
+    if (!state.samples[i].fired) continue;
+    const x = padL + (i / Math.max(n - 1, 1)) * w;
+    pctx.fillRect(x - 1, padT, 2, h);
+  }
+  // y-axis labels
+  pctx.fillStyle = '#888'; pctx.font = '10px ui-monospace';
+  pctx.textAlign = 'right'; pctx.textBaseline = 'middle';
+  pctx.fillText('+' + maxAbs.toFixed(1), padL - 4, padT + 4);
+  pctx.fillText('0', padL - 4, y0);
+  pctx.fillText('-' + maxAbs.toFixed(1), padL - 4, padT + h - 4);
+  // x-axis
+  pctx.textAlign = 'center'; pctx.textBaseline = 'top';
+  pctx.fillText(`0`, padL, padT + h + 4);
+  pctx.fillText(`${n} tokens`, cssW - padR, padT + h + 4);
+}
+window.addEventListener('resize', drawChart);
+
+// --- footer ---
+function updateFooter() {
+  const detName = $('detName').value || 'd';
+  const effId = $('effId').value || 'demo-effector';
+  const n = state.samples.length;
+  $('fTokens').textContent = n;
+  if (n > 0) {
+    const ds = state.samples.map(s => s.detectors[detName] ?? 0);
+    const es = state.samples.map(s => s.effectors[effId] ?? 0);
+    $('fDetRange').textContent = `[${Math.min(...ds).toFixed(2)}, ${Math.max(...ds).toFixed(2)}]`;
+    $('fEffRange').textContent = `[${Math.min(...es).toFixed(2)}, ${Math.max(...es).toFixed(2)}]`;
+    $('fFires').textContent = String(state.samples.filter(s => s.fired).length);
+  } else {
+    $('fDetRange').textContent = '—';
+    $('fEffRange').textContent = '—';
+    $('fFires').textContent = '0';
+  }
+  if (state.tStart) {
+    const dt = ((state.running ? performance.now() : (state.tLastEnd ?? performance.now())) - state.tStart) / 1000;
+    $('fWall').textContent = dt.toFixed(2) + 's';
+  }
+}
+</script>
+</body>
+</html>
