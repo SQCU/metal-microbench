@@ -145,16 +145,22 @@
 
     <section>
       <h2>vectors</h2>
-      <div class="row">
-        <button id="loadDemoBtn">load demo vectors</button>
+      <div class="row" style="margin-bottom:0.3em">
+        <button id="narrativeDemoBtn" style="background:var(--accent);color:#002;font-weight:700;border:0">
+          narrative demo
+        </button>
         <span class="hint" style="flex:1;margin:0 0 0 0.5em">
-          registers orthogonal demo-detector + demo-effector
+          registers two distinct cvecs (fantasy-detector ⊕ eerie-effector) at L=20
         </span>
       </div>
-      <div class="hint" style="margin-bottom:0.6em">
-        or construct one from prose pairs below — the effect becomes legible:
-        you pick what the vector should <i>mean</i>, the engine does mean(pos)-mean(neg)
-        at a chosen layer and normalizes.
+      <div class="row">
+        <button id="loadDemoBtn">random orthogonal demo</button>
+      </div>
+      <div class="hint" style="margin:0.6em 0">
+        <b>important:</b> detector and effector should be DIFFERENT cvecs.
+        using the same vector for both creates positive feedback — the effector
+        bumps the residual along the detector's axis, so intensity saturates
+        above threshold and the trigger never re-edges.
       </div>
 
       <h2 style="margin-top:0.8em;color:var(--accent)">construct from pairs</h2>
@@ -174,13 +180,14 @@
         placeholder="gloomy things&#10;someone sobbing alone&#10;a cold bleak afternoon"></textarea>
       <div class="row" style="margin-top:0.4em">
         <button id="cxBuildBtn">construct</button>
-        <span class="hint" id="cxStatus" style="flex:1;margin:0 0 0 0.5em">ready</span>
+        <button id="cxAsDetBtn" title="construct and assign as detector">→ detector</button>
+        <button id="cxAsEffBtn" title="construct and assign as effector">→ effector</button>
       </div>
+      <div class="hint" id="cxStatus" style="margin-top:0.3em">ready</div>
       <div class="hint">
-        the resulting vector gets registered under <code>new id</code> — fill
-        it into the detector and/or effector <code>cvec id</code> fields above to use it.
-        <b>raw_norm</b> in the response is a separation-strength readout; higher = more
-        distinct direction in representation space at that layer.
+        construct stores the vector under <code>new id</code>; use the <code>→ detector</code>
+        / <code>→ effector</code> buttons to build and auto-assign to the matching role.
+        <b>raw_norm</b> is a separation-strength readout (higher = more distinct direction).
       </div>
     </section>
 
@@ -274,7 +281,7 @@
       </div>
       <div class="slider-row">
         <label>threshold</label>
-        <input type="range" id="trigTh" min="-3" max="3" step="0.05" value="1.0">
+        <input type="range" id="trigTh" min="-60" max="60" step="0.5" value="1.0">
         <span class="val" id="trigThVal">+1.00</span>
       </div>
       <div class="hint">
@@ -367,7 +374,7 @@ $('cxNeg').value = [
   "He stared at the floor, unable to remember anything worth smiling about.",
 ].join('\n');
 
-$('cxBuildBtn').addEventListener('click', async () => {
+async function buildFromPairs(assignRole = null /* 'detector' | 'effector' | null */) {
   const id = $('cxId').value.trim() || 'my-direction';
   const layer = parseInt($('cxLayer').value) || 15;
   const positive = $('cxPos').value.split('\n').map(s => s.trim()).filter(Boolean);
@@ -376,7 +383,7 @@ $('cxBuildBtn').addEventListener('click', async () => {
     $('cxStatus').textContent = 'need ≥1 of each';
     return;
   }
-  $('cxBuildBtn').disabled = true;
+  for (const b of ['cxBuildBtn','cxAsDetBtn','cxAsEffBtn']) $(b).disabled = true;
   $('cxStatus').textContent = `capturing ${positive.length + negative.length} residuals…`;
   try {
     const t0 = performance.now();
@@ -389,23 +396,61 @@ $('cxBuildBtn').addEventListener('click', async () => {
     if (!resp.ok) {
       const err = await resp.text();
       $('cxStatus').textContent = `error: ${err.slice(0, 120)}`;
-    } else {
-      const j = await resp.json();
-      $('cxStatus').innerHTML =
-        `registered <b>${j.id}</b> @ L${j.layer} in ${dt}s · raw_norm=${j.raw_norm.toFixed(2)}`;
-      // Convenience: auto-plug the new id into detector + effector fields
-      // so the user can immediately hit run and see it in action.
-      $('detId').value = id;
-      $('effId').value = id;
-      $('systemMsg').innerHTML =
-        `constructed <b>${id}</b> from ${positive.length}⊕ / ${negative.length}⊖ examples ` +
-        `at L${layer}. it's now wired as both detector and effector — hit <b>run</b> ` +
-        `to see its effect on the prompt above.`;
+      return;
     }
+    const j = await resp.json();
+    let roleNote = '';
+    if (assignRole === 'detector') {
+      $('detId').value = id; $('detLayer').value = layer;
+      roleNote = ' · assigned as detector';
+    } else if (assignRole === 'effector') {
+      $('effId').value = id; $('effLayer').value = layer;
+      roleNote = ' · assigned as effector';
+    }
+    $('cxStatus').innerHTML =
+      `registered <b>${j.id}</b> @ L${j.layer} in ${dt}s · raw_norm=${j.raw_norm.toFixed(2)}${roleNote}`;
   } catch (e) {
     $('cxStatus').textContent = `error: ${e.message || e}`;
   } finally {
-    $('cxBuildBtn').disabled = false;
+    for (const b of ['cxBuildBtn','cxAsDetBtn','cxAsEffBtn']) $(b).disabled = false;
+  }
+}
+
+$('cxBuildBtn').addEventListener('click', () => buildFromPairs(null));
+$('cxAsDetBtn').addEventListener('click', () => buildFromPairs('detector'));
+$('cxAsEffBtn').addEventListener('click', () => buildFromPairs('effector'));
+
+$('narrativeDemoBtn').addEventListener('click', async () => {
+  $('narrativeDemoBtn').disabled = true;
+  $('systemMsg').textContent = 'building narrative vectors (12 prompts through the engine)…';
+  try {
+    const t0 = performance.now();
+    const r = await fetch('/v1/demo/narrative-vectors', { method: 'POST' });
+    if (!r.ok) {
+      $('systemMsg').textContent = 'narrative demo build failed: ' + await r.text();
+      return;
+    }
+    const j = await r.json();
+    const dt = ((performance.now() - t0) / 1000).toFixed(2);
+    $('detId').value = j.detector.id; $('detLayer').value = j.layer;
+    $('effId').value = j.effector.id; $('effLayer').value = j.layer;
+    $('trigTh').value = j.suggested_threshold;
+    $('trigThVal').textContent = '+' + j.suggested_threshold.toFixed(2);
+    $('prompt').value = j.prompt;
+    // Sane defaults for the narrative demo envelope: peak 3, long
+    // decay so the effector's bite lingers for a few tokens.
+    $('effPeak').value = 3; $('effPeakVal').textContent = '3.0';
+    $('effAttack').value = 2; $('effAttackVal').textContent = '2';
+    $('effDecay').value = 12; $('effDecayVal').textContent = '12';
+    $('systemMsg').innerHTML =
+      `built narrative demo in ${dt}s · ` +
+      `<b>${j.detector.id}</b> (raw_norm=${j.detector.raw_norm.toFixed(2)}) · ` +
+      `<b>${j.effector.id}</b> (raw_norm=${j.effector.raw_norm.toFixed(2)}) · ` +
+      `suggested threshold ${j.suggested_threshold} · prompt pre-filled. hit <b>run</b>.`;
+  } catch (e) {
+    $('systemMsg').textContent = 'error: ' + (e.message || e);
+  } finally {
+    $('narrativeDemoBtn').disabled = false;
   }
 });
 
@@ -517,8 +562,46 @@ $('runBtn').addEventListener('click', async () => {
     state.running = false;
     $('runBtn').disabled = false;
     updateFooter();
+    autoCalibrateThreshold();
   }
 });
+
+// After a run, rescale the threshold slider's range to match the observed
+// detector intensity — raw dot products with a unit-norm cvec depend on
+// residual magnitude, which varies per-layer / per-model from ±3 at
+// early layers to ±60 deep in the stack. Fixed ranges are nearly always
+// wrong. Additionally, for edge-triggering to produce dynamics, the
+// threshold should sit near the MEDIAN of the observed distribution —
+// otherwise everything's above (0 rising edges) or below (no fires).
+function autoCalibrateThreshold() {
+  const detName = $('detName').value || 'd';
+  if (state.samples.length === 0) return;
+  const ds = state.samples.map(s => s.detectors[detName] ?? 0).sort((a, b) => a - b);
+  const lo = ds[0], hi = ds[ds.length - 1];
+  const median = ds[Math.floor(ds.length / 2)];
+  const pad = Math.max(0.5, (hi - lo) * 0.15);
+  const newMin = Math.floor((lo - pad) * 10) / 10;
+  const newMax = Math.ceil((hi + pad) * 10) / 10;
+  const th = $('trigTh');
+  th.min = String(newMin);
+  th.max = String(newMax);
+  th.step = String(Math.max(0.05, (newMax - newMin) / 120));
+  // If the user's current threshold is outside the observed range OR
+  // below the 10th percentile, snap to the median so the next run
+  // actually has edge crossings to work with. Otherwise leave their
+  // choice alone.
+  const cur = parseFloat(th.value);
+  const p10 = ds[Math.floor(ds.length * 0.1)];
+  const p90 = ds[Math.floor(ds.length * 0.9)];
+  if (cur < newMin || cur > newMax || cur < p10 || cur > p90) {
+    th.value = String(median);
+    $('trigThVal').textContent = (median >= 0 ? '+' : '') + median.toFixed(2);
+    $('systemMsg').innerHTML =
+      `auto-calibrated threshold to median (${median.toFixed(2)}) — tokens ` +
+      `range [${lo.toFixed(2)}, ${hi.toFixed(2)}]. click <b>run</b> again for ` +
+      `edge-triggered dynamics from that midpoint.`;
+  }
+}
 
 function renderTokens() {
   const host = $('tokens');

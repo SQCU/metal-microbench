@@ -468,6 +468,89 @@ async def control_construct(req: Request) -> JSONResponse:
     })
 
 
+@app.post("/v1/demo/narrative-vectors")
+async def demo_narrative_vectors() -> JSONResponse:
+    """Construct two conceptually distinct cvecs — one for detection, one
+    for intervention — so the /steering UI can demonstrate a meaningful
+    detector→effector gate without semantic feedback. The detector fires
+    on fantasy-adjacent vocabulary; the effector tilts output toward an
+    eerie/atmospheric register. Layered at L=20 (near the end of the
+    network, where representations are most topical).
+    Returns {ids, prompt, suggested_threshold}."""
+    NATURE = [
+      "An old stone archway opened onto a silver river, unicorns grazing at its edge.",
+      "Ancient runes glowed along the dragon's spine as it curled around the moonlit tower.",
+      "The elven prince drew a blade that hummed with starlight and forgotten songs.",
+      "A wizard's lantern illuminated shelves of dusty tomes and whispering crystal skulls.",
+      "In the mist-veiled glade, a white stag bowed to the girl who spoke with the trees.",
+      "The enchanted forest hummed with phoenix wings and the footsteps of hidden fae.",
+    ]
+    MUNDANE = [
+      "She refreshed her inbox and stared at the quarterly reports waiting for review.",
+      "The conference call dragged on; someone was muted but they didn't know it.",
+      "Traffic was terrible on the 101 again and the coffee in his thermos was cold.",
+      "He updated the spreadsheet with next week's payroll numbers before leaving.",
+      "The printer jammed for the third time and she considered calling IT support.",
+      "She paid her utility bill online and added milk to the grocery list.",
+    ]
+    EERIE = [
+      "A faint, wrong humming seemed to come from beneath the floorboards, too regular to be natural.",
+      "Shadows lengthened in the empty room though no one had moved the lamp.",
+      "Every photograph on the wall now faced slightly away from where she stood.",
+      "The child's lullaby hummed from the vents had no melody, only breath and intention.",
+      "He noticed the mirror showed the room reflected backwards, and a figure he did not recognize.",
+      "The wallpaper pattern repeated, but in one corner a face was emerging into the print.",
+    ]
+    WARM = [
+      "The kitchen smelled of fresh bread and coffee; her grandmother was humming off-key.",
+      "Sunlight through the curtains painted the quilt in soft yellow, and the dog sighed contentedly.",
+      "They laughed together about the silly mistake, relieved and relaxed now.",
+      "The cat purred louder than the rain against the window.",
+      "He hugged his daughter goodnight and she murmured something sweet already half-asleep.",
+      "Her friends filled the living room with music and warm laughter about nothing important.",
+    ]
+
+    # Construct both using the existing /v1/control/construct logic.
+    # Calling the local handler directly via g.capture + register to avoid
+    # an HTTP round-trip.
+    import struct, math
+    HIDDEN = 2816
+    LAYER = 20
+
+    def build(pos: list[str], neg: list[str], cvec_id: str) -> dict:
+        def accumulate(examples):
+            acc = [0.0] * HIDDEN
+            for ex in examples:
+                raw = g.capture_residual_for_prompt(ex, LAYER, chat_template=True)
+                vals = struct.unpack(f"<{HIDDEN}e", raw)
+                for i in range(HIDDEN): acc[i] += vals[i]
+            return [x / len(examples) for x in acc]
+        pm, nm = accumulate(pos), accumulate(neg)
+        diff = [p - n for p, n in zip(pm, nm)]
+        norm = math.sqrt(sum(x * x for x in diff))
+        if norm < 1e-9: raise HTTPException(500, f"{cvec_id}: zero norm")
+        diff = [x / norm for x in diff]
+        g.control_register_fp16(cvec_id, struct.pack(f"<{HIDDEN}e", *diff))
+        return {"id": cvec_id, "raw_norm": norm}
+
+    det = build(NATURE, MUNDANE, "narrative-detector")   # fires on fantasy vocabulary
+    eff = build(EERIE, WARM, "narrative-effector")       # applies an eerie tilt
+    return JSONResponse({
+        "detector": det,
+        "effector": eff,
+        "layer": LAYER,
+        "prompt": "Write the first two paragraphs of a short story about a girl who finds a door in the woods.",
+        "suggested_threshold": 35.0,   # late-layer residuals at L=20 run in the
+                                        # 20-70 range; 35 puts us near the middle
+                                        # as a first guess. UI auto-calibrates to
+                                        # the observed median after the first run.
+        "note": ("detector = fantasy-vocab direction, fires on tokens that push the "
+                 "residual toward mythic/fairy-tale register. effector = eerie-tone "
+                 "direction, nudges subsequent tokens toward atmospheric dread. "
+                 "layer 20 is late-network where topical representations concentrate."),
+    })
+
+
 @app.post("/v1/demo/steering-vectors")
 def demo_steering_vectors() -> JSONResponse:
     """Register a deterministic pair of orthogonal unit-norm random
