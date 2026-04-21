@@ -26,6 +26,7 @@ Open <http://localhost:8000> for the client index; pick one of the three demo cl
 | `/tetraplex` | four synchronized chat streams, bandwidth chart + KV tenancy strip | batched AR decode at B=4 |
 | `/labeler` | drop a folder of PNGs, get JSONL labels back; 4 live-decoding ribbons drain a queue | vision cache + shared-schema prefix + multi-slot soft prefill |
 | `/loom` | tree-of-thoughts with SVG-woven branches forked from a shared root | content-hash prefix cache + fork-from-node |
+| `/compare` | prompt A/B harness — one system prompt, K user-prompt variants side-by-side | prefix cache load-bearing across concurrent sessions |
 
 ---
 
