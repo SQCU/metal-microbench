@@ -444,6 +444,14 @@ public func gemma_submit_image_path(_ sid: Int32,
 // POST /v1/images/prewarm: an agent can pre-populate entries it expects
 // to re-reference later so the first "real" request sees a hit.
 //
+// Unlike gemma_submit_image_path, this WAITS for the vision CB to
+// complete before returning. The async pipeline exists to let vision
+// overlap with LM decode on concurrent sessions, but for the prewarm
+// use case the whole point is "ensure this image is ready before the
+// caller's next step" — returning with the CB still in flight defeats
+// that semantic and makes batched-decode workflows (labeler, etc.)
+// silently lose the batching win.
+//
 // Returns soft-token count on success (cache hit or miss), -1 on error.
 @_cdecl("gemma_vision_prewarm_path")
 public func gemma_vision_prewarm_path(_ pngPath: UnsafePointer<CChar>?) -> Int32 {
@@ -451,6 +459,8 @@ public func gemma_vision_prewarm_path(_ pngPath: UnsafePointer<CChar>?) -> Int32
     guard let p = pngPath else { return -1 }
     let pathStr = String(cString: p)
     guard let padded = ensureCachedSofts(pngPath: pathStr) else { return -1 }
+    padded.pendingCB?.waitUntilCompleted()
+    padded.pendingCB = nil
     return Int32(padded.count)
 }
 

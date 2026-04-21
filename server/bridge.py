@@ -643,6 +643,34 @@ def index() -> FileResponse:
     return FileResponse(str(_STATIC_DIR / "index.html"))
 
 
+@app.get("/labeler")
+def labeler_page() -> FileResponse:
+    return FileResponse(str(_STATIC_DIR / "labeler.html"))
+
+
+@app.get("/v1/demo/frames")
+def demo_frames(limit: int = 16) -> JSONResponse:
+    """Convenience endpoint for the labeler demo — returns the bundled
+    amongus test frames as inlined data URLs so the client can populate
+    its queue with one click. Caps at ?limit=N (default 16) so the one-
+    click demo loads snappily. Scoped to <repo>/test_data/frames (dev
+    checkout); production deployments wouldn't expose this."""
+    frames_dir = Path(__file__).parent.parent / "test_data" / "frames"
+    if not frames_dir.is_dir():
+        return JSONResponse({"frames": []})
+    out = []
+    for p in sorted(frames_dir.glob("*.png"))[:max(1, limit)]:
+        try:
+            data = p.read_bytes()
+        except OSError:
+            continue
+        out.append({
+            "name": p.name,
+            "data_url": "data:image/png;base64," + base64.b64encode(data).decode("ascii"),
+        })
+    return JSONResponse({"frames": out})
+
+
 def main() -> None:
     import uvicorn
     uvicorn.run(

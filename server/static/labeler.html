@@ -1,0 +1,574 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>gemma metal bridge — image labeler</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --c0: #5cf; --c1: #fa3; --c2: #8f5; --c3: #f69;
+    --bg: #0a0a0a; --panel: #121212; --border: #222;
+    --text: #d4d4d4; --mute: #888; --accent: #6a9;
+  }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font-family: ui-monospace, 'SF Mono', Monaco, monospace; height: 100%; }
+  body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+  header {
+    padding: 0.7em 1.2em; border-bottom: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: center;
+    flex-wrap: wrap; gap: 0.8em; flex: none;
+  }
+  header h1 { margin: 0; font-size: 1rem; font-weight: 500; color: var(--accent); }
+  header .status { font-size: 0.78rem; color: var(--mute); }
+  header a { color: var(--accent); text-decoration: none; }
+  .config {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 0.8em; padding: 0.8em 1em; border-bottom: 1px solid var(--border);
+    flex: none;
+  }
+  .field label {
+    display: block; font-size: 0.72rem; color: var(--mute);
+    text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.3em;
+  }
+  .field textarea, .field input {
+    width: 100%; box-sizing: border-box; background: var(--panel);
+    color: var(--text); border: 1px solid var(--border); border-radius: 3px;
+    padding: 0.5em; font: inherit; font-size: 0.85rem;
+  }
+  .field textarea { resize: vertical; min-height: 4em; }
+  .row { display: flex; gap: 0.8em; align-items: center; padding: 0.6em 1em;
+    border-bottom: 1px solid var(--border); flex-wrap: wrap; flex: none; }
+  .row button {
+    background: var(--c0); color: #002; border: 0; padding: 0.5em 1.2em;
+    font: inherit; font-weight: 700; border-radius: 3px; cursor: pointer;
+  }
+  .row button:disabled { background: #444; color: var(--mute); cursor: not-allowed; }
+  .row button.secondary { background: #2a3040; color: var(--text); }
+  .row .hint { font-size: 0.78rem; color: var(--mute); }
+
+  main {
+    flex: 1; min-height: 0; overflow: hidden;
+    display: grid; grid-template-columns: 280px 1fr 360px; gap: 0.6em;
+    padding: 0.6em;
+  }
+  .col { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+  .col h2 {
+    margin: 0 0 0.4em 0; font-size: 0.78rem; color: var(--mute);
+    text-transform: uppercase; letter-spacing: 0.05em; font-weight: 500;
+  }
+  .col .body {
+    flex: 1; min-height: 0; overflow: auto; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 3px; padding: 0.5em;
+  }
+
+  .drop {
+    padding: 0.8em; background: var(--panel); border: 1px dashed var(--border);
+    border-radius: 3px; text-align: center; font-size: 0.82rem; color: var(--mute);
+    margin-bottom: 0.4em; cursor: pointer;
+  }
+  .drop.active { border-color: var(--c0); color: var(--c0); }
+  .imglist { display: flex; flex-direction: column; gap: 0.3em; }
+  .imgrow {
+    display: flex; gap: 0.5em; align-items: center; font-size: 0.78rem;
+    padding: 0.2em 0.3em; border-radius: 2px;
+  }
+  .imgrow img { width: 40px; height: 40px; object-fit: cover; border-radius: 2px; }
+  .imgrow .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .imgrow .status { font-size: 0.7rem; color: var(--mute); }
+  .imgrow.done { background: rgba(136, 255, 85, 0.08); }
+  .imgrow.running { background: rgba(92, 204, 255, 0.08); }
+  .imgrow.error { background: rgba(255, 80, 80, 0.08); color: #faa; }
+
+  .ribbons { display: grid; grid-template-rows: 1fr 1fr 1fr 1fr; gap: 0.4em; min-height: 0; }
+  .ribbon {
+    display: flex; flex-direction: column; min-height: 0;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 3px; overflow: hidden;
+  }
+  .ribbon-head {
+    padding: 0.3em 0.5em; font-size: 0.72rem;
+    border-bottom: 1px solid var(--border);
+    display: flex; justify-content: space-between; gap: 0.5em;
+  }
+  .ribbon-head .tag { font-weight: 700; }
+  .ribbon[data-slot="0"] .tag { color: var(--c0); }
+  .ribbon[data-slot="1"] .tag { color: var(--c1); }
+  .ribbon[data-slot="2"] .tag { color: var(--c2); }
+  .ribbon[data-slot="3"] .tag { color: var(--c3); }
+  .ribbon-head .meta { color: var(--mute); }
+  .ribbon-body {
+    flex: 1; overflow: auto; padding: 0.4em 0.5em;
+    font-size: 0.82rem; white-space: pre-wrap; word-break: break-word;
+  }
+
+  .kv-col { gap: 0.4em; }
+  .kv-strip {
+    display: flex; flex-wrap: wrap; gap: 2px; padding: 0.3em;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 3px; min-height: 2em; align-content: flex-start;
+  }
+  .kv-strip .label {
+    width: 100%; font-size: 0.7rem; color: var(--mute); margin-bottom: 0.2em;
+  }
+  .kv-cell {
+    width: 8px; height: 8px; border-radius: 1px; flex: none;
+    background: #2a3040;
+  }
+  .kv-cell.own { background: #2e4860; }
+  .kv-cell.shr2 { background: var(--c0); }
+  .kv-cell.shr3p { background: #fff; }
+
+  .stats {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 3px; padding: 0.5em; font-size: 0.78rem;
+    display: grid; grid-template-columns: 1fr 1fr; gap: 0.3em 0.6em;
+  }
+  .stats .k { color: var(--mute); }
+  .stats .v { color: var(--text); text-align: right; }
+
+  .results {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 3px; padding: 0.5em; font-size: 0.78rem;
+    flex: 1; overflow: auto;
+  }
+  .result-row {
+    padding: 0.3em 0; border-bottom: 1px solid #1a1a1a;
+    display: flex; gap: 0.4em; font-size: 0.72rem;
+  }
+  .result-row .r-name { color: var(--mute); flex: 0 0 100px; overflow: hidden; text-overflow: ellipsis; }
+  .result-row .r-json { color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.68rem; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>gemma-4-a4b · image labeler demo</h1>
+  <span class="status" id="statusText">checking…</span>
+  <a href="/">← tetraplex</a>
+</header>
+
+<section class="config">
+  <div class="field">
+    <label>schema / labeling prompt (applied to every image)</label>
+    <textarea id="schemaPrompt">You are labeling a single video frame. Output ONE line of strict JSON (no prose, no markdown fences) with exactly these keys:
+{"subject": string, "color": string, "scene": string (≤10 words), "mood": one of "neutral" "action" "comedic" "tense"}</textarea>
+  </div>
+  <div class="field">
+    <label>per-image user turn</label>
+    <textarea id="userPrompt">Label this frame:</textarea>
+  </div>
+</section>
+
+<div class="row">
+  <button id="runBtn">run labeler</button>
+  <button id="loadDemoBtn" class="secondary">load amongus test frames</button>
+  <button id="clearBtn" class="secondary">clear queue + results</button>
+  <label class="hint" style="margin-left:0.8em">
+    <input type="checkbox" id="prewarmFirst" checked>
+    prewarm vision cache first (makes AR batch properly — vision serializes on GPU either way)
+  </label>
+</div>
+
+<main>
+  <section class="col">
+    <h2>images · <span id="qSummary">0 pending</span></h2>
+    <div class="body">
+      <div class="drop" id="dropZone">drop PNG/JPG files here or click</div>
+      <input type="file" id="fileInput" multiple accept="image/*" style="display:none">
+      <div class="imglist" id="imgList"></div>
+    </div>
+  </section>
+
+  <section class="col">
+    <h2>live decode (4 slots)</h2>
+    <div class="ribbons" id="ribbons">
+      <div class="ribbon" data-slot="0">
+        <div class="ribbon-head"><span class="tag">slot 0</span><span class="meta" data-meta>idle</span></div>
+        <div class="ribbon-body" data-body></div>
+      </div>
+      <div class="ribbon" data-slot="1">
+        <div class="ribbon-head"><span class="tag">slot 1</span><span class="meta" data-meta>idle</span></div>
+        <div class="ribbon-body" data-body></div>
+      </div>
+      <div class="ribbon" data-slot="2">
+        <div class="ribbon-head"><span class="tag">slot 2</span><span class="meta" data-meta>idle</span></div>
+        <div class="ribbon-body" data-body></div>
+      </div>
+      <div class="ribbon" data-slot="3">
+        <div class="ribbon-head"><span class="tag">slot 3</span><span class="meta" data-meta>idle</span></div>
+        <div class="ribbon-body" data-body></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="col kv-col">
+    <h2>KV tenancy (shared prefix = schema prompt pages)</h2>
+    <div class="kv-strip" id="kvStrip">
+      <div class="label">no active sessions</div>
+    </div>
+    <h2 style="margin-top:0.4em">throughput</h2>
+    <div class="stats" id="stats">
+      <div class="k">elapsed</div><div class="v" id="stElapsed">—</div>
+      <div class="k">done / total</div><div class="v" id="stDone">— / —</div>
+      <div class="k">images/sec (agg)</div><div class="v" id="stRate">—</div>
+      <div class="k">tokens/sec (agg)</div><div class="v" id="stTok">—</div>
+      <div class="k">vision cache hit rate</div><div class="v" id="stCache">—</div>
+      <div class="k">eta</div><div class="v" id="stEta">—</div>
+    </div>
+    <h2 style="margin-top:0.4em">results · <a id="dlLink" href="#" style="color:var(--accent);font-weight:normal">download jsonl</a></h2>
+    <div class="results" id="results"></div>
+  </section>
+</main>
+
+<script>
+const CONCURRENCY = 4;
+const SLOT_COLORS = ['--c0','--c1','--c2','--c3'];
+
+const state = {
+  images: [],        // {id, name, dataUrl, status:'pending'|'running'|'done'|'error', slot?:int, result?, tokens:int, ms?:number}
+  nextId: 0,
+  running: false,
+  startedAt: null,
+  tokenTotal: 0,
+};
+
+// --- UI elements ---
+const statusText = document.getElementById('statusText');
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+const imgList = document.getElementById('imgList');
+const runBtn = document.getElementById('runBtn');
+const loadDemoBtn = document.getElementById('loadDemoBtn');
+const clearBtn = document.getElementById('clearBtn');
+const qSummary = document.getElementById('qSummary');
+const ribbons = [0,1,2,3].map(s => ({
+  node: document.querySelector(`.ribbon[data-slot="${s}"]`),
+  body: document.querySelector(`.ribbon[data-slot="${s}"] [data-body]`),
+  meta: document.querySelector(`.ribbon[data-slot="${s}"] [data-meta]`),
+}));
+const kvStrip = document.getElementById('kvStrip');
+const resultsEl = document.getElementById('results');
+const dlLink = document.getElementById('dlLink');
+const stElapsed = document.getElementById('stElapsed');
+const stDone = document.getElementById('stDone');
+const stRate = document.getElementById('stRate');
+const stTok = document.getElementById('stTok');
+const stCache = document.getElementById('stCache');
+const stEta = document.getElementById('stEta');
+
+// --- server health ---
+async function checkHealth() {
+  try {
+    const r = await (await fetch('/health')).json();
+    statusText.textContent = r.status === 'ready'
+      ? `ready · ${r.model} · multimodal=${r.multimodal}`
+      : 'loading…';
+  } catch {
+    statusText.textContent = 'bridge unreachable';
+  }
+}
+setInterval(checkHealth, 3000); checkHealth();
+
+// --- drag/drop + file picker ---
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('active'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('active'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault(); dropZone.classList.remove('active');
+  ingestFiles(e.dataTransfer.files);
+});
+fileInput.addEventListener('change', e => ingestFiles(e.target.files));
+
+function ingestFiles(files) {
+  for (const f of files) {
+    if (!f.type.startsWith('image/')) continue;
+    const reader = new FileReader();
+    reader.onload = () => {
+      state.images.push({
+        id: state.nextId++, name: f.name,
+        dataUrl: reader.result, status: 'pending', tokens: 0,
+      });
+      renderImgList();
+    };
+    reader.readAsDataURL(f);
+  }
+}
+
+// Load demo frames from server (amongus test frames bundled with repo).
+loadDemoBtn.addEventListener('click', async () => {
+  try {
+    const r = await fetch('/v1/demo/frames');
+    if (!r.ok) {
+      // Fall back: populate with some hard-coded filenames and let server stream them.
+      statusText.textContent = 'no /v1/demo/frames endpoint — drop images manually';
+      return;
+    }
+    const list = await r.json();
+    for (const it of list.frames) {
+      state.images.push({
+        id: state.nextId++, name: it.name,
+        dataUrl: it.data_url, status: 'pending', tokens: 0,
+      });
+    }
+    renderImgList();
+  } catch (e) {
+    console.error(e);
+  }
+});
+
+function renderImgList() {
+  imgList.innerHTML = '';
+  for (const img of state.images) {
+    const row = document.createElement('div');
+    row.className = `imgrow ${img.status}`;
+    row.innerHTML = `
+      <img src="${img.dataUrl}" alt="">
+      <span class="name">${escapeHtml(img.name)}</span>
+      <span class="status">${img.status}${img.slot !== undefined && img.status === 'running' ? ' · s'+img.slot : ''}${img.ms ? ' · '+img.ms+'ms' : ''}</span>`;
+    imgList.appendChild(row);
+  }
+  const pending = state.images.filter(i => i.status === 'pending').length;
+  const running = state.images.filter(i => i.status === 'running').length;
+  const done = state.images.filter(i => i.status === 'done').length;
+  qSummary.textContent = `${done}/${state.images.length} done · ${running} running · ${pending} pending`;
+  stDone.textContent = `${done} / ${state.images.length}`;
+}
+
+clearBtn.addEventListener('click', () => {
+  if (state.running) return;
+  state.images = [];
+  renderImgList();
+  resultsEl.innerHTML = '';
+  dlLink.href = '#';
+  stElapsed.textContent = '—'; stRate.textContent = '—'; stTok.textContent = '—'; stEta.textContent = '—';
+  for (const rb of ribbons) { rb.body.textContent = ''; rb.meta.textContent = 'idle'; }
+});
+
+// --- run loop: keeps up to CONCURRENCY requests in flight ---
+runBtn.addEventListener('click', async () => {
+  if (state.running) return;
+  const pending = state.images.filter(i => i.status === 'pending');
+  if (pending.length === 0) return;
+  state.running = true; state.startedAt = performance.now(); state.tokenTotal = 0;
+  runBtn.disabled = true; loadDemoBtn.disabled = true; clearBtn.disabled = true;
+
+  const schema = document.getElementById('schemaPrompt').value;
+  const userTurn = document.getElementById('userPrompt').value;
+  const prewarm = document.getElementById('prewarmFirst').checked;
+
+  // Prewarm phase: hit /v1/images/prewarm sequentially on every pending
+  // image. Vision tower serializes on GPU regardless, but doing it now
+  // means every chat completion below hits the content-hash cache and
+  // skips vision entirely — so all 4 slots enter AR at the same time and
+  // batch decode fires at full 4× throughput. Without prewarm, sessions
+  // trickle into AR as their vision finishes and end up mostly solo-decoding.
+  if (prewarm) {
+    statusText.textContent = 'prewarming vision cache…';
+    for (const img of pending) {
+      try {
+        await fetch('/v1/images/prewarm', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ image_url: img.dataUrl }),
+        });
+      } catch (e) { console.warn('prewarm failed:', e); }
+      img.name_prewarmed = true;
+    }
+    statusText.textContent = 'prewarm done · decoding…';
+  }
+
+  // Assign slots greedily as images start; slot frees on finish.
+  const slotBusy = [false, false, false, false];
+
+  async function launchOne(img) {
+    const slot = slotBusy.findIndex(b => !b);
+    if (slot < 0) throw new Error('no slot');
+    slotBusy[slot] = true;
+    img.slot = slot; img.status = 'running'; img.tokens = 0;
+    ribbons[slot].body.textContent = '';
+    ribbons[slot].meta.textContent = `→ ${img.name}`;
+    renderImgList();
+    const t0 = performance.now();
+    try {
+      const body = {
+        model: 'gemma-4-a4b-q4km',
+        max_tokens: 120,
+        stream: true,
+        messages: [
+          { role: 'user', content: [
+            { type: 'text', text: schema + '\n' + userTurn + '\n' },
+            { type: 'image_url', image_url: { url: img.dataUrl } },
+          ]},
+        ],
+      };
+      const resp = await fetch('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const reader = resp.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      let full = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n\n')) !== -1) {
+          const frame = buf.slice(0, i); buf = buf.slice(i+2);
+          if (!frame.startsWith('data: ')) continue;
+          const payload = frame.slice(6);
+          if (payload === '[DONE]') break;
+          try {
+            const j = JSON.parse(payload);
+            const delta = j.choices?.[0]?.delta?.content;
+            if (delta) {
+              full += delta;
+              img.tokens += 1;   // approx — one SSE frame ≈ one token batch
+              state.tokenTotal += 1;
+              ribbons[slot].body.textContent = full;
+              ribbons[slot].body.scrollTop = ribbons[slot].body.scrollHeight;
+            }
+          } catch {}
+        }
+      }
+      img.ms = Math.round(performance.now() - t0);
+      img.result = extractJson(full) || { raw: full.trim() };
+      img.status = 'done';
+      ribbons[slot].meta.textContent = `✓ ${img.name} · ${img.ms}ms`;
+      appendResult(img);
+    } catch (e) {
+      img.status = 'error'; img.ms = Math.round(performance.now() - t0);
+      img.result = { error: String(e) };
+      ribbons[slot].meta.textContent = `err: ${e.message || e}`;
+      appendResult(img);
+    } finally {
+      slotBusy[slot] = false;
+      renderImgList();
+    }
+  }
+
+  // Pump loop: while queue non-empty and slot available, launch; await all.
+  const inFlight = new Set();
+  while (true) {
+    const nextPending = state.images.find(i => i.status === 'pending');
+    const freeSlot = slotBusy.findIndex(b => !b);
+    if (nextPending && freeSlot >= 0) {
+      const p = launchOne(nextPending);
+      inFlight.add(p);
+      p.finally(() => inFlight.delete(p));
+      // Stagger microscopically so the server sees them as concurrent,
+      // not all arriving in the same event-loop tick (gives the pump
+      // cleaner slot assignment).
+      await new Promise(r => setTimeout(r, 20));
+    } else if (inFlight.size > 0) {
+      await Promise.race(inFlight);
+    } else {
+      break;
+    }
+  }
+  await Promise.allSettled(inFlight);
+
+  state.running = false;
+  runBtn.disabled = false; loadDemoBtn.disabled = false; clearBtn.disabled = false;
+});
+
+function extractJson(s) {
+  // Gemma often wraps output in text; grab the first balanced {} block.
+  let d = 0, start = -1;
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '{') { if (d === 0) start = i; d++; }
+    else if (s[i] === '}') { d--; if (d === 0 && start >= 0) {
+      try { return JSON.parse(s.slice(start, i+1)); } catch {}
+    }}
+  }
+  return null;
+}
+
+function appendResult(img) {
+  const row = document.createElement('div'); row.className = 'result-row';
+  const nameEl = document.createElement('span'); nameEl.className = 'r-name';
+  nameEl.textContent = img.name;
+  const jsonEl = document.createElement('span'); jsonEl.className = 'r-json';
+  jsonEl.textContent = JSON.stringify(img.result);
+  row.appendChild(nameEl); row.appendChild(jsonEl);
+  resultsEl.appendChild(row);
+  resultsEl.scrollTop = resultsEl.scrollHeight;
+  refreshDownload();
+}
+
+function refreshDownload() {
+  const lines = state.images.filter(i => i.status === 'done' || i.status === 'error').map(i =>
+    JSON.stringify({ name: i.name, ms: i.ms, ...i.result })
+  ).join('\n');
+  const blob = new Blob([lines + '\n'], { type: 'application/x-ndjson' });
+  dlLink.href = URL.createObjectURL(blob);
+  dlLink.download = 'labels.jsonl';
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// --- KV tenancy poll + stats ---
+async function pollKv() {
+  try {
+    const snap = await (await fetch('/v1/kv/snapshot')).json();
+    renderKv(snap);
+  } catch {}
+  try {
+    const cache = await (await fetch('/v1/cache/stats')).json();
+    const hits = cache.hits || 0, misses = cache.misses || 0;
+    const total = hits + misses;
+    stCache.textContent = total ? `${hits}/${total} (${(100*hits/total).toFixed(0)}%)` : '—';
+  } catch {}
+  updateStats();
+}
+setInterval(pollKv, 250);
+
+function renderKv(snap) {
+  kvStrip.innerHTML = '';
+  const sessions = snap.sessions || [];
+  if (sessions.length === 0) {
+    const lbl = document.createElement('div'); lbl.className = 'label';
+    lbl.textContent = 'no active sessions'; kvStrip.appendChild(lbl); return;
+  }
+  for (const sess of sessions) {
+    const lbl = document.createElement('div'); lbl.className = 'label';
+    lbl.textContent = `s${sess.sid} · ${sess.state} · ${sess.position} tok · ${sess.page_count} pg (${sess.shared_count} shared)`;
+    kvStrip.appendChild(lbl);
+    for (const p of sess.pages) {
+      const cell = document.createElement('div'); cell.className = 'kv-cell';
+      if (p.refcount >= 3) cell.classList.add('shr3p');
+      else if (p.refcount >= 2) cell.classList.add('shr2');
+      else cell.classList.add('own');
+      cell.title = `phys ${p.phys}${p.shared_with.length ? ' · shared with s'+p.shared_with.join(',s') : ''}`;
+      kvStrip.appendChild(cell);
+    }
+  }
+}
+
+function updateStats() {
+  if (!state.startedAt) return;
+  const elapsedMs = state.running
+    ? performance.now() - state.startedAt
+    : (state.images.some(i => i.ms) ? Math.max(...state.images.filter(i=>i.ms).map(i => (i.ms || 0))) : 0);
+  const done = state.images.filter(i => i.status === 'done').length;
+  const dtSec = elapsedMs / 1000;
+  stElapsed.textContent = dtSec.toFixed(1) + 's';
+  stRate.textContent = dtSec > 0 ? (done / dtSec).toFixed(2) : '—';
+  stTok.textContent = dtSec > 0 ? (state.tokenTotal / dtSec).toFixed(0) : '—';
+  const remaining = state.images.filter(i => i.status !== 'done' && i.status !== 'error').length;
+  if (remaining > 0 && done > 0) {
+    const eta = (dtSec / done) * remaining;
+    stEta.textContent = eta.toFixed(1) + 's';
+  } else {
+    stEta.textContent = '—';
+  }
+}
+setInterval(updateStats, 500);
+</script>
+</body>
+</html>

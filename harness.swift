@@ -202,6 +202,50 @@ func runVisionEndToEndForward(framePath: String, stPath: String) {
     }
 }
 
+// VISION_CONCURRENT_QUEUES=<n> — submit N vision forwards in parallel on
+// N distinct MTLCommandQueues. Answers: does the M5 Max GPU actually run
+// multiple CBs from different queues concurrently, or does it serialize
+// them? Single-queue baseline vs N-queue wall-clock tells us directly.
+func runVisionConcurrentQueues(batchDir: String, stPath: String, nQueues: Int) {
+    print("\n=== Vision concurrent-queue test (N=\(nQueues)) ===")
+    do {
+        let st = try SafetensorsFile(stPath)
+        let weights = try loadVisionWeights(st, device: device)
+        let fm = FileManager.default
+        let pngs = (try fm.contentsOfDirectory(atPath: batchDir))
+            .filter { $0.hasSuffix(".png") }.sorted().prefix(nQueues)
+        precondition(pngs.count >= 1, "need ≥1 PNG in VISION_BATCH_DIR")
+        var batches: [PatchBatch] = []
+        for p in pngs {
+            batches.append(try gemma4ImagePreprocess(path: "\(batchDir)/\(p)", device: device))
+        }
+
+        // Baseline: single queue, serial
+        let tSerial0 = Date()
+        for b in batches {
+            _ = runVisionTowerForward(batch: b, weights: weights, device: device, queue: queue)
+        }
+        let tSerial = Date().timeIntervalSince(tSerial0) * 1000
+        print(String(format: "  serial on 1 queue:  %.1f ms (%d images)", tSerial, batches.count))
+
+        // Concurrent: N queues, submit all async, wait on all
+        let queues = (0..<batches.count).map { _ in device.makeCommandQueue()! }
+        let tPar0 = Date()
+        var cbs: [MTLCommandBuffer] = []
+        for (i, b) in batches.enumerated() {
+            let (_, _, cb) = runVisionTowerForwardAsync(batch: b, weights: weights,
+                                                         device: device, queue: queues[i])
+            cbs.append(cb)
+        }
+        for cb in cbs { cb.waitUntilCompleted() }
+        let tPar = Date().timeIntervalSince(tPar0) * 1000
+        print(String(format: "  concurrent on %d queues: %.1f ms  (%.2fx speedup)",
+                     batches.count, tPar, tSerial / tPar))
+    } catch {
+        print("  concurrent-queue test failed: \(error)")
+    }
+}
+
 // VISION_BATCH_DIR=<dir> — run the batched forward over the first 4
 // PNGs in the directory, compare per-image soft-tokens to the serial
 // runVisionTowerForward path. Validates numerical equivalence + measures

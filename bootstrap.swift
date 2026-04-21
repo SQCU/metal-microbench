@@ -3576,6 +3576,11 @@ if let batchDir = ProcessInfo.processInfo.environment["VISION_BATCH_DIR"],
    let stPath = ProcessInfo.processInfo.environment["VISION_ST"] {
     runVisionBatchForward(batchDir: batchDir, stPath: stPath)
 }
+if let batchDir = ProcessInfo.processInfo.environment["VISION_CONCURRENT_DIR"],
+   let stPath = ProcessInfo.processInfo.environment["VISION_ST"] {
+    let n = Int(ProcessInfo.processInfo.environment["VISION_CONCURRENT_N"] ?? "2") ?? 2
+    runVisionConcurrentQueues(batchDir: batchDir, stPath: stPath, nQueues: n)
+}
 if let aspectDir = ProcessInfo.processInfo.environment["VISION_ASPECT_DIR"],
    let stPath = ProcessInfo.processInfo.environment["VISION_ST"] {
     runVisionAspectSweep(aspectDir: aspectDir, stPath: stPath)
