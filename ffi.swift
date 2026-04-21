@@ -692,6 +692,31 @@ public func gemma_set_capture_layer(_ layer: Int32) -> Int32 {
     return 0
 }
 
+// All-layer capture toggle. When enabled, every layer's post-FFN
+// residual gets blitted into its L-indexed slot of gAllLayerCaptureBuf
+// during each tick. Meant to be on briefly during screening passes
+// and off the rest of the time (tiny but not zero per-layer blit cost).
+@_cdecl("gemma_set_capture_all_layers")
+public func gemma_set_capture_all_layers(_ enabled: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    gCaptureAllLayers = (enabled != 0)
+    return 0
+}
+
+// Copy the NUM_LAYERS × HIDDEN × fp16 all-layer capture buffer into
+// the caller's output. Returns bytes written, or if outPtr is nil,
+// the needed size.
+@_cdecl("gemma_get_all_layer_residuals")
+public func gemma_get_all_layer_residuals(_ outPtr: UnsafeMutablePointer<UInt8>?,
+                                           _ maxBytes: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    let need = NUM_LAYERS * HIDDEN * 2
+    guard let p = outPtr else { return Int32(need) }
+    let n = min(need, Int(maxBytes))
+    memcpy(p, gAllLayerCaptureBuf.contents(), n)
+    return Int32(n)
+}
+
 // Copy the most-recently-captured residual (HIDDEN × fp16 = 5632 B)
 // into the caller's buffer. Returns bytes written (= HIDDEN * 2) or
 // the buffer size needed if outPtr is nil. The buffer is overwritten

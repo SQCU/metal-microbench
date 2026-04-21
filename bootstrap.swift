@@ -1943,6 +1943,15 @@ var gResidualCaptureLayer: Int = -1
 let gResidualCaptureBuf: MTLBuffer = device.makeBuffer(
     length: HIDDEN * 2, options: .storageModeShared)!
 
+// All-layer capture: when enabled, every layer's post-FFN residual gets
+// blitted into gAllLayerCaptureBuf at its L-indexed slot. Used by the
+// screening endpoint to compute per-layer separation + coherence
+// metrics without needing one forward pass per layer-guess. Layout:
+// [NUM_LAYERS, HIDDEN] fp16, slot 0 = layer 0, etc.
+var gCaptureAllLayers: Bool = false
+let gAllLayerCaptureBuf: MTLBuffer = device.makeBuffer(
+    length: NUM_LAYERS * HIDDEN * 2, options: .storageModeShared)!
+
 // Per-tick staging: for each slot, the list of (cvec buffer, layer, mag)
 // triples to apply at their respective layers this step. Populated by
 // step() from each session's activeControls + envelope evaluation, then
@@ -2305,6 +2314,14 @@ func buildStepCB(_ w: LmWeights, sharedPrefixPages: Int = 0) -> MTLCommandBuffer
                 print("[capture] blit fired in buildStepCB @ layer \(L)")
             }
         }
+        // All-layer capture: one blit per layer into its L-indexed slot.
+        if gCaptureAllLayers {
+            let blit = cb.makeBlitCommandEncoder()!
+            blit.copy(from: hidden, sourceOffset: 0,
+                      to: gAllLayerCaptureBuf, destinationOffset: L * HIDDEN * 2,
+                      size: HIDDEN * 2)
+            blit.endEncoding()
+        }
         if let dump = LM_DUMP_STAGING {
             let blit = cb.makeBlitCommandEncoder()!
             blit.copy(from: hidden, sourceOffset: 0,
@@ -2473,6 +2490,18 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
             blit.copy(from: pre_hidden,
                       sourceOffset: (qLen - 1) * HIDDEN * 2,
                       to: gResidualCaptureBuf, destinationOffset: 0,
+                      size: HIDDEN * 2)
+            blit.endEncoding()
+        }
+        // All-layer capture during prefill: one blit per layer, last-
+        // position slot only. Used by the screening endpoint so a
+        // single forward pass per example yields every layer's
+        // signature without needing to re-run.
+        if gCaptureAllLayers {
+            let blit = cb.makeBlitCommandEncoder()!
+            blit.copy(from: pre_hidden,
+                      sourceOffset: (qLen - 1) * HIDDEN * 2,
+                      to: gAllLayerCaptureBuf, destinationOffset: L * HIDDEN * 2,
                       size: HIDDEN * 2)
             blit.endEncoding()
         }

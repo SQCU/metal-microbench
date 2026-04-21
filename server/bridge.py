@@ -403,6 +403,105 @@ async def prewarm_image(req: Request) -> JSONResponse:
     })
 
 
+@app.post("/v1/control/screen")
+async def control_screen(req: Request) -> JSONResponse:
+    """Screen every layer for separation strength + per-pair coherence
+    on a pair of prose sets, then register a cvec at the best layer(s).
+    Body: {"id": "anti-elara",
+           "positive": [...],
+           "negative": [...],
+           "chat_template": true,
+           "top_k": 3,             # register at top-K layers (id-0, id-1, ...)
+           "register_best": true}  # register at the single best layer under `id`
+
+    Returns per-layer stats so the UI can plot signal vs layer and pick
+    intervention points. Metric is a composite:
+        signal   = ||mean(positive) - mean(negative)||
+        coherence = mean over pairs i of cos(diff_i, mean_diff)
+        score     = signal * max(0, coherence)
+    High score = directions consistently point the same way AND
+    separation is large — the best layer for steering this feature."""
+    import numpy as np
+    body = await req.json()
+    cvec_id = str(body.get("id", "")).strip()
+    positives = [str(x) for x in (body.get("positive") or []) if str(x).strip()]
+    negatives = [str(x) for x in (body.get("negative") or []) if str(x).strip()]
+    chat_template = bool(body.get("chat_template", True))
+    register_best = bool(body.get("register_best", True))
+    top_k = int(body.get("top_k", 1))
+    if not cvec_id or not positives or not negatives:
+        raise HTTPException(400, "need id, positive (≥1), negative (≥1)")
+
+    HIDDEN = 2816
+    NUM_LAYERS = 30
+
+    def capture_stack(examples: list[str]) -> np.ndarray:
+        # Returns [n_examples, NUM_LAYERS, HIDDEN] fp32.
+        rows = []
+        for ex in examples:
+            blob = g.capture_all_layer_residuals_for_prompt(ex, chat_template=chat_template)
+            arr = np.frombuffer(blob, dtype=np.float16).astype(np.float32)
+            rows.append(arr.reshape(NUM_LAYERS, HIDDEN))
+        return np.stack(rows)  # [N, L, D]
+
+    pos = capture_stack(positives)   # [P, L, D]
+    neg = capture_stack(negatives)   # [N, L, D]
+
+    # Per-layer stats. For "coherence" we pair each positive with each
+    # negative cross-product style — mean signal is well-defined over
+    # (unpaired) sets. If the caller happens to pass same-count lists,
+    # coherence computes over element-wise pairs too; here we default
+    # to the set-mean difference.
+    layer_stats = []
+    for L in range(NUM_LAYERS):
+        pL = pos[:, L, :]           # [P, D]
+        nL = neg[:, L, :]           # [N, D]
+        mean_diff = pL.mean(axis=0) - nL.mean(axis=0)       # [D]
+        signal = float(np.linalg.norm(mean_diff))
+        # Coherence: for each individual "positive - negative_mean" and
+        # "positive_mean - negative_i" projection onto mean_diff, how
+        # consistently aligned are they? Measured via cosine.
+        if signal > 1e-9:
+            u = mean_diff / signal
+            pos_coh = float(np.mean((pL - nL.mean(0)) @ u / (np.linalg.norm(pL - nL.mean(0), axis=1) + 1e-9)))
+            neg_coh = float(np.mean((pL.mean(0) - nL) @ u / (np.linalg.norm(pL.mean(0) - nL, axis=1) + 1e-9)))
+            coherence = (pos_coh + neg_coh) / 2
+        else:
+            coherence = 0.0
+        score = signal * max(coherence, 0.0)
+        layer_stats.append({
+            "layer": L,
+            "signal": signal,
+            "coherence": coherence,
+            "score": score,
+        })
+
+    # Sort by score, pick top-K for registration (under `id` for the
+    # single best, and "`id`-L{n}" for runners-up if top_k > 1).
+    ranked = sorted(layer_stats, key=lambda s: s["score"], reverse=True)
+    if register_best and ranked:
+        best_L = ranked[0]["layer"]
+        direction = pos[:, best_L, :].mean(0) - neg[:, best_L, :].mean(0)
+        direction = direction / (np.linalg.norm(direction) + 1e-9)
+        g.control_register_fp16(cvec_id, direction.astype(np.float16).tobytes())
+    registered = [{"id": cvec_id, "layer": ranked[0]["layer"]}] if (register_best and ranked) else []
+    for i in range(1, min(top_k, len(ranked))):
+        L = ranked[i]["layer"]
+        subid = f"{cvec_id}-L{L}"
+        direction = pos[:, L, :].mean(0) - neg[:, L, :].mean(0)
+        direction = direction / (np.linalg.norm(direction) + 1e-9)
+        g.control_register_fp16(subid, direction.astype(np.float16).tobytes())
+        registered.append({"id": subid, "layer": L})
+
+    return JSONResponse({
+        "registered": registered,
+        "best_layer": ranked[0]["layer"] if ranked else None,
+        "best_score": ranked[0]["score"] if ranked else None,
+        "layer_stats": layer_stats,
+        "ranked_layers": [{"layer": s["layer"], "score": s["score"]} for s in ranked[:5]],
+    })
+
+
 @app.post("/v1/control/construct")
 async def control_construct(req: Request) -> JSONResponse:
     """Build a control vector from contrastive prose pairs. Body:

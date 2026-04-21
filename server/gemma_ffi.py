@@ -617,3 +617,52 @@ def control_list_ids() -> list[str]:
     if n <= 0:
         return []
     return [s for s in buf.raw[:n].decode("utf-8", errors="replace").split(",") if s]
+
+
+# --- All-layer residual capture ---
+
+_lib.gemma_set_capture_all_layers.argtypes = [C.c_int32]
+_lib.gemma_set_capture_all_layers.restype = C.c_int32
+
+_lib.gemma_get_all_layer_residuals.argtypes = [C.POINTER(C.c_uint8), C.c_int32]
+_lib.gemma_get_all_layer_residuals.restype = C.c_int32
+
+def set_capture_all_layers(enabled: bool) -> None:
+    _lib.gemma_set_capture_all_layers(1 if enabled else 0)
+
+def get_all_layer_residuals() -> bytes:
+    """Return NUM_LAYERS × HIDDEN × fp16 = 30*2816*2 = 168960 bytes.
+    Layer L starts at offset L * HIDDEN * 2."""
+    need = _lib.gemma_get_all_layer_residuals(None, 0)
+    if need <= 0:
+        return b""
+    buf = (C.c_uint8 * need)()
+    n = _lib.gemma_get_all_layer_residuals(buf, need)
+    return bytes(buf[:n]) if n > 0 else b""
+
+def capture_all_layer_residuals_for_prompt(prompt: str, chat_template: bool = True,
+                                             timeout_s: float = 20.0) -> bytes:
+    """Run prompt through engine once, return all 30 layers' last-
+    priming-token residuals concatenated as one fp16 blob. Same pattern
+    as capture_residual_for_prompt but captures every layer in one pass."""
+    import time
+    set_capture_all_layers(True)
+    try:
+        sid = open_session(max_new_tokens=1)
+        try:
+            if chat_template:
+                wrapped = f"<|turn>user\n{prompt}<turn|>\n<|turn>model\n"
+            else:
+                wrapped = prompt
+            toks = tokenize(wrapped, add_bos=True)
+            submit(sid, toks)
+            t0 = time.time()
+            while session_state(sid) in (STATE_IDLE, STATE_PRIMING):
+                if time.time() - t0 > timeout_s:
+                    raise RuntimeError(f"capture timeout ({timeout_s}s)")
+                time.sleep(0.002)
+            return get_all_layer_residuals()
+        finally:
+            close_session(sid)
+    finally:
+        set_capture_all_layers(False)
