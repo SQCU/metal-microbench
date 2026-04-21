@@ -510,6 +510,92 @@ public func gemma_vision_fetch_softs_by_key(_ hexKey: UnsafePointer<CChar>?,
     return Int32(n)
 }
 
+// Register a control vector by caller-assigned string id. Sessions
+// reference the cvec via this id in gemma_session_add_control. Bytes
+// must be exactly HIDDEN * 2 (fp16). Returns 0 on success, -1 on error.
+// Re-registering the same id replaces the existing entry (consumers
+// referencing it continue to see the OLD buffer until they re-attach —
+// the buffer is strongly retained by each ActiveControl).
+@_cdecl("gemma_control_register_fp16")
+public func gemma_control_register_fp16(_ idPtr: UnsafePointer<CChar>?,
+                                         _ dataPtr: UnsafePointer<UInt8>?,
+                                         _ nBytes: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let ip = idPtr, let dp = dataPtr else { return -1 }
+    let id = String(cString: ip)
+    if id.isEmpty { return -1 }
+    let expected = HIDDEN * 2
+    guard Int(nBytes) == expected else {
+        print("[cvec] register id=\(id): size mismatch (got \(nBytes), expected \(expected))")
+        return -1
+    }
+    guard let buf = device.makeBuffer(length: expected, options: .storageModeShared) else { return -1 }
+    memcpy(buf.contents(), dp, expected)
+    gCvecRegistry[id] = buf
+    return 0
+}
+
+// Attach a cvector to a session with an ADSR envelope. Activation time
+// (startPosition / startTurn) is captured as the session's current
+// counters — the envelope's elapsed time is measured relative to that.
+// Shape: 0=linear, 1=expIn, 2=expOut, 3=cubic (smoothstep).
+// Units: 0=tokens, 1=turns.
+@_cdecl("gemma_session_add_control")
+public func gemma_session_add_control(_ sid: Int32,
+                                       _ cvecIdPtr: UnsafePointer<CChar>?,
+                                       _ layer: Int32,
+                                       _ polarity: Float,
+                                       _ peakMagnitude: Float,
+                                       _ attack: Float,
+                                       _ decay: Float,
+                                       _ sustainLevel: Float,
+                                       _ release: Float,
+                                       _ shape: Int32,
+                                       _ units: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let s = gSessions[sid] else { return -1 }
+    guard let ip = cvecIdPtr else { return -1 }
+    let cvecId = String(cString: ip)
+    guard let buf = gCvecRegistry[cvecId] else {
+        print("[cvec] session \(sid) add_control: no cvec registered for id=\(cvecId)")
+        return -1
+    }
+    let shapes: [CvecShape] = [.linear, .expIn, .expOut, .cubic]
+    let shapeVal = shapes[max(0, min(shapes.count - 1, Int(shape)))]
+    let unitsVal: CvecUnits = (units == 0 ? .tokens : .turns)
+    let env = CvecEnvelope(attack: attack, decay: decay, sustainLevel: sustainLevel,
+                            release: release, peakMagnitude: peakMagnitude,
+                            shape: shapeVal, units: unitsVal)
+    let t = s.currentTimeCoords
+    let ctrl = ActiveControl(cvecId: cvecId, buffer: buf, layer: Int(layer),
+                              envelope: env, polarity: polarity,
+                              startPosition: t.position, startTurn: t.turn)
+    s.addControl(ctrl)
+    return 0
+}
+
+// Drop all active controls on a session (e.g. at turn-end or on reset).
+@_cdecl("gemma_session_clear_controls")
+public func gemma_session_clear_controls(_ sid: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let s = gSessions[sid] else { return -1 }
+    s.clearControls()
+    return 0
+}
+
+// Signal a control's sustain → release transition (begin the release
+// ramp NOW). Pass the same cvec_id used at add_control time.
+@_cdecl("gemma_session_release_control")
+public func gemma_session_release_control(_ sid: Int32,
+                                           _ cvecIdPtr: UnsafePointer<CChar>?) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let s = gSessions[sid] else { return -1 }
+    guard let ip = cvecIdPtr else { return -1 }
+    let t = s.currentTimeCoords
+    s.releaseControl(cvecId: String(cString: ip), position: t.position, turn: t.turn)
+    return 0
+}
+
 // Submit pre-computed soft tokens to a session. The client is handing
 // back softs they received from a previous image submission — the server
 // brackets with BOI/EOI and appends to the chunk queue without running

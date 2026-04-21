@@ -503,6 +503,24 @@ func encAddScaledCvec(_ cb: MTLCommandBuffer, dst: MTLBuffer, cvec: MTLBuffer,
     enc.endEncoding()
 }
 
+// Per-slot variant: only the row at dst[slot, :] gets the injection.
+// buildStepCB calls this once per (slot, active-control) pair per layer
+// so concurrent sessions can carry independent steering state. dst is
+// offset by slot * N * sizeof(half) and the kernel sees numVecs=1.
+func encAddScaledCvecSlot(_ cb: MTLCommandBuffer, dst: MTLBuffer, slot: Int,
+                           cvec: MTLBuffer, mag: Float, N: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(addScaledCvecPSO)
+    enc.setBuffer(dst, offset: slot * N * 2, index: 0)
+    enc.setBuffer(cvec, offset: 0, index: 1)
+    var Nv = UInt32(N); var magv = mag
+    enc.setBytes(&Nv, length: 4, index: 2)
+    enc.setBytes(&magv, length: 4, index: 3)
+    enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
 func encGemvV5(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ W: MTLBuffer, _ out: MTLBuffer, Din: Int, Dout: Int, numVecs: Int = B) {
     let enc = cb.makeComputeCommandEncoder()!
     enc.setComputePipelineState(gemvV5PSO)
@@ -1887,6 +1905,19 @@ let LM_DUMP_STAGING: MTLBuffer? = {
 //   LM_CVEC_MAG   = scalar float magnitude (positive or negative)
 // Validates the kernel cost is negligible before we invest in the
 // ADSR evaluator + multi-vector / multi-layer plumbing of Phase B.
+// Phase B: named cvector registry keyed by caller-assigned id string,
+// populated via gemma_control_register_fp16 FFI. Per-session active-control
+// lists reference entries here by id. Phase A's LM_CVEC_* env-gated path
+// still works — the kernel dispatch site checks both sources.
+var gCvecRegistry: [String: MTLBuffer] = [:]
+
+// Per-tick staging: for each slot, the list of (cvec buffer, layer, mag)
+// triples to apply at their respective layers this step. Populated by
+// step() from each session's activeControls + envelope evaluation, then
+// read by buildStepCB inside the per-layer loop.
+struct SlotControl { let buffer: MTLBuffer; let layer: Int; let mag: Float }
+var gSlotControls: [[SlotControl]] = Array(repeating: [], count: B)
+
 let LM_CVEC_LAYER: Int = Int(ProcessInfo.processInfo.environment["LM_CVEC_LAYER"] ?? "") ?? -1
 let LM_CVEC_MAG:   Float = Float(ProcessInfo.processInfo.environment["LM_CVEC_MAG"] ?? "") ?? 0.0
 let LM_CVEC_BUF:   MTLBuffer? = {
@@ -2182,11 +2213,24 @@ func buildStepCB(_ w: LmWeights, sharedPrefixPages: Int = 0) -> MTLCommandBuffer
         encRmsNormAddScale(cb, x: ffn_combined, gammaBuf: lw.postFfnNorm,
                            residual: hidden, scalar: lw.layerOutputScale,
                            out: hidden, N: HIDDEN, numVecs: B)
-        // Control-vector injection at the post-FFN residual site. Phase A:
-        // static scalar magnitude loaded from env. No-op when LM_CVEC_BUF is nil.
+        // Control-vector injection at the post-FFN residual site.
+        //
+        // Phase A: LM_CVEC_* env vars apply ONE cvec at ONE layer to ALL
+        // slots at constant magnitude (still supported for microbench
+        // validation without touching the FFI).
         if let cvec = LM_CVEC_BUF, L == LM_CVEC_LAYER, LM_CVEC_MAG != 0.0 {
             encAddScaledCvec(cb, dst: hidden, cvec: cvec, mag: LM_CVEC_MAG,
                               N: HIDDEN, numVecs: B)
+        }
+        // Phase B: per-slot active controls, evaluated by step() each tick
+        // and staged in gSlotControls. One tiny dispatch per (slot, ctrl)
+        // pair with a non-zero magnitude. Dispatches are free by Apple's
+        // scheduler standards — each is 1 TG × 32 threads × HIDDEN halves.
+        for slot in 0..<B {
+            for sc in gSlotControls[slot] where sc.layer == L && sc.mag != 0.0 {
+                encAddScaledCvecSlot(cb, dst: hidden, slot: slot,
+                                      cvec: sc.buffer, mag: sc.mag, N: HIDDEN)
+            }
         }
         if let dump = LM_DUMP_STAGING {
             let blit = cb.makeBlitCommandEncoder()!

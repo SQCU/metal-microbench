@@ -403,6 +403,29 @@ async def prewarm_image(req: Request) -> JSONResponse:
     })
 
 
+@app.post("/v1/control/vectors")
+async def control_register(req: Request) -> JSONResponse:
+    """Register a control vector by caller-assigned id. Body JSON:
+      {"id": "jubilant-animal", "fp16_b64": "<base64 of HIDDEN × fp16>"}
+    The bytes go straight to the engine's cvec registry; session-level
+    activation happens per-request via the chat completions "controls"
+    field (or directly via gemma_session_add_control for non-HTTP clients)."""
+    body = await req.json()
+    cvec_id = body.get("id", "")
+    b64 = body.get("fp16_b64", "")
+    if not cvec_id or not b64:
+        raise HTTPException(400, "id and fp16_b64 are required")
+    try:
+        raw = base64.b64decode(b64)
+    except Exception as e:
+        raise HTTPException(400, f"invalid base64: {e}")
+    try:
+        g.control_register_fp16(cvec_id, raw)
+    except Exception as e:
+        raise HTTPException(400, str(e))
+    return JSONResponse({"id": cvec_id, "bytes": len(raw)})
+
+
 @app.post("/v1/media/extract")
 async def media_extract(req: Request) -> JSONResponse:
     """Run the vision tower on an image and return the soft tokens as a
@@ -508,16 +531,52 @@ async def _iter_session_tokens(state: SessionState):
         yield chunk
 
 
+def _attach_controls(sid: int, controls: list[dict]) -> None:
+    """Attach each control spec to the session before its first tick.
+    Schema: {cvec_id, layer, polarity, peak_magnitude, attack, decay,
+             sustain_level, release, shape, units}. All envelope fields
+    are optional; unspecified defaults to a constant magnitude (attack=
+    decay=release=0, sustain_level=1)."""
+    for c in controls or []:
+        g.session_add_control(
+            sid,
+            str(c["cvec_id"]),
+            int(c.get("layer", 0)),
+            polarity       = float(c.get("polarity", 1.0)),
+            peak_magnitude = float(c.get("peak_magnitude", 1.0)),
+            attack         = float(c.get("attack", 0.0)),
+            decay          = float(c.get("decay", 0.0)),
+            sustain_level  = float(c.get("sustain_level", 1.0)),
+            release        = float(c.get("release", 0.0)),
+            shape          = str(c.get("shape", "linear")),
+            units          = str(c.get("units", "tokens")),
+        )
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request) -> Any:
     body = await req.json()
     messages = body.get("messages", [])
     max_tokens = int(body.get("max_tokens", 256))
     stream = bool(body.get("stream", False))
+    controls = body.get("controls", []) or []
     if not messages:
         raise HTTPException(400, "messages is required")
 
-    sid, state = _open_session_with_messages(messages, max_tokens)
+    # Attach controls BEFORE submit_messages so we capture the session's
+    # envelope-start position at 0 — otherwise the pump thread could tick
+    # between open and attach and advance `position` ahead of us.
+    sid = g.open_session(max_new_tokens=max_tokens)
+    state = SessionState(sid=sid)
+    with _sessions_lock:
+        _sessions[sid] = state
+    if controls:
+        try:
+            _attach_controls(sid, controls)
+        except Exception as e:
+            _close_session(sid)
+            raise HTTPException(400, f"control attachment failed: {e}")
+    submit_messages(sid, messages)
     created = int(time.time())
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
 

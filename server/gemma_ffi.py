@@ -134,6 +134,24 @@ _lib.gemma_vision_fetch_softs_by_key.restype = C.c_int32
 _lib.gemma_submit_softs.argtypes = [C.c_int32, C.POINTER(C.c_uint8), C.c_int32, C.c_int32, C.c_int32]
 _lib.gemma_submit_softs.restype = C.c_int32
 
+# Control-vector API (Phase B).
+_lib.gemma_control_register_fp16.argtypes = [C.c_char_p, C.POINTER(C.c_uint8), C.c_int32]
+_lib.gemma_control_register_fp16.restype = C.c_int32
+
+_lib.gemma_session_add_control.argtypes = [
+    C.c_int32, C.c_char_p, C.c_int32,
+    C.c_float, C.c_float,       # polarity, peakMagnitude
+    C.c_float, C.c_float, C.c_float, C.c_float,  # attack, decay, sustainLevel, release
+    C.c_int32, C.c_int32,       # shape (0-3), units (0=tokens, 1=turns)
+]
+_lib.gemma_session_add_control.restype = C.c_int32
+
+_lib.gemma_session_clear_controls.argtypes = [C.c_int32]
+_lib.gemma_session_clear_controls.restype = C.c_int32
+
+_lib.gemma_session_release_control.argtypes = [C.c_int32, C.c_char_p]
+_lib.gemma_session_release_control.restype = C.c_int32
+
 _lib.gemma_vision_cache_entries.argtypes = []
 _lib.gemma_vision_cache_entries.restype = C.c_int32
 
@@ -430,3 +448,39 @@ def page_owners(phys: int, max_n: int = 32) -> list[int]:
     buf = (C.c_int32 * max_n)()
     n = _lib.gemma_page_owners(int(phys), buf, max_n)
     return [buf[i] for i in range(n)] if n > 0 else []
+
+
+# --- Control-vector API (Phase B) ---
+
+_SHAPES = {"linear": 0, "exp-in": 1, "exp-out": 2, "cubic": 3}
+_UNITS = {"tokens": 0, "turns": 1}
+
+def control_register_fp16(cvec_id: str, fp16_bytes: bytes) -> None:
+    """Register a cvec by string id. bytes must be HIDDEN*2 (5632 at HIDDEN=2816)."""
+    if not cvec_id:
+        raise ValueError("cvec_id must be non-empty")
+    buf = (C.c_uint8 * len(fp16_bytes)).from_buffer_copy(fp16_bytes)
+    r = _lib.gemma_control_register_fp16(cvec_id.encode("utf-8"), buf, len(fp16_bytes))
+    if r != 0:
+        raise RuntimeError(f"gemma_control_register_fp16 failed for id={cvec_id!r}")
+
+def session_add_control(sid: int, cvec_id: str, layer: int,
+                          polarity: float = 1.0,
+                          peak_magnitude: float = 1.0,
+                          attack: float = 0.0, decay: float = 0.0,
+                          sustain_level: float = 1.0, release: float = 0.0,
+                          shape: str = "linear", units: str = "tokens") -> None:
+    r = _lib.gemma_session_add_control(
+        int(sid), cvec_id.encode("utf-8"), int(layer),
+        float(polarity), float(peak_magnitude),
+        float(attack), float(decay), float(sustain_level), float(release),
+        int(_SHAPES.get(shape, 0)), int(_UNITS.get(units, 0)),
+    )
+    if r != 0:
+        raise RuntimeError(f"gemma_session_add_control failed (sid={sid}, cvec={cvec_id})")
+
+def session_clear_controls(sid: int) -> None:
+    _lib.gemma_session_clear_controls(int(sid))
+
+def session_release_control(sid: int, cvec_id: str) -> None:
+    _lib.gemma_session_release_control(int(sid), cvec_id.encode("utf-8"))

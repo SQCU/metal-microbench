@@ -85,6 +85,102 @@ enum PrimingChunk {
     }
 }
 
+// MARK: - Control vectors (Phase B)
+//
+// A cvector is an (injection-layer-L, HIDDEN-length half) pair applied as
+// residual[L, b, :] += envelope(t) · polarity · cvec[:] at every AR step.
+// Per-session active-controls list is evaluated each tick; the scheduler
+// then dispatches one tiny add kernel per (slot, control) pair per layer.
+//
+// `position` and `turnIndex` on Session are the two time axes. The
+// envelope chooses which via its `units`.
+
+enum CvecShape: String, Codable {
+    case linear = "linear"
+    case expIn  = "exp-in"     // f(t) = t²  — slow start, fast end
+    case expOut = "exp-out"    // f(t) = 1-(1-t)² — fast start, slow end
+    case cubic  = "cubic"      // f(t) = 3t² - 2t³ — smoothstep
+    func apply(_ p: Float) -> Float {
+        let t = max(0, min(1, p))
+        switch self {
+        case .linear: return t
+        case .expIn:  return t * t
+        case .expOut: return 1 - (1 - t) * (1 - t)
+        case .cubic:  return t * t * (3 - 2 * t)
+        }
+    }
+}
+
+enum CvecUnits: String, Codable {
+    case tokens, turns
+}
+
+struct CvecEnvelope {
+    var attack: Float = 0         // ramp-up duration in `units`
+    var decay: Float = 0          // peak → sustain duration
+    var sustainLevel: Float = 1   // 0..1 fraction of peak magnitude
+    var release: Float = 0        // sustain → 0 duration after stop
+    var peakMagnitude: Float = 1  // the "A" peak in ADSR
+    var shape: CvecShape = .linear
+    var units: CvecUnits = .tokens
+}
+
+// One active control vector on a session. `magnitudeAt(position:turn:)`
+// is pure and cheap — evaluated once per tick before the engine builds
+// the step CB, so the kernel sees a precomputed scalar.
+final class ActiveControl {
+    let cvecId: String          // key into the cvec registry
+    let buffer: MTLBuffer       // resolved cvec MTLBuffer (half × HIDDEN)
+    let layer: Int              // which LM layer to inject at
+    let envelope: CvecEnvelope
+    let polarity: Float         // +1 or -1 (or arbitrary multiplier)
+    let startPosition: Int      // session.position at activation
+    let startTurn: Int          // session.turnIndex at activation
+    var stopPosition: Int? = nil
+    var stopTurn: Int? = nil
+    init(cvecId: String, buffer: MTLBuffer, layer: Int,
+         envelope: CvecEnvelope, polarity: Float,
+         startPosition: Int, startTurn: Int) {
+        self.cvecId = cvecId; self.buffer = buffer; self.layer = layer
+        self.envelope = envelope; self.polarity = polarity
+        self.startPosition = startPosition; self.startTurn = startTurn
+    }
+    func magnitudeAt(position: Int, turn: Int) -> Float {
+        let elapsed: Float
+        switch envelope.units {
+        case .tokens: elapsed = Float(position - startPosition)
+        case .turns:  elapsed = Float(turn - startTurn)
+        }
+        if elapsed < 0 { return 0 }
+        let peak = envelope.peakMagnitude * polarity
+        let sustain = peak * envelope.sustainLevel
+        // Attack: 0 → peak over `attack` units.
+        if elapsed < envelope.attack {
+            return peak * envelope.shape.apply(elapsed / max(envelope.attack, 1e-9))
+        }
+        // Decay: peak → sustain over `decay` units.
+        let afterAttack = elapsed - envelope.attack
+        if afterAttack < envelope.decay {
+            let p = envelope.shape.apply(afterAttack / max(envelope.decay, 1e-9))
+            return peak + (sustain - peak) * p
+        }
+        // Sustain (if no stop) or release (if stop has been triggered).
+        let stopRef: Int?
+        let nowRef: Int
+        switch envelope.units {
+        case .tokens: stopRef = stopPosition; nowRef = position
+        case .turns:  stopRef = stopTurn;     nowRef = turn
+        }
+        guard let stop = stopRef else { return sustain }
+        let rel = Float(nowRef - stop)
+        if rel < 0 { return sustain }
+        if rel < envelope.release {
+            return sustain * (1 - envelope.shape.apply(rel / max(envelope.release, 1e-9)))
+        }
+        return 0
+    }
+}
+
 final class Session {
     let id: Int
     // Which active-batch slot this session is currently occupying, or nil
@@ -122,6 +218,32 @@ final class Session {
     // Next KV-cache write position. k_len after a step == position + 1.
     fileprivate var position: Int = 0
     fileprivate var numGenerated: Int = 0
+
+    // Control-vector state (Phase B). activeControls is evaluated once
+    // per tick inside step(); turnIndex advances at each model-response
+    // boundary (submit() flips .done→.paused increments it).
+    fileprivate(set) var activeControls: [ActiveControl] = []
+    fileprivate(set) var turnIndex: Int = 0
+
+    func addControl(_ c: ActiveControl) { activeControls.append(c) }
+    func removeControls(cvecId: String) {
+        activeControls.removeAll { $0.cvecId == cvecId }
+    }
+    func clearControls() { activeControls.removeAll(keepingCapacity: false) }
+    // Signal a control's sustain → release transition. Caller passes the
+    // current (position, turn) so the ADSR decays relative to that point.
+    func releaseControl(cvecId: String, position: Int, turn: Int) {
+        for c in activeControls where c.cvecId == cvecId && c.stopPosition == nil {
+            c.stopPosition = position; c.stopTurn = turn
+        }
+    }
+    // Snapshot of (position, turn) at the moment the caller reads them —
+    // used by the FFI when activating a control so the envelope's start
+    // time is captured relative to session state without exposing the
+    // fileprivate fields.
+    var currentTimeCoords: (position: Int, turn: Int) {
+        return (position, turnIndex)
+    }
 
     // Tokens the caller can consume.
     fileprivate var outputQueue: [UInt32] = []
@@ -621,6 +743,20 @@ final class LmEngine {
             let spp = shared_phys_pages.contents().assumingMemoryBound(to: UInt32.self)
             for p in 0..<sharedPrefix {
                 spp[p] = UInt32(reference.ownedPages[p])
+            }
+        }
+
+        // Control-vector per-tick staging. For every occupied slot, evaluate
+        // each of its active controls' envelopes at the current (position,
+        // turn) and stash the resulting (buffer, layer, mag) triples in
+        // gSlotControls[slot]. Silenced slots just get an empty list.
+        for slot in 0..<B { gSlotControls[slot].removeAll(keepingCapacity: true) }
+        for slot in 0..<B where realSlot[slot] {
+            guard let sid = slotAssignment[slot],
+                  let s = residentSessions[sid] else { continue }
+            for c in s.activeControls {
+                let m = c.magnitudeAt(position: s.position, turn: s.turnIndex)
+                if m != 0 { gSlotControls[slot].append(SlotControl(buffer: c.buffer, layer: c.layer, mag: m)) }
             }
         }
 
