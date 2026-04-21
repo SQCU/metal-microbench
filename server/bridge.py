@@ -586,6 +586,14 @@ def demo_steering_vectors() -> JSONResponse:
     })
 
 
+@app.get("/v1/control/vectors")
+def control_list_vectors() -> JSONResponse:
+    """List currently-registered cvec ids. UI clients call this before
+    submitting a chat request so they can surface "X isn't registered"
+    early instead of waiting for the engine to 400."""
+    return JSONResponse({"ids": g.control_list_ids()})
+
+
 @app.post("/v1/control/vectors")
 async def control_register(req: Request) -> JSONResponse:
     """Register a control vector by caller-assigned id. Body JSON:

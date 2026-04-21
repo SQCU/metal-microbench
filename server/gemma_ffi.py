@@ -602,3 +602,18 @@ def capture_residual_for_prompt(prompt: str, layer: int,
             close_session(sid)
     finally:
         set_capture_layer(-1)
+
+
+_lib.gemma_control_list_ids.argtypes = [C.c_char_p, C.c_int32]
+_lib.gemma_control_list_ids.restype = C.c_int32
+
+def control_list_ids() -> list[str]:
+    """Return currently-registered cvec ids, sorted."""
+    need = _lib.gemma_control_list_ids(None, 0)
+    if need <= 0:
+        return []
+    buf = C.create_string_buffer(need + 8)
+    n = _lib.gemma_control_list_ids(buf, len(buf))
+    if n <= 0:
+        return []
+    return [s for s in buf.raw[:n].decode("utf-8", errors="replace").split(",") if s]

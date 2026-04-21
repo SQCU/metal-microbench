@@ -461,8 +461,38 @@ const state = {
   tStart: null,
 };
 
+// Preflight: confirm the cvec ids the UI will reference are actually
+// registered on the server. If not, surface a specific "rebuild these
+// first" message instead of letting the chat request 400 opaquely.
+async function preflightCvecIds() {
+  try {
+    const r = await fetch('/v1/control/vectors');
+    if (!r.ok) return true;  // degrade gracefully, don't block the run
+    const { ids } = await r.json();
+    const have = new Set(ids);
+    const needed = [];
+    if ($('detEnabled').checked) needed.push(['detector', $('detId').value.trim()]);
+    if ($('effEnabled').checked) needed.push(['effector', $('effId').value.trim()]);
+    if ($('trigEnabled').checked && $('effEnabled').checked) {
+      needed.push(['trigger effector', $('effId').value.trim()]);
+    }
+    const missing = needed.filter(([_, id]) => id && !have.has(id));
+    if (missing.length > 0) {
+      const ml = missing.map(([role, id]) => `<b>${id}</b> (needed for ${role})`).join(', ');
+      const hl = ids.length ? `registered ids: ${ids.join(', ')}` : 'no cvecs registered yet';
+      $('systemMsg').innerHTML =
+        `missing cvecs: ${ml}. ${hl}. click <b>narrative demo</b> or <b>construct</b> to register.`;
+      return false;
+    }
+    return true;
+  } catch {
+    return true;
+  }
+}
+
 $('runBtn').addEventListener('click', async () => {
   if (state.running) return;
+  if (!(await preflightCvecIds())) return;
   state.running = true; state.tStart = performance.now();
   $('runBtn').disabled = true;
   state.samples = [];
@@ -514,7 +544,13 @@ $('runBtn').addEventListener('click', async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    if (!resp.ok) {
+      const body = await resp.text();
+      // Propagate the server's specific error ("no cvec registered for
+      // id=X", etc.) so the user can see WHICH cvec is missing and
+      // rebuild it — not a bare HTTP 400.
+      throw new Error(`HTTP ${resp.status}: ${body.slice(0, 240)}`);
+    }
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
     let buf = '';

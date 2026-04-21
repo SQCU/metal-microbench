@@ -516,6 +516,21 @@ public func gemma_vision_fetch_softs_by_key(_ hexKey: UnsafePointer<CChar>?,
 // Re-registering the same id replaces the existing entry (consumers
 // referencing it continue to see the OLD buffer until they re-attach —
 // the buffer is strongly retained by each ActiveControl).
+// Return the currently-registered cvec ids as a comma-separated string.
+// Useful for UIs that want to warn "this id isn't on the server" before
+// submitting a request that would 400.
+@_cdecl("gemma_control_list_ids")
+public func gemma_control_list_ids(_ outPtr: UnsafeMutablePointer<CChar>?,
+                                    _ maxBytes: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    let ids = gCvecRegistry.keys.sorted().joined(separator: ",")
+    let bytes = Array(ids.utf8)
+    if outPtr == nil { return Int32(bytes.count) }
+    let n = min(bytes.count, Int(maxBytes))
+    for i in 0..<n { outPtr![i] = CChar(bitPattern: bytes[i]) }
+    return Int32(n)
+}
+
 @_cdecl("gemma_control_register_fp16")
 public func gemma_control_register_fp16(_ idPtr: UnsafePointer<CChar>?,
                                          _ dataPtr: UnsafePointer<UInt8>?,
