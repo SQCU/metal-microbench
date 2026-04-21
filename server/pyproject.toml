@@ -11,11 +11,7 @@ dependencies = [
     "huggingface_hub>=0.23",  # for scripts/fetch-weights.py
 ]
 
-[project.scripts]
-gemma-bridge = "bridge:main"
-gemma-webapp = "webapp:main"
-gemma-serve = "serve:main"
-
 [tool.uv]
-# Nothing special — this project has no editable deps; uv sync builds a
-# venv from `dependencies` above.
+# Not a distributable package — just a venv for serve.py / scripts/*.py
+# Explicitly false to silence uv's "skipping entry points" warning.
+package = false
