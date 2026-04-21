@@ -36,6 +36,7 @@ let rmsNoScalePSO   = pso("rms_norm_noscale")
 let scaleByScalarPSO = pso("scale_by_scalar")
 let routerPreNormPSO = pso("router_prenorm_scale")
 let addInplacePSO   = pso("add_inplace")
+let addScaledCvecPSO = pso("add_scaled_cvector_fp16")
 let geluMulPSO      = pso("gelu_mul_inplace")
 let moeCombineWritePSO = pso("moe_combine_write")
 let gemvV5PSO      = pso("dense_gemv_v5")
@@ -480,6 +481,23 @@ func encAddInplace(_ cb: MTLCommandBuffer, dst: MTLBuffer, src: MTLBuffer, N: In
     enc.setBuffer(dst, offset: 0, index: 0); enc.setBuffer(src, offset: 0, index: 1)
     var Nv = UInt32(N)
     enc.setBytes(&Nv, length: 4, index: 2)
+    enc.dispatchThreadgroups(MTLSize(width: numVecs, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// Scaled cvector injection into residual: dst[b, :] += mag * cvec[:] for
+// every b in [0, numVecs). Cheap — one 32-thread TG per row, weight-bound
+// on the HIDDEN-length cvec read. Intended to be called at one or more
+// designated post-residual sites inside the LM layer loop.
+func encAddScaledCvec(_ cb: MTLCommandBuffer, dst: MTLBuffer, cvec: MTLBuffer,
+                       mag: Float, N: Int, numVecs: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(addScaledCvecPSO)
+    enc.setBuffer(dst, offset: 0, index: 0); enc.setBuffer(cvec, offset: 0, index: 1)
+    var Nv = UInt32(N); var magv = mag
+    enc.setBytes(&Nv, length: 4, index: 2)
+    enc.setBytes(&magv, length: 4, index: 3)
     enc.dispatchThreadgroups(MTLSize(width: numVecs, height: 1, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
@@ -1861,6 +1879,33 @@ let LM_DUMP_STAGING: MTLBuffer? = {
     return device.makeBuffer(length: (NUM_LAYERS + 1) * HIDDEN * 2, options: .storageModeShared)!
 }()
 
+// Phase A control-vector injection: ONE cvector at ONE layer with a
+// constant scalar magnitude, loaded from a raw fp16 binary of length
+// HIDDEN (=2816) halves. Activated via env vars:
+//   LM_CVEC_PATH  = path to fp16 binary
+//   LM_CVEC_LAYER = layer index (0..NUM_LAYERS-1)
+//   LM_CVEC_MAG   = scalar float magnitude (positive or negative)
+// Validates the kernel cost is negligible before we invest in the
+// ADSR evaluator + multi-vector / multi-layer plumbing of Phase B.
+let LM_CVEC_LAYER: Int = Int(ProcessInfo.processInfo.environment["LM_CVEC_LAYER"] ?? "") ?? -1
+let LM_CVEC_MAG:   Float = Float(ProcessInfo.processInfo.environment["LM_CVEC_MAG"] ?? "") ?? 0.0
+let LM_CVEC_BUF:   MTLBuffer? = {
+    guard let path = ProcessInfo.processInfo.environment["LM_CVEC_PATH"],
+          LM_CVEC_LAYER >= 0, !path.isEmpty else { return nil }
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+        print("[cvec] failed to read \(path)"); return nil
+    }
+    let expected = HIDDEN * 2
+    guard data.count == expected else {
+        print("[cvec] \(path) is \(data.count) bytes, expected \(expected) (HIDDEN=\(HIDDEN) × fp16)")
+        return nil
+    }
+    let buf = device.makeBuffer(length: expected, options: .storageModeShared)!
+    _ = data.withUnsafeBytes { src in memcpy(buf.contents(), src.baseAddress, expected) }
+    print("[cvec] loaded \(path), injecting at layer \(LM_CVEC_LAYER) with mag=\(LM_CVEC_MAG)")
+    return buf
+}()
+
 // When LM_DUMP_L0_INTERNALS=<dir> is set, allocate staging buffers for
 // intra-layer probes captured inside decoder layer 0:
 //   slot 0 = hidden after post_attn_norm + residual add (pre_feedforward_layernorm input)
@@ -2137,6 +2182,12 @@ func buildStepCB(_ w: LmWeights, sharedPrefixPages: Int = 0) -> MTLCommandBuffer
         encRmsNormAddScale(cb, x: ffn_combined, gammaBuf: lw.postFfnNorm,
                            residual: hidden, scalar: lw.layerOutputScale,
                            out: hidden, N: HIDDEN, numVecs: B)
+        // Control-vector injection at the post-FFN residual site. Phase A:
+        // static scalar magnitude loaded from env. No-op when LM_CVEC_BUF is nil.
+        if let cvec = LM_CVEC_BUF, L == LM_CVEC_LAYER, LM_CVEC_MAG != 0.0 {
+            encAddScaledCvec(cb, dst: hidden, cvec: cvec, mag: LM_CVEC_MAG,
+                              N: HIDDEN, numVecs: B)
+        }
         if let dump = LM_DUMP_STAGING {
             let blit = cb.makeBlitCommandEncoder()!
             blit.copy(from: hidden, sourceOffset: 0,
