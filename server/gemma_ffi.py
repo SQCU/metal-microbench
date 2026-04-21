@@ -484,3 +484,43 @@ def session_clear_controls(sid: int) -> None:
 
 def session_release_control(sid: int, cvec_id: str) -> None:
     _lib.gemma_session_release_control(int(sid), cvec_id.encode("utf-8"))
+
+
+# --- Phase C-Read: detectors + triggers ---
+
+_lib.gemma_session_add_detector.argtypes = [C.c_int32, C.c_char_p, C.c_char_p, C.c_int32]
+_lib.gemma_session_add_detector.restype = C.c_int32
+
+_lib.gemma_session_add_trigger.argtypes = [C.c_int32, C.c_char_p, C.c_int32, C.c_float, C.c_char_p]
+_lib.gemma_session_add_trigger.restype = C.c_int32
+
+_lib.gemma_session_clear_detectors.argtypes = [C.c_int32]
+_lib.gemma_session_clear_detectors.restype = C.c_int32
+
+_lib.gemma_session_read_intensity.argtypes = [C.c_int32, C.c_char_p]
+_lib.gemma_session_read_intensity.restype = C.c_float
+
+_TRIGGER_CONDS = {"on-exceed": 0, "on-fall": 1}
+
+def session_add_detector(sid: int, name: str, cvec_id: str, layer: int) -> None:
+    r = _lib.gemma_session_add_detector(int(sid), name.encode("utf-8"),
+                                         cvec_id.encode("utf-8"), int(layer))
+    if r != 0:
+        raise RuntimeError(f"gemma_session_add_detector failed (sid={sid}, name={name}, cvec={cvec_id})")
+
+def session_add_trigger(sid: int, detector_name: str, condition: str,
+                          threshold: float, effector_cvec_id: str) -> None:
+    cond = _TRIGGER_CONDS.get(condition)
+    if cond is None:
+        raise ValueError(f"condition must be one of {list(_TRIGGER_CONDS)}")
+    r = _lib.gemma_session_add_trigger(int(sid), detector_name.encode("utf-8"),
+                                         cond, float(threshold),
+                                         effector_cvec_id.encode("utf-8"))
+    if r != 0:
+        raise RuntimeError(f"gemma_session_add_trigger failed")
+
+def session_clear_detectors(sid: int) -> None:
+    _lib.gemma_session_clear_detectors(int(sid))
+
+def session_read_intensity(sid: int, name: str) -> float:
+    return float(_lib.gemma_session_read_intensity(int(sid), name.encode("utf-8")))

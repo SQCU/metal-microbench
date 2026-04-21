@@ -134,8 +134,11 @@ final class ActiveControl {
     let layer: Int              // which LM layer to inject at
     let envelope: CvecEnvelope
     let polarity: Float         // +1 or -1 (or arbitrary multiplier)
-    let startPosition: Int      // session.position at activation
-    let startTurn: Int          // session.turnIndex at activation
+    // start{Position,Turn} are mutable so a gated trigger can RESTART
+    // the envelope at an arbitrary later moment without allocating a
+    // new ActiveControl. stop fields clear on restart.
+    var startPosition: Int
+    var startTurn: Int
     var stopPosition: Int? = nil
     var stopTurn: Int? = nil
     init(cvecId: String, buffer: MTLBuffer, layer: Int,
@@ -144,6 +147,13 @@ final class ActiveControl {
         self.cvecId = cvecId; self.buffer = buffer; self.layer = layer
         self.envelope = envelope; self.polarity = polarity
         self.startPosition = startPosition; self.startTurn = startTurn
+    }
+    // Reset the envelope clock to (position, turn). Triggered by a
+    // detector event; behaves exactly as if the control were freshly
+    // attached — attack ramp replays from zero.
+    func restart(position: Int, turn: Int) {
+        startPosition = position; startTurn = turn
+        stopPosition = nil; stopTurn = nil
     }
     func magnitudeAt(position: Int, turn: Int) -> Float {
         let elapsed: Float
@@ -179,6 +189,49 @@ final class ActiveControl {
         }
         return 0
     }
+}
+
+// Phase C-Read: measurement direction attached to a session. Each tick,
+// a dot product at the attached layer is written into a host-visible
+// intensity buffer; pump reads it back after CB completion and feeds
+// the trigger evaluator. Detectors are purely observational — they
+// don't modify the residual stream.
+final class DetectorAttachment {
+    let name: String           // session-scoped alias used by triggers
+    let cvecId: String         // registry key for the underlying vector
+    let buffer: MTLBuffer      // HIDDEN × fp16
+    let layer: Int             // which LM layer's post-FFN residual to measure
+    var lastIntensity: Float = 0      // this tick's reading (post-step update)
+    var prevIntensity: Float = 0      // last tick's reading (for edge detection)
+    init(name: String, cvecId: String, buffer: MTLBuffer, layer: Int) {
+        self.name = name; self.cvecId = cvecId; self.buffer = buffer; self.layer = layer
+    }
+}
+
+// Gate condition for detector → effector coupling. Edge-triggered: fires
+// ONCE per threshold crossing, not every tick where the condition holds.
+// Passing the prev→curr pair is enough to implement both rise and fall
+// edges without any state beyond what the detector already carries.
+enum TriggerCondition {
+    case onExceed(threshold: Float)   // rising edge past threshold
+    case onFall(threshold: Float)     // falling edge past threshold
+    func fires(prev: Float, curr: Float) -> Bool {
+        switch self {
+        case .onExceed(let th): return prev <= th && curr > th
+        case .onFall(let th):   return prev >= th && curr < th
+        }
+    }
+}
+
+// Detector → effector gate. When the condition fires, the matching
+// effector's ADSR envelope is RESTARTED (startPosition ← now,
+// stopPosition ← nil) so its attack/decay plays out fresh from the
+// trigger instant. Triggers carry no continuous coupling to the
+// detector's intensity — only the edge event transfers.
+struct SessionTrigger {
+    let detectorName: String
+    let condition: TriggerCondition
+    let effectorCvecId: String
 }
 
 final class Session {
@@ -225,6 +278,11 @@ final class Session {
     fileprivate(set) var activeControls: [ActiveControl] = []
     fileprivate(set) var turnIndex: Int = 0
 
+    // Phase C-Read state. Detectors produce per-tick intensity readings;
+    // triggers gate effector-envelope restarts on edge events.
+    fileprivate(set) var detectors: [DetectorAttachment] = []
+    fileprivate(set) var triggers: [SessionTrigger] = []
+
     func addControl(_ c: ActiveControl) { activeControls.append(c) }
     func removeControls(cvecId: String) {
         activeControls.removeAll { $0.cvecId == cvecId }
@@ -235,6 +293,32 @@ final class Session {
     func releaseControl(cvecId: String, position: Int, turn: Int) {
         for c in activeControls where c.cvecId == cvecId && c.stopPosition == nil {
             c.stopPosition = position; c.stopTurn = turn
+        }
+    }
+    // Detector / trigger APIs — detectors added via FFI, triggers are
+    // pure value types (no buffer refs) so attachment is trivial.
+    func addDetector(_ d: DetectorAttachment) { detectors.append(d) }
+    func removeDetectors(name: String) { detectors.removeAll { $0.name == name } }
+    func clearDetectors() { detectors.removeAll(keepingCapacity: false) }
+    func addTrigger(_ t: SessionTrigger) { triggers.append(t) }
+    func clearTriggers() { triggers.removeAll(keepingCapacity: false) }
+    // Read-only accessors for the pump (intensity readback, trigger eval).
+    var detectorCount: Int { detectors.count }
+    func detectorAt(_ i: Int) -> DetectorAttachment { detectors[i] }
+    // Evaluate every trigger against current detector state, firing
+    // effector restarts as edges cross. Called by step() AFTER intensity
+    // readback and BEFORE the next tick's dispatch, so restarts affect
+    // the immediately-following tick's envelope magnitude.
+    func evaluateTriggers(position: Int, turn: Int,
+                           log: ((String) -> Void)? = nil) {
+        for tr in triggers {
+            guard let det = detectors.first(where: { $0.name == tr.detectorName }) else { continue }
+            if tr.condition.fires(prev: det.prevIntensity, curr: det.lastIntensity) {
+                for c in activeControls where c.cvecId == tr.effectorCvecId {
+                    c.restart(position: position, turn: turn)
+                }
+                log?("[cvec-trigger] s\(id) detector=\(tr.detectorName) prev=\(det.prevIntensity) curr=\(det.lastIntensity) → restart \(tr.effectorCvecId)")
+            }
         }
     }
     // Snapshot of (position, turn) at the moment the caller reads them —
@@ -759,6 +843,19 @@ final class LmEngine {
                 if m != 0 { gSlotControls[slot].append(SlotControl(buffer: c.buffer, layer: c.layer, mag: m)) }
             }
         }
+        // Phase C-Read: stage detectors, assigning each a linear offset
+        // into gIntensityBuf so the CB kernel knows where to write its
+        // scalar output. Max MAX_DETECTORS_PER_SLOT detectors per slot.
+        for slot in 0..<B { gSlotDetectors[slot].removeAll(keepingCapacity: true) }
+        for slot in 0..<B where realSlot[slot] {
+            guard let sid = slotAssignment[slot],
+                  let s = residentSessions[sid] else { continue }
+            let base = slot * MAX_DETECTORS_PER_SLOT
+            for (i, d) in s.detectors.prefix(MAX_DETECTORS_PER_SLOT).enumerated() {
+                gSlotDetectors[slot].append(SlotDetector(
+                    buffer: d.buffer, layer: d.layer, outSlot: base + i))
+            }
+        }
 
         let t0 = Date()
         let cb = buildStepCB(weights, sharedPrefixPages: sharedPrefix)
@@ -766,6 +863,28 @@ final class LmEngine {
         lastStepMs = Date().timeIntervalSince(t0) * 1000
         totalSteps += 1
         if let err = cb.error { print("  GPU step error: \(err)"); return 0 }
+
+        // Phase C-Read readback. Pull intensities out of gIntensityBuf
+        // (host-visible) into each session's DetectorAttachment state —
+        // prev gets last tick's curr, curr gets this tick's measurement.
+        // Then evaluate gated triggers for edge-fires and restart any
+        // effector envelopes they activate. The effector restarts take
+        // effect on the NEXT tick's magnitudeAt() evaluation — classic
+        // cross-tick side-chain, no in-CB coupling.
+        let intP = gIntensityBuf.contents().bindMemory(to: Float.self,
+                                                       capacity: B * MAX_DETECTORS_PER_SLOT)
+        let logCvec = ProcessInfo.processInfo.environment["LM_CVEC_LOG"] != nil
+        for slot in 0..<B where realSlot[slot] {
+            guard let sid = slotAssignment[slot],
+                  let s = residentSessions[sid] else { continue }
+            let base = slot * MAX_DETECTORS_PER_SLOT
+            for (i, d) in s.detectors.prefix(MAX_DETECTORS_PER_SLOT).enumerated() {
+                d.prevIntensity = d.lastIntensity
+                d.lastIntensity = intP[base + i]
+            }
+            s.evaluateTriggers(position: s.position, turn: s.turnIndex,
+                                log: logCvec ? { print($0) } : nil)
+        }
 
         let logP = logits.contents().assumingMemoryBound(to: Float16.self)
         var emitted = 0

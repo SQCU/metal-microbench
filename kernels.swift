@@ -171,6 +171,31 @@ kernel void add_inplace(
     for (uint i = t; i < N; i += 32) { dst[b*N+i] = half(float(dst[b*N+i]) + float(src[b*N+i])); }
 }
 
+// Residual-stream measurement: intensities[b] = dot(dst[b, :], meas[:])
+// Pure read — doesn't modify the residual. One 32-thread TG per slot;
+// per-lane partial sum is combined via simd_sum then lane 0 writes the
+// scalar out. Paired with add_scaled_cvector_fp16 to form the detect/
+// trigger/effect loop: this kernel's output gets read back CPU-side
+// between ticks and fed into the trigger evaluator, which optionally
+// restarts an effector ADSR envelope for the NEXT tick. No in-CB
+// coupling — the detector and effector are fully decoupled feedforward.
+kernel void measure_dot_fp16(
+    device const half*  src          [[buffer(0)]],  // [B, N] residual stream
+    device const half*  meas         [[buffer(1)]],  // [N]    measurement direction
+    device       float* intensities  [[buffer(2)]],  // [B]    output, one scalar per slot
+    constant uint&      N            [[buffer(3)]],
+    uint2 tg  [[threadgroup_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    uint b = tg.x; uint t = lid.x;
+    float acc = 0.0f;
+    for (uint i = t; i < N; i += 32) {
+        acc += float(src[b*N + i]) * float(meas[i]);
+    }
+    acc = simd_sum(acc);
+    if (t == 0) intensities[b] = acc;
+}
+
 // Residual-stream control-vector injection: dst[b, :] += mag * cvec[:]
 // One cvec is shared across every batch slot (same steering vector applies
 // to every sequence in the active batch). Bandwidth-bound and tiny — cvec

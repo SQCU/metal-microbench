@@ -596,6 +596,76 @@ public func gemma_session_release_control(_ sid: Int32,
     return 0
 }
 
+// Attach a detector: a named direction that gets measured against the
+// post-FFN residual at the specified layer every tick. The resulting
+// scalar intensity is visible to triggers and readable via
+// gemma_session_read_intensity. `name` is a session-scoped alias used
+// by gemma_session_add_trigger; `cvecId` picks an already-registered
+// vector from the registry (detectors and effectors share the same
+// registry since they're both HIDDEN-length fp16 vectors).
+@_cdecl("gemma_session_add_detector")
+public func gemma_session_add_detector(_ sid: Int32,
+                                        _ namePtr: UnsafePointer<CChar>?,
+                                        _ cvecIdPtr: UnsafePointer<CChar>?,
+                                        _ layer: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let s = gSessions[sid] else { return -1 }
+    guard let np = namePtr, let ip = cvecIdPtr else { return -1 }
+    let name = String(cString: np)
+    let cvecId = String(cString: ip)
+    guard let buf = gCvecRegistry[cvecId] else {
+        print("[cvec] session \(sid) add_detector: no cvec registered for id=\(cvecId)")
+        return -1
+    }
+    s.addDetector(DetectorAttachment(name: name, cvecId: cvecId,
+                                      buffer: buf, layer: Int(layer)))
+    return 0
+}
+
+// Attach a gated trigger: when `detectorName`'s intensity crosses
+// `threshold` in the direction set by `conditionCode`, restart the
+// envelope of the effector control whose cvecId matches
+// `effectorCvecId`. conditionCode: 0 = onExceed, 1 = onFall.
+@_cdecl("gemma_session_add_trigger")
+public func gemma_session_add_trigger(_ sid: Int32,
+                                       _ detNamePtr: UnsafePointer<CChar>?,
+                                       _ conditionCode: Int32,
+                                       _ threshold: Float,
+                                       _ effectorCvecIdPtr: UnsafePointer<CChar>?) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let s = gSessions[sid] else { return -1 }
+    guard let dp = detNamePtr, let ep = effectorCvecIdPtr else { return -1 }
+    let cond: TriggerCondition = (conditionCode == 0
+        ? .onExceed(threshold: threshold)
+        : .onFall(threshold: threshold))
+    s.addTrigger(SessionTrigger(detectorName: String(cString: dp),
+                                 condition: cond,
+                                 effectorCvecId: String(cString: ep)))
+    return 0
+}
+
+// Drop all detectors / triggers on a session.
+@_cdecl("gemma_session_clear_detectors")
+public func gemma_session_clear_detectors(_ sid: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let s = gSessions[sid] else { return -1 }
+    s.clearDetectors(); s.clearTriggers()
+    return 0
+}
+
+// Peek the most recent intensity reading for a detector (for telemetry
+// / UI, not for the main feedback path — triggers already consume this
+// internally). Returns 0.0 for unknown detector names.
+@_cdecl("gemma_session_read_intensity")
+public func gemma_session_read_intensity(_ sid: Int32,
+                                          _ namePtr: UnsafePointer<CChar>?) -> Float {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let s = gSessions[sid] else { return 0 }
+    guard let np = namePtr else { return 0 }
+    let name = String(cString: np)
+    return s.detectors.first(where: { $0.name == name })?.lastIntensity ?? 0
+}
+
 // Submit pre-computed soft tokens to a session. The client is handing
 // back softs they received from a previous image submission — the server
 // brackets with BOI/EOI and appends to the chunk queue without running

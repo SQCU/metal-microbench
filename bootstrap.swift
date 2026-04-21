@@ -37,6 +37,7 @@ let scaleByScalarPSO = pso("scale_by_scalar")
 let routerPreNormPSO = pso("router_prenorm_scale")
 let addInplacePSO   = pso("add_inplace")
 let addScaledCvecPSO = pso("add_scaled_cvector_fp16")
+let measureDotPSO    = pso("measure_dot_fp16")
 let geluMulPSO      = pso("gelu_mul_inplace")
 let moeCombineWritePSO = pso("moe_combine_write")
 let gemvV5PSO      = pso("dense_gemv_v5")
@@ -499,6 +500,26 @@ func encAddScaledCvec(_ cb: MTLCommandBuffer, dst: MTLBuffer, cvec: MTLBuffer,
     enc.setBytes(&Nv, length: 4, index: 2)
     enc.setBytes(&magv, length: 4, index: 3)
     enc.dispatchThreadgroups(MTLSize(width: numVecs, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// Per-slot dot-product measurement. Writes a single float into
+// `intensities[slot]` representing the raw projection of the residual
+// row onto the measurement direction. Pair with the Phase C-Read pump
+// logic that reads this buffer back between ticks and gates effector
+// envelopes on threshold crossings.
+func encMeasureDotSlot(_ cb: MTLCommandBuffer, src: MTLBuffer, slot: Int,
+                        meas: MTLBuffer, intensities: MTLBuffer,
+                        intensitySlotOffsetBytes: Int, N: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(measureDotPSO)
+    enc.setBuffer(src, offset: slot * N * 2, index: 0)
+    enc.setBuffer(meas, offset: 0, index: 1)
+    enc.setBuffer(intensities, offset: intensitySlotOffsetBytes, index: 2)
+    var Nv = UInt32(N)
+    enc.setBytes(&Nv, length: 4, index: 3)
+    enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
 }
@@ -1918,6 +1939,21 @@ var gCvecRegistry: [String: MTLBuffer] = [:]
 struct SlotControl { let buffer: MTLBuffer; let layer: Int; let mag: Float }
 var gSlotControls: [[SlotControl]] = Array(repeating: [], count: B)
 
+// Phase C-Read staging. Detectors-to-dispatch this tick, per slot, as
+// (buffer, layer, intensity-output-slot-index). intensity-slot-index is
+// the linear offset into gIntensityBuf where the kernel writes this
+// detector's scalar output.
+struct SlotDetector { let buffer: MTLBuffer; let layer: Int; let outSlot: Int }
+var gSlotDetectors: [[SlotDetector]] = Array(repeating: [], count: B)
+
+// Host-visible scratch for per-tick intensity readback. Max 8 detectors
+// per slot is plenty for Phase C-Read prototyping; layout is linear
+// [slot][detector-index-within-slot] of float32.
+let MAX_DETECTORS_PER_SLOT = 8
+let gIntensityBuf: MTLBuffer = device.makeBuffer(
+    length: B * MAX_DETECTORS_PER_SLOT * 4,
+    options: .storageModeShared)!
+
 let LM_CVEC_LAYER: Int = Int(ProcessInfo.processInfo.environment["LM_CVEC_LAYER"] ?? "") ?? -1
 let LM_CVEC_MAG:   Float = Float(ProcessInfo.processInfo.environment["LM_CVEC_MAG"] ?? "") ?? 0.0
 let LM_CVEC_BUF:   MTLBuffer? = {
@@ -2230,6 +2266,19 @@ func buildStepCB(_ w: LmWeights, sharedPrefixPages: Int = 0) -> MTLCommandBuffer
             for sc in gSlotControls[slot] where sc.layer == L && sc.mag != 0.0 {
                 encAddScaledCvecSlot(cb, dst: hidden, slot: slot,
                                       cvec: sc.buffer, mag: sc.mag, N: HIDDEN)
+            }
+        }
+        // Phase C-Read: after writes land, measure the residual against
+        // each active detector whose layer matches this one. Each
+        // dispatch writes one scalar into gIntensityBuf at its assigned
+        // slot — pump reads them back after CB completion.
+        for slot in 0..<B {
+            for sd in gSlotDetectors[slot] where sd.layer == L {
+                encMeasureDotSlot(cb, src: hidden, slot: slot,
+                                   meas: sd.buffer,
+                                   intensities: gIntensityBuf,
+                                   intensitySlotOffsetBytes: sd.outSlot * 4,
+                                   N: HIDDEN)
             }
         }
         if let dump = LM_DUMP_STAGING {
