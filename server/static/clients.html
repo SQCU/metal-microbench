@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>gemma metal bridge — clients</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0a0a0a; --panel: #121212; --border: #222;
+    --text: #d4d4d4; --mute: #888; --accent: #6a9;
+    --c0: #5cf; --c1: #fa3; --c2: #8f5; --c3: #f69;
+  }
+  html, body { margin:0; padding:0; background:var(--bg); color:var(--text);
+    font-family: ui-monospace, 'SF Mono', Monaco, monospace; min-height:100%; }
+  header {
+    padding:0.9em 1.4em; border-bottom:1px solid var(--border);
+    display:flex; justify-content:space-between; align-items:center;
+  }
+  header h1 { margin:0; font-size:1rem; font-weight:500; color:var(--accent); }
+  header .status { font-size:0.78rem; color:var(--mute); }
+
+  main { max-width: 900px; margin: 0 auto; padding: 2em 1.5em; }
+  .intro {
+    color:var(--mute); font-size:0.88rem; line-height:1.6;
+    margin-bottom:2em;
+  }
+  .intro b { color:var(--text); font-weight:500; }
+  .intro a { color:var(--accent); }
+
+  .grid {
+    display:grid; grid-template-columns: 1fr; gap: 0.9em;
+  }
+  @media (min-width: 720px) {
+    .grid { grid-template-columns: 1fr 1fr; }
+  }
+  a.card {
+    display:block; text-decoration:none; color:inherit;
+    background:var(--panel); border:1px solid var(--border);
+    border-radius:4px; padding:1em 1.1em;
+    transition: border-color 0.15s, transform 0.15s;
+  }
+  a.card:hover { border-color:var(--accent); transform: translateY(-1px); }
+  a.card .name {
+    display:flex; justify-content:space-between; align-items:baseline;
+    font-weight:600; font-size:0.98rem; margin-bottom:0.4em;
+  }
+  a.card .name .path {
+    font-family: inherit; color:var(--mute); font-size:0.78rem; font-weight:400;
+  }
+  a.card[data-color="0"] .name .path { color: var(--c0); }
+  a.card[data-color="1"] .name .path { color: var(--c1); }
+  a.card[data-color="2"] .name .path { color: var(--c2); }
+  a.card[data-color="3"] .name .path { color: var(--c3); }
+  a.card .desc {
+    font-size:0.80rem; color:var(--mute); line-height:1.5;
+  }
+  a.card .chips {
+    margin-top:0.6em; display:flex; flex-wrap:wrap; gap:0.3em;
+    font-size:0.68rem;
+  }
+  .chip {
+    background:#1a1f28; color:#aef; border:1px solid #222;
+    padding:1px 6px; border-radius:2px;
+  }
+
+  .endpoints {
+    margin-top: 2.5em; background:var(--panel); border:1px solid var(--border);
+    border-radius:4px; padding: 0.9em 1.1em;
+  }
+  .endpoints h2 {
+    margin:0 0 0.6em 0; font-size:0.82rem; font-weight:500; color:var(--mute);
+    text-transform:uppercase; letter-spacing:0.05em;
+  }
+  .endpoints table { width:100%; border-collapse:collapse; font-size:0.78rem; }
+  .endpoints td { padding:0.25em 0.4em; vertical-align:top; }
+  .endpoints td.m { color:var(--c1); font-weight:600; width:3em; }
+  .endpoints td.p { color:var(--text); font-family: inherit; width:14em; }
+  .endpoints td.d { color:var(--mute); }
+
+  footer {
+    margin-top: 2em; padding: 1em 1.4em; border-top:1px solid var(--border);
+    color: var(--mute); font-size:0.72rem; text-align:center;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>gemma metal bridge</h1>
+  <span class="status" id="statusText">checking…</span>
+</header>
+
+<main>
+  <p class="intro">
+    A FastAPI bridge in front of a Gemma-4-A4B inference engine running on
+    Metal / M5 Max. OpenAI-compatible REST at <b>/v1/*</b>; demo clients
+    below. Every client is the same HTTP API you'd get from any chat
+    endpoint — they differ only in how they exercise the engine's
+    paged-attention + prefix-cache + batched-decode primitives.
+  </p>
+
+  <div class="grid">
+
+    <a class="card" href="/tetraplex" data-color="0">
+      <div class="name">tetraplex <span class="path">/tetraplex</span></div>
+      <div class="desc">
+        Four concurrent chat streams, bandwidth chart + per-session KV
+        tenancy strip. Original demo — exercises batch-of-4 AR decode
+        against a shared model. Optional MODE=multimodal renders an
+        amongus frame into each pane.
+      </div>
+      <div class="chips">
+        <span class="chip">batched AR decode</span>
+        <span class="chip">kv tenancy viz</span>
+        <span class="chip">multimodal</span>
+      </div>
+    </a>
+
+    <a class="card" href="/labeler" data-color="1">
+      <div class="name">image labeler <span class="path">/labeler</span></div>
+      <div class="desc">
+        Drop PNGs (or load the bundled amongus frames), hand the engine
+        a schema prompt, watch 4 live-decoding ribbons drain the queue.
+        Downloadable JSONL of results. Shows vision tower cache, shared
+        schema-prefix KV pages, and scheduler coalescing work-by-type.
+      </div>
+      <div class="chips">
+        <span class="chip">vision cache</span>
+        <span class="chip">shared prefix</span>
+        <span class="chip">multi-slot softs prefill</span>
+      </div>
+    </a>
+
+    <a class="card" href="/loom" data-color="2">
+      <div class="name">loom <span class="path">/loom</span></div>
+      <div class="desc">
+        Tree-of-thoughts. Fork N branches from a shared root, each biased
+        by a seed suffix. Click any finished node to fork further from
+        there. SVG threads connect parent to child. Watch the KV tenancy
+        climb as sibling branches share their ancestor-path pages.
+      </div>
+      <div class="chips">
+        <span class="chip">content-hash prefix cache</span>
+        <span class="chip">fork-from-node</span>
+        <span class="chip">greedy-sampling pedagogy</span>
+      </div>
+    </a>
+
+  </div>
+
+  <section class="endpoints">
+    <h2>REST endpoints</h2>
+    <table>
+      <tr><td class="m">GET</td><td class="p">/health</td>
+          <td class="d">engine readiness, model name, cache stats</td></tr>
+      <tr><td class="m">POST</td><td class="p">/v1/chat/completions</td>
+          <td class="d">OpenAI-compat chat; supports <code>image_url</code> and <code>softs</code> content items</td></tr>
+      <tr><td class="m">POST</td><td class="p">/v1/completions</td>
+          <td class="d">raw-text completions (no chat template applied)</td></tr>
+      <tr><td class="m">POST</td><td class="p">/v1/images/prewarm</td>
+          <td class="d">run vision tower + cache softs ahead of time</td></tr>
+      <tr><td class="m">POST</td><td class="p">/v1/media/extract</td>
+          <td class="d">run vision, return softs as base64 blob for client-side persistence</td></tr>
+      <tr><td class="m">GET</td><td class="p">/v1/kv/snapshot</td>
+          <td class="d">per-session page ownership + refcount (the tenancy viz data source)</td></tr>
+      <tr><td class="m">GET</td><td class="p">/v1/cache/stats</td>
+          <td class="d">vision soft-tokens cache hit rate + size</td></tr>
+      <tr><td class="m">POST</td><td class="p">/v1/cache/clear</td>
+          <td class="d">flush the vision cache</td></tr>
+      <tr><td class="m">GET</td><td class="p">/v1/demo/frames</td>
+          <td class="d">bundled amongus frames as data URLs (dev convenience)</td></tr>
+      <tr><td class="m">GET</td><td class="p">/v1/models</td>
+          <td class="d">OpenAI-compat model list</td></tr>
+    </table>
+  </section>
+</main>
+
+<footer>
+  clients are just HTML served from <code>server/static/</code>; server-side
+  state is the engine + vision tower + content-hash prefix cache.
+</footer>
+
+<script>
+async function checkHealth() {
+  try {
+    const r = await (await fetch('/health')).json();
+    const bits = [r.status];
+    if (r.model) bits.push(r.model);
+    if (r.multimodal) bits.push('multimodal');
+    if (r.active_sessions != null) bits.push(`${r.active_sessions} active session${r.active_sessions === 1 ? '' : 's'}`);
+    document.getElementById('statusText').textContent = bits.join(' · ');
+  } catch {
+    document.getElementById('statusText').textContent = 'bridge unreachable';
+  }
+}
+setInterval(checkHealth, 3000); checkHealth();
+</script>
+</body>
+</html>

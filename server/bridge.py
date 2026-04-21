@@ -639,7 +639,15 @@ app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 
 @app.get("/")
-def index() -> FileResponse:
+def client_index() -> FileResponse:
+    """Directory of demo clients + API endpoint reference. Every client
+    below is just static HTML in server/static/ — the bridge doesn't
+    privilege any of them, they're peers consuming the same /v1/* API."""
+    return FileResponse(str(_STATIC_DIR / "clients.html"))
+
+
+@app.get("/tetraplex")
+def tetraplex_page() -> FileResponse:
     return FileResponse(str(_STATIC_DIR / "index.html"))
 
 
