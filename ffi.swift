@@ -666,6 +666,34 @@ public func gemma_session_read_intensity(_ sid: Int32,
     return s.detectors.first(where: { $0.name == name })?.lastIntensity ?? 0
 }
 
+// Pairwise prose cvec constructor: set the layer whose residual should
+// be blitted into the capture buffer after each tick's post-FFN write.
+// Pass -1 to disable. Active for as long as it's set — caller is
+// responsible for resetting after it's done capturing.
+@_cdecl("gemma_set_capture_layer")
+public func gemma_set_capture_layer(_ layer: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    gResidualCaptureLayer = Int(layer)
+    return 0
+}
+
+// Copy the most-recently-captured residual (HIDDEN × fp16 = 5632 B)
+// into the caller's buffer. Returns bytes written (= HIDDEN * 2) or
+// the buffer size needed if outPtr is nil. The buffer is overwritten
+// on every tick while capture is active — caller times the read to
+// pick up the residual from the tick they care about (typically the
+// last priming tick before the session transitions to .generating).
+@_cdecl("gemma_get_captured_residual")
+public func gemma_get_captured_residual(_ outPtr: UnsafeMutablePointer<UInt8>?,
+                                         _ maxBytes: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    let need = HIDDEN * 2
+    guard let p = outPtr else { return Int32(need) }
+    let n = min(need, Int(maxBytes))
+    memcpy(p, gResidualCaptureBuf.contents(), n)
+    return Int32(n)
+}
+
 // Drain per-token samples as a JSON array and copy into caller-provided
 // buffer. Returns bytes written (truncated if buffer too small — caller
 // should size generously, ~200 bytes per sample is a safe upper bound).

@@ -151,7 +151,37 @@
           registers orthogonal demo-detector + demo-effector
         </span>
       </div>
-      <div class="hint">or <code>POST /v1/control/vectors</code> with your own <code>{id, fp16_b64}</code>.</div>
+      <div class="hint" style="margin-bottom:0.6em">
+        or construct one from prose pairs below — the effect becomes legible:
+        you pick what the vector should <i>mean</i>, the engine does mean(pos)-mean(neg)
+        at a chosen layer and normalizes.
+      </div>
+
+      <h2 style="margin-top:0.8em;color:var(--accent)">construct from pairs</h2>
+      <div class="row">
+        <label for="cxId">new id</label>
+        <input type="text" id="cxId" value="my-direction" placeholder="e.g. joy-direction">
+      </div>
+      <div class="row">
+        <label for="cxLayer">layer</label>
+        <input type="number" id="cxLayer" min="0" max="29" value="15">
+      </div>
+      <label class="hint" style="display:block;margin-top:0.4em">positive examples (one per line):</label>
+      <textarea id="cxPos" rows="3" style="width:100%;box-sizing:border-box;font-size:0.74rem"
+        placeholder="joyful things&#10;someone laughing freely&#10;a warm sunny afternoon"></textarea>
+      <label class="hint" style="display:block;margin-top:0.4em">negative examples (one per line):</label>
+      <textarea id="cxNeg" rows="3" style="width:100%;box-sizing:border-box;font-size:0.74rem"
+        placeholder="gloomy things&#10;someone sobbing alone&#10;a cold bleak afternoon"></textarea>
+      <div class="row" style="margin-top:0.4em">
+        <button id="cxBuildBtn">construct</button>
+        <span class="hint" id="cxStatus" style="flex:1;margin:0 0 0 0.5em">ready</span>
+      </div>
+      <div class="hint">
+        the resulting vector gets registered under <code>new id</code> — fill
+        it into the detector and/or effector <code>cvec id</code> fields above to use it.
+        <b>raw_norm</b> in the response is a separation-strength readout; higher = more
+        distinct direction in representation space at that layer.
+      </div>
     </section>
 
     <section>
@@ -317,6 +347,65 @@ $('loadDemoBtn').addEventListener('click', async () => {
     $('systemMsg').innerHTML = '<b>demo vectors registered.</b> now hit <b>run</b>.';
   } else {
     $('systemMsg').textContent = 'failed to register demo vectors';
+  }
+});
+
+// Pre-fill the constructor textareas with a mild contrastive pair so the
+// "construct" button works end-to-end on first click — the intervention
+// then has a legible meaning when tested on an unrelated cat-description
+// prompt (which is the default below).
+$('cxPos').value = [
+  "A warm, sunny afternoon full of easy laughter and gentle conversation.",
+  "She felt a wave of pure joy wash over her, bright and uncomplicated.",
+  "The children ran through the sprinkler, shrieking with delight.",
+  "He smiled softly, remembering the best day of his life.",
+].join('\n');
+$('cxNeg').value = [
+  "A cold, grey morning weighed down by a dull sense of dread.",
+  "She felt a hollow ache in her chest, heavy and unshakeable.",
+  "The room was silent except for the quiet sound of her crying.",
+  "He stared at the floor, unable to remember anything worth smiling about.",
+].join('\n');
+
+$('cxBuildBtn').addEventListener('click', async () => {
+  const id = $('cxId').value.trim() || 'my-direction';
+  const layer = parseInt($('cxLayer').value) || 15;
+  const positive = $('cxPos').value.split('\n').map(s => s.trim()).filter(Boolean);
+  const negative = $('cxNeg').value.split('\n').map(s => s.trim()).filter(Boolean);
+  if (!positive.length || !negative.length) {
+    $('cxStatus').textContent = 'need ≥1 of each';
+    return;
+  }
+  $('cxBuildBtn').disabled = true;
+  $('cxStatus').textContent = `capturing ${positive.length + negative.length} residuals…`;
+  try {
+    const t0 = performance.now();
+    const resp = await fetch('/v1/control/construct', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, layer, positive, negative }),
+    });
+    const dt = ((performance.now() - t0) / 1000).toFixed(2);
+    if (!resp.ok) {
+      const err = await resp.text();
+      $('cxStatus').textContent = `error: ${err.slice(0, 120)}`;
+    } else {
+      const j = await resp.json();
+      $('cxStatus').innerHTML =
+        `registered <b>${j.id}</b> @ L${j.layer} in ${dt}s · raw_norm=${j.raw_norm.toFixed(2)}`;
+      // Convenience: auto-plug the new id into detector + effector fields
+      // so the user can immediately hit run and see it in action.
+      $('detId').value = id;
+      $('effId').value = id;
+      $('systemMsg').innerHTML =
+        `constructed <b>${id}</b> from ${positive.length}⊕ / ${negative.length}⊖ examples ` +
+        `at L${layer}. it's now wired as both detector and effector — hit <b>run</b> ` +
+        `to see its effect on the prompt above.`;
+    }
+  } catch (e) {
+    $('cxStatus').textContent = `error: ${e.message || e}`;
+  } finally {
+    $('cxBuildBtn').disabled = false;
   }
 });
 

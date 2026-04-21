@@ -403,6 +403,71 @@ async def prewarm_image(req: Request) -> JSONResponse:
     })
 
 
+@app.post("/v1/control/construct")
+async def control_construct(req: Request) -> JSONResponse:
+    """Build a control vector from contrastive prose pairs. Body:
+      {"id":            "joy-direction",
+       "layer":         15,
+       "positive":      ["joyful example 1", "another cheerful example", ...],
+       "negative":      ["sad example 1",    "another downcast example",  ...],
+       "chat_template": true}   // default true — wrap each example in a user/model turn
+
+    For each example, the engine runs a forward pass and captures the
+    last-priming-tick residual at the given layer. The final cvec is
+    normalized(mean(positive) - mean(negative)). Registered under `id`
+    in the cvec registry — use it as an effector or detector cvec_id
+    in /v1/chat/completions. Returns the pre-normalization norm + counts
+    as a rough "signal strength" indicator (very small norm = classes
+    are indistinguishable at this layer)."""
+    import struct, math
+    body = await req.json()
+    cvec_id = str(body.get("id", "")).strip()
+    layer = int(body.get("layer", 15))
+    positives = [str(x) for x in (body.get("positive") or []) if str(x).strip()]
+    negatives = [str(x) for x in (body.get("negative") or []) if str(x).strip()]
+    chat_template = bool(body.get("chat_template", True))
+    if not cvec_id or not positives or not negatives:
+        raise HTTPException(400, "need id, positive (≥1), negative (≥1)")
+
+    HIDDEN = 2816
+    def accumulate(examples: list[str]) -> list[float]:
+        acc = [0.0] * HIDDEN
+        for ex in examples:
+            raw = g.capture_residual_for_prompt(ex, layer, chat_template=chat_template)
+            # raw is HIDDEN little-endian float16 halves. Use struct to
+            # decode — Python's '<e' is IEEE-754 binary16.
+            vals = struct.unpack(f"<{HIDDEN}e", raw)
+            for i in range(HIDDEN):
+                acc[i] += vals[i]
+        return [x / len(examples) for x in acc]
+
+    pos_mean = accumulate(positives)
+    neg_mean = accumulate(negatives)
+    direction = [p - n for p, n in zip(pos_mean, neg_mean)]
+    raw_norm = math.sqrt(sum(x * x for x in direction))
+    if raw_norm < 1e-9:
+        raise HTTPException(400, "positive and negative means are identical — "
+                                 "examples are indistinguishable at this layer")
+    direction = [x / raw_norm for x in direction]
+    # Pack to fp16 and register.
+    bytes_out = struct.pack(f"<{HIDDEN}e", *direction)
+    try:
+        g.control_register_fp16(cvec_id, bytes_out)
+    except Exception as e:
+        raise HTTPException(400, str(e))
+    return JSONResponse({
+        "id": cvec_id,
+        "layer": layer,
+        "positive_count": len(positives),
+        "negative_count": len(negatives),
+        "hidden": HIDDEN,
+        "raw_norm": raw_norm,
+        "note": ("constructed from mean(positive)-mean(negative), normalized. "
+                 "raw_norm indicates separation strength — higher is a more "
+                 "distinct direction in representation space"),
+    })
+
+
 @app.post("/v1/demo/steering-vectors")
 def demo_steering_vectors() -> JSONResponse:
     """Register a deterministic pair of orthogonal unit-norm random

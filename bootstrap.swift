@@ -1932,6 +1932,17 @@ let LM_DUMP_STAGING: MTLBuffer? = {
 // still works — the kernel dispatch site checks both sources.
 var gCvecRegistry: [String: MTLBuffer] = [:]
 
+// Residual capture for the pairwise prose cvec constructor. When
+// gResidualCaptureLayer >= 0, buildStepCB blits `hidden` into
+// gResidualCaptureBuf after that layer's post-FFN residual write.
+// The most recent captured residual is the one from the most recent
+// tick — caller is responsible for observing session state
+// transitions (.priming → .generating) to read at the intended moment.
+// Host-visible; caller reads directly via gemma_get_captured_residual.
+var gResidualCaptureLayer: Int = -1
+let gResidualCaptureBuf: MTLBuffer = device.makeBuffer(
+    length: HIDDEN * 2, options: .storageModeShared)!
+
 // Per-tick staging: for each slot, the list of (cvec buffer, layer, mag)
 // triples to apply at their respective layers this step. Populated by
 // step() from each session's activeControls + envelope evaluation, then
@@ -2281,6 +2292,19 @@ func buildStepCB(_ w: LmWeights, sharedPrefixPages: Int = 0) -> MTLCommandBuffer
                                    N: HIDDEN)
             }
         }
+        // Residual capture for the pairwise prose constructor. Captures
+        // slot 0 only — the constructor always runs one-off sessions so
+        // slot 0 is the only real one.
+        if gResidualCaptureLayer == L {
+            let blit = cb.makeBlitCommandEncoder()!
+            blit.copy(from: hidden, sourceOffset: 0,
+                      to: gResidualCaptureBuf, destinationOffset: 0,
+                      size: HIDDEN * 2)
+            blit.endEncoding()
+            if ProcessInfo.processInfo.environment["LM_CVEC_LOG"] != nil {
+                print("[capture] blit fired in buildStepCB @ layer \(L)")
+            }
+        }
         if let dump = LM_DUMP_STAGING {
             let blit = cb.makeBlitCommandEncoder()!
             blit.copy(from: hidden, sourceOffset: 0,
@@ -2439,6 +2463,19 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
         encRmsNormAddScale(cb, x: pre_ffn_combined, gammaBuf: lw.postFfnNorm,
                            residual: pre_hidden, scalar: lw.layerOutputScale,
                            out: pre_hidden, N: HIDDEN, numVecs: N)
+        // Residual capture for the pairwise prose constructor — mirror
+        // of the buildStepCB hook. Captures slot 0's LAST-position
+        // residual (position qLen-1) at the designated layer. This is
+        // the representation the model would use to predict the next
+        // token, the conventional snapshot for representation engineering.
+        if gResidualCaptureLayer == L {
+            let blit = cb.makeBlitCommandEncoder()!
+            blit.copy(from: pre_hidden,
+                      sourceOffset: (qLen - 1) * HIDDEN * 2,
+                      to: gResidualCaptureBuf, destinationOffset: 0,
+                      size: HIDDEN * 2)
+            blit.endEncoding()
+        }
     }
 
     // Final output norm + unembed + softcap. v4 softcap's accumulator is

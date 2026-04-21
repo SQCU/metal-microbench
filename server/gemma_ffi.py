@@ -544,3 +544,61 @@ def session_poll_samples_json(sid: int) -> str:
     if n <= 0:
         return "[]"
     return buf.raw[:n].decode("utf-8", errors="replace")
+
+
+# --- Residual capture (for /v1/control/construct) ---
+
+_lib.gemma_set_capture_layer.argtypes = [C.c_int32]
+_lib.gemma_set_capture_layer.restype = C.c_int32
+
+_lib.gemma_get_captured_residual.argtypes = [C.POINTER(C.c_uint8), C.c_int32]
+_lib.gemma_get_captured_residual.restype = C.c_int32
+
+def set_capture_layer(layer: int) -> None:
+    _lib.gemma_set_capture_layer(int(layer))
+
+def get_captured_residual() -> bytes:
+    """Copy the engine's most-recently-captured residual (HIDDEN × fp16)
+    into a caller-visible buffer. Use while capture is active to grab
+    the residual from the tick just completed."""
+    HIDDEN_BYTES = 2816 * 2   # HIDDEN × fp16
+    buf = (C.c_uint8 * HIDDEN_BYTES)()
+    n = _lib.gemma_get_captured_residual(buf, HIDDEN_BYTES)
+    return bytes(buf[:n]) if n > 0 else b""
+
+def capture_residual_for_prompt(prompt: str, layer: int,
+                                  chat_template: bool = True,
+                                  timeout_s: float = 20.0) -> bytes:
+    """Run `prompt` through the engine, return the layer-L residual at
+    the last priming token as fp16 bytes. Opens and closes a throwaway
+    session; pump thread (if any) drives the ticking.
+
+    chat_template=True wraps the prompt in Gemma's user/model turn
+    template so the model sees it as a real conversational turn rather
+    than raw context."""
+    import time
+    set_capture_layer(int(layer))
+    try:
+        sid = open_session(max_new_tokens=1)
+        try:
+            if chat_template:
+                wrapped = f"<|turn>user\n{prompt}<turn|>\n<|turn>model\n"
+            else:
+                wrapped = prompt
+            toks = tokenize(wrapped, add_bos=True)
+            submit(sid, toks)
+            # Wait until the engine finishes priming — at that moment,
+            # gResidualCaptureBuf holds the last-priming-tick residual
+            # at layer L. (The same tick samples the first generated
+            # token; we discard it.)
+            t0 = time.time()
+            while session_state(sid) in (STATE_IDLE, STATE_PRIMING):
+                if time.time() - t0 > timeout_s:
+                    raise RuntimeError(
+                        f"capture timed out after {timeout_s}s (state={session_state(sid)})")
+                time.sleep(0.002)
+            return get_captured_residual()
+        finally:
+            close_session(sid)
+    finally:
+        set_capture_layer(-1)
