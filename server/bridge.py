@@ -44,13 +44,22 @@ from fastapi.staticfiles import StaticFiles
 import gemma_ffi as g
 
 
-GGUF_PATH = os.environ.get(
-    "GGUF_PATH",
-    "/Users/mdot/models/gemma-4-a4b/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
+# Paths can come from two places, checked in this order:
+#   1. GEMMA_GGUF / GEMMA_SAFETENSORS env vars (what serve.py sets after
+#      resolving config.toml; also the escape hatch for one-off overrides)
+#   2. Legacy GGUF_PATH / VISION_ST env vars for anyone running the bridge
+#      manually via the old command-line invocation.
+# If none of the above are set, the bridge will error at startup with a
+# pointer to serve.py + fetch-weights.py.
+GGUF_PATH = (
+    os.environ.get("GEMMA_GGUF")
+    or os.environ.get("GGUF_PATH")
+    or ""
 )
-VISION_SAFETENSORS = os.environ.get(
-    "VISION_ST",
-    "/Users/mdot/models/gemma-4-a4b-bf16/model-00001-of-00002.safetensors",
+VISION_SAFETENSORS = (
+    os.environ.get("GEMMA_SAFETENSORS")
+    or os.environ.get("VISION_ST")
+    or ""
 )
 MODEL_NAME = os.environ.get("GEMMA_MODEL_NAME", "gemma-4-a4b-q4km")
 
@@ -117,6 +126,13 @@ app.add_middleware(
 @app.on_event("startup")
 def _startup() -> None:
     global _pump_running, _pump_thread
+    if not GGUF_PATH or not Path(GGUF_PATH).exists():
+        raise RuntimeError(
+            f"GGUF weights not found at {GGUF_PATH!r}. "
+            "Either run `uv run --with huggingface_hub python server/scripts/fetch-weights.py` "
+            "to download, point server/config.toml's gguf_path at an existing file, "
+            "or launch with GEMMA_GGUF=/path/to/.gguf."
+        )
     print(f"[bridge] loading {GGUF_PATH}")
     t0 = time.time()
     g.init(GGUF_PATH)
@@ -125,7 +141,7 @@ def _startup() -> None:
     # Vision weights are optional — only loaded if the safetensors file
     # exists at the configured path. Without them, /v1/chat/completions
     # with image_url content items will 400.
-    if Path(VISION_SAFETENSORS).exists():
+    if VISION_SAFETENSORS and Path(VISION_SAFETENSORS).exists():
         t1 = time.time()
         try:
             g.vision_init(VISION_SAFETENSORS)
@@ -133,7 +149,8 @@ def _startup() -> None:
         except Exception as e:
             print(f"[bridge] vision init failed: {e}")
     else:
-        print(f"[bridge] vision safetensors not at {VISION_SAFETENSORS} — image_url disabled")
+        where = VISION_SAFETENSORS or "(not configured)"
+        print(f"[bridge] vision safetensors not at {where} — image_url disabled")
 
     _pump_running = True
     _pump_thread = threading.Thread(target=_pump_loop, name="gemma-pump", daemon=True)

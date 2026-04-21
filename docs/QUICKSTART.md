@@ -9,13 +9,39 @@ make libgemma_metal.dylib
 # 2. Install bridge deps (uv creates a venv automatically)
 cd server && uv sync
 
-# 3. Point the bridge at your weights and run it
-GEMMA_SAFETENSORS=/path/to/model-00001-of-00002.safetensors \
-GEMMA_GGUF=/path/to/model.q4_k_m.gguf \
-uv run uvicorn bridge:app --host 0.0.0.0 --port 8000
+# 3. Fetch the Gemma-4 weights (GGUF + bf16 safetensors) into ./models/
+uv run python scripts/fetch-weights.py
+
+# 4. Launch — reads server/config.toml, runs uvicorn on port 8000
+uv run python serve.py
 ```
 
-Open <http://localhost:8000> for the client index; pick one of the three demo clients or drive the REST API directly.
+Open <http://localhost:8000> for the client index; pick one of the five demo clients or drive the REST API directly.
+
+## Configuration
+
+All paths and server settings live in **`server/config.toml`**. Edit it to point at different model files, change the port, or override the HuggingFace repos that `fetch-weights.py` pulls from:
+
+```toml
+[model]
+gguf_path = "models/gemma-4/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
+safetensors_path = "models/gemma-4-bf16/model-00001-of-00002.safetensors"
+
+[server]
+host = "0.0.0.0"
+port = 8000
+log_level = "warning"
+
+[fetch]
+gguf_repo = "unsloth/gemma-3-27b-it-GGUF"
+gguf_filename = "gemma-3-27b-it-UD-Q4_K_M.gguf"
+safetensors_repo = "google/gemma-3-27b-it"
+# ...
+```
+
+Env-var overrides take precedence: `GEMMA_GGUF`, `GEMMA_SAFETENSORS`, `GEMMA_HOST`, `GEMMA_PORT`, `GEMMA_LOG_LEVEL`, `GEMMA_MODEL_NAME`.
+
+Gemma is a gated HuggingFace repo — run `huggingface-cli login` before `fetch-weights.py` if you haven't already accepted its license.
 
 ---
 

@@ -1,0 +1,44 @@
+# gemma-metal bridge config
+#
+# Paths are resolved relative to the REPO ROOT (one level up from this
+# file). Absolute paths work too.
+#
+# Override any field via matching GEMMA_* env vars if you need to:
+#   GEMMA_GGUF, GEMMA_SAFETENSORS, GEMMA_HOST, GEMMA_PORT, GEMMA_LOG_LEVEL
+# env vars win over config-file values.
+
+[model]
+# LM weights: Q4_K_M GGUF is what the engine's GEMVs are tuned for.
+gguf_path = "models/gemma-4/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
+
+# Vision-tower weights: first shard of the bf16 safetensors checkpoint.
+# Omit or leave blank to run text-only (image content items will 400).
+safetensors_path = "models/gemma-4-bf16/model-00001-of-00002.safetensors"
+
+# Display name returned by /v1/models and shown in client status bars.
+display_name = "gemma-4-a4b-q4km"
+
+[server]
+host = "0.0.0.0"
+port = 8000
+log_level = "warning"
+
+[fetch]
+# `scripts/fetch-weights.py` uses these to pull from HuggingFace.
+# The defaults point at unsloth's Q4_K_M quant and the official bf16
+# safetensors. If you're pointing at a different upload, override here.
+gguf_repo = "unsloth/gemma-3-27b-it-GGUF"
+gguf_filename = "gemma-3-27b-it-UD-Q4_K_M.gguf"
+gguf_local_dir = "models/gemma-4"
+
+safetensors_repo = "google/gemma-3-27b-it"
+# Both shards are needed; the first carries the vision tower weights.
+safetensors_files = [
+    "model-00001-of-00002.safetensors",
+    "model-00002-of-00002.safetensors",
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "processor_config.json",
+]
+safetensors_local_dir = "models/gemma-4-bf16"
