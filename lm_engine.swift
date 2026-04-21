@@ -862,46 +862,48 @@ final class LmEngine {
         runAdmissionPass()
         let busy = activeSessions.filter { $0.state.isBusy }
         if busy.isEmpty { return 0 }
-        // 1a. Multi-slot soft-tokens prefill: ALL busy sessions have a
-        //     .softTokens chunk at head → one buildPrefillCB dispatch
-        //     processes every slot's softs simultaneously (skipEmbed=true,
-        //     per-slot rows in pre_hidden). The point is weight-load
-        //     amortization: one dense-GEMV of attnQ/attnK/attnV runs once
-        //     and feeds all 4 slots' Q/K/V projections, instead of 4
-        //     single-slot dispatches each reloading the weights. Same
-        //     story for every layer's MLP/MoE/projection.
+        // Scheduling policy: group by work-type, not "all-or-nothing". On
+        // any given tick, pick the work category that has the most slots
+        // batchable together. Sessions in other categories don't lose
+        // their turn — they get processed on the next tick with their own
+        // peers. Prevents the priority-inversion where s1 sprints ahead
+        // into AR while s2/s3/s4 are still in softs and then can't batch
+        // with each other because "not all busy are softs".
         let softBusy = busy.filter { sess in
             if case .softTokens = sess.chunkQueue.first { return true }
             return false
         }
-        if softBusy.count == busy.count && softBusy.count > 1 {
+        let primeBusy = busy.filter { hasPrefillChunk($0, minTokensThreshold: 2) }
+
+        // 1. Multi-slot soft-tokens prefill, fires on ≥2 softs-ready slots.
+        //    stepMultiSlotSoftPrefill silences non-participating slots via
+        //    scratch pages — they skip this tick and resume next one.
+        if softBusy.count >= 2 {
             let beforeCounts = softBusy.map { $0.outputQueue.count }
             _ = stepMultiSlotSoftPrefill(softBusy)
             return zip(softBusy, beforeCounts).reduce(0) { $0 + ($1.0.outputQueue.count - $1.1) }
         }
-        // 1b. Single-session soft-tokens path (or mixed: only one session
-        //     has softs pending while others are elsewhere in their queue).
+        // 2. Single-session soft-tokens path (only one session has softs
+        //    queued; no batching opportunity here).
         if let s = softBusy.first {
             let before = s.outputQueue.count
             _ = stepPrefillForSession(s)
             return s.outputQueue.count - before
         }
-        // 2. Multi-slot prefill: all busy sessions priming with ≥2 prefill
-        //    tokens remaining. Peak aggregate throughput for cold-start of
-        //    many concurrent users — each slot primes its own tokens in the
-        //    same buildPrefillCB call, no AR-stepping zero-emit steps.
-        if busy.count > 1, allPrimeReady(busy, minTokensThreshold: 2) {
-            let beforeCounts = busy.map { $0.outputQueue.count }
-            _ = stepMultiSlotPrefill(busy)
-            return zip(busy, beforeCounts).reduce(0) { $0 + ($1.0.outputQueue.count - $1.1) }
+        // 3. Multi-slot text prefill, same relaxed gate as softs: fires
+        //    on ≥2 prefill-ready sessions even if others are in AR.
+        if primeBusy.count >= 2 {
+            let beforeCounts = primeBusy.map { $0.outputQueue.count }
+            _ = stepMultiSlotPrefill(primeBusy)
+            return zip(primeBusy, beforeCounts).reduce(0) { $0 + ($1.0.outputQueue.count - $1.1) }
         }
-        // 3. Single-session fast prefill.
-        if busy.count == 1, hasPrefillChunk(busy[0], minTokensThreshold: 2) {
-            let before = busy[0].outputQueue.count
-            _ = stepPrefillForSession(busy[0])
-            return busy[0].outputQueue.count - before
+        // 4. Single-session fast prefill.
+        if let s = primeBusy.first {
+            let before = s.outputQueue.count
+            _ = stepPrefillForSession(s)
+            return s.outputQueue.count - before
         }
-        // 4. AR batch across all busy sessions.
+        // 5. AR batch across all busy sessions.
         return step()
     }
 
