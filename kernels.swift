@@ -216,6 +216,28 @@ kernel void add_scaled_cvector_fp16(
     }
 }
 
+// Prefill-variant: per-row magnitudes. dst[r, :] += mags[r] * cvec[:], with
+// rows indexed over the full prefill tile (numVecs = B * qLen). mags[r] == 0
+// is a no-op row — the dispatch wastes ~32 thread-cycles reading zeros, but
+// we avoid a per-(slot, position) dispatch-count explosion and keep the CPU
+// scheduler out of the hot path. Called once per (layer, active-control)
+// pair by encodePrefillTileInto.
+kernel void add_scaled_cvector_prefill_fp16(
+    device       half*  dst   [[buffer(0)]],   // [numVecs, N] residual rows
+    device const half*  cvec  [[buffer(1)]],   // [N] control vector
+    device const float* mags  [[buffer(2)]],   // [numVecs] per-row magnitude
+    constant uint&      N     [[buffer(3)]],
+    uint2 tg  [[threadgroup_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    uint r = tg.x; uint t = lid.x;
+    float m = mags[r];
+    if (m == 0.0f) return;
+    for (uint i = t; i < N; i += 32) {
+        dst[r*N + i] = half(float(dst[r*N + i]) + m * float(cvec[i]));
+    }
+}
+
 // Dense GEMV v5 (split-K, 4 SGs × 128 threads/TG) — best for D_out ≤ 8192
 kernel void dense_gemv_v5(
     device const half* hidden [[buffer(0)]], device const half* W [[buffer(1)]],

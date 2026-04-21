@@ -191,6 +191,104 @@ final class ActiveControl {
     }
 }
 
+// Pure-function digest over the cvec state that touches a given page's
+// position range. Extracted from Session so the digest is testable in
+// isolation (no engine/weights required) and so a future RL trainer can
+// compute the digest for a planned rollout before instantiating the
+// session.
+//
+// Strictness contract (agreed with user for RL-grade train/test
+// determinism):
+//   - Digest is over envelope *parameters* (exact), never evaluated
+//     magnitudes (floaty, non-deterministic across kernel variants).
+//   - Includes the start-offset-relative-to-page-start, so two sessions
+//     must have triggered the cvec at the same relative phase to share
+//     pages. Strict — if you want looser sharing, loosen here explicitly.
+//   - Stable across process restarts: cvecId hashed as UTF-8 byte
+//     sequence; no reliance on Swift's seeded String.hashValue.
+//   - Empty activeControls → returns 0 → hashPage collapses to the
+//     pre-existing token-only hash. Unsteered sessions keep sharing.
+func computeCvecDigest(activeControls: [ActiveControl],
+                        pageStart: Int, pageSize: Int) -> UInt64 {
+    if activeControls.isEmpty { return 0 }
+    let pageEnd = pageStart + pageSize
+    var h: UInt64 = 0xcbf29ce484222325
+    struct DigestEntry {
+        let layer: Int; let cvecId: String
+        let startOffset: Int; let stopOffset: Int
+        let env: CvecEnvelope; let polarity: Float
+        let startPosition: Int; let startTurn: Int
+        let stopPosition: Int?; let stopTurn: Int?
+    }
+    var entries: [DigestEntry] = []
+    for c in activeControls {
+        let cStart = c.startPosition
+        let cStop = c.stopPosition.map { $0 + Int(c.envelope.release.rounded(.up)) }
+            ?? Int.max
+        let intersects = cStart < pageEnd && cStop > pageStart
+        if !intersects { continue }
+        entries.append(DigestEntry(
+            layer: c.layer, cvecId: c.cvecId,
+            startOffset: cStart - pageStart,
+            stopOffset: (c.stopPosition ?? Int.max) - pageStart,
+            env: c.envelope, polarity: c.polarity,
+            startPosition: c.startPosition, startTurn: c.startTurn,
+            stopPosition: c.stopPosition, stopTurn: c.stopTurn))
+    }
+    // If no control's window intersected this page, the page is
+    // effectively unsteered — return 0 so hashPage collapses to the
+    // token-only key and sharing with unsteered pages is possible.
+    if entries.isEmpty { return 0 }
+    entries.sort { (a, b) -> Bool in
+        if a.layer != b.layer { return a.layer < b.layer }
+        if a.cvecId != b.cvecId { return a.cvecId < b.cvecId }
+        return a.startOffset < b.startOffset
+    }
+    @inline(__always) func mixU64(_ x: UInt64) {
+        var v = x
+        for _ in 0..<8 {
+            h ^= v & 0xff
+            h = h &* 0x100000001b3
+            v >>= 8
+        }
+    }
+    @inline(__always) func mixF32(_ f: Float) {
+        mixU64(UInt64(f.bitPattern))
+    }
+    @inline(__always) func mixInt(_ i: Int) {
+        mixU64(UInt64(bitPattern: Int64(i)))
+    }
+    @inline(__always) func mixString(_ s: String) {
+        for b in s.utf8 {
+            h ^= UInt64(b)
+            h = h &* 0x100000001b3
+        }
+        h ^= 0xff
+        h = h &* 0x100000001b3
+    }
+    mixInt(entries.count)
+    for e in entries {
+        mixInt(e.layer)
+        mixString(e.cvecId)
+        mixInt(e.startOffset)
+        mixInt(e.stopOffset)
+        mixInt(e.startPosition)
+        mixInt(e.startTurn)
+        mixInt(e.stopPosition ?? Int.min)
+        mixInt(e.stopTurn ?? Int.min)
+        mixF32(e.polarity)
+        mixF32(e.env.attack)
+        mixF32(e.env.decay)
+        mixF32(e.env.sustainLevel)
+        mixF32(e.env.release)
+        mixF32(e.env.peakMagnitude)
+        mixString(e.env.shape.rawValue)
+        mixString(e.env.units.rawValue)
+    }
+    if h == 0 { h = 0x9e3779b97f4a7c15 }
+    return h
+}
+
 // Phase C-Read: measurement direction attached to a session. Each tick,
 // a dot product at the attached layer is written into a host-visible
 // intensity buffer; pump reads it back after CB completion and feeds
@@ -252,6 +350,9 @@ final class Session {
     //   can reach without growing. Pages are allocated on-demand as the
     //   session's position advances (see growPagesFor(kLen:)).
     fileprivate var ownedPages: [Int] = []
+    // Diagnostic + test accessor: number of phys pages this session
+    // owns. Read after submit() to measure cache-adoption counts.
+    var ownedPageCount: Int { ownedPages.count }
     // Full token history for per-page prefix hashing. Append-only —
     // submit() extends it, and hash(consumedTokens[0..(P+1)*PAGE]) is
     // the content identity of logical page P. Used for:
@@ -302,6 +403,15 @@ final class Session {
         activeControls.removeAll { $0.cvecId == cvecId }
     }
     func clearControls() { activeControls.removeAll(keepingCapacity: false) }
+
+    // Digest every ActiveControl whose envelope window intersects the
+    // position range [pageStart, pageStart + pageSize). Output feeds
+    // PageManager.hashPage(_:cvecDigest:) so the content-cache key
+    // partitions by cvec state as well as tokens.
+    func cvecDigestForPage(pageStart: Int, pageSize: Int) -> UInt64 {
+        return computeCvecDigest(activeControls: activeControls,
+                                  pageStart: pageStart, pageSize: pageSize)
+    }
     // Signal a control's sustain → release transition. Caller passes the
     // current (position, turn) so the ADSR decays relative to that point.
     func releaseControl(cvecId: String, position: Int, turn: Int) {
@@ -420,6 +530,29 @@ final class Session {
         var skipPrefix = 0
         if firstSubmit {
             skipPrefix = adoptSharedPrefixPages(engine: eng)
+            // Guarantee the prefill tail covers ≥ 1 token. A session that
+            // adopts every page of its prompt has all K/V cached, but the
+            // post-prefill sampling path (which produces the next-token
+            // logit AND transitions state → .done) only fires when
+            // stepPrefillForSession actually runs. Without this backoff,
+            // such a session sits in .priming with an empty chunkQueue
+            // forever and the scheduler burns no-op ticks.
+            //
+            // Unadopt the trailing page(s) until the tail has ≥ 1 token:
+            // pop from ownedPages, release from PageManager. Release
+            // only drops this session's ref; the contentIndex entry
+            // survives so the next session with the same prefix still
+            // hits the cache on that page.
+            while skipPrefix > 0 && skipPrefix * PAGE_SLIDE >= tokens.count {
+                // Each adopted slide page contributed TWO phys pages to
+                // ownedPages (slide primary + full sibling); unadopt both.
+                let lastFull = ownedPages.removeLast()
+                let lastSlide = ownedPages.removeLast()
+                try? eng.pageManager.releasePage(physPage: lastFull, sessionId: id)
+                try? eng.pageManager.releasePage(physPage: lastSlide, sessionId: id)
+                skipPrefix -= 1
+                promotedPageCount = skipPrefix
+            }
             position = skipPrefix * PAGE_SLIDE
         }
         // Queue the un-cached tail for prefill.
@@ -493,16 +626,31 @@ final class Session {
     }
 
     // Walk the PageManager's content index for leading pages of
-    // consumedTokens. Returns the number of pages successfully adopted.
-    // Idempotent-ish: safe to call, just returns 0 if none match.
+    // consumedTokens. Returns the number of SLIDE pages successfully
+    // adopted (each adopted slide page appends TWO phys pages to
+    // ownedPages — the slide primary and the full-sibling — because
+    // Gemma-4's full-attn uses half the page size of its slide-attn
+    // layers and a single 16-token slide page straddles two full pages
+    // in the full-K/V cache).
+    //
+    // Hash key includes a per-page cvec-state digest (see
+    // cvecDigestForPage). Sessions with identical tokens but different
+    // active controls get different keys and correctly MISS each
+    // other's pages — preventing steered K/V from polluting unsteered
+    // sessions (and vice versa).
     private func adoptSharedPrefixPages(engine: LmEngine) -> Int {
         var adopted = 0
         while (adopted + 1) * PAGE_SLIDE <= consumedTokens.count {
             let end = (adopted + 1) * PAGE_SLIDE
-            let prefixHash = PageManager.hashPage(consumedTokens[0..<end])
-            guard let phys = engine.pageManager.findByHash(prefixHash) else { break }
-            engine.pageManager.shareExisting(physPage: phys, sessionId: id)
-            ownedPages.append(phys)
+            let pageStart = adopted * PAGE_SLIDE
+            let digest = cvecDigestForPage(pageStart: pageStart, pageSize: PAGE_SLIDE)
+            let prefixHash = PageManager.hashPage(consumedTokens[0..<end],
+                                                   cvecDigest: digest)
+            guard let pair = engine.pageManager.findByHash(prefixHash) else { break }
+            engine.pageManager.shareExisting(physPage: pair.slidePrimary, sessionId: id)
+            engine.pageManager.shareExisting(physPage: pair.fullSibling, sessionId: id)
+            ownedPages.append(pair.slidePrimary)
+            ownedPages.append(pair.fullSibling)
             adopted += 1
         }
         // Adopted pages are already content-indexed — don't re-promote.
@@ -616,7 +764,17 @@ final class LmEngine {
     // Fails if the page pool is exhausted — caller must close a session or
     // evict another resident to make room.
     fileprivate func ensurePages(_ s: Session, forKLen kLen: Int) -> Bool {
-        let needed = (kLen + PAGE_SLIDE - 1) / PAGE_SLIDE
+        // Allocate at PAGE_FULL granularity (the SMALLER of slide/full
+        // page sizes) so block_table has enough entries for the
+        // full-attention layers, which use PAGE_FULL=8 while slide uses
+        // PAGE_SLIDE=16. Under the old PAGE_SLIDE granularity, full-
+        // attn's block_table[ceil(kLen/16)..ceil(kLen/8)-1] was filled
+        // with SCRATCH_PAGE_BASE, silently reading zeros and producing
+        // KL~0.38 divergence across cache replay. Each slide page
+        // occupies TWO phys slots (one primary for the slide K/V + the
+        // first 8 full K/V positions, one sibling for the second 8 full
+        // K/V positions).
+        let needed = (kLen + PAGE_FULL - 1) / PAGE_FULL
         while s.ownedPages.count < needed {
             do {
                 let p = try pageManager.allocFresh(sessionId: s.id)
@@ -693,11 +851,26 @@ final class LmEngine {
             // only when a submit staged tokens in chunkQueue that were
             // consumed without being added to consumedTokens), skip.
             let end = (p + 1) * PAGE_SLIDE
-            guard end <= s.consumedTokens.count, p < s.ownedPages.count else {
+            // Each slide page P occupies TWO phys pages in ownedPages:
+            // ownedPages[2P] is the slide primary (holds slide K/V for
+            // positions [P*16, P*16+15] + full K/V for [P*16, P*16+7]),
+            // and ownedPages[2P+1] is the full sibling (holds full K/V
+            // for [P*16+8, P*16+15]).  Skip promotion until both are
+            // allocated.
+            let slideIdx = 2 * p
+            let fullIdx  = 2 * p + 1
+            guard end <= s.consumedTokens.count,
+                  fullIdx < s.ownedPages.count else {
                 break
             }
-            let hash = PageManager.hashPage(s.consumedTokens[0..<end])
-            pageManager.promoteToShared(physPage: s.ownedPages[p], contentHash: hash)
+            let pageStart = p * PAGE_SLIDE
+            let digest = s.cvecDigestForPage(pageStart: pageStart,
+                                              pageSize: PAGE_SLIDE)
+            let hash = PageManager.hashPage(s.consumedTokens[0..<end],
+                                             cvecDigest: digest)
+            pageManager.promotePair(slidePrimary: s.ownedPages[slideIdx],
+                                     fullSibling: s.ownedPages[fullIdx],
+                                     contentHash: hash)
             s.promotedPageCount += 1
         }
     }
@@ -1087,6 +1260,34 @@ final class LmEngine {
         }
 
         precomputeFlexPrefillMasks(qLen: thisTile, positionStart: positionStart)
+        // Prefill-time cvec staging. Mirrors the AR-side evaluation in
+        // step(): for every ActiveControl on this session, allocate a
+        // [B*thisTile] mag buffer, evaluate the envelope at each
+        // (slot=sslot, position=positionStart+i), and leave mag=0 for
+        // silenced slots + positions outside the envelope window. Hook
+        // in encodePrefillTileInto shorts-circuits zero-mag rows in the
+        // kernel so idle slots cost near-zero. Pool-backed to avoid per-
+        // tile allocations.
+        gPrefillControls.removeAll(keepingCapacity: true)
+        let prefillRows = B * thisTile
+        for (pcIdx, c) in s.activeControls.enumerated() {
+            let magsBuf = acquirePrefillMagBuf(pcIdx)
+            let magsP = magsBuf.contents().bindMemory(to: Float.self,
+                                                       capacity: prefillRows)
+            // Zero all rows first (silenced slots stay zero).
+            for r in 0..<prefillRows { magsP[r] = 0 }
+            // Fill the sslot row: one magnitude per tile position. Envelope
+            // evaluator is pure — same math as AR's per-tick evaluation.
+            for i in 0..<thisTile {
+                let pos = positionStart + i
+                let m = c.magnitudeAt(position: pos, turn: s.turnIndex)
+                magsP[sslot * thisTile + i] = m
+            }
+            gPrefillControls.append(PrefillControl(buffer: c.buffer,
+                                                    layer: c.layer,
+                                                    magsBuf: magsBuf))
+        }
+        defer { gPrefillControls.removeAll(keepingCapacity: true) }
         let t0 = Date()
         let cb = buildPrefillCB(weights, qLen: thisTile, skipEmbed: skipEmbed)
         cb.commit(); cb.waitUntilCompleted()

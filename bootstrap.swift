@@ -37,6 +37,7 @@ let scaleByScalarPSO = pso("scale_by_scalar")
 let routerPreNormPSO = pso("router_prenorm_scale")
 let addInplacePSO   = pso("add_inplace")
 let addScaledCvecPSO = pso("add_scaled_cvector_fp16")
+let addScaledCvecPrefillPSO = pso("add_scaled_cvector_prefill_fp16")
 let measureDotPSO    = pso("measure_dot_fp16")
 let geluMulPSO      = pso("gelu_mul_inplace")
 let moeCombineWritePSO = pso("moe_combine_write")
@@ -538,6 +539,27 @@ func encAddScaledCvecSlot(_ cb: MTLCommandBuffer, dst: MTLBuffer, slot: Int,
     enc.setBytes(&Nv, length: 4, index: 2)
     enc.setBytes(&magv, length: 4, index: 3)
     enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// Prefill-variant cvec injection: dst[r, :] += mags[r] * cvec[:] for every
+// row r in [0, numVecs). mags[r]==0 short-circuits in the kernel so slots
+// without this control active at a given position pay near-zero cost. One
+// dispatch per (layer, active-control) pair during encodePrefillTileInto.
+// `magsBuf` is a [numVecs] float buffer the engine fills CPU-side by
+// evaluating each control's envelope at pre_q_positions[b*qLen+i].
+func encAddScaledCvecPrefill(_ cb: MTLCommandBuffer, dst: MTLBuffer,
+                              cvec: MTLBuffer, magsBuf: MTLBuffer,
+                              N: Int, numVecs: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(addScaledCvecPrefillPSO)
+    enc.setBuffer(dst, offset: 0, index: 0)
+    enc.setBuffer(cvec, offset: 0, index: 1)
+    enc.setBuffer(magsBuf, offset: 0, index: 2)
+    var Nv = UInt32(N)
+    enc.setBytes(&Nv, length: 4, index: 3)
+    enc.dispatchThreadgroups(MTLSize(width: numVecs, height: 1, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
 }
@@ -1959,6 +1981,30 @@ let gAllLayerCaptureBuf: MTLBuffer = device.makeBuffer(
 struct SlotControl { let buffer: MTLBuffer; let layer: Int; let mag: Float }
 var gSlotControls: [[SlotControl]] = Array(repeating: [], count: B)
 
+// Per-prefill-tile staging: one entry per (layer, cvec) pair that should
+// fire during the tile. `magsBuf` holds [B * qLen] floats, evaluated
+// CPU-side from ActiveControl.magnitudeAt at each (slot, position) using
+// pre_q_positions. mag==0 rows short-circuit inside the kernel, so silent
+// slots and not-yet-active envelope positions pay near-zero cost.
+// stepPrefillForSession rebuilds this list before each buildPrefillCB
+// and clears it after the commit returns.
+struct PrefillControl { let buffer: MTLBuffer; let layer: Int; let magsBuf: MTLBuffer }
+var gPrefillControls: [PrefillControl] = []
+
+// Scratch pool of mag buffers reused across prefill tiles — one per
+// potential (layer, control) pair in flight. Sized at B*MAX_Q_LEN floats
+// each. Pool grows as needed; reused in FIFO order. Since prefill runs
+// one tile at a time and commit-and-waits before returning, buffers are
+// safe to reuse as soon as gPrefillControls.removeAll() fires.
+var gPrefillMagBufPool: [MTLBuffer] = []
+func acquirePrefillMagBuf(_ tileIdx: Int) -> MTLBuffer {
+    while gPrefillMagBufPool.count <= tileIdx {
+        gPrefillMagBufPool.append(device.makeBuffer(
+            length: B * MAX_Q_LEN * 4, options: .storageModeShared)!)
+    }
+    return gPrefillMagBufPool[tileIdx]
+}
+
 // Phase C-Read staging. Detectors-to-dispatch this tick, per slot, as
 // (buffer, layer, intensity-output-slot-index). intensity-slot-index is
 // the linear offset into gIntensityBuf where the kernel writes this
@@ -2480,6 +2526,17 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
         encRmsNormAddScale(cb, x: pre_ffn_combined, gammaBuf: lw.postFfnNorm,
                            residual: pre_hidden, scalar: lw.layerOutputScale,
                            out: pre_hidden, N: HIDDEN, numVecs: N)
+        // Prefill-time control-vector injection. Same post-FFN residual
+        // site as buildStepCB so a span that gets split into prefill-then-
+        // prefill-resume (or prefill-then-AR) sees identical steering
+        // semantics to one that ran fully through AR. Each PrefillControl
+        // carries a per-row mags buffer (zero rows are no-ops), populated
+        // CPU-side before encode from ActiveControl.magnitudeAt(position,
+        // turn) over pre_q_positions.
+        for pc in gPrefillControls where pc.layer == L {
+            encAddScaledCvecPrefill(cb, dst: pre_hidden, cvec: pc.buffer,
+                                     magsBuf: pc.magsBuf, N: HIDDEN, numVecs: N)
+        }
         // Residual capture for the pairwise prose constructor — mirror
         // of the buildStepCB hook. Captures slot 0's LAST-position
         // residual (position qLen-1) at the designated layer. This is
@@ -3818,10 +3875,12 @@ if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
    ProcessInfo.processInfo.environment["LM_PREFILL_VALIDATE"] == nil,
    ProcessInfo.processInfo.environment["LM_GENERATE"] == nil,
    ProcessInfo.processInfo.environment["LM_MULTISESSION"] == nil,
+   ProcessInfo.processInfo.environment["LM_TEST_CVEC_CACHE"] == nil,
+   ProcessInfo.processInfo.environment["LM_TEST_CACHE_DIVERGENCE"] == nil,
    !isDumpRun {
     // GGUF_PATH alone → LM forward benchmark. If LM_KL_REF, LM_PREFILL_VALIDATE,
-    // LM_GENERATE, LM_MULTISESSION, or any dump flag is also set, let those
-    // harnesses drive (all reuse loadLmWeights).
+    // LM_GENERATE, LM_MULTISESSION, LM_TEST_CVEC_CACHE or any dump flag is also
+    // set, let those harnesses drive (all reuse loadLmWeights).
     runGgufPathHarness(ggufPath: ggufPath)
 }
 if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
@@ -3921,6 +3980,21 @@ if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"], isDumpRun,
 }
 if let ggufPath = ProcessInfo.processInfo.environment["GGUF_VALIDATE"] {
     runGgufValidateHarness(ggufPath: ggufPath)
+}
+// CVEC correctness harness. LM_TEST_CVEC_DIGEST=1 runs the pure-logic
+// digest unit tests (fast, no weights). LM_TEST_CVEC_CACHE=1 runs the
+// full integration test (requires GGUF_PATH).
+if ProcessInfo.processInfo.environment["LM_TEST_CVEC_DIGEST"] != nil {
+    runCvecDigestUnitTests()
+}
+if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
+   ProcessInfo.processInfo.environment["LM_TEST_CVEC_CACHE"] != nil {
+    runCvecDigestUnitTests()
+    runCvecCacheIntegrationTest(ggufPath: ggufPath)
+}
+if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
+   ProcessInfo.processInfo.environment["LM_TEST_CACHE_DIVERGENCE"] != nil {
+    runPrefillCacheDivergenceDump(ggufPath: ggufPath)
 }
 } // end runEnvDrivenDemos
 
