@@ -648,6 +648,11 @@ def labeler_page() -> FileResponse:
     return FileResponse(str(_STATIC_DIR / "labeler.html"))
 
 
+@app.get("/loom")
+def loom_page() -> FileResponse:
+    return FileResponse(str(_STATIC_DIR / "loom.html"))
+
+
 @app.get("/v1/demo/frames")
 def demo_frames(limit: int = 16) -> JSONResponse:
     """Convenience endpoint for the labeler demo — returns the bundled

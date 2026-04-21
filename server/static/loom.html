@@ -1,0 +1,557 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>gemma metal bridge — loom</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0a0a0a; --panel: #121212; --border: #222;
+    --text: #d4d4d4; --mute: #888; --accent: #6a9;
+    --thread-0: #5cf; --thread-1: #fa3; --thread-2: #8f5;
+    --thread-3: #f69; --thread-4: #b9f; --thread-5: #4dd;
+    --thread-6: #fb6; --thread-7: #a96;
+    --focus: #ffde47;
+  }
+  html, body { margin:0; padding:0; background:var(--bg); color:var(--text);
+    font-family: ui-monospace, 'SF Mono', Monaco, monospace; height:100%; }
+  body { display:flex; flex-direction:column; height:100vh; overflow:hidden; }
+  header {
+    padding:0.7em 1.2em; border-bottom:1px solid var(--border);
+    display:flex; justify-content:space-between; align-items:center;
+    flex-wrap:wrap; gap:0.8em; flex:none;
+  }
+  header h1 { margin:0; font-size:1rem; font-weight:500; color:var(--accent); }
+  header .status { font-size:0.78rem; color:var(--mute); }
+  header a { color:var(--accent); text-decoration:none; margin-left:0.8em; }
+
+  .seed-panel {
+    padding:0.6em 1em; border-bottom:1px solid var(--border); flex:none;
+    display:flex; gap:0.6em; align-items:stretch; flex-wrap:wrap;
+  }
+  .seed-panel textarea {
+    flex:1; min-width:340px; background:var(--panel); color:var(--text);
+    border:1px solid var(--border); border-radius:3px; padding:0.5em;
+    font:inherit; font-size:0.85rem; resize:vertical; min-height:3em;
+  }
+  .seed-controls { display:flex; flex-direction:column; gap:0.3em; font-size:0.78rem; min-width:240px; }
+  .seed-controls select, .seed-controls input[type=number] {
+    background:var(--panel); color:var(--text); border:1px solid var(--border);
+    border-radius:3px; padding:0.25em 0.4em; font:inherit; font-size:0.78rem;
+  }
+  .seed-controls .row { display:flex; gap:0.4em; align-items:center; flex-wrap:wrap; }
+  .seed-controls label { color:var(--mute); }
+  .seed-controls button {
+    background:var(--thread-0); color:#002; border:0; padding:0.4em 0.9em;
+    font:inherit; font-weight:700; border-radius:3px; cursor:pointer;
+    font-size:0.82rem;
+  }
+  .seed-controls button:disabled { background:#444; color:var(--mute); cursor:not-allowed; }
+  .seed-controls button.secondary { background:#2a3040; color:var(--text); font-weight:400; }
+
+  main.viewport {
+    flex:1; min-height:0; overflow:auto; padding:1.5em; position:relative;
+    background: radial-gradient(ellipse at top, #0d1220 0%, #060606 60%);
+  }
+  svg.links {
+    position:absolute; inset:0; pointer-events:none; overflow:visible;
+  }
+
+  .tree { position:relative; display:flex; flex-direction:column;
+    align-items:center; gap:2em; min-width:fit-content; min-height:100%; }
+  .level { display:flex; justify-content:center; gap:0.8em;
+    flex-wrap:nowrap; min-height:1px; }
+  .node {
+    position:relative; width:180px; min-height:110px; max-height:260px;
+    background:var(--panel); border:1px solid var(--border); border-radius:4px;
+    padding:0.5em 0.6em; font-size:0.74rem; line-height:1.35;
+    cursor:pointer; transition:border-color 0.15s, box-shadow 0.15s;
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+  .node:hover { border-color:#444; }
+  .node.focused {
+    border-color:var(--focus); box-shadow:0 0 0 2px rgba(255,222,71,0.15);
+  }
+  .node .head {
+    display:flex; justify-content:space-between; align-items:center;
+    font-size:0.66rem; color:var(--mute); margin-bottom:0.25em; gap:0.3em;
+  }
+  .node .head .tag { font-weight:700; letter-spacing:0.05em; }
+  .node .head .badge {
+    background:#1a2030; padding:1px 4px; border-radius:2px;
+    font-size:0.62rem; color:#aef;
+  }
+  .node .seed {
+    color:var(--mute); font-style:italic; font-size:0.68rem;
+    margin-bottom:0.2em; overflow:hidden; text-overflow:ellipsis;
+    white-space:nowrap;
+  }
+  .node .body {
+    flex:1; overflow:auto; color:var(--text); white-space:pre-wrap;
+    word-break:break-word; font-size:0.74rem;
+  }
+  .node .body.pending { color:var(--mute); font-style:italic; }
+
+  /* per-thread color accents */
+  .node[data-thread="0"] .tag { color:var(--thread-0); }
+  .node[data-thread="1"] .tag { color:var(--thread-1); }
+  .node[data-thread="2"] .tag { color:var(--thread-2); }
+  .node[data-thread="3"] .tag { color:var(--thread-3); }
+  .node[data-thread="4"] .tag { color:var(--thread-4); }
+  .node[data-thread="5"] .tag { color:var(--thread-5); }
+  .node[data-thread="6"] .tag { color:var(--thread-6); }
+  .node[data-thread="7"] .tag { color:var(--thread-7); }
+
+  .node .fork-bar {
+    margin-top:0.3em; padding-top:0.3em; border-top:1px dashed #2a2a2a;
+    display:flex; gap:0.3em; flex-wrap:wrap;
+  }
+  .node .fork-bar button {
+    background:#1a1f28; color:var(--text); border:1px solid var(--border);
+    border-radius:2px; padding:0.15em 0.45em; font:inherit; font-size:0.64rem;
+    cursor:pointer;
+  }
+  .node .fork-bar button:hover { background:#2a3040; }
+  .node .fork-bar button:disabled { opacity:0.4; cursor:not-allowed; }
+
+  footer {
+    padding:0.4em 1em; border-top:1px solid var(--border); flex:none;
+    font-size:0.72rem; color:var(--mute); display:flex; gap:1.2em;
+    flex-wrap:wrap; align-items:center;
+  }
+  footer .stat b { color:var(--text); font-weight:500; }
+
+  .empty {
+    text-align:center; color:var(--mute); font-style:italic;
+    padding:3em 1em; font-size:0.9rem;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>gemma-4 · loom</h1>
+  <div>
+    <span class="status" id="statusText">checking…</span>
+    <a href="/labeler">labeler</a>
+    <a href="/">tetraplex</a>
+  </div>
+</header>
+
+<section class="seed-panel">
+  <textarea id="rootPrompt" placeholder="the seed prompt — everything the first forks will continue from">The question "what is the best way to spend a rainy Sunday afternoon?" has many answers, depending on who's asking.</textarea>
+  <div class="seed-controls">
+    <div class="row">
+      <label for="seedPack">diversifier</label>
+      <select id="seedPack">
+        <option value="thought">thoughtful (Step by step…)</option>
+        <option value="mood">moods (Optimistically…)</option>
+        <option value="style">styles (As a poet…)</option>
+        <option value="numeric">numeric (First thought…)</option>
+        <option value="none">none (greedy = identical!)</option>
+        <option value="custom">custom (one per line)</option>
+      </select>
+    </div>
+    <textarea id="customSeeds" style="display:none; min-height:4em;"
+      placeholder="one seed per line — each starts a branch"></textarea>
+    <div class="row">
+      <label for="forkN">branches</label>
+      <input type="number" id="forkN" min="2" max="8" value="4">
+      <label for="maxTok">tokens</label>
+      <input type="number" id="maxTok" min="20" max="200" value="60">
+    </div>
+    <div class="row">
+      <button id="spinBtn">spin root</button>
+      <button id="resetBtn" class="secondary">reset loom</button>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" id="stripChannels" checked> hide &lt;|channel&gt; markers</label>
+    </div>
+  </div>
+</section>
+
+<main class="viewport" id="viewport">
+  <svg class="links" id="links"></svg>
+  <div class="tree" id="tree">
+    <div class="empty">type a seed prompt above → hit <b>spin root</b> to weave the first branches.
+      each branch is a separate session on the engine; matching prefix tokens auto-share KV pages.</div>
+  </div>
+</main>
+
+<footer>
+  <span class="stat">nodes: <b id="fNodes">0</b></span>
+  <span class="stat">running: <b id="fRunning">0</b></span>
+  <span class="stat">total tokens: <b id="fTokens">0</b></span>
+  <span class="stat">kv shared across slots: <b id="fShared">—</b></span>
+  <span style="flex:1"></span>
+  <span class="stat">click a node to focus · that node's "fork N" spawns children from its endpoint · root prompt is shared across every first-level branch</span>
+</footer>
+
+<script>
+// --- seed packs ---
+const SEED_PACKS = {
+  thought: ["Step by step:", "Actually,", "On the other hand,", "Creatively,",
+            "Most likely,", "Counterintuitively,", "Practically speaking,", "Historically,"],
+  mood:    ["Optimistically,", "Pessimistically,", "Pragmatically,", "Playfully,",
+            "Nervously,", "Serenely,", "Mischievously,", "Wistfully,"],
+  style:   ["As a poet might put it,", "A scientist would say:", "A child's answer:",
+            "In academic terms,", "In the voice of a noir detective,",
+            "From a software engineer's angle,", "A stoic would note,", "A painter responds:"],
+  numeric: ["First thought:", "Second thought:", "Third thought:",
+            "Fourth thought:", "Fifth thought:", "Sixth thought:",
+            "Seventh thought:", "Eighth thought:"],
+  none:    ["", "", "", "", "", "", "", ""],
+};
+
+// --- model ---
+// Each node: { id, parentId, depth, thread, seed, text, fullPrompt, status, tokens, ms, el }
+// status: 'pending' | 'running' | 'done' | 'error'
+const nodes = new Map();
+let nextNodeId = 0;
+let focusedId = null;
+
+// --- UI elements ---
+const statusText = document.getElementById('statusText');
+const rootPrompt = document.getElementById('rootPrompt');
+const seedPack = document.getElementById('seedPack');
+const customSeeds = document.getElementById('customSeeds');
+const forkN = document.getElementById('forkN');
+const maxTok = document.getElementById('maxTok');
+const spinBtn = document.getElementById('spinBtn');
+const resetBtn = document.getElementById('resetBtn');
+const tree = document.getElementById('tree');
+const viewport = document.getElementById('viewport');
+const links = document.getElementById('links');
+
+seedPack.addEventListener('change', () => {
+  customSeeds.style.display = seedPack.value === 'custom' ? 'block' : 'none';
+});
+
+// Gemma-4's reasoning-output markers. Non-visual clients can strip them;
+// keeping a toggle because peeking at the raw stream is itself part of
+// the point of a loom interface.
+function displayText(s) {
+  if (!document.getElementById('stripChannels')?.checked) return s;
+  return s.replace(/<\|channel>[\s\S]*?<channel\|>/g, '')
+          .replace(/<\|channel>/g, '').replace(/<channel\|>/g, '');
+}
+document.addEventListener('change', (e) => {
+  if (e.target.id === 'stripChannels') {
+    for (const n of nodes.values()) {
+      if (n.bodyEl && (n.status === 'done' || n.status === 'running')) {
+        n.bodyEl.textContent = displayText(n.text || '');
+      }
+    }
+  }
+});
+
+// --- server health ---
+async function checkHealth() {
+  try {
+    const r = await (await fetch('/health')).json();
+    statusText.textContent = r.status === 'ready' ? `ready · ${r.model}` : 'loading…';
+  } catch { statusText.textContent = 'bridge unreachable'; }
+}
+setInterval(checkHealth, 3000); checkHealth();
+
+// --- helpers ---
+function getSeeds(n) {
+  const pack = seedPack.value;
+  if (pack === 'custom') {
+    const lines = customSeeds.value.split('\n').map(s => s.trim());
+    return Array.from({length:n}, (_,i) => lines[i] ?? "");
+  }
+  const list = SEED_PACKS[pack] || SEED_PACKS.thought;
+  return Array.from({length:n}, (_,i) => list[i % list.length]);
+}
+
+function buildPrompt(nodeId) {
+  // Walk up to root, concatenating parent texts + this node's seed.
+  const chain = [];
+  let id = nodeId;
+  while (id !== null && id !== undefined) {
+    const n = nodes.get(id);
+    if (!n) break;
+    chain.unshift(n);
+    id = n.parentId;
+  }
+  // Root node's text IS the root prompt; subsequent nodes contribute
+  // their seed + generated text to the running transcript.
+  let s = '';
+  for (let i = 0; i < chain.length; i++) {
+    const n = chain[i];
+    if (i === 0) {
+      s += n.text;       // root prompt (fixed)
+    } else {
+      s += ' ' + n.seed + (n.text ? ' ' + n.text : '');
+    }
+  }
+  return s;
+}
+
+// For a fork FROM a given parent, the prompt is: everything up to and
+// including that parent, plus the seed of this new branch. The engine
+// continues from there.
+function buildBranchPrompt(parentId, seed) {
+  const base = parentId === null ? rootPrompt.value : buildPrompt(parentId);
+  return base + (seed ? ' ' + seed : '');
+}
+
+// --- rendering ---
+function render() {
+  // Group by depth.
+  const byDepth = new Map();
+  let maxDepth = 0;
+  for (const n of nodes.values()) {
+    if (!byDepth.has(n.depth)) byDepth.set(n.depth, []);
+    byDepth.get(n.depth).push(n);
+    maxDepth = Math.max(maxDepth, n.depth);
+  }
+  // Sort each level by (parentId, thread).
+  for (const arr of byDepth.values()) {
+    arr.sort((a, b) => {
+      const pd = (a.parentId ?? -1) - (b.parentId ?? -1);
+      return pd !== 0 ? pd : a.thread - b.thread;
+    });
+  }
+  // Clear and rebuild.
+  tree.innerHTML = '';
+  if (nodes.size === 0) {
+    tree.innerHTML = '<div class="empty">type a seed prompt above → hit <b>spin root</b> to weave the first branches.</div>';
+    links.innerHTML = '';
+    return;
+  }
+  for (let d = 0; d <= maxDepth; d++) {
+    const levelEl = document.createElement('div');
+    levelEl.className = 'level';
+    const arr = byDepth.get(d) || [];
+    for (const n of arr) {
+      levelEl.appendChild(renderNode(n));
+    }
+    tree.appendChild(levelEl);
+  }
+  drawLinks();
+}
+
+function renderNode(n) {
+  const el = document.createElement('div');
+  el.className = 'node' + (n.id === focusedId ? ' focused' : '');
+  el.setAttribute('data-thread', String(n.thread % 8));
+  el.setAttribute('data-id', String(n.id));
+  el.addEventListener('click', (e) => {
+    if (e.target.closest('button')) return;
+    focusedId = n.id; render();
+  });
+  const head = document.createElement('div'); head.className = 'head';
+  const tag = document.createElement('span'); tag.className = 'tag';
+  tag.textContent = n.depth === 0 ? 'root' : `n${n.id}·d${n.depth}·t${n.thread}`;
+  const badge = document.createElement('span'); badge.className = 'badge';
+  badge.textContent = n.status === 'running' ? `${n.tokens}t` : (n.status === 'done' ? `${n.tokens}t·${n.ms}ms` : n.status);
+  head.appendChild(tag); head.appendChild(badge);
+  el.appendChild(head);
+  if (n.seed) {
+    const seedEl = document.createElement('div'); seedEl.className = 'seed';
+    seedEl.textContent = '↪ ' + n.seed;
+    el.appendChild(seedEl);
+  }
+  const body = document.createElement('div'); body.className = 'body';
+  if (n.status === 'pending') { body.classList.add('pending'); body.textContent = '…queued'; }
+  else if (n.status === 'error') { body.textContent = `error: ${n.error || 'unknown'}`; }
+  else { body.textContent = displayText(n.text || ''); }
+  el.appendChild(body);
+  n.bodyEl = body; n.badgeEl = badge;
+
+  // Fork bar: only on nodes that finished.
+  if (n.status === 'done' || n.depth === 0) {
+    const bar = document.createElement('div'); bar.className = 'fork-bar';
+    for (const count of [2, 4, 8]) {
+      const b = document.createElement('button');
+      b.textContent = `fork ${count}`;
+      b.disabled = runningCount() > 0;
+      b.addEventListener('click', (e) => { e.stopPropagation(); forkFrom(n.id, count); });
+      bar.appendChild(b);
+    }
+    el.appendChild(bar);
+  }
+  n.el = el;
+  return el;
+}
+
+function drawLinks() {
+  // Draw SVG curves parent → child.
+  const rect = viewport.getBoundingClientRect();
+  links.setAttribute('width', tree.scrollWidth);
+  links.setAttribute('height', tree.scrollHeight);
+  links.innerHTML = '';
+  for (const n of nodes.values()) {
+    if (n.parentId === null || n.parentId === undefined) continue;
+    const parent = nodes.get(n.parentId);
+    if (!parent || !parent.el || !n.el) continue;
+    const pr = parent.el.getBoundingClientRect();
+    const nr = n.el.getBoundingClientRect();
+    const vr = viewport.getBoundingClientRect();
+    const x1 = pr.left + pr.width/2 - vr.left + viewport.scrollLeft;
+    const y1 = pr.bottom - vr.top + viewport.scrollTop;
+    const x2 = nr.left + nr.width/2 - vr.left + viewport.scrollLeft;
+    const y2 = nr.top - vr.top + viewport.scrollTop;
+    const mid = (y1 + y2) / 2;
+    const d = `M ${x1} ${y1} C ${x1} ${mid}, ${x2} ${mid}, ${x2} ${y2}`;
+    const color = `var(--thread-${n.thread % 8})`;
+    const path = document.createElementNS('http://www.w3.org/2000/svg','path');
+    path.setAttribute('d', d);
+    path.setAttribute('stroke', color);
+    path.setAttribute('stroke-width', '1.5');
+    path.setAttribute('fill', 'none');
+    path.setAttribute('opacity', '0.55');
+    links.appendChild(path);
+  }
+}
+window.addEventListener('resize', drawLinks);
+
+function runningCount() {
+  let n = 0; for (const x of nodes.values()) if (x.status === 'running') n++;
+  return n;
+}
+function updateStats() {
+  document.getElementById('fNodes').textContent = nodes.size;
+  document.getElementById('fRunning').textContent = runningCount();
+  let tot = 0; for (const x of nodes.values()) tot += x.tokens || 0;
+  document.getElementById('fTokens').textContent = tot;
+}
+
+// --- spin root ---
+spinBtn.addEventListener('click', async () => {
+  if (!rootPrompt.value.trim()) return;
+  // If there's already a root, just spawn more children from it.
+  let root = [...nodes.values()].find(n => n.parentId === null);
+  if (!root) {
+    root = {
+      id: nextNodeId++, parentId: null, depth: 0, thread: 0,
+      seed: '', text: rootPrompt.value, status: 'done',
+      tokens: 0, ms: 0, bodyEl: null, badgeEl: null, el: null,
+    };
+    nodes.set(root.id, root);
+    focusedId = root.id;
+  }
+  render();
+  forkFrom(root.id, parseInt(forkN.value) || 4);
+});
+
+resetBtn.addEventListener('click', () => {
+  if (runningCount() > 0) return;
+  nodes.clear(); nextNodeId = 0; focusedId = null; render();
+  updateStats();
+});
+
+// --- fork: spawn N children from a parent node ---
+async function forkFrom(parentId, count) {
+  const seeds = getSeeds(count);
+  const parent = nodes.get(parentId);
+  if (!parent) return;
+  const newNodes = [];
+  for (let i = 0; i < count; i++) {
+    const n = {
+      id: nextNodeId++, parentId, depth: parent.depth + 1,
+      thread: i, seed: seeds[i] || '',
+      text: '', fullPrompt: buildBranchPrompt(parentId, seeds[i] || ''),
+      status: 'running', tokens: 0, ms: 0, error: null,
+      bodyEl: null, badgeEl: null, el: null,
+    };
+    nodes.set(n.id, n); newNodes.push(n);
+  }
+  render(); updateStats();
+
+  // Fire all N in parallel. The content-hash prefix cache will auto-share
+  // KV pages across these sessions (they all have the same ancestor
+  // tokens, differing only in the seed suffix).
+  await Promise.allSettled(newNodes.map(n => streamOne(n)));
+  render(); updateStats();
+}
+
+async function streamOne(n) {
+  const t0 = performance.now();
+  n.bodyEl.textContent = ''; n.bodyEl.classList.remove('pending');
+  try {
+    // /v1/chat/completions applies the Gemma chat template (the model's
+    // trained format). The accumulated ancestor-path + seed goes in as
+    // ONE user message — the model's response IS the branch continuation.
+    // Concurrent sibling branches with the same ancestor text hit the
+    // content-hash prefix cache: tokenized prefix hashes match → shared
+    // KV pages across all N sessions, so forking is cheap in memory and
+    // re-prefill-compute even though each branch is its own session.
+    const resp = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        model: 'gemma-4-a4b-q4km',
+        max_tokens: parseInt(maxTok.value) || 60,
+        stream: true,
+        messages: [{ role: 'user', content: n.fullPrompt }],
+      }),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n\n')) !== -1) {
+        const frame = buf.slice(0, i); buf = buf.slice(i+2);
+        if (!frame.startsWith('data: ')) continue;
+        const payload = frame.slice(6);
+        if (payload === '[DONE]') break;
+        try {
+          const j = JSON.parse(payload);
+          const delta = j.choices?.[0]?.text ?? j.choices?.[0]?.delta?.content;
+          if (delta) {
+            n.text += delta; n.tokens += 1;
+            if (n.bodyEl) {
+              n.bodyEl.textContent = displayText(n.text);
+              n.bodyEl.scrollTop = n.bodyEl.scrollHeight;
+            }
+            if (n.badgeEl) n.badgeEl.textContent = `${n.tokens}t`;
+            updateStats();
+          }
+        } catch {}
+      }
+    }
+    n.status = 'done'; n.ms = Math.round(performance.now() - t0);
+    if (n.badgeEl) n.badgeEl.textContent = `${n.tokens}t·${n.ms}ms`;
+  } catch (e) {
+    n.status = 'error'; n.error = String(e); n.ms = Math.round(performance.now() - t0);
+  }
+}
+
+// --- kv tenancy poll (background) ---
+async function pollKv() {
+  try {
+    const snap = await (await fetch('/v1/kv/snapshot')).json();
+    let shared = 0, totalPages = 0;
+    for (const s of snap.sessions || []) {
+      shared += s.shared_count || 0;
+      totalPages += s.page_count || 0;
+    }
+    document.getElementById('fShared').textContent =
+      totalPages ? `${shared}/${totalPages} pages` : '—';
+  } catch {}
+  // re-draw links periodically in case layout shifted
+  drawLinks();
+}
+setInterval(pollKv, 500);
+
+// Keyboard: enter fork-focused-node-by-4; esc unfocus; r resets if empty
+document.addEventListener('keydown', (e) => {
+  if (e.target.matches('input,textarea,select')) return;
+  if (e.key === 'f' && focusedId !== null) {
+    e.preventDefault();
+    if (runningCount() === 0) forkFrom(focusedId, parseInt(forkN.value) || 4);
+  } else if (e.key === 'Escape') {
+    focusedId = null; render();
+  }
+});
+</script>
+</body>
+</html>
