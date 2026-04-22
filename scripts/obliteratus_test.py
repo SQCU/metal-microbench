@@ -124,18 +124,37 @@ def main() -> None:
 
     components = fit['components']
 
+    # Mode is selected via CLI: second arg "additive" (default) or "project".
+    mode = sys.argv[2] if len(sys.argv) > 2 else "additive"
+    print(f"\n   (mode={mode})")
+
     def build_controls(intensity: float) -> list:
-        if intensity == 0:
+        if intensity == 0 and mode == "additive":
             return []
-        polarity = 1 if intensity > 0 else -1
-        mag = abs(intensity)
+        if mode == "additive":
+            polarity = 1 if intensity > 0 else -1
+            mag = abs(intensity)
+            return [{
+                "cvec_id": c["cvec_id"],
+                "layer": c["layer"],
+                "polarity": polarity,
+                "peak_magnitude": c["scale"] * mag,
+                "attack": 0, "decay": 0, "sustain_level": 1.0, "release": 0,
+                "shape": "linear", "units": "tokens",
+                "mode": "additive",
+            } for c in components]
+        # Project mode: `intensity` is the TARGET projection value.
+        # Scaled per-component by its relative eigenvalue, same as
+        # additive, so PC1 gets the full coerce and weaker components
+        # get proportionally scaled targets.
         return [{
             "cvec_id": c["cvec_id"],
             "layer": c["layer"],
-            "polarity": polarity,
-            "peak_magnitude": c["scale"] * mag,
+            "polarity": 1.0,  # always +1 in project mode (sign is in target)
+            "peak_magnitude": c["scale"] * intensity,
             "attack": 0, "decay": 0, "sustain_level": 1.0, "release": 0,
             "shape": "linear", "units": "tokens",
+            "mode": "project",
         } for c in components]
 
     # --- Step 2: test at several intensities ---
@@ -150,8 +169,16 @@ def main() -> None:
 
     print(f"\n[2] generating at several intensities (greedy, max_tokens=240)…")
     print(f"    prompt: {TEST_PROMPT!r}")
+    # Different intensity sweep for project mode: target=0 is the
+    # canonical ablation; nonzero values coerce to that projection.
+    # Typical projection scales are O(1-10) so ±1, ±2 are already
+    # strong in project mode.
+    if mode == "project":
+        intensities = [0.0, -0.5, -1.0, -2.0, -5.0, 0.5, 2.0]
+    else:
+        intensities = [0.0, -1.0, -3.0, -5.0, -10.0, -20.0, 3.0]
     results = []
-    for intensity in [0.0, -1.0, -3.0, -5.0, -10.0, -20.0, 3.0]:
+    for intensity in intensities:
         tag = f"intensity={intensity:+.1f}"
         if intensity == 0:
             tag += "  (baseline)"

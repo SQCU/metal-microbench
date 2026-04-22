@@ -38,6 +38,9 @@ let routerPreNormPSO = pso("router_prenorm_scale")
 let addInplacePSO   = pso("add_inplace")
 let addScaledCvecPSO = pso("add_scaled_cvector_fp16")
 let addScaledCvecPrefillPSO = pso("add_scaled_cvector_prefill_fp16")
+let projectCvecPSO          = pso("project_cvector_fp16")
+let projectCvecSlotPSO      = pso("project_cvector_slot_fp16")
+let projectCvecPrefillPSO   = pso("project_cvector_prefill_fp16")
 let measureDotPSO    = pso("measure_dot_fp16")
 let geluMulPSO      = pso("gelu_mul_inplace")
 let moeCombineWritePSO = pso("moe_combine_write")
@@ -559,6 +562,66 @@ func encAddScaledCvecPrefill(_ cb: MTLCommandBuffer, dst: MTLBuffer,
     enc.setBuffer(magsBuf, offset: 0, index: 2)
     var Nv = UInt32(N)
     enc.setBytes(&Nv, length: 4, index: 3)
+    enc.dispatchThreadgroups(MTLSize(width: numVecs, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// ------------------------------------------------------------------
+// Projection-steer dispatchers. Each writes the residual's projection
+// onto cvec to a caller-specified target value AND writes the pre-
+// write projection to currentProjBuf — one dispatch that both
+// coerces AND measures, enabling representation-engineering flows
+// where the user wants to read a feature's natural level at each
+// position alongside any coercion they apply.
+// ------------------------------------------------------------------
+func encProjectCvec(_ cb: MTLCommandBuffer, dst: MTLBuffer, cvec: MTLBuffer,
+                     currentProjBuf: MTLBuffer, target: Float,
+                     N: Int, numVecs: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(projectCvecPSO)
+    enc.setBuffer(dst, offset: 0, index: 0)
+    enc.setBuffer(cvec, offset: 0, index: 1)
+    enc.setBuffer(currentProjBuf, offset: 0, index: 2)
+    var Nv = UInt32(N); var t = target
+    enc.setBytes(&Nv, length: 4, index: 3)
+    enc.setBytes(&t, length: 4, index: 4)
+    enc.dispatchThreadgroups(MTLSize(width: numVecs, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+func encProjectCvecSlot(_ cb: MTLCommandBuffer, dst: MTLBuffer, slot: Int,
+                         cvec: MTLBuffer, currentProjBuf: MTLBuffer,
+                         currentProjSlotOffsetBytes: Int, target: Float, N: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(projectCvecSlotPSO)
+    enc.setBuffer(dst, offset: slot * N * 2, index: 0)
+    enc.setBuffer(cvec, offset: 0, index: 1)
+    enc.setBuffer(currentProjBuf, offset: currentProjSlotOffsetBytes, index: 2)
+    var Nv = UInt32(N); var t = target
+    enc.setBytes(&Nv, length: 4, index: 3)
+    enc.setBytes(&t, length: 4, index: 4)
+    enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// Prefill variant. targets buffer holds [numVecs] fp32; a row with
+// target == Float.nan is skipped (kernel checks isnan). Matches the
+// add_scaled_cvector_prefill_fp16 idiom of "zero magnitude = no-op row"
+// but with a non-zero sentinel so target=0 remains meaningful.
+func encProjectCvecPrefill(_ cb: MTLCommandBuffer, dst: MTLBuffer,
+                            cvec: MTLBuffer, targetsBuf: MTLBuffer,
+                            currentProjBuf: MTLBuffer, N: Int, numVecs: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(projectCvecPrefillPSO)
+    enc.setBuffer(dst, offset: 0, index: 0)
+    enc.setBuffer(cvec, offset: 0, index: 1)
+    enc.setBuffer(targetsBuf, offset: 0, index: 2)
+    enc.setBuffer(currentProjBuf, offset: 0, index: 3)
+    var Nv = UInt32(N)
+    enc.setBytes(&Nv, length: 4, index: 4)
     enc.dispatchThreadgroups(MTLSize(width: numVecs, height: 1, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
@@ -1978,8 +2041,34 @@ let gAllLayerCaptureBuf: MTLBuffer = device.makeBuffer(
 // triples to apply at their respective layers this step. Populated by
 // step() from each session's activeControls + envelope evaluation, then
 // read by buildStepCB inside the per-layer loop.
-struct SlotControl { let buffer: MTLBuffer; let layer: Int; let mag: Float }
+// For additive mode: `mag` = scalar the residual gets pushed BY.
+// For project mode: `mag` = target projection value the residual's
+// feature level gets coerced TO. Which mode is active is encoded in
+// `mode`. measureOutSlot is the linear slot index in
+// gProjectMeasureBuf where the kernel writes this control's
+// pre-write projection (only populated when mode == .project); lets
+// the pump read the natural feature level at each tick. ADSR
+// envelope is applied to both modes identically (so you can e.g.
+// ramp a target projection value over time, or fade out an
+// obliteratus-style removal).
+struct SlotControl {
+    let buffer: MTLBuffer
+    let layer: Int
+    let mag: Float
+    let mode: CvecMode
+    let measureOutSlot: Int    // index into gProjectMeasureBuf
+}
 var gSlotControls: [[SlotControl]] = Array(repeating: [], count: B)
+
+// Scratch buffer for project-mode kernels' pre-write projection
+// measurements. Each active project-mode control gets a unique slot
+// index allocated during step()'s staging; the kernel writes that
+// scalar into gProjectMeasureBuf[slot_idx]. The pump reads these
+// post-CB to populate TokenSample.effectors[].projection or similar
+// representation-engineering telemetry.
+let MAX_PROJECT_CONTROLS_PER_SLOT = 8
+let gProjectMeasureBuf: MTLBuffer = device.makeBuffer(
+    length: B * MAX_PROJECT_CONTROLS_PER_SLOT * 4, options: .storageModeShared)!
 
 // Per-prefill-tile staging: one entry per (layer, cvec) pair that should
 // fire during the tile. `magsBuf` holds [B * qLen] floats, evaluated
@@ -1988,7 +2077,20 @@ var gSlotControls: [[SlotControl]] = Array(repeating: [], count: B)
 // slots and not-yet-active envelope positions pay near-zero cost.
 // stepPrefillForSession rebuilds this list before each buildPrefillCB
 // and clears it after the commit returns.
-struct PrefillControl { let buffer: MTLBuffer; let layer: Int; let magsBuf: MTLBuffer }
+// Two flavors: additive uses magsBuf as the per-row scalar to add;
+// project uses targetsBuf as the per-row TARGET projection (with
+// Float.nan = skip-row sentinel). projectMeasuresBuf receives the
+// pre-write projections per row when mode == .project (unused
+// otherwise). Only one of magsBuf/targetsBuf is meaningful per entry
+// based on mode, but both fields exist on the struct for simplicity.
+struct PrefillControl {
+    let buffer: MTLBuffer
+    let layer: Int
+    let mode: CvecMode
+    let magsBuf: MTLBuffer          // additive-mode per-row scalars
+    let targetsBuf: MTLBuffer       // project-mode per-row targets (NaN = skip)
+    let projectMeasuresBuf: MTLBuffer  // project-mode pre-write readback
+}
 var gPrefillControls: [PrefillControl] = []
 
 // Scratch pool of mag buffers reused across prefill tiles — one per
@@ -2325,13 +2427,33 @@ func buildStepCB(_ w: LmWeights, sharedPrefixPages: Int = 0) -> MTLCommandBuffer
                               N: HIDDEN, numVecs: B)
         }
         // Phase B: per-slot active controls, evaluated by step() each tick
-        // and staged in gSlotControls. One tiny dispatch per (slot, ctrl)
-        // pair with a non-zero magnitude. Dispatches are free by Apple's
-        // scheduler standards — each is 1 TG × 32 threads × HIDDEN halves.
+        // and staged in gSlotControls. For additive mode, sc.mag is the
+        // scalar to push the residual BY; for project mode, sc.mag is the
+        // TARGET projection value to coerce the residual TO. Project-mode
+        // dispatches ALSO write the pre-write projection into
+        // gProjectMeasureBuf[measureOutSlot] so the pump can read back
+        // the natural feature level at this tick (representation-
+        // engineering measurement primitive).
         for slot in 0..<B {
-            for sc in gSlotControls[slot] where sc.layer == L && sc.mag != 0.0 {
-                encAddScaledCvecSlot(cb, dst: hidden, slot: slot,
-                                      cvec: sc.buffer, mag: sc.mag, N: HIDDEN)
+            for sc in gSlotControls[slot] where sc.layer == L {
+                switch sc.mode {
+                case .additive:
+                    if sc.mag != 0.0 {
+                        encAddScaledCvecSlot(cb, dst: hidden, slot: slot,
+                                              cvec: sc.buffer, mag: sc.mag, N: HIDDEN)
+                    }
+                case .project:
+                    // Always dispatch for project mode — the target may
+                    // legitimately be 0 (= remove the feature entirely).
+                    // Only way to skip would be an explicit "disabled"
+                    // flag, which we don't have; envelope evaluation
+                    // handles fade-in/out timing separately.
+                    encProjectCvecSlot(cb, dst: hidden, slot: slot,
+                                        cvec: sc.buffer,
+                                        currentProjBuf: gProjectMeasureBuf,
+                                        currentProjSlotOffsetBytes: sc.measureOutSlot * 4,
+                                        target: sc.mag, N: HIDDEN)
+                }
             }
         }
         // Phase C-Read: after writes land, measure the residual against
@@ -2534,8 +2656,16 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
         // CPU-side before encode from ActiveControl.magnitudeAt(position,
         // turn) over pre_q_positions.
         for pc in gPrefillControls where pc.layer == L {
-            encAddScaledCvecPrefill(cb, dst: pre_hidden, cvec: pc.buffer,
-                                     magsBuf: pc.magsBuf, N: HIDDEN, numVecs: N)
+            switch pc.mode {
+            case .additive:
+                encAddScaledCvecPrefill(cb, dst: pre_hidden, cvec: pc.buffer,
+                                         magsBuf: pc.magsBuf, N: HIDDEN, numVecs: N)
+            case .project:
+                encProjectCvecPrefill(cb, dst: pre_hidden, cvec: pc.buffer,
+                                       targetsBuf: pc.targetsBuf,
+                                       currentProjBuf: pc.projectMeasuresBuf,
+                                       N: HIDDEN, numVecs: N)
+            }
         }
         // Residual capture for the pairwise prose constructor — mirror
         // of the buildStepCB hook. Captures slot 0's LAST-position

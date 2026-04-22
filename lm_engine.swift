@@ -125,6 +125,18 @@ struct CvecEnvelope {
     var units: CvecUnits = .tokens
 }
 
+// Mode for how a control interacts with the residual stream at its
+// injection layer.
+//   .additive  — residual += mag * cvec  (current default).
+//                good for "push the residual along this axis."
+//   .project   — residual's projection onto cvec is SET to target
+//                (via current_proj measurement + delta write). same
+//                kernel reads the pre-write projection so callers
+//                get measurement-for-free. representation-engineering
+//                primitive — target=0 removes the feature entirely,
+//                nonzero targets coerce to a specific feature level.
+enum CvecMode: String, Codable { case additive, project }
+
 // One active control vector on a session. `magnitudeAt(position:turn:)`
 // is pure and cheap — evaluated once per tick before the engine builds
 // the step CB, so the kernel sees a precomputed scalar.
@@ -134,6 +146,7 @@ final class ActiveControl {
     let layer: Int              // which LM layer to inject at
     let envelope: CvecEnvelope
     let polarity: Float         // +1 or -1 (or arbitrary multiplier)
+    let mode: CvecMode          // additive or project
     // start{Position,Turn} are mutable so a gated trigger can RESTART
     // the envelope at an arbitrary later moment without allocating a
     // new ActiveControl. stop fields clear on restart.
@@ -143,9 +156,11 @@ final class ActiveControl {
     var stopTurn: Int? = nil
     init(cvecId: String, buffer: MTLBuffer, layer: Int,
          envelope: CvecEnvelope, polarity: Float,
-         startPosition: Int, startTurn: Int) {
+         startPosition: Int, startTurn: Int,
+         mode: CvecMode = .additive) {
         self.cvecId = cvecId; self.buffer = buffer; self.layer = layer
         self.envelope = envelope; self.polarity = polarity
+        self.mode = mode
         self.startPosition = startPosition; self.startTurn = startTurn
     }
     // Reset the envelope clock to (position, turn). Triggered by a
@@ -270,6 +285,7 @@ func computeCvecDigest(activeControls: [ActiveControl],
         let env: CvecEnvelope; let polarity: Float
         let startPosition: Int; let startTurn: Int
         let stopPosition: Int?; let stopTurn: Int?
+        let mode: CvecMode
     }
     var entries: [DigestEntry] = []
     for c in activeControls {
@@ -284,7 +300,8 @@ func computeCvecDigest(activeControls: [ActiveControl],
             stopOffset: (c.stopPosition ?? Int.max) - pageStart,
             env: c.envelope, polarity: c.polarity,
             startPosition: c.startPosition, startTurn: c.startTurn,
-            stopPosition: c.stopPosition, stopTurn: c.stopTurn))
+            stopPosition: c.stopPosition, stopTurn: c.stopTurn,
+            mode: c.mode))
     }
     // If no control's window intersected this page, the page is
     // effectively unsteered — return 0 so hashPage collapses to the
@@ -335,6 +352,7 @@ func computeCvecDigest(activeControls: [ActiveControl],
         mixF32(e.env.peakMagnitude)
         mixString(e.env.shape.rawValue)
         mixString(e.env.units.rawValue)
+        mixString(e.mode.rawValue)
     }
     if h == 0 { h = 0x9e3779b97f4a7c15 }
     return h
@@ -1150,13 +1168,38 @@ final class LmEngine {
         // each of its active controls' envelopes at the current (position,
         // turn) and stash the resulting (buffer, layer, mag) triples in
         // gSlotControls[slot]. Silenced slots just get an empty list.
+        // Per-slot active-control staging. Each control's envelope-
+        // evaluated scalar becomes either the ADD magnitude (additive
+        // mode) or the TARGET projection (project mode); the dispatch
+        // picks the appropriate kernel based on mode. Project-mode
+        // controls claim a slot in gProjectMeasureBuf so the kernel
+        // can write back pre-write projections for telemetry.
         for slot in 0..<B { gSlotControls[slot].removeAll(keepingCapacity: true) }
         for slot in 0..<B where realSlot[slot] {
             guard let sid = slotAssignment[slot],
                   let s = residentSessions[sid] else { continue }
+            let measBase = slot * MAX_PROJECT_CONTROLS_PER_SLOT
+            var measIdx = 0
             for c in s.activeControls {
                 let m = c.magnitudeAt(position: s.position, turn: s.turnIndex)
-                if m != 0 { gSlotControls[slot].append(SlotControl(buffer: c.buffer, layer: c.layer, mag: m)) }
+                switch c.mode {
+                case .additive:
+                    if m != 0 {
+                        gSlotControls[slot].append(SlotControl(
+                            buffer: c.buffer, layer: c.layer, mag: m,
+                            mode: .additive, measureOutSlot: 0))
+                    }
+                case .project:
+                    // Always stage project mode (target=0 is meaningful
+                    // = remove feature). Assign a measure-buf slot;
+                    // drop extras past the per-slot cap.
+                    if measIdx < MAX_PROJECT_CONTROLS_PER_SLOT {
+                        gSlotControls[slot].append(SlotControl(
+                            buffer: c.buffer, layer: c.layer, mag: m,
+                            mode: .project, measureOutSlot: measBase + measIdx))
+                        measIdx += 1
+                    }
+                }
             }
         }
         // Phase C-Read: stage detectors, assigning each a linear offset
@@ -1353,24 +1396,42 @@ final class LmEngine {
         // in encodePrefillTileInto shorts-circuits zero-mag rows in the
         // kernel so idle slots cost near-zero. Pool-backed to avoid per-
         // tile allocations.
+        // Prefill staging: for each active control, allocate a per-row
+        // buffer sized [B * thisTile] floats. Additive mode fills this
+        // with per-row ADD magnitudes (0 = silenced row); project mode
+        // fills it with per-row TARGET projections (Float.nan = silenced
+        // row, so target=0 can still coerce to zero meaningfully). We
+        // allocate TWO buffers per control (mags + targets) from the
+        // pool for simplicity; only one is meaningful per dispatch.
         gPrefillControls.removeAll(keepingCapacity: true)
         let prefillRows = B * thisTile
         for (pcIdx, c) in s.activeControls.enumerated() {
-            let magsBuf = acquirePrefillMagBuf(pcIdx)
+            // Per-control scratch buffers. We reuse the mag-buf pool
+            // for both additive-mags and project-targets (same fp32
+            // shape); allocate measurement buffers in a second pool.
+            let magsBuf = acquirePrefillMagBuf(pcIdx * 3 + 0)
+            let targetsBuf = acquirePrefillMagBuf(pcIdx * 3 + 1)
+            let measuresBuf = acquirePrefillMagBuf(pcIdx * 3 + 2)
             let magsP = magsBuf.contents().bindMemory(to: Float.self,
                                                        capacity: prefillRows)
-            // Zero all rows first (silenced slots stay zero).
-            for r in 0..<prefillRows { magsP[r] = 0 }
-            // Fill the sslot row: one magnitude per tile position. Envelope
-            // evaluator is pure — same math as AR's per-tick evaluation.
+            let targP = targetsBuf.contents().bindMemory(to: Float.self,
+                                                          capacity: prefillRows)
+            for r in 0..<prefillRows {
+                magsP[r] = 0                    // additive-mode silenced
+                targP[r] = Float.nan            // project-mode silenced
+            }
             for i in 0..<thisTile {
                 let pos = positionStart + i
                 let m = c.magnitudeAt(position: pos, turn: s.turnIndex)
-                magsP[sslot * thisTile + i] = m
+                switch c.mode {
+                case .additive: magsP[sslot * thisTile + i] = m
+                case .project:  targP[sslot * thisTile + i] = m
+                }
             }
-            gPrefillControls.append(PrefillControl(buffer: c.buffer,
-                                                    layer: c.layer,
-                                                    magsBuf: magsBuf))
+            gPrefillControls.append(PrefillControl(
+                buffer: c.buffer, layer: c.layer, mode: c.mode,
+                magsBuf: magsBuf, targetsBuf: targetsBuf,
+                projectMeasuresBuf: measuresBuf))
         }
         defer { gPrefillControls.removeAll(keepingCapacity: true) }
         let t0 = Date()

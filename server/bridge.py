@@ -1551,9 +1551,14 @@ async def _iter_session_tokens(state: SessionState):
 def _attach_controls(sid: int, controls: list[dict]) -> None:
     """Attach each control spec to the session before its first tick.
     Schema: {cvec_id, layer, polarity, peak_magnitude, attack, decay,
-             sustain_level, release, shape, units}. All envelope fields
-    are optional; unspecified defaults to a constant magnitude (attack=
-    decay=release=0, sustain_level=1)."""
+             sustain_level, release, shape, units, mode}.
+    All envelope fields are optional.
+
+    `mode`: "additive" (default) pushes residual BY peak_magnitude *
+    cvec; "project" coerces residual's projection onto cvec TO
+    peak_magnitude (representation-engineering primitive — target=0
+    removes the feature, nonzero targets coerce to a specific level).
+    """
     for c in controls or []:
         g.session_add_control(
             sid,
@@ -1567,6 +1572,7 @@ def _attach_controls(sid: int, controls: list[dict]) -> None:
             release        = float(c.get("release", 0.0)),
             shape          = str(c.get("shape", "linear")),
             units          = str(c.get("units", "tokens")),
+            mode           = str(c.get("mode", "additive")),
         )
 
 

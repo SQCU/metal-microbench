@@ -647,7 +647,13 @@ public func gemma_session_add_control(_ sid: Int32,
                                        _ sustainLevel: Float,
                                        _ release: Float,
                                        _ shape: Int32,
-                                       _ units: Int32) -> Int32 {
+                                       _ units: Int32,
+                                       _ mode: Int32) -> Int32 {
+    // mode: 0 = additive (residual += mag * cvec)
+    //       1 = project  (residual projection onto cvec coerced to mag)
+    // Additive stays the default for backward compat; mode=1 adds
+    // representation-engineering primitives (target=0 removes the
+    // feature, nonzero target coerces to a specific level).
     ffiLock.lock(); defer { ffiLock.unlock() }
     guard let s = gSessions[sid] else { return -1 }
     guard let ip = cvecIdPtr else { return -1 }
@@ -659,13 +665,15 @@ public func gemma_session_add_control(_ sid: Int32,
     let shapes: [CvecShape] = [.linear, .expIn, .expOut, .cubic]
     let shapeVal = shapes[max(0, min(shapes.count - 1, Int(shape)))]
     let unitsVal: CvecUnits = (units == 0 ? .tokens : .turns)
+    let modeVal: CvecMode = (mode == 1 ? .project : .additive)
     let env = CvecEnvelope(attack: attack, decay: decay, sustainLevel: sustainLevel,
                             release: release, peakMagnitude: peakMagnitude,
                             shape: shapeVal, units: unitsVal)
     let t = s.currentTimeCoords
     let ctrl = ActiveControl(cvecId: cvecId, buffer: buf, layer: Int(layer),
                               envelope: env, polarity: polarity,
-                              startPosition: t.position, startTurn: t.turn)
+                              startPosition: t.position, startTurn: t.turn,
+                              mode: modeVal)
     s.addControl(ctrl)
     return 0
 }

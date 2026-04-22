@@ -143,6 +143,7 @@ _lib.gemma_session_add_control.argtypes = [
     C.c_float, C.c_float,       # polarity, peakMagnitude
     C.c_float, C.c_float, C.c_float, C.c_float,  # attack, decay, sustainLevel, release
     C.c_int32, C.c_int32,       # shape (0-3), units (0=tokens, 1=turns)
+    C.c_int32,                  # mode: 0=additive, 1=project
 ]
 _lib.gemma_session_add_control.restype = C.c_int32
 
@@ -523,17 +524,36 @@ def control_register_fp16(cvec_id: str, fp16_bytes: bytes) -> None:
     if r != 0:
         raise RuntimeError(f"gemma_control_register_fp16 failed for id={cvec_id!r}")
 
+_MODES = {"additive": 0, "project": 1, "add": 0, "projection": 1}
+
 def session_add_control(sid: int, cvec_id: str, layer: int,
                           polarity: float = 1.0,
                           peak_magnitude: float = 1.0,
                           attack: float = 0.0, decay: float = 0.0,
                           sustain_level: float = 1.0, release: float = 0.0,
-                          shape: str = "linear", units: str = "tokens") -> None:
+                          shape: str = "linear", units: str = "tokens",
+                          mode: str = "additive") -> None:
+    """Attach a control vector to a session.
+
+    mode:
+      "additive" (default)  — residual += mag * cvec at the control's layer.
+                             Kept as default for backward-compat with prose-
+                             steering-style nudging use cases.
+      "project"             — residual's projection onto cvec is coerced
+                             to `peak_magnitude` (target value). 0 removes
+                             the feature ("obliteratus"-style ablation);
+                             nonzero targets coerce to a specific feature
+                             level. Pre-write projection is measured in
+                             the same dispatch and can be read back via
+                             the project-measurement API (for RE measurement
+                             + elicitation in one primitive).
+    """
     r = _lib.gemma_session_add_control(
         int(sid), cvec_id.encode("utf-8"), int(layer),
         float(polarity), float(peak_magnitude),
         float(attack), float(decay), float(sustain_level), float(release),
         int(_SHAPES.get(shape, 0)), int(_UNITS.get(units, 0)),
+        int(_MODES.get(mode, 0)),
     )
     if r != 0:
         raise RuntimeError(f"gemma_session_add_control failed (sid={sid}, cvec={cvec_id})")

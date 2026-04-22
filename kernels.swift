@@ -216,6 +216,101 @@ kernel void add_scaled_cvector_fp16(
     }
 }
 
+// Projection-steer: set the residual's projection onto cvec to a specific
+// target magnitude. Unlike add_scaled_cvector which pushes BY an amount,
+// this coerces the residual INTO a specific projection value — the
+// representation-engineering primitive. target=0 removes the direction
+// entirely (obliteratus-style ablation); target>0 elicits/amplifies;
+// target<0 expresses the opposite valence. Also returns the PRE-WRITE
+// projection value per slot so callers can read the "natural" feature
+// level at each position — measurement + coercion in one dispatch.
+//
+// cvec MUST be unit-norm for the projection arithmetic to be clean:
+//   current_proj = <hidden, cvec>
+//   delta        = target - current_proj
+//   hidden      += delta * cvec      (after which <hidden, cvec> == target)
+kernel void project_cvector_fp16(
+    device       half*  dst          [[buffer(0)]],  // [B, N] residual, written in place
+    device const half*  cvec         [[buffer(1)]],  // [N] unit direction
+    device       float* currentProj  [[buffer(2)]],  // [B] output, pre-write projection
+    constant uint&      N            [[buffer(3)]],
+    constant float&     target       [[buffer(4)]],  // desired projection magnitude
+    uint2 tg  [[threadgroup_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    uint b = tg.x; uint t = lid.x;
+    // Phase 1: dot product. 32-thread simdgroup reduction via simd_sum.
+    float acc = 0.0f;
+    for (uint i = t; i < N; i += 32) {
+        acc += float(dst[b*N + i]) * float(cvec[i]);
+    }
+    acc = simd_sum(acc);
+    if (t == 0) currentProj[b] = acc;
+    // Phase 2: every lane computes the same delta and writes its stripe.
+    float delta = target - acc;
+    for (uint i = t; i < N; i += 32) {
+        dst[b*N + i] = half(float(dst[b*N + i]) + delta * float(cvec[i]));
+    }
+}
+
+// Per-slot variant of project_cvector_fp16: caller offsets dst by
+// slot*N*sizeof(half) and the kernel sees numVecs=1. Used in buildStepCB
+// for per-session independent projection steering, same pattern as
+// encAddScaledCvecSlot.
+kernel void project_cvector_slot_fp16(
+    device       half*  dst          [[buffer(0)]],  // dst+slot*N, [1, N]
+    device const half*  cvec         [[buffer(1)]],
+    device       float* currentProj  [[buffer(2)]],  // [1], pre-write projection
+    constant uint&      N            [[buffer(3)]],
+    constant float&     target       [[buffer(4)]],
+    uint lid [[thread_position_in_threadgroup]])
+{
+    float acc = 0.0f;
+    for (uint i = lid; i < N; i += 32) {
+        acc += float(dst[i]) * float(cvec[i]);
+    }
+    acc = simd_sum(acc);
+    if (lid == 0) currentProj[0] = acc;
+    float delta = target - acc;
+    for (uint i = lid; i < N; i += 32) {
+        dst[i] = half(float(dst[i]) + delta * float(cvec[i]));
+    }
+}
+
+// Prefill variant: per-row target magnitudes over [numVecs, N]. rows
+// with target == sentinel skip entirely (so silenced slots + positions
+// outside the envelope window pay near-zero cost, same pattern as
+// add_scaled_cvector_prefill_fp16). We can't use target==0 as a skip
+// sentinel because 0 is a meaningful coerce-to-zero value; instead use
+// NaN (Float.nan from Swift-side writes the marker). currentProj[r]
+// receives the pre-write projection for every active row.
+kernel void project_cvector_prefill_fp16(
+    device       half*  dst          [[buffer(0)]],  // [numVecs, N]
+    device const half*  cvec         [[buffer(1)]],  // [N]
+    device const float* targets      [[buffer(2)]],  // [numVecs] per-row target (NaN = skip)
+    device       float* currentProj  [[buffer(3)]],  // [numVecs] output
+    constant uint&      N            [[buffer(4)]],
+    uint2 tg  [[threadgroup_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    uint r = tg.x; uint t = lid.x;
+    float target = targets[r];
+    // NaN check: a row is skipped if its target is NaN. isnan() is a
+    // valid Metal intrinsic.
+    bool skip = isnan(target);
+    float acc = 0.0f;
+    for (uint i = t; i < N; i += 32) {
+        acc += float(dst[r*N + i]) * float(cvec[i]);
+    }
+    acc = simd_sum(acc);
+    if (t == 0) currentProj[r] = skip ? 0.0f : acc;
+    if (skip) return;
+    float delta = target - acc;
+    for (uint i = t; i < N; i += 32) {
+        dst[r*N + i] = half(float(dst[r*N + i]) + delta * float(cvec[i]));
+    }
+}
+
 // Prefill-variant: per-row magnitudes. dst[r, :] += mags[r] * cvec[:], with
 // rows indexed over the full prefill tile (numVecs = B * qLen). mags[r] == 0
 // is a no-op row — the dispatch wastes ~32 thread-cycles reading zeros, but
