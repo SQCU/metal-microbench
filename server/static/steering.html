@@ -175,17 +175,18 @@
         <input type="range" id="maxK" min="1" max="8" step="1" value="4">
         <span class="val" id="maxKVal">4</span>
       </div>
-      <div class="slider-row" title="where in a chat context the pos/neg residuals are sampled from. rollout is most principled: the model continues each seed for K tokens, we capture residuals at every generation step. fits directions sampled from the model's generation-time distribution, avoiding the planning/meta-approach axis that single-position captures pick up.">
+      <div class="slider-row" title="how pos/neg residuals are sampled. shared_source (teacher-forced) is the most principled: each pos/neg prose example is teacher-forced from a shared anchor prompt, residuals captured at every position. PCA deltas then live in strictly trajectory-comparable space — both branches share the anchor exactly, and every position is guaranteed to stay in-class (no bigram-attractor contamination, no model-drift).">
         <label for="captureMode">capture</label>
         <select id="captureMode" style="flex:1; background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:3px; padding:0.25em 0.4em; font:inherit; font-size:0.78rem">
-          <option value="rollout" selected>rollout (K gen-steps/seed)</option>
+          <option value="shared_source" selected>shared_source (teacher-forced)</option>
+          <option value="rollout">rollout (model samples K steps)</option>
           <option value="model_gen">model_gen (single, mid-gen)</option>
           <option value="user_end">user_end (single, prose-after-user)</option>
         </select>
         <span></span>
       </div>
       <div class="slider-row" id="rolloutDepthRow">
-        <label for="rolloutDepth" title="K tokens generated per seed when capture_mode=rollout. Higher K gives more samples for PCA (cleaner fit) at linear compute cost (~30ms/step/seed).">rollout K</label>
+        <label for="rolloutDepth" title="K positions per example. Longer K gives more samples for PCA (cleaner fit) at linear cost (~30 ms/position/example).">positions K</label>
         <input type="range" id="rolloutDepth" min="4" max="32" step="2" value="16">
         <span class="val" id="rolloutDepthVal">16</span>
       </div>
@@ -399,7 +400,7 @@ function preflightFitBody() {
     max_components_per_layer: parseInt($('maxK').value),
     capture_mode: $('captureMode').value,
   };
-  if (body.capture_mode === 'rollout') {
+  if (body.capture_mode === 'rollout' || body.capture_mode === 'shared_source') {
     body.rollout_depth = parseInt($('rolloutDepth').value);
   }
   return body;
@@ -407,8 +408,9 @@ function preflightFitBody() {
 
 // Show/hide the rolloutDepth slider based on capture_mode.
 function refreshRolloutRow() {
+  const m = $('captureMode').value;
   $('rolloutDepthRow').style.display =
-    $('captureMode').value === 'rollout' ? '' : 'none';
+    (m === 'rollout' || m === 'shared_source') ? '' : 'none';
 }
 $('captureMode').addEventListener('change', refreshRolloutRow);
 refreshRolloutRow();
@@ -436,9 +438,10 @@ $('fitBtn').addEventListener('click', async () => {
   }
   $('fitBtn').disabled = true;
   const N = body.positive.length + body.negative.length;
-  if (body.capture_mode === 'rollout') {
+  if (body.capture_mode === 'rollout' || body.capture_mode === 'shared_source') {
+    const label = body.capture_mode === 'rollout' ? 'rollout' : 'teacher-forced';
     $('fitStatus').textContent =
-      `fitting (rollout): ${N} seeds × ${body.rollout_depth} AR steps = ${N * body.rollout_depth} samples, ~${(N * body.rollout_depth * 0.035).toFixed(1)}s…`;
+      `fitting (${label}): ${N} examples × ${body.rollout_depth} positions = ${N * body.rollout_depth} samples, ~${(N * body.rollout_depth * 0.035).toFixed(1)}s…`;
   } else {
     $('fitStatus').textContent =
       `fitting: ${N} forward passes × ${NUM_LAYERS} layers…`;

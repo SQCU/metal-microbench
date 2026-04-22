@@ -873,23 +873,17 @@ async def control_construct_pca(req: Request) -> JSONResponse:
     # (mid-model-generation), which often manifests as degenerate token
     # repetition in small-intensity steered generations.
     capture_mode = str(body.get("capture_mode", "user_end")).strip()
-    if capture_mode not in ("user_end", "model_gen", "rollout"):
-        raise HTTPException(400, f"capture_mode must be 'user_end', 'model_gen', or 'rollout'")
-    # rollout-mode specific knobs. K AR steps per seed. "rollout_prompt"
-    # is the user-turn instruction that precedes each seed; the model
-    # continues the seed + generates K more tokens, and we snap the
-    # all-layer residual at each generated position. Gives PCA a [N*K,
-    # HIDDEN] matrix sampled from the model's generation-time
-    # distribution (vs. the planning/meta-approach endpoint that
-    # user_end and model_gen single-position captures hit). Designed
-    # to avoid the "assistant-persona meta-behavior takeover" the
-    # other modes produce when the fitted direction is applied at
-    # generation time.
+    if capture_mode not in ("user_end", "model_gen", "rollout", "shared_source"):
+        raise HTTPException(400,
+            "capture_mode must be 'user_end', 'model_gen', 'rollout', or 'shared_source'")
+    # rollout/shared_source-mode specific knobs.
+    # K = positions per example.
     rollout_depth = int(body.get("rollout_depth", 16))
     rollout_prompt = str(body.get("rollout_prompt",
         "Continue the prose in the same style.")).strip()
-    if capture_mode == "rollout" and rollout_depth < 2:
-        raise HTTPException(400, "rollout_depth must be ≥ 2 for capture_mode=rollout")
+    if capture_mode in ("rollout", "shared_source") and rollout_depth < 2:
+        raise HTTPException(400,
+            f"rollout_depth must be ≥ 2 for capture_mode={capture_mode}")
     if not id_prefix or not positives or not negatives:
         raise HTTPException(400, "need id_prefix, positive (≥1), negative (≥1)")
     if not (0.0 < top_p <= 1.0):
@@ -911,6 +905,79 @@ async def control_construct_pca(req: Request) -> JSONResponse:
                        f"{GEMMA_TURN_OPEN}model\n<|channel>thought\n<channel|>{example}")
             return wrapped, False
         return example, chat_template
+
+    def teacher_force_residuals(continuation: str) -> np.ndarray:
+        """Teacher-force `continuation` tokens through the engine,
+        rooted in a SHARED anchor prompt `rollout_prompt`, capturing
+        all-layer residuals at each of K teacher-forced positions.
+        Returns [K, NUM_LAYERS, HIDDEN] fp32.
+
+        Why this matters vs rollout mode: rollout lets the model
+        generate its own K tokens past the seed, which means if the
+        model drifts off-class (e.g. a "joyful" seed doesn't actually
+        elicit joyful continuation, or the sampler lands on a neutral
+        token-repetition attractor early), the captured residuals are
+        contaminated by whatever the model chose rather than staying
+        in the target class. Teacher-forcing through a KNOWN in-class
+        continuation guarantees residuals come from the right
+        distribution position-by-position.
+
+        Also: all examples share the same S_0 (rollout_prompt + turn
+        markers), so per-layer deltas between pos and neg are
+        trajectory-comparable from the same starting state — no
+        prompt-specific noise in the fitted direction.
+        """
+        anchor_wrapped = (f"{GEMMA_TURN_OPEN}user\n{rollout_prompt}{GEMMA_TURN_CLOSE}\n"
+                           f"{GEMMA_TURN_OPEN}model\n<|channel>thought\n<channel|>")
+        anchor_toks = g.tokenize(anchor_wrapped, add_bos=True)
+        cont_toks = g.tokenize(continuation, add_bos=False)[:rollout_depth]
+        K = len(cont_toks)
+        if K < 2:
+            # Example tokenizes to too little; skip by returning a
+            # zero-weight placeholder (caller should filter).
+            return np.zeros((0, NUM_LAYERS, HIDDEN), dtype=np.float32)
+
+        sid = g.open_session(max_new_tokens=K + 4)
+        try:
+            # Submit anchor, drain prefill → position = len(anchor).
+            # After prefill the slot's residual buffer has state from
+            # the last anchor position — that's S_0's endpoint.
+            g.submit(sid, anchor_toks)
+            target_pos = len(anchor_toks)
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                if g.session_position(sid) >= target_pos: break
+                time.sleep(0.002)
+            g.session_pause(sid)
+
+            rows = np.zeros((K, NUM_LAYERS, HIDDEN), dtype=np.float32)
+            # Row 0: residual at S_0's endpoint (before any
+            # continuation token consumed). Same for all examples of
+            # the same class since anchor is shared — this anchors
+            # the trajectory.
+            rows[0] = np.frombuffer(g.get_all_layer_residuals(),
+                                    dtype=np.float16).astype(np.float32).reshape(NUM_LAYERS, HIDDEN)
+
+            # For each continuation token i in 0..K-2, submit as a
+            # 1-token chunk which the engine's AR step consumes as
+            # teacher-forced input. Position advances by 1 per
+            # submit; we capture the residual written at that new
+            # position. Row i+1 = residual having just consumed
+            # cont_toks[i].
+            for i in range(K - 1):
+                g.submit(sid, [int(cont_toks[i])])
+                target_pos += 1
+                g.session_resume(sid)
+                d2 = time.time() + 10
+                while time.time() < d2:
+                    if g.session_position(sid) >= target_pos: break
+                    time.sleep(0.002)
+                g.session_pause(sid)
+                rows[i + 1] = np.frombuffer(g.get_all_layer_residuals(),
+                                             dtype=np.float16).astype(np.float32).reshape(NUM_LAYERS, HIDDEN)
+            return rows
+        finally:
+            _close_session(sid)
 
     def rollout_residuals(seed: str) -> np.ndarray:
         """Run rollout_depth AR steps on a seed and capture all-layer
@@ -954,14 +1021,20 @@ async def control_construct_pca(req: Request) -> JSONResponse:
             _close_session(sid)
 
     def capture_stack(examples: list[str]) -> np.ndarray:
-        if capture_mode == "rollout":
-            # Enable capture for the duration; each rollout_residuals
-            # call relies on gAllLayerCaptureBuf being populated every
-            # AR tick. Returns stacked rows with rollout dim flattened.
+        if capture_mode in ("rollout", "shared_source"):
+            # Both modes need the all-layer capture enabled for the
+            # duration. rollout_residuals samples model-generated
+            # continuation; teacher_force_residuals teacher-forces a
+            # known continuation. Flatten [n_examples, K, L, D] →
+            # [n_examples*K, L, D].
+            fn = teacher_force_residuals if capture_mode == "shared_source" else rollout_residuals
             g.set_capture_all_layers(True)
             try:
-                chunks = [rollout_residuals(ex) for ex in examples]
-                # Stack [n_examples, K, L, D] → [n_examples*K, L, D]
+                chunks = [fn(ex) for ex in examples]
+                chunks = [c for c in chunks if c.shape[0] > 0]
+                if not chunks:
+                    raise HTTPException(400,
+                        "every example tokenized to < 2 tokens — add longer prose")
                 stacked = np.concatenate(chunks, axis=0)
             finally:
                 g.set_capture_all_layers(False)
