@@ -83,21 +83,47 @@
   .heatmap .xlabel { grid-column: 2; color:var(--mute); font-size:0.6rem;
     padding-top:0.2em; display:flex; justify-content:space-around; }
 
-  /* Output area. */
-  .output { overflow:auto; padding:1em 1.4em; font-size:0.95rem; line-height:1.7; }
+  /* Output area — 4-lane grid of parallel decodes at different
+     intensity multipliers. The engine batches all 4 at B=4, so wall-
+     clock is ~same as a single stream. */
+  .output { overflow:auto; padding:1em 1.2em; font-size:0.85rem;
+    display:flex; flex-direction:column; gap:0.6em; }
   .output .system {
-    font-size:0.74rem; color:var(--mute); margin-bottom:0.8em;
+    font-size:0.74rem; color:var(--mute);
     padding:0.4em 0.6em; background:var(--panel); border-left:3px solid var(--accent);
-    border-radius:2px;
+    border-radius:2px; flex:none;
   }
-  .output .tokens {
+  .lanes {
+    display:grid; grid-template-columns: repeat(4, 1fr); gap:0.5em;
+    flex:1; min-height:0;
+  }
+  .lane {
+    background: var(--panel); border:1px solid var(--border); border-radius:3px;
+    display:flex; flex-direction:column; min-height:0;
+  }
+  .lane.running { border-color: var(--accent); }
+  .lane.flipped { border-color: var(--neg); }
+  .lane.baseline { border-color: var(--mute); }
+  .lane .hdr {
+    padding:0.35em 0.55em; border-bottom:1px solid var(--border);
+    font-size:0.7rem; color:var(--mute); display:flex; justify-content:space-between;
+    align-items:center; gap:0.4em;
+  }
+  .lane .hdr b { color:var(--text); font-weight:500; font-variant-numeric:tabular-nums; }
+  .lane .hdr .badge {
+    background:#1a2030; padding:1px 5px; border-radius:2px;
+    font-size:0.62rem; font-variant-numeric:tabular-nums;
+  }
+  .lane.flipped .hdr { color: var(--neg); }
+  .lane.baseline .hdr { color: var(--mute); }
+  .lane .body {
+    flex:1; overflow:auto; padding:0.5em 0.6em; line-height:1.55;
     white-space:pre-wrap; word-break:break-word;
     font-family: ui-monospace, 'SF Mono', Monaco, monospace;
   }
-  .output .tokens .tok {
-    padding: 1px 2px; border-radius: 2px; transition: background 0.1s;
+  .lane .body:empty::before {
+    content: '(idle)'; color: var(--mute); font-style:italic; font-size:0.7rem;
   }
-  .output .tokens .tok:hover { outline: 1px solid var(--accent); }
 
   /* Curl hint — what the UI is doing on the wire. */
   .curl-hint {
@@ -191,9 +217,13 @@
         <span class="val" id="maxTokVal">80</span>
       </div>
       <button id="runBtn" class="primary hot" style="width:100%; margin-top:0.4em" disabled>
-        run steered
+        run 4 lanes
       </button>
       <div class="hint" id="runStatus" style="margin-top:0.3em">fit an intervention first.</div>
+      <div class="hint" style="margin-top:0.3em; display:flex; justify-content:space-between">
+        <span>sampling: <b style="color:var(--text)">greedy (argmax)</b></span>
+        <span>lanes: <b style="color:var(--text)">baseline · 1× · 2× · -1×</b></span>
+      </div>
       <div id="runCurl" class="curl-hint" style="display:none"></div>
     </section>
 
@@ -201,12 +231,30 @@
 
   <div class="output">
     <div class="system" id="systemMsg">
-      <b>2 clicks to see residual-stream steering in action:</b><br>
-      1. hit <b>sample</b> (loads a joy-vs-dread contrast) then <b>fit intervention</b> to fit the PCA across all 30 layers.<br>
-      2. hit <b>run steered</b> to generate with the fitted intervention applied.<br>
-      the <code>intensity</code> slider lets you re-run at different strengths (including negative = flipped polarity) without re-fitting. the curl-style boxes under each button show the exact API call they're making, so you can replicate from a terminal.
+      <b>2 clicks to see residual-stream steering in action:</b>
+      hit <b>sample</b> → <b>fit intervention</b> → <b>run 4 lanes</b>.
+      sampling is greedy (argmax), so any difference between lanes is attributable
+      purely to the intervention magnitude — no RNG noise. each lane is one parallel
+      <code>/v1/chat/completions</code> session; the engine batches them at B=4.
     </div>
-    <div class="tokens" id="tokens"></div>
+    <div class="lanes" id="lanes">
+      <div class="lane baseline" data-lane="off">
+        <div class="hdr"><span>baseline · 0</span><span class="badge" id="badge-off">—</span></div>
+        <div class="body" id="body-off"></div>
+      </div>
+      <div class="lane" data-lane="mid">
+        <div class="hdr"><span>steered · <b id="label-mid">+1.0</b></span><span class="badge" id="badge-mid">—</span></div>
+        <div class="body" id="body-mid"></div>
+      </div>
+      <div class="lane" data-lane="hi">
+        <div class="hdr"><span>strong · <b id="label-hi">+2.0</b></span><span class="badge" id="badge-hi">—</span></div>
+        <div class="body" id="body-hi"></div>
+      </div>
+      <div class="lane flipped" data-lane="neg">
+        <div class="hdr"><span>flipped · <b id="label-neg">-1.0</b></span><span class="badge" id="badge-neg">—</span></div>
+        <div class="body" id="body-neg"></div>
+      </div>
+    </div>
   </div>
 
 </main>
@@ -408,58 +456,114 @@ function renderHeatmap() {
 }
 
 // ====================================================================
-// Build the controls[] array for the run request.
-// ====================================================================
-function buildRunControls() {
-  if (!fit.components) return [];
-  const intensity = parseFloat($('intensity').value);
+// 4-lane parallel decode. Each lane fires its own /v1/chat/completions
+// stream at a different effective intensity; the engine batches all 4
+// at B=4 (same scheduler path as tetraplex/compare/loom), so 4 parallel
+// decodes are roughly the same wall-clock as 1. Greedy sampling means
+// the ONLY difference between lanes is the magnitude of the fitted
+// intervention applied — isolates the causal effect of steering.
+const LANES = [
+  { key: 'off', label: 'baseline', mult: 0,  // unsteered reference
+    controlsFn: () => [] },
+  { key: 'mid', label: 'steered',  mult: 1,
+    controlsFn: () => buildControlsAt(parseFloat($('intensity').value)) },
+  { key: 'hi',  label: 'strong',   mult: 2,
+    controlsFn: () => buildControlsAt(parseFloat($('intensity').value) * 2) },
+  { key: 'neg', label: 'flipped',  mult: -1,
+    controlsFn: () => buildControlsAt(-parseFloat($('intensity').value)) },
+];
+
+function buildControlsAt(intensity) {
+  if (!fit.components || intensity === 0) return [];
   const polarity = intensity < 0 ? -1 : 1;
-  const absIntensity = Math.abs(intensity);
+  const absI = Math.abs(intensity);
   return fit.components.map(c => ({
     cvec_id: c.cvec_id,
     layer: c.layer,
     polarity,
-    peak_magnitude: c.scale * absIntensity,
+    peak_magnitude: c.scale * absI,
     attack: 0, decay: 0, sustain_level: 1.0, release: 0,
     shape: 'linear', units: 'tokens',
   }));
 }
 
-function buildRunBody() {
+function buildRunBody(controls) {
   return {
     model: 'gemma-4-a4b-q4km',
     max_tokens: parseInt($('maxTok').value),
     stream: true,
     messages: [{ role: 'user', content: $('prompt').value }],
-    controls: buildRunControls(),
+    controls,
+    // Sampling config left out of the request body → engine default is
+    // greedy argmax (bootstrap.swift:step() picks bestI by logit max).
+    // If/when the engine grows a sampling path, pass it here.
   };
 }
 
 function refreshRunCurl() {
   if (!fit.components) { showCurl('runCurl', null, null, null); return; }
-  const body = buildRunBody();
-  // Stream false for the curl hint so the user gets a single JSON
-  // response they can eyeball. The UI itself keeps stream:true for
-  // smooth rendering.
-  showCurl('runCurl', 'POST', '/v1/chat/completions', {...body, stream: false});
+  // Show the "steered" lane's request as the canonical example — the
+  // other three are variations on the intensity multiplier. Annotate
+  // with the full lane set so the user knows 4 are fired in parallel.
+  const steered = buildRunBody(LANES[1].controlsFn());
+  showCurl('runCurl', 'POST', '/v1/chat/completions', {...steered, stream: false});
+  // Append a comment line describing the fan-out.
+  const el = $('runCurl');
+  el.textContent = el.textContent +
+    `\n\n# fired in parallel × 4 lanes with peak_magnitude scaled by [0, 1x, 2x, -1x]` +
+    ` of your intensity ${parseFloat($('intensity').value).toFixed(1)}.` +
+    `\n# greedy sampling (engine default) — no temperature/top_p/top_k params needed.`;
 }
 for (const id of ['prompt','maxTok','intensity']) {
-  $(id).addEventListener('input', refreshRunCurl);
+  $(id).addEventListener('input', () => { refreshRunCurl(); updateLaneLabels(); });
+}
+function updateLaneLabels() {
+  const i = parseFloat($('intensity').value);
+  $('label-mid').textContent = (i >= 0 ? '+' : '') + i.toFixed(1);
+  $('label-hi').textContent  = (i * 2 >= 0 ? '+' : '') + (i * 2).toFixed(1);
+  $('label-neg').textContent = (-i >= 0 ? '+' : '') + (-i).toFixed(1);
+}
+updateLaneLabels();
+
+// ====================================================================
+// Run: fire all 4 lanes concurrently. Each streams into its own body
+// div. Per-lane RAF-batched flush so fast engine output doesn't stall
+// the browser's rendering pipeline (same pattern as loom).
+// ====================================================================
+const laneState = new Map();
+for (const L of LANES) laneState.set(L.key, { pending: '', tokens: 0, bodyEl: null, badgeEl: null, dirty: false });
+
+let rafPending = false;
+function scheduleFlush() {
+  if (rafPending) return;
+  rafPending = true;
+  requestAnimationFrame(flushAllDirty);
+}
+function flushAllDirty() {
+  rafPending = false;
+  for (const L of LANES) {
+    const s = laneState.get(L.key);
+    if (!s.dirty) continue;
+    if (s.bodyEl && s.pending) {
+      s.bodyEl.appendChild(document.createTextNode(s.pending));
+      s.bodyEl.scrollTop = s.bodyEl.scrollHeight;
+      s.pending = '';
+    }
+    if (s.badgeEl) s.badgeEl.textContent = `${s.tokens}t`;
+    s.dirty = false;
+  }
+  updateFooter();
 }
 
-// ====================================================================
-// Run: stream the chat completion and render tokens as they arrive.
-// ====================================================================
-$('runBtn').addEventListener('click', async () => {
-  if (!fit.components) return;
-  $('runBtn').disabled = true;
-  $('tokens').innerHTML = '';
-  run.samples = []; run.tokens = 0; run.tStart = performance.now();
-  $('fTokens').textContent = '0'; $('fRate').textContent = '…'; $('fWall').textContent = '—';
-
-  const body = buildRunBody();
-  $('runStatus').textContent = `running with ${body.controls.length} intervention components…`;
-
+async function streamLane(L) {
+  const s = laneState.get(L.key);
+  s.bodyEl = $('body-' + L.key);
+  s.badgeEl = $('badge-' + L.key);
+  s.bodyEl.textContent = '';
+  s.pending = ''; s.tokens = 0;
+  const laneEl = document.querySelector(`.lane[data-lane="${L.key}"]`);
+  laneEl.classList.add('running');
+  const body = buildRunBody(L.controlsFn());
   try {
     const resp = await fetch('/v1/chat/completions', {
       method: 'POST',
@@ -467,13 +571,12 @@ $('runBtn').addEventListener('click', async () => {
       body: JSON.stringify(body),
     });
     if (!resp.ok) {
-      $('runStatus').textContent = `HTTP ${resp.status}: ${(await resp.text()).slice(0, 240)}`;
+      s.bodyEl.textContent = `[error] HTTP ${resp.status}: ${(await resp.text()).slice(0, 120)}`;
       return;
     }
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
     let buf = '';
-    const tokensEl = $('tokens');
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -487,33 +590,54 @@ $('runBtn').addEventListener('click', async () => {
         let j; try { j = JSON.parse(payload); } catch { continue; }
         const text = j.choices?.[0]?.delta?.content;
         if (text) {
-          const span = document.createElement('span');
-          span.className = 'tok';
-          span.textContent = text;
-          tokensEl.appendChild(span);
-          run.tokens += 1;
-          updateFooter();
+          s.pending += text;
+          s.tokens += 1;
+          s.dirty = true;
+          scheduleFlush();
         }
       }
     }
+  } catch (e) {
+    s.bodyEl.textContent = `[stream error] ${e.message || e}`;
+  } finally {
+    laneEl.classList.remove('running');
+  }
+}
+
+$('runBtn').addEventListener('click', async () => {
+  if (!fit.components) return;
+  $('runBtn').disabled = true;
+  run.tStart = performance.now();
+  $('runStatus').textContent = `running 4 lanes in parallel…`;
+  try {
+    await Promise.allSettled(LANES.map(streamLane));
     const dt = (performance.now() - run.tStart) / 1000;
+    const total = LANES.reduce((n, L) => n + laneState.get(L.key).tokens, 0);
     $('runStatus').innerHTML =
-      `generated <b>${run.tokens}</b> tokens in ${dt.toFixed(2)}s · ` +
-      `${(run.tokens / dt).toFixed(1)} tok/s · try adjusting intensity and re-running (no re-fit needed).`;
+      `4 lanes × ${LANES[0].controlsFn ? '(varying intensity)' : ''} · ` +
+      `<b>${total}</b> tokens total in ${dt.toFixed(2)}s · ` +
+      `<b>${(total / dt).toFixed(0)} tok/s</b> aggregate · ` +
+      `retune intensity and re-run (no re-fit).`;
   } catch (e) {
     $('runStatus').textContent = `error: ${e.message || e}`;
   } finally {
     $('runBtn').disabled = false;
     updateFooter();
+    flushAllDirty();
   }
 });
 
 function updateFooter() {
-  $('fTokens').textContent = String(run.tokens);
+  // Aggregate across all lanes. Rate is total-tokens / wall-time so it
+  // reports the effective aggregate throughput (≈4× single-lane rate
+  // once the engine batches at B=4).
+  let total = 0;
+  for (const L of LANES) total += laneState.get(L.key)?.tokens ?? 0;
+  $('fTokens').textContent = String(total);
   if (run.tStart) {
     const dt = (performance.now() - run.tStart) / 1000;
     $('fWall').textContent = dt.toFixed(1) + 's';
-    if (dt > 0.1) $('fRate').textContent = (run.tokens / dt).toFixed(0) + ' tok/s';
+    if (dt > 0.1) $('fRate').textContent = (total / dt).toFixed(0) + ' tok/s agg';
   }
 }
 </script>
