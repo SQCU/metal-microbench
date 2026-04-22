@@ -213,6 +213,18 @@ public func gemma_session_state(_ sid: Int32) -> Int32 {
     }
 }
 
+// Current session position (tokens consumed by K/V cache so far).
+// Used by /v1/perplexity to poll for prefill/AR completion: after
+// submit(N tokens), position advances by N once the prefill/AR tick
+// has run. Polling position>expected tells us when logits are ready
+// to read.
+@_cdecl("gemma_session_position")
+public func gemma_session_position(_ sid: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let s = gSessions[sid] else { return -1 }
+    return Int32(s.positionForDebug)
+}
+
 // --- Tokenizer (so Python doesn't have to bundle a second one) ---
 
 // Tokenize text_len UTF-8 bytes. If outTokens is nil, returns the number of
@@ -664,6 +676,67 @@ public func gemma_session_clear_controls(_ sid: Int32) -> Int32 {
     ffiLock.lock(); defer { ffiLock.unlock() }
     guard let s = gSessions[sid] else { return -1 }
     s.clearControls()
+    return 0
+}
+
+// Teacher-forcing + logit readback used by /v1/perplexity to walk a
+// known completion under controls and compute per-position logprobs.
+// The UI compares perplexity across lanes + control-configs to spot
+// locally-unstable fitted directions (distributions collapsed to a
+// single fixed-point token) versus genuinely-shifted trajectories.
+//
+// Workflow from Python:
+//   1. open_session, attach controls, submit(prompt), drain.
+//   2. read slot logits  → first completion token's logit distribution
+//   3. set_next_input(completion[0]); tick(); read slot logits → next
+//   4. ... repeat over completion length.
+// The session's AR tick path uses nextGeneratedInput as the input
+// token; forceNextInput overrides it with the caller's choice.
+
+// Copy the current slot's logits ([VOCAB] fp16) into the caller's
+// buffer. The logits represent the model's prediction for the
+// position that the session is about to consume (i.e. the NEXT
+// token's distribution). Returns VOCAB on success, negative on error.
+@_cdecl("gemma_session_get_slot_logits")
+public func gemma_session_get_slot_logits(_ sid: Int32,
+                                           _ outBuf: UnsafeMutablePointer<Float16>?) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let s = gSessions[sid], let slot = s.slot, let out = outBuf else { return -1 }
+    let logP = logits.contents().assumingMemoryBound(to: Float16.self)
+    let base = slot * VOCAB
+    for i in 0..<VOCAB { out[i] = logP[base + i] }
+    return Int32(VOCAB)
+}
+
+// Pause/resume used by /v1/perplexity. While paused, the pump skips
+// the session (wantsSlot=false), so the caller can control exactly
+// when forward passes happen relative to logit reads.
+@_cdecl("gemma_session_pause")
+public func gemma_session_pause(_ sid: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let s = gSessions[sid] else { return -1 }
+    s.pauseForExternal()
+    return 0
+}
+
+@_cdecl("gemma_session_resume")
+public func gemma_session_resume(_ sid: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let s = gSessions[sid] else { return -1 }
+    s.resumeFromExternalPause()
+    return 0
+}
+
+// Teacher-force: override the token the next AR tick will consume.
+// Session must be in .generating state (call after prefill has
+// completed and the session has entered AR). Does not itself trigger
+// a tick — caller drives tick() separately.
+@_cdecl("gemma_session_set_next_input")
+public func gemma_session_set_next_input(_ sid: Int32,
+                                          _ token: UInt32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let s = gSessions[sid] else { return -1 }
+    s.forceNextInput(token)
     return 0
 }
 

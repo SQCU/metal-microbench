@@ -175,6 +175,14 @@
         <input type="range" id="maxK" min="1" max="8" step="1" value="4">
         <span class="val" id="maxKVal">4</span>
       </div>
+      <div class="slider-row" title="where in a chat context the pos/neg residuals are sampled from. user_end: end of a user turn (the model is about to respond). model_gen: mid-model-generation (the model is producing this prose right now). model_gen often fixes degenerate-repetition pathologies in steered generations by matching the cvec's fit-time context to the application-time context.">
+        <label for="captureMode">capture</label>
+        <select id="captureMode" style="flex:1; background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:3px; padding:0.25em 0.4em; font:inherit; font-size:0.78rem">
+          <option value="user_end">user_end (prose-after-user)</option>
+          <option value="model_gen">model_gen (mid-generation)</option>
+        </select>
+        <span></span>
+      </div>
       <div style="display:flex; gap:0.4em; margin-top:0.4em">
         <button id="fitBtn" class="primary">fit intervention</button>
         <button id="sampleBtn" title="load default joy-vs-dread pairs">sample</button>
@@ -245,19 +253,31 @@
     </div>
     <div class="lanes" id="lanes">
       <div class="lane baseline" data-lane="off">
-        <div class="hdr"><span>baseline · 0</span><span class="badge" id="badge-off">—</span></div>
+        <div class="hdr">
+          <span>baseline · 0</span>
+          <span><span class="badge" id="badge-off">—</span> <span class="badge" id="ppl-off" title="perplexity of this lane's output under its own intervention config">—</span></span>
+        </div>
         <div class="body" id="body-off"></div>
       </div>
       <div class="lane" data-lane="mid">
-        <div class="hdr"><span>steered · <b id="label-mid">+1.0</b></span><span class="badge" id="badge-mid">—</span></div>
+        <div class="hdr">
+          <span>steered · <b id="label-mid">+1.0</b></span>
+          <span><span class="badge" id="badge-mid">—</span> <span class="badge" id="ppl-mid" title="perplexity">—</span></span>
+        </div>
         <div class="body" id="body-mid"></div>
       </div>
       <div class="lane" data-lane="hi">
-        <div class="hdr"><span>strong · <b id="label-hi">+2.0</b></span><span class="badge" id="badge-hi">—</span></div>
+        <div class="hdr">
+          <span>strong · <b id="label-hi">+2.0</b></span>
+          <span><span class="badge" id="badge-hi">—</span> <span class="badge" id="ppl-hi" title="perplexity">—</span></span>
+        </div>
         <div class="body" id="body-hi"></div>
       </div>
       <div class="lane flipped" data-lane="neg">
-        <div class="hdr"><span>flipped · <b id="label-neg">-1.0</b></span><span class="badge" id="badge-neg">—</span></div>
+        <div class="hdr">
+          <span>flipped · <b id="label-neg">-1.0</b></span>
+          <span><span class="badge" id="badge-neg">—</span> <span class="badge" id="ppl-neg" title="perplexity">—</span></span>
+        </div>
         <div class="body" id="body-neg"></div>
       </div>
     </div>
@@ -371,6 +391,7 @@ function preflightFitBody() {
     positive, negative,
     top_p: parseFloat($('topP').value),
     max_components_per_layer: parseInt($('maxK').value),
+    capture_mode: $('captureMode').value,
   };
 }
 
@@ -378,7 +399,8 @@ function preflightFitBody() {
 function refreshFitCurl() {
   showCurl('fitCurl', 'POST', '/v1/control/construct_pca', preflightFitBody());
 }
-for (const id of ['pos','neg','topP','maxK']) $(id).addEventListener('input', refreshFitCurl);
+for (const id of ['pos','neg','topP','maxK','captureMode']) $(id).addEventListener('input', refreshFitCurl);
+$('captureMode').addEventListener('change', refreshFitCurl);
 refreshFitCurl();
 
 // ====================================================================
@@ -585,8 +607,10 @@ async function streamLane(L) {
   s.badgeEl = $('badge-' + L.key);
   s.bodyEl.textContent = '';
   s.pending = ''; s.tokens = 0;
+  s.fullText = '';
   const laneEl = document.querySelector(`.lane[data-lane="${L.key}"]`);
   laneEl.classList.add('running');
+  $('ppl-' + L.key).textContent = '—';
   const body = buildRunBody(L.controlsFn());
   try {
     const resp = await fetch('/v1/chat/completions', {
@@ -616,6 +640,7 @@ async function streamLane(L) {
         if (text) {
           s.pending += text;
           s.tokens += 1;
+          s.fullText += text;
           s.dirty = true;
           scheduleFlush();
         }
@@ -625,6 +650,55 @@ async function streamLane(L) {
     s.bodyEl.textContent = `[stream error] ${e.message || e}`;
   } finally {
     laneEl.classList.remove('running');
+  }
+}
+
+// After a lane finishes, score its completion under its own control set
+// via /v1/perplexity. Returns perplexity + collapsed-positions so the
+// user can see e.g. "lane -1x collapsed 18/28 positions" — the exact
+// collapse signature of the "unblinking unblinking..." pathology.
+async function scoreLane(L) {
+  const s = laneState.get(L.key);
+  if (!s.fullText) return;
+  const prompt = $('prompt').value;
+  // Strip Gemma thought channel markers the same way the UI does
+  // visually so the scored sequence matches what the user sees.
+  const completion = s.fullText
+    .replace(/<\|channel>[\s\S]*?<channel\|>/g, '')
+    .replace(/<turn\|>/g, '')
+    .trim();
+  if (!completion) return;
+  const body = {
+    prompt,
+    completion,
+    controls: L.controlsFn(),
+    top_k: 3,
+  };
+  const pplEl = $('ppl-' + L.key);
+  pplEl.textContent = 'scoring…';
+  try {
+    const r = await fetch('/v1/perplexity', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) { pplEl.textContent = 'score err'; return; }
+    const j = await r.json();
+    const ppl = j.perplexity;
+    const col = j.collapsed_positions;
+    const n = j.completion_tokens;
+    // Color the chip red when collapse fraction is high — that's the
+    // "distribution pinned to one token" pathology that produces
+    // `unblinking unblinking...` style output.
+    const frac = col / Math.max(n, 1);
+    pplEl.style.color = frac > 0.5 ? 'var(--neg)' : frac > 0.25 ? 'var(--eff)' : '#8f5';
+    pplEl.textContent =
+      `ppl=${ppl.toFixed(1)} · col=${col}/${n}`;
+    pplEl.title = `perplexity: ${ppl.toFixed(2)}\n` +
+                  `collapsed positions (top-1 prob > 0.95): ${col}/${n}\n` +
+                  `mean_logprob: ${j.mean_logprob.toFixed(3)}`;
+  } catch (e) {
+    pplEl.textContent = 'score err';
   }
 }
 
@@ -641,7 +715,17 @@ $('runBtn').addEventListener('click', async () => {
       `4 lanes × ${LANES[0].controlsFn ? '(varying intensity)' : ''} · ` +
       `<b>${total}</b> tokens total in ${dt.toFixed(2)}s · ` +
       `<b>${(total / dt).toFixed(0)} tok/s</b> aggregate · ` +
-      `retune intensity and re-run (no re-fit).`;
+      `scoring perplexity…`;
+    // Fire perplexity scoring for all 4 lanes in parallel. Each lane's
+    // completion is scored under its OWN control config — the chip
+    // tells you "what the model thinks of the text it just produced
+    // while steered this way." Collapsed positions > 50% = the
+    // distribution pinned to single tokens (the `unblinking` pathology).
+    await Promise.allSettled(LANES.map(scoreLane));
+    $('runStatus').innerHTML =
+      `4 lanes · <b>${total}</b> tokens in ${dt.toFixed(2)}s · ` +
+      `<b>${(total / dt).toFixed(0)} tok/s agg</b> · ` +
+      `retune intensity or capture mode and re-run.`;
   } catch (e) {
     $('runStatus').textContent = `error: ${e.message || e}`;
   } finally {

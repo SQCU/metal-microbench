@@ -623,6 +623,199 @@ async def control_construct(req: Request) -> JSONResponse:
     })
 
 
+@app.post("/v1/perplexity")
+async def perplexity(req: Request) -> JSONResponse:
+    """Teacher-force a completion under an optional set of intervention
+    controls and return per-token logprobs + top-K alternatives + mean
+    perplexity. The use case is diagnosing steering pathologies: a
+    steered completion that degenerates into token-repetition will
+    show collapsed entropy (top-1 logprob near 0, all alternatives
+    vanishingly small), while a genuinely shifted-but-coherent
+    completion will show a normal entropy profile with a moved mean.
+
+    Implementation: open a session, attach controls if any, submit the
+    prompt (prefill), then walk the completion token-by-token via AR
+    teacher-force: read slot logits → compute log-softmax → record the
+    actual token's logprob + top-K alternatives → set_next_input(
+    completion_token) → tick. One AR step per completion token. With
+    B=4 batching, 4 such calls can run in parallel without slowdown.
+
+    Body:
+      {"prompt":      "...",
+       "completion":  "...",         // text to teacher-force
+       "controls":    [...],         // optional, same shape as chat/completions
+       "chat_template": true,        // default true: wrap prompt in
+                                     // <|turn>user\n...<turn|>\n<|turn>model\n
+                                     // and prefix completion with thought
+                                     // markers so teacher-forced sequence
+                                     // matches what /v1/chat/completions
+                                     // actually emits. Without this, scores
+                                     // are computed on a completely
+                                     // mis-contextualized sequence and come
+                                     // out hugely negative.
+       "temperature": 0.0,
+       "top_k":       5}             // per-position top-K alternatives
+
+    Returns:
+      {"prompt_tokens": N,
+       "completion_tokens": M,
+       "mean_logprob": float,
+       "perplexity": float,
+       "min_logprob": float,
+       "collapsed_positions": int,   // count of positions where top-1 prob > 0.95
+       "tokens": [{"id", "text", "logprob", "top_alternatives": [...]}]}
+    """
+    import numpy as np
+    body = await req.json()
+    prompt = str(body.get("prompt", "")).strip()
+    completion = str(body.get("completion", "")).strip()
+    controls = body.get("controls", []) or []
+    temperature = float(body.get("temperature", 0.0))
+    top_k = int(body.get("top_k", 5))
+    chat_template = bool(body.get("chat_template", True))
+    if not prompt or not completion:
+        raise HTTPException(400, "prompt and completion are both required")
+
+    # When chat_template=True (default), wrap the prompt as a user turn
+    # and prefix the completion with the model-turn + thought-channel
+    # markers that /v1/chat/completions emits. The teacher-forced
+    # sequence then looks exactly like a realistic chat, and logprobs
+    # reflect the model's actual in-context predictions. Without this
+    # the model is being asked to predict raw prose tokens after raw
+    # instruction tokens — a sequence it has never been trained on,
+    # producing catastrophic logprobs (≈ -30 on the first token).
+    if chat_template:
+        prompt_wrapped = f"{GEMMA_TURN_OPEN}user\n{prompt}{GEMMA_TURN_CLOSE}\n{GEMMA_TURN_OPEN}model\n<|channel>thought\n<channel|>"
+        completion_wrapped = completion
+    else:
+        prompt_wrapped = prompt
+        completion_wrapped = completion
+
+    prompt_toks = g.tokenize(prompt_wrapped, add_bos=True)
+    completion_toks = g.tokenize(completion_wrapped, add_bos=False)
+    if not completion_toks:
+        raise HTTPException(400, "completion tokenized to 0 tokens")
+
+    # Flow (no teacher-forcing APIs needed; we just re-submit tokens as
+    # 1-token prefill tiles, using each post-prefill logits buffer):
+    #   1. submit(prompt)                  → logits predict completion[0]
+    #   2. for i in 1..N: submit([c[i-1]]) → logits predict completion[i]
+    # Between submits, drain waits for state to settle back to .generating.
+    # Cost: N 1-token prefill tiles ≈ N * 40ms. Batchable at B=4 if the
+    # UI fires multiple perplexity calls concurrently.
+    #
+    # The session's own post-prefill "sampled first token" is a phantom:
+    # it goes into outputQueue but never K/V-writes, because no AR tick
+    # consumes it before our next submit flips state back to .priming.
+    # maxNewTokens is set wide enough to never hit the generation cap.
+    max_tokens = len(completion_toks) * 2 + 16
+    sid = g.open_session(max_new_tokens=max_tokens)
+    try:
+        if temperature > 0:
+            g.session_set_temperature(sid, temperature)
+        if controls:
+            _attach_controls(sid, controls)
+
+        def score_slot_logits(expected_tok: int) -> tuple[float, list[dict], float]:
+            """Read slot logits, compute log-softmax of `expected_tok`,
+            top-K alts (excluding the expected token), and top-1 prob
+            (for collapse detection)."""
+            raw = g.session_get_slot_logits(sid)
+            arr = np.frombuffer(raw, dtype=np.float16).astype(np.float32)
+            m = arr.max()
+            arr = arr - m
+            lse = float(np.log(np.exp(arr).sum()))
+            logprobs = arr - lse
+            lp = float(logprobs[int(expected_tok)])
+            # argpartition for top (k+1) so we can skip the actual
+            # token without losing a slot.
+            kp = min(top_k + 1, len(logprobs))
+            idx = np.argpartition(-logprobs, kp - 1)[:kp]
+            idx = idx[np.argsort(-logprobs[idx])]
+            alts = []
+            for alt_id in idx:
+                if int(alt_id) == int(expected_tok): continue
+                alts.append({
+                    "id": int(alt_id),
+                    "text": g.detokenize([int(alt_id)]),
+                    "logprob": float(logprobs[int(alt_id)]),
+                })
+                if len(alts) >= top_k: break
+            top1_prob = float(np.exp(float(logprobs[int(idx[0])])))
+            return lp, alts, top1_prob
+
+        def wait_position(target: int, timeout_s: float = 30.0):
+            """Block until session position reaches `target`. The pump
+            ticks the session once per AR step (~30 ms), advancing
+            position by 1 per tick on single-token priming chunks; by
+            qLen=8 per tile on multi-token prefill. Polling position
+            directly sidesteps the state-machine race where a session
+            briefly passes through .generating between ticks."""
+            deadline = time.time() + timeout_s
+            while time.time() < deadline:
+                pos = g.session_position(sid)
+                if pos >= target:
+                    return
+                time.sleep(0.002)
+            raise HTTPException(500,
+                f"session position {g.session_position(sid)} didn't reach "
+                f"target {target} within {timeout_s}s")
+
+        # Submit prompt, wait for prefill → position == len(prompt).
+        g.submit(sid, prompt_toks)
+        target_pos = len(prompt_toks)
+        wait_position(target_pos)
+        # Immediately pause: prevents the pump from firing an unwanted
+        # AR tick on the now-.generating session before we can read
+        # logits and queue the next teacher-forced chunk. Without this,
+        # the pump's ~30 ms tick cadence reliably interleaves between
+        # our "read logits" and "submit next token", shifting positions
+        # and corrupting the scored sequence.
+        g.session_pause(sid)
+
+        per_token = []
+        sum_lp = 0.0
+        min_lp = 0.0
+        collapsed = 0
+        for i, tok in enumerate(completion_toks):
+            # Slot logits now predict the token at position target_pos
+            # (= completion[i]). Read + score while paused.
+            lp, alts, top1 = score_slot_logits(int(tok))
+            sum_lp += lp
+            if lp < min_lp: min_lp = lp
+            if top1 > 0.95: collapsed += 1
+            per_token.append({
+                "id": int(tok),
+                "text": g.detokenize([int(tok)]),
+                "logprob": lp,
+                "top_alternatives": alts,
+            })
+            # Teacher-force the next token: queue it, resume, wait for
+            # position to advance, then re-pause. The pump fires exactly
+            # one AR step (the 1-token chunk below the min=2 fast-prefill
+            # threshold falls to step()) which writes K/V at target_pos
+            # and new logits at target_pos+1.
+            if i + 1 < len(completion_toks):
+                g.submit(sid, [int(tok)])
+                target_pos += 1
+                g.session_resume(sid)
+                wait_position(target_pos)
+                g.session_pause(sid)
+
+        mean_lp = sum_lp / len(completion_toks)
+        return JSONResponse({
+            "prompt_tokens": len(prompt_toks),
+            "completion_tokens": len(completion_toks),
+            "mean_logprob": mean_lp,
+            "perplexity": float(np.exp(-mean_lp)),
+            "min_logprob": min_lp,
+            "collapsed_positions": collapsed,
+            "tokens": per_token,
+        })
+    finally:
+        _close_session(sid)
+
+
 @app.post("/v1/control/construct_pca")
 async def control_construct_pca(req: Request) -> JSONResponse:
     """Fit a control-vector *set* across the whole model. For each layer
@@ -666,6 +859,22 @@ async def control_construct_pca(req: Request) -> JSONResponse:
     top_p = float(body.get("top_p", 0.80))
     max_components_per_layer = int(body.get("max_components_per_layer", 4))
     chat_template = bool(body.get("chat_template", True))
+    # capture_mode controls what "position in context" the residual is
+    # sampled from:
+    #   "user_end"  (default) — example wraps as user prose, residual
+    #                captured at the end of the user turn. Represents
+    #                "the model is ABOUT TO respond to this user text."
+    #   "model_gen" — example wraps as the model having generated the
+    #                prose inside its own turn, residual captured at
+    #                end-of-model-content. Represents "the model IS
+    #                generating this style of prose right now."
+    # The "model_gen" mode closes the context mismatch between where
+    # the cvec was fit (user-prose endpoint) and where it's applied
+    # (mid-model-generation), which often manifests as degenerate token
+    # repetition in small-intensity steered generations.
+    capture_mode = str(body.get("capture_mode", "user_end")).strip()
+    if capture_mode not in ("user_end", "model_gen"):
+        raise HTTPException(400, f"capture_mode must be 'user_end' or 'model_gen'")
     if not id_prefix or not positives or not negatives:
         raise HTTPException(400, "need id_prefix, positive (≥1), negative (≥1)")
     if not (0.0 < top_p <= 1.0):
@@ -676,11 +885,23 @@ async def control_construct_pca(req: Request) -> JSONResponse:
     HIDDEN = 2816
     NUM_LAYERS = 30
 
+    def wrap_for_capture(example: str) -> tuple[str, bool]:
+        """Return (text, use_engine_chat_template).
+        For model_gen mode we build the full template manually (with a
+        generic "write a paragraph:" user turn) and pass the entire
+        string through with chat_template=False so the engine doesn't
+        double-wrap. Captured residual is at end of the model's prose."""
+        if capture_mode == "model_gen":
+            wrapped = (f"{GEMMA_TURN_OPEN}user\nwrite a short paragraph of prose.{GEMMA_TURN_CLOSE}\n"
+                       f"{GEMMA_TURN_OPEN}model\n<|channel>thought\n<channel|>{example}")
+            return wrapped, False
+        return example, chat_template
+
     def capture_stack(examples: list[str]) -> np.ndarray:
-        # Returns [n_examples, NUM_LAYERS, HIDDEN] fp32.
         rows = []
         for ex in examples:
-            blob = g.capture_all_layer_residuals_for_prompt(ex, chat_template=chat_template)
+            text, use_chat = wrap_for_capture(ex)
+            blob = g.capture_all_layer_residuals_for_prompt(text, chat_template=use_chat)
             arr = np.frombuffer(blob, dtype=np.float16).astype(np.float32)
             rows.append(arr.reshape(NUM_LAYERS, HIDDEN))
         return np.stack(rows)

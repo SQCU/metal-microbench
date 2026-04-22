@@ -152,6 +152,22 @@ _lib.gemma_session_clear_controls.restype = C.c_int32
 _lib.gemma_session_set_temperature.argtypes = [C.c_int32, C.c_float]
 _lib.gemma_session_set_temperature.restype = C.c_int32
 
+# Teacher-forcing + logit readback (used by /v1/perplexity).
+_lib.gemma_session_get_slot_logits.argtypes = [C.c_int32, C.POINTER(C.c_uint16)]
+_lib.gemma_session_get_slot_logits.restype = C.c_int32
+
+_lib.gemma_session_set_next_input.argtypes = [C.c_int32, C.c_uint32]
+_lib.gemma_session_set_next_input.restype = C.c_int32
+
+_lib.gemma_session_position.argtypes = [C.c_int32]
+_lib.gemma_session_position.restype = C.c_int32
+
+_lib.gemma_session_pause.argtypes = [C.c_int32]
+_lib.gemma_session_pause.restype = C.c_int32
+
+_lib.gemma_session_resume.argtypes = [C.c_int32]
+_lib.gemma_session_resume.restype = C.c_int32
+
 _lib.gemma_session_release_control.argtypes = [C.c_int32, C.c_char_p]
 _lib.gemma_session_release_control.restype = C.c_int32
 
@@ -529,6 +545,42 @@ def session_clear_controls(sid: int) -> None:
 def session_set_temperature(sid: int, temperature: float) -> None:
     """0 = greedy argmax (engine default). >0 enables softmax sampling."""
     _lib.gemma_session_set_temperature(int(sid), float(temperature))
+
+
+_LOGIT_VOCAB = 262144
+_logit_buf = (C.c_uint16 * _LOGIT_VOCAB)()   # module-scoped scratch — VOCAB fp16
+
+def session_get_slot_logits(sid: int) -> bytes:
+    """Returns VOCAB fp16 logits as raw bytes. Caller converts to numpy.
+    Session must currently own a slot (post-prefill, in generating state)."""
+    n = _lib.gemma_session_get_slot_logits(int(sid), _logit_buf)
+    if n < 0:
+        raise RuntimeError("session has no slot or no logits yet")
+    return bytes(_logit_buf)
+
+
+def session_set_next_input(sid: int, token: int) -> None:
+    """Teacher-force the next AR tick to consume `token` instead of the
+    session's sampled token. Session must be in .generating state."""
+    rc = _lib.gemma_session_set_next_input(int(sid), int(token))
+    if rc < 0:
+        raise RuntimeError(f"set_next_input failed (sid={sid})")
+
+
+def session_position(sid: int) -> int:
+    """Current position (K/V length) of the session. -1 on error."""
+    return int(_lib.gemma_session_position(int(sid)))
+
+
+def session_pause(sid: int) -> None:
+    """Block the pump from ticking this session until resume() is called."""
+    _lib.gemma_session_pause(int(sid))
+
+
+def session_resume(sid: int) -> None:
+    """Re-allow the pump to tick this session (sets state back to .priming
+    so it picks up any queued chunks)."""
+    _lib.gemma_session_resume(int(sid))
 
 def session_release_control(sid: int, cvec_id: str) -> None:
     _lib.gemma_session_release_control(int(sid), cvec_id.encode("utf-8"))

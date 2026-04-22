@@ -426,6 +426,27 @@ final class Session {
     // When state == .generating, the last-sampled token becomes the next
     // step's input; kept separate from the chunk queue for state clarity.
     fileprivate var nextGeneratedInput: UInt32 = 0
+    // Teacher-forcing: override the token that will be fed to the next
+    // AR tick instead of the sampled one. Used by /v1/perplexity to
+    // drive the session through a known completion while reading
+    // logits at each position. Caller is responsible for ensuring the
+    // session is in .generating state when this is set.
+    func forceNextInput(_ token: UInt32) { nextGeneratedInput = token }
+
+    // Pause/resume the session for external orchestration. While
+    // paused, wantsSlot returns false so the scheduler's pump skips
+    // this session during tick(); caller drives progress via submit
+    // + wait_position with no risk of an unwanted interleaved AR tick
+    // overwriting logits between a read and the next submit. Used by
+    // /v1/perplexity to teacher-force a completion one token at a
+    // time under controls without the pump racing past the position
+    // we just scored.
+    func pauseForExternal() {
+        if state == .generating || state == .priming { state = .paused }
+    }
+    func resumeFromExternalPause() {
+        if state == .paused { state = .priming }   // .priming so pump picks up chunks
+    }
     // Next KV-cache write position. k_len after a step == position + 1.
     fileprivate var position: Int = 0
     fileprivate var numGenerated: Int = 0
