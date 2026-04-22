@@ -623,6 +623,151 @@ async def control_construct(req: Request) -> JSONResponse:
     })
 
 
+@app.post("/v1/control/construct_pca")
+async def control_construct_pca(req: Request) -> JSONResponse:
+    """Fit a control-vector *set* across the whole model. For each layer
+    L, compute deltas = positive_residual_L - mean(negative_residual_L)
+    and run SVD on the [P, HIDDEN] matrix. Each (layer, component) pair
+    gets its own eigenvalue. Flatten into one global list, sort by
+    eigenvalue descending, keep the top entries until cumulative ≥
+    top_p × total_variance.
+
+    The output set is a partition of the model's pos-vs-neg variation
+    across layers AND components — a richer story than "steer at layer
+    N", one that doesn't suggest residual streams are layer-local.
+    Typical shape: a handful of (L, 0) PC1s plus a few high-signal
+    (L, 1) PC2s dominate the first ~80% of variance; everything else is
+    noise.
+
+    Body:
+      {"id_prefix":              "joy",      // cvecs registered as "joy-L12-C0", ...
+       "positive":               [...],
+       "negative":               [...],
+       "top_p":                  0.80,       // cumulative-variance threshold (default 0.80)
+       "max_components_per_layer": 4,        // hard cap (default 4; full rank is min(P,H))
+       "chat_template":          true}
+
+    Returns:
+      {"components": [{layer, component, eigenvalue, fraction,
+                       cumulative, cvec_id, scale}, ...],
+       "total_variance", "captured_variance", "captured_fraction",
+       "top_p", "all_eigenvalues": [[ev per component] per layer]}
+
+    `scale` is eigenvalue / max_eigenvalue — apply these as the
+    peakMagnitude of each attached ActiveControl to preserve the
+    relative importance structure PCA gave us. A single user-facing
+    intensity multiplier on top of these scales is all you should need.
+    """
+    import numpy as np
+    body = await req.json()
+    id_prefix = str(body.get("id_prefix", "")).strip()
+    positives = [str(x) for x in (body.get("positive") or []) if str(x).strip()]
+    negatives = [str(x) for x in (body.get("negative") or []) if str(x).strip()]
+    top_p = float(body.get("top_p", 0.80))
+    max_components_per_layer = int(body.get("max_components_per_layer", 4))
+    chat_template = bool(body.get("chat_template", True))
+    if not id_prefix or not positives or not negatives:
+        raise HTTPException(400, "need id_prefix, positive (≥1), negative (≥1)")
+    if not (0.0 < top_p <= 1.0):
+        raise HTTPException(400, "top_p must be in (0, 1]")
+    if max_components_per_layer < 1:
+        raise HTTPException(400, "max_components_per_layer must be ≥ 1")
+
+    HIDDEN = 2816
+    NUM_LAYERS = 30
+
+    def capture_stack(examples: list[str]) -> np.ndarray:
+        # Returns [n_examples, NUM_LAYERS, HIDDEN] fp32.
+        rows = []
+        for ex in examples:
+            blob = g.capture_all_layer_residuals_for_prompt(ex, chat_template=chat_template)
+            arr = np.frombuffer(blob, dtype=np.float16).astype(np.float32)
+            rows.append(arr.reshape(NUM_LAYERS, HIDDEN))
+        return np.stack(rows)
+
+    pos = capture_stack(positives)   # [P, L, D]
+    neg = capture_stack(negatives)   # [N, L, D]
+    P = pos.shape[0]
+
+    # Per-layer SVD. deltas_L[i] = pos_L[i] - mean(neg_L); we do NOT
+    # mean-center deltas because PC1 should align with the class-mean
+    # direction (the primary steering direction), and mean-centering
+    # would project that out. PC2+ then capture variation *around* PC1
+    # — fine-grained sub-directions within the "positive" class.
+    max_k = min(max_components_per_layer, P)
+    all_components = []   # (layer, k, eigenvalue, unit_direction)
+    per_layer_eigenvalues: list[list[float]] = []
+    for L in range(NUM_LAYERS):
+        deltas = pos[:, L, :] - neg[:, L, :].mean(axis=0, keepdims=True)  # [P, D]
+        # SVD: deltas = U @ diag(s) @ Vt; Vt[k] is the kth principal
+        # direction; s[k]^2 is the corresponding eigenvalue (variance).
+        try:
+            _, s, Vt = np.linalg.svd(deltas, full_matrices=False)
+        except np.linalg.LinAlgError:
+            per_layer_eigenvalues.append([0.0] * max_k)
+            continue
+        eigs = (s ** 2).tolist()
+        per_layer_eigenvalues.append(eigs[:max_k] + [0.0] * max(0, max_k - len(eigs)))
+        for k in range(min(max_k, len(s))):
+            if eigs[k] <= 1e-9: continue
+            all_components.append((L, k, float(eigs[k]), Vt[k].astype(np.float32)))
+
+    if not all_components:
+        raise HTTPException(400, "no non-degenerate components — positive and "
+                                 "negative sets produce no separable variation")
+
+    # Global sort by eigenvalue, truncate at cumulative top_p.
+    all_components.sort(key=lambda t: t[2], reverse=True)
+    total = sum(ev for _, _, ev, _ in all_components)
+    kept: list[tuple[int, int, float, np.ndarray]] = []
+    running = 0.0
+    for comp in all_components:
+        if running / total >= top_p:
+            break
+        kept.append(comp)
+        running += comp[2]
+    captured_fraction = running / total if total > 0 else 0.0
+
+    # Register each kept component. scale = eigenvalue / top_eigenvalue.
+    max_ev = kept[0][2] if kept else 1.0
+    out_components = []
+    cum = 0.0
+    for (L, k, ev, v) in kept:
+        cvec_id = f"{id_prefix}-L{L:02d}-C{k}"
+        g.control_register_fp16(cvec_id, v.astype(np.float16).tobytes())
+        cum += ev
+        out_components.append({
+            "layer": L,
+            "component": k,
+            "eigenvalue": ev,
+            "fraction": ev / total if total > 0 else 0.0,
+            "cumulative": cum / total if total > 0 else 0.0,
+            "cvec_id": cvec_id,
+            "scale": ev / max_ev,
+        })
+
+    return JSONResponse({
+        "id_prefix": id_prefix,
+        "top_p": top_p,
+        "max_components_per_layer": max_components_per_layer,
+        "positive_count": len(positives),
+        "negative_count": len(negatives),
+        "total_variance": total,
+        "captured_variance": running,
+        "captured_fraction": captured_fraction,
+        "components": out_components,
+        # Full grid so the UI can render a [NUM_LAYERS × max_components_per_layer]
+        # heatmap of every (layer, component_rank) eigenvalue, highlighting
+        # the ones that made the top-p cut vs the ones that didn't.
+        "all_eigenvalues": per_layer_eigenvalues,
+        "note": ("Each component is a unit direction in residual space at its "
+                 "(layer, component_rank) position. scale = eigenvalue/max — "
+                 "attach the components as a batch of ActiveControls at their "
+                 "listed layers, using scale × your global intensity knob as "
+                 "peakMagnitude. The whole set is one 'intervention'."),
+    })
+
+
 @app.post("/v1/demo/elara-haunt")
 async def demo_elara_haunt() -> JSONResponse:
     """Screen the Elara-direction (at its best layer) as a DETECTOR and

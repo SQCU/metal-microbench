@@ -197,6 +197,56 @@
         / <code>→ effector</code> buttons to build and auto-assign to the matching role.
         <b>raw_norm</b> is a separation-strength readout (higher = more distinct direction).
       </div>
+
+      <h2 style="margin-top:1.0em;color:var(--accent)">fit across model (PCA)</h2>
+      <div class="hint" style="margin-bottom:0.4em">
+        A single-layer cvec treats the residual stream as if the signal lives
+        at one depth. In practice it doesn't — contrastive variation is a
+        <em>pattern across (layer, principal-component) pairs</em>, with some
+        mid-stack layers contributing multiple components and many layers
+        contributing none. This fitter SVDs the pos-minus-neg deltas per
+        layer, flattens every (layer, PC) pair into one ranked list, and
+        keeps the top-K until cumulative eigenvalue crosses your chosen
+        threshold.
+      </div>
+      <div class="row">
+        <label for="pcaPrefix">id prefix</label>
+        <input type="text" id="pcaPrefix" value="pca-fit" placeholder="e.g. joy-pca">
+      </div>
+      <div class="row">
+        <label for="pcaTopP">top-p</label>
+        <input type="range" id="pcaTopP" min="0.5" max="0.99" step="0.01" value="0.8"
+          style="flex:1; min-width:100px">
+        <span id="pcaTopPVal" style="min-width:4em; text-align:right; font-variant-numeric:tabular-nums">0.80</span>
+      </div>
+      <div class="row">
+        <label for="pcaMaxK" title="max components per layer (hard cap; the fitter returns up to min(P, this))">max PCs/layer</label>
+        <input type="number" id="pcaMaxK" min="1" max="10" value="4" style="max-width:5em">
+      </div>
+      <div class="row" style="margin-top:0.4em">
+        <button id="pcaFitBtn">fit across model</button>
+        <label style="margin-left:0.6em"><input type="checkbox" id="pcaUse" disabled> use PCA fit for run</label>
+      </div>
+      <div class="hint" id="pcaStatus" style="margin-top:0.3em">uses the same positive/negative pairs as <code>construct from pairs</code> above. fit runs one forward pass per example; ~4s for 5+5 pairs on M5 Max.</div>
+      <div id="pcaResultsPanel" style="margin-top:0.5em; display:none">
+        <div class="hint" id="pcaSummary" style="margin-bottom:0.3em">—</div>
+        <div id="pcaHeatmap" style="display:grid; gap:1px; background:#000; padding:1px; border-radius:2px;"></div>
+        <div class="hint" style="margin-top:0.3em; font-size:0.66rem">
+          rows = layers (top-down 0..29) · columns = component rank (PC1, PC2, …) ·
+          brightness = eigenvalue fraction · <span style="color:#ffde47">yellow outline</span>
+          = made the top-p cut and is registered as a cvec · hover for (L, k, ev) detail.
+        </div>
+        <div class="row" style="margin-top:0.4em">
+          <label for="pcaIntensity">global intensity</label>
+          <input type="range" id="pcaIntensity" min="0" max="3" step="0.1" value="1.0"
+            style="flex:1; min-width:100px">
+          <span id="pcaIntensityVal" style="min-width:4em; text-align:right; font-variant-numeric:tabular-nums">1.0</span>
+        </div>
+        <div class="hint" style="font-size:0.66rem">
+          each component's peakMagnitude = scale × intensity, where scale = eigenvalue / max_eigenvalue.
+          intensity is the single knob that uniformly scales the whole fit.
+        </div>
+      </div>
     </section>
 
     <section>
@@ -425,6 +475,142 @@ async function buildFromPairs(assignRole = null /* 'detector' | 'effector' | nul
 }
 
 $('cxBuildBtn').addEventListener('click', () => buildFromPairs(null));
+
+// ====================================================================
+// PCA fit across the whole model. Uses the same cxPos/cxNeg textareas
+// as the single-layer constructor above, but calls /v1/control/construct_pca
+// which returns a ranked list of (layer, component, eigenvalue, cvec_id)
+// tuples truncated at cumulative top_p.
+// ====================================================================
+const NUM_LAYERS = 30;
+const pcaState = {
+  components: null,       // server-returned list (attached when "use" checked)
+  allEigs: null,          // [NUM_LAYERS][max_k] grid for the heatmap
+  maxComponentsPerLayer: 4,
+  totalVariance: 0,
+  capturedFraction: 0,
+};
+
+$('pcaTopP').addEventListener('input', (e) => {
+  $('pcaTopPVal').textContent = parseFloat(e.target.value).toFixed(2);
+});
+$('pcaIntensity').addEventListener('input', (e) => {
+  $('pcaIntensityVal').textContent = parseFloat(e.target.value).toFixed(1);
+});
+
+$('pcaFitBtn').addEventListener('click', async () => {
+  const positive = $('cxPos').value.split('\n').map(s => s.trim()).filter(Boolean);
+  const negative = $('cxNeg').value.split('\n').map(s => s.trim()).filter(Boolean);
+  if (positive.length < 2 || negative.length < 2) {
+    $('pcaStatus').textContent = 'need ≥2 of each (SVD degenerates on fewer samples)';
+    return;
+  }
+  const id_prefix = $('pcaPrefix').value.trim() || 'pca-fit';
+  const top_p = parseFloat($('pcaTopP').value);
+  const max_components_per_layer = parseInt($('pcaMaxK').value) || 4;
+  pcaState.maxComponentsPerLayer = max_components_per_layer;
+
+  $('pcaFitBtn').disabled = true;
+  $('pcaStatus').textContent =
+    `fitting: ${positive.length + negative.length} forward passes × all ${NUM_LAYERS} layers…`;
+  try {
+    const t0 = performance.now();
+    const resp = await fetch('/v1/control/construct_pca', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id_prefix, positive, negative, top_p, max_components_per_layer }),
+    });
+    const dt = ((performance.now() - t0) / 1000).toFixed(2);
+    if (!resp.ok) {
+      const err = await resp.text();
+      $('pcaStatus').textContent = `error: ${err.slice(0, 240)}`;
+      return;
+    }
+    const j = await resp.json();
+    pcaState.components = j.components;
+    pcaState.allEigs = j.all_eigenvalues;
+    pcaState.totalVariance = j.total_variance;
+    pcaState.capturedFraction = j.captured_fraction;
+
+    $('pcaSummary').innerHTML =
+      `fit in ${dt}s · <b>${j.components.length}</b> components kept across ` +
+      `<b>${new Set(j.components.map(c => c.layer)).size}</b> layers · ` +
+      `captured <b>${(j.captured_fraction * 100).toFixed(1)}%</b> of total variation ` +
+      `(top-p target = ${(top_p * 100).toFixed(0)}%). ` +
+      `each component registered as <code>${id_prefix}-Lxx-Ck</code>.`;
+    renderHeatmap();
+    $('pcaResultsPanel').style.display = 'block';
+    $('pcaUse').disabled = false;
+    $('pcaUse').checked = true;
+  } catch (e) {
+    $('pcaStatus').textContent = `error: ${e.message || e}`;
+  } finally {
+    $('pcaFitBtn').disabled = false;
+    $('pcaStatus').textContent = pcaState.components
+      ? `${pcaState.components.length} components ready · toggle "use PCA fit" + hit run`
+      : 'fit failed';
+  }
+});
+
+function renderHeatmap() {
+  const grid = $('pcaHeatmap');
+  grid.innerHTML = '';
+  const maxK = pcaState.maxComponentsPerLayer;
+  grid.style.gridTemplateColumns = `repeat(${maxK}, 1fr)`;
+  // Kept set (for yellow outline): map (layer, component) → true.
+  const kept = new Set();
+  for (const c of (pcaState.components || [])) {
+    kept.add(`${c.layer}:${c.component}`);
+  }
+  // Max eigenvalue across the whole grid for color scaling.
+  let maxEv = 1e-9;
+  for (const row of pcaState.allEigs) for (const ev of row) {
+    if (ev > maxEv) maxEv = ev;
+  }
+  for (let L = 0; L < NUM_LAYERS; L++) {
+    const row = pcaState.allEigs[L] || [];
+    for (let k = 0; k < maxK; k++) {
+      const ev = row[k] || 0;
+      const intensity = Math.sqrt(ev / maxEv);   // sqrt to boost low cells
+      const hue = 120;  // green
+      const bg = ev > 0
+        ? `hsl(${hue} 60% ${Math.min(60, 8 + intensity * 45)}%)`
+        : '#0a0a0a';
+      const cell = document.createElement('div');
+      cell.style.cssText = `
+        background:${bg}; aspect-ratio:1/1; min-height:11px;
+        border: ${kept.has(`${L}:${k}`) ? '1px solid var(--focus)' : '1px solid transparent'};
+        box-sizing: border-box; cursor:help;
+      `;
+      const evStr = ev > 0 ? ev.toFixed(1) : '—';
+      cell.title = `L${L} PC${k+1}  eigenvalue=${evStr}${kept.has(`${L}:${k}`) ? '  · KEPT' : ''}`;
+      grid.appendChild(cell);
+    }
+  }
+}
+
+// Compose the controls[] array the runBtn handler will send. Returns
+// [] when PCA fit isn't active. Each component becomes one ActiveControl
+// with peakMagnitude = scale × intensity; envelope is flat (full-on for
+// the whole session) so the fit reads as an "always-applied profile."
+// If you want ADSR over a PCA fit, that's a separate UI layer.
+function pcaControlsForRun() {
+  if (!pcaState.components || !$('pcaUse').checked) return null;
+  const intensity = parseFloat($('pcaIntensity').value);
+  const polarity = parseInt($('effPol').value) || 1;
+  return pcaState.components.map(c => ({
+    cvec_id: c.cvec_id,
+    layer: c.layer,
+    polarity,
+    peak_magnitude: c.scale * intensity,
+    attack: 0,
+    decay: 0,
+    sustain_level: 1.0,
+    release: 0,
+    shape: 'linear',
+    units: 'tokens',
+  }));
+}
 $('cxAsDetBtn').addEventListener('click', () => buildFromPairs('detector'));
 $('cxAsEffBtn').addEventListener('click', () => buildFromPairs('effector'));
 
@@ -558,7 +744,17 @@ $('runBtn').addEventListener('click', async () => {
   if ($('detEnabled').checked) {
     body.detectors.push({ name: detName, cvec_id: detId, layer: parseInt($('detLayer').value) });
   }
-  if ($('effEnabled').checked) {
+  // PCA fit wins over single-effector when active: attach the whole
+  // ranked set of (layer, component) interventions instead of one
+  // hand-chosen cvec. The effector section's polarity knob still
+  // applies (sign flip); its ADSR knobs are ignored — the PCA flow
+  // uses a flat-always-on envelope because the concept here is
+  // "ride the fitted intervention through the whole generation,"
+  // not "trigger a transient effect."
+  const pcaControls = pcaControlsForRun();
+  if (pcaControls) {
+    for (const c of pcaControls) body.controls.push(c);
+  } else if ($('effEnabled').checked) {
     body.controls.push({
       cvec_id: effId,
       layer: parseInt($('effLayer').value),
