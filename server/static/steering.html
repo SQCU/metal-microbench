@@ -216,13 +216,19 @@
         <input type="range" id="maxTok" min="20" max="240" step="10" value="80">
         <span class="val" id="maxTokVal">80</span>
       </div>
+      <div class="slider-row">
+        <label for="temperature" title="0 = greedy argmax (deterministic). >0 = softmax sampling (trajectory variation on each re-run).">sampling T</label>
+        <input type="range" id="temperature" min="0" max="1.5" step="0.05" value="0">
+        <span class="val" id="temperatureVal">greedy</span>
+      </div>
       <button id="runBtn" class="primary hot" style="width:100%; margin-top:0.4em" disabled>
         run 4 lanes
       </button>
       <div class="hint" id="runStatus" style="margin-top:0.3em">fit an intervention first.</div>
-      <div class="hint" style="margin-top:0.3em; display:flex; justify-content:space-between">
-        <span>sampling: <b style="color:var(--text)">greedy (argmax)</b></span>
-        <span>lanes: <b style="color:var(--text)">baseline · 1× · 2× · -1×</b></span>
+      <div class="hint" style="margin-top:0.3em">
+        lanes: <b style="color:var(--text)">baseline · 1× · 2× · -1×</b> of intensity ·
+        <b id="samplingMode" style="color:var(--text)">greedy</b> · same prompt across all lanes.
+        at T=0 lanes are deterministic; set T&gt;0 to see trajectory diversity across re-runs.
       </div>
       <div id="runCurl" class="curl-hint" style="display:none"></div>
     </section>
@@ -319,6 +325,17 @@ for (const [id, digits] of [['topP', 2], ['maxK', 0], ['intensity', 1], ['maxTok
   };
   el.addEventListener('input', upd); upd();
 }
+// Temperature slider has a non-numeric label at T=0 (shows "greedy")
+// to make the greedy/argmax default unmistakable in the UI.
+function updateTempLabel() {
+  const t = parseFloat($('temperature').value);
+  const label = t <= 0 ? 'greedy' : t.toFixed(2);
+  $('temperatureVal').textContent = label;
+  $('samplingMode').textContent =
+    t <= 0 ? 'greedy (argmax)' : `softmax T=${t.toFixed(2)}`;
+}
+$('temperature').addEventListener('input', () => { updateTempLabel(); refreshRunCurl(); });
+updateTempLabel();
 
 // --- State ---
 const fit = {
@@ -488,16 +505,19 @@ function buildControlsAt(intensity) {
 }
 
 function buildRunBody(controls) {
-  return {
+  const t = parseFloat($('temperature').value);
+  const body = {
     model: 'gemma-4-a4b-q4km',
     max_tokens: parseInt($('maxTok').value),
     stream: true,
     messages: [{ role: 'user', content: $('prompt').value }],
     controls,
-    // Sampling config left out of the request body → engine default is
-    // greedy argmax (bootstrap.swift:step() picks bestI by logit max).
-    // If/when the engine grows a sampling path, pass it here.
   };
+  // Only include temperature when non-zero so the curl hint stays clean
+  // for the default greedy case — matches how the engine treats
+  // missing/zero identically (falls through to argmax).
+  if (t > 0) body.temperature = t;
+  return body;
 }
 
 function refreshRunCurl() {
@@ -509,10 +529,14 @@ function refreshRunCurl() {
   showCurl('runCurl', 'POST', '/v1/chat/completions', {...steered, stream: false});
   // Append a comment line describing the fan-out.
   const el = $('runCurl');
+  const t = parseFloat($('temperature').value);
+  const samplingNote = t > 0
+    ? `# sampling: softmax T=${t.toFixed(2)} — each lane + each re-run produces a distinct trajectory.`
+    : `# sampling: greedy argmax (T=0) — deterministic; lane differences are pure intervention-driven.`;
   el.textContent = el.textContent +
     `\n\n# fired in parallel × 4 lanes with peak_magnitude scaled by [0, 1x, 2x, -1x]` +
     ` of your intensity ${parseFloat($('intensity').value).toFixed(1)}.` +
-    `\n# greedy sampling (engine default) — no temperature/top_p/top_k params needed.`;
+    `\n${samplingNote}`;
 }
 for (const id of ['prompt','maxTok','intensity']) {
   $(id).addEventListener('input', () => { refreshRunCurl(); updateLaneLabels(); });

@@ -1175,6 +1175,10 @@ async def chat_completions(req: Request) -> Any:
     controls = body.get("controls", []) or []
     detectors = body.get("detectors", []) or []
     triggers = body.get("triggers", []) or []
+    # Sampling: 0 (default) = greedy argmax; >0 = stochastic softmax.
+    # No top-p/top-k yet — temperature alone already unlocks trajectory
+    # variation under intervention (which is the immediate use case).
+    temperature = float(body.get("temperature", 0.0))
     if not messages:
         raise HTTPException(400, "messages is required")
 
@@ -1183,6 +1187,8 @@ async def chat_completions(req: Request) -> Any:
     # pump thread could tick between open and attach and advance
     # `position` ahead of us.
     sid = g.open_session(max_new_tokens=max_tokens)
+    if temperature > 0:
+        g.session_set_temperature(sid, temperature)
     state = SessionState(sid=sid)
     with _sessions_lock:
         _sessions[sid] = state

@@ -667,6 +667,22 @@ public func gemma_session_clear_controls(_ sid: Int32) -> Int32 {
     return 0
 }
 
+// Session sampling config. temperature=0 is greedy argmax (default,
+// matches prior behavior exactly). Positive values enable stochastic
+// softmax sampling with the session's own RNG — each re-run produces
+// a different trajectory, useful for demonstrating intervention effect
+// as a DISTRIBUTIONAL shift rather than a single argmax-flip. No top-p
+// / top-k filtering yet; temperature alone is enough for visible
+// trajectory diversity at the demo's scale.
+@_cdecl("gemma_session_set_temperature")
+public func gemma_session_set_temperature(_ sid: Int32,
+                                           _ temperature: Float) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let s = gSessions[sid] else { return -1 }
+    s.samplingTemperature = max(0, temperature)
+    return 0
+}
+
 // Signal a control's sustain → release transition (begin the release
 // ramp NOW). Pass the same cvec_id used at add_control time.
 @_cdecl("gemma_session_release_control")

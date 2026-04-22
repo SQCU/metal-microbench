@@ -149,6 +149,9 @@ _lib.gemma_session_add_control.restype = C.c_int32
 _lib.gemma_session_clear_controls.argtypes = [C.c_int32]
 _lib.gemma_session_clear_controls.restype = C.c_int32
 
+_lib.gemma_session_set_temperature.argtypes = [C.c_int32, C.c_float]
+_lib.gemma_session_set_temperature.restype = C.c_int32
+
 _lib.gemma_session_release_control.argtypes = [C.c_int32, C.c_char_p]
 _lib.gemma_session_release_control.restype = C.c_int32
 
@@ -521,6 +524,11 @@ def session_add_control(sid: int, cvec_id: str, layer: int,
 
 def session_clear_controls(sid: int) -> None:
     _lib.gemma_session_clear_controls(int(sid))
+
+
+def session_set_temperature(sid: int, temperature: float) -> None:
+    """0 = greedy argmax (engine default). >0 enables softmax sampling."""
+    _lib.gemma_session_set_temperature(int(sid), float(temperature))
 
 def session_release_control(sid: int, cvec_id: str) -> None:
     _lib.gemma_session_release_control(int(sid), cvec_id.encode("utf-8"))

@@ -191,6 +191,57 @@ final class ActiveControl {
     }
 }
 
+// Sample one token from a logit vector. `temperature == 0` (default) is
+// greedy argmax — same semantics as the old inline loops it replaces;
+// `temperature > 0` does softmax sampling with numerically stable
+// max-subtraction + inverse-CDF draw from the session's RNG. One
+// shared implementation so all 5 sampling sites (AR step, prefill
+// post-sample, multi-slot variants, branch demo) share behavior.
+//
+// No top-p/top-k filtering yet — the immediate use case is "show
+// trajectory variation under intervention," which temperature alone
+// unlocks. Nucleus filtering is a follow-up that requires a partial
+// sort over V=262144 tokens; premature here.
+func sampleTokenFromLogits(_ logP: UnsafePointer<Float16>,
+                            base: Int,
+                            temperature: Float,
+                            rng: inout SystemRandomNumberGenerator) -> UInt32 {
+    if temperature <= 0 {
+        var bestI = 0
+        var bestV: Float = -.infinity
+        for v in 0..<VOCAB {
+            let x = Float(logP[base + v])
+            if x > bestV { bestV = x; bestI = v }
+        }
+        return UInt32(bestI)
+    }
+    // Softmax with max-shift. Find max, then exponentiate + accumulate.
+    let tInv: Float = 1.0 / temperature
+    var m: Float = -.infinity
+    for v in 0..<VOCAB {
+        let x = Float(logP[base + v]) * tInv
+        if x > m { m = x }
+    }
+    var sumExp: Float = 0
+    // Re-scan: compute exp(x - m), accumulate into sum, and build a
+    // running CDF target for inverse sampling in the same pass. We
+    // draw `r ∈ [0, sumExp)` up front and walk forward until the
+    // running cumulative crosses r — no VOCAB-sized scratch needed.
+    let r = Float.random(in: 0..<1, using: &rng)
+    // But we don't know sumExp yet without scanning, so do two passes:
+    // pass 1 to compute sumExp; pass 2 to inverse-CDF sample.
+    for v in 0..<VOCAB {
+        sumExp += expf(Float(logP[base + v]) * tInv - m)
+    }
+    let target = r * sumExp
+    var cum: Float = 0
+    for v in 0..<VOCAB {
+        cum += expf(Float(logP[base + v]) * tInv - m)
+        if cum >= target { return UInt32(v) }
+    }
+    return UInt32(VOCAB - 1)
+}
+
 // Pure-function digest over the cvec state that touches a given page's
 // position range. Extracted from Session so the digest is testable in
 // isolation (no engine/weights required) and so a future RL trainer can
@@ -341,6 +392,12 @@ final class Session {
     var slot: Int?
     let eosId: UInt32
     var maxNewTokens: Int
+    // Sampling temperature. 0 (default) = greedy argmax, preserving
+    // deterministic behavior for cache-replay + steering-comparison
+    // demos. Positive values enable softmax sampling with the session's
+    // own RNG (trajectory variation visible across re-runs).
+    var samplingTemperature: Float = 0.0
+    fileprivate var rng = SystemRandomNumberGenerator()
     fileprivate weak var engine: LmEngine?
 
     fileprivate(set) var state: SessionState = .idle
@@ -1120,12 +1177,9 @@ final class LmEngine {
             guard let sid = slotAssignment[slot],
                   let s = residentSessions[sid], s.state.isBusy else { continue }
             let base = slot * VOCAB
-            var bestI = 0; var bestV: Float = -.infinity
-            for v in 0..<VOCAB {
-                let x = Float(logP[base + v])
-                if x > bestV { bestV = x; bestI = v }
-            }
-            let sampled = UInt32(bestI)
+            let sampled = sampleTokenFromLogits(logP, base: base,
+                                                 temperature: s.samplingTemperature,
+                                                 rng: &s.rng)
             s.position += 1
 
             if s.state == .priming {
@@ -1335,12 +1389,9 @@ final class LmEngine {
         if s.chunkQueue.isEmpty {
             let base = sslot * VOCAB
             let logP = logits.contents().assumingMemoryBound(to: Float16.self)
-            var bestI = 0; var bestV: Float = -.infinity
-            for v in 0..<VOCAB {
-                let x = Float(logP[base + v])
-                if x > bestV { bestV = x; bestI = v }
-            }
-            let sampled = UInt32(bestI)
+            let sampled = sampleTokenFromLogits(logP, base: base,
+                                                 temperature: s.samplingTemperature,
+                                                 rng: &s.rng)
             s.state = .generating
             s.outputQueue.append(sampled)
             s.consumedTokens.append(sampled)
@@ -1536,12 +1587,9 @@ final class LmEngine {
             if s.chunkQueue.isEmpty {
                 let base = b * VOCAB
                 let logP = logits.contents().assumingMemoryBound(to: Float16.self)
-                var bestI = 0; var bestV: Float = -.infinity
-                for v in 0..<VOCAB {
-                    let x = Float(logP[base + v])
-                    if x > bestV { bestV = x; bestI = v }
-                }
-                let sampled = UInt32(bestI)
+                let sampled = sampleTokenFromLogits(logP, base: base,
+                                                     temperature: s.samplingTemperature,
+                                                     rng: &s.rng)
                 s.state = .generating
                 s.outputQueue.append(sampled)
                 s.consumedTokens.append(sampled)
@@ -1687,12 +1735,9 @@ final class LmEngine {
             if s.chunkQueue.isEmpty {
                 let base = b * VOCAB
                 let logP = logits.contents().assumingMemoryBound(to: Float16.self)
-                var bestI = 0; var bestV: Float = -.infinity
-                for v in 0..<VOCAB {
-                    let x = Float(logP[base + v])
-                    if x > bestV { bestV = x; bestI = v }
-                }
-                let sampled = UInt32(bestI)
+                let sampled = sampleTokenFromLogits(logP, base: base,
+                                                     temperature: s.samplingTemperature,
+                                                     rng: &s.rng)
                 s.state = .generating
                 s.outputQueue.append(sampled)
                 s.consumedTokens.append(sampled)
