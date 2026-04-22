@@ -623,6 +623,68 @@ async def control_construct(req: Request) -> JSONResponse:
     })
 
 
+@app.post("/v1/tokenize")
+async def tokenize_endpoint(req: Request) -> JSONResponse:
+    """Diagnostic: tokenize a raw string, return [{id, text}] pairs so
+    callers can verify the Gemma-4 chat template special-tokens
+    (<|turn>, <turn|>, <|channel>, <channel|>) map to single special-
+    token IDs rather than being split into surface-char subtokens.
+    Body: {"text": "...", "add_bos": false}"""
+    body = await req.json()
+    text = str(body.get("text", ""))
+    add_bos = bool(body.get("add_bos", False))
+    toks = g.tokenize(text, add_bos=add_bos)
+    out = [{"id": int(t), "text": g.detokenize([int(t)])} for t in toks]
+    return JSONResponse({"tokens": out, "count": len(toks)})
+
+
+@app.post("/v1/detokenize")
+async def detokenize_endpoint(req: Request) -> JSONResponse:
+    """Diagnostic: given a list of token IDs, return the string each
+    one detokenizes to. Lets callers probe what ID 106 (eos) or ID 2
+    (bos) actually look like as strings."""
+    body = await req.json()
+    ids = body.get("ids") or []
+    out = [{"id": int(t), "text": g.detokenize([int(t)])} for t in ids]
+    return JSONResponse({"tokens": out})
+
+
+@app.post("/v1/raw_generate")
+async def raw_generate(req: Request) -> JSONResponse:
+    """Diagnostic: submit a raw token-ID list (bypassing chat-template
+    construction) and greedily generate up to max_tokens new tokens.
+    Lets callers A/B test whether constructing a prompt with actual
+    special-token IDs (105 = <|turn>, 106 = <turn|>, etc.) vs their
+    surface-string forms ('<|turn>' → 4 subtoken IDs) produces
+    materially different generation.
+    Body: {"token_ids": [2, 105, ...], "max_tokens": 64}"""
+    body = await req.json()
+    token_ids = [int(x) for x in body.get("token_ids", [])]
+    max_tokens = int(body.get("max_tokens", 64))
+    if not token_ids:
+        raise HTTPException(400, "token_ids required")
+    sid = g.open_session(max_new_tokens=max_tokens)
+    try:
+        g.submit(sid, token_ids)
+        out_ids: list[int] = []
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            out_ids.extend(g.poll(sid, 64))
+            if g.session_state(sid) == g.STATE_DONE:
+                out_ids.extend(g.poll(sid, 64))
+                break
+            await asyncio.sleep(0.02)
+        text = g.detokenize(out_ids)
+        return JSONResponse({
+            "prompt_tokens": len(token_ids),
+            "output_tokens": len(out_ids),
+            "output_token_ids": out_ids,
+            "output_text": text,
+        })
+    finally:
+        _close_session(sid)
+
+
 @app.post("/v1/perplexity")
 async def perplexity(req: Request) -> JSONResponse:
     """Teacher-force a completion under an optional set of intervention
