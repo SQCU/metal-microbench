@@ -680,50 +680,97 @@ async function streamLane(L) {
   }
 }
 
-// After a lane finishes, score its completion under its own control set
-// via /v1/perplexity. Returns perplexity + collapsed-positions so the
-// user can see e.g. "lane -1x collapsed 18/28 positions" — the exact
-// collapse signature of the "unblinking unblinking..." pathology.
+// After a lane finishes, score its completion TWO ways and show the
+// delta:
+//   self-ppl:     perplexity under the lane's own controls (how
+//                 predictable is this text to the steered model)
+//   baseline-ppl: perplexity under NO controls (how surprised is the
+//                 unsteered model by this steered text)
+// Δ = base - self is the direct measure of intervention strength. If
+// Δ is small, the fitted direction barely moved the distribution —
+// autoregressive rollout re-anchoring washed out the cvec's push,
+// and the output is essentially what the baseline would have produced.
+// If Δ is large, the steered trajectory lives in a region the
+// baseline finds unlikely: the intervention survived the rollout.
+//
+// Per user: single-position "cvec flip the argmax" demos cheat —
+// they don't let rollout re-anchoring happen. Δ in a full-rollout
+// setting is the honest metric, and it's typically smaller than the
+// memetic folklore suggests, which is itself an interesting finding
+// about how LMs behave as AR machines vs bigram-like predictors.
 async function scoreLane(L) {
   const s = laneState.get(L.key);
   if (!s.fullText) return;
   const prompt = $('prompt').value;
-  // Strip Gemma thought channel markers the same way the UI does
-  // visually so the scored sequence matches what the user sees.
   const completion = s.fullText
     .replace(/<\|channel>[\s\S]*?<channel\|>/g, '')
     .replace(/<turn\|>/g, '')
     .trim();
   if (!completion) return;
-  const body = {
-    prompt,
-    completion,
-    controls: L.controlsFn(),
-    top_k: 3,
-  };
   const pplEl = $('ppl-' + L.key);
   pplEl.textContent = 'scoring…';
+  const laneControls = L.controlsFn();
+  // Fire self + baseline in parallel — engine batches them at B=4.
+  const selfReq = fetch('/v1/perplexity', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt, completion, controls: laneControls, top_k: 3 }),
+  });
+  const baseReq = (laneControls && laneControls.length > 0)
+    ? fetch('/v1/perplexity', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt, completion, controls: [], top_k: 3 }),
+      })
+    : null;
   try {
-    const r = await fetch('/v1/perplexity', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) { pplEl.textContent = 'score err'; return; }
-    const j = await r.json();
-    const ppl = j.perplexity;
-    const col = j.collapsed_positions;
-    const n = j.completion_tokens;
-    // Color the chip red when collapse fraction is high — that's the
-    // "distribution pinned to one token" pathology that produces
-    // `unblinking unblinking...` style output.
+    const [selfRes, baseRes] = await Promise.all([
+      selfReq,
+      baseReq || Promise.resolve(null),
+    ]);
+    if (!selfRes.ok) { pplEl.textContent = 'score err'; return; }
+    const selfJ = await selfRes.json();
+    const baseJ = (baseRes && baseRes.ok) ? await baseRes.json() : null;
+    const selfPpl = selfJ.perplexity;
+    const col = selfJ.collapsed_positions;
+    const n = selfJ.completion_tokens;
     const frac = col / Math.max(n, 1);
-    pplEl.style.color = frac > 0.5 ? 'var(--neg)' : frac > 0.25 ? 'var(--eff)' : '#8f5';
-    pplEl.textContent =
-      `ppl=${ppl.toFixed(1)} · col=${col}/${n}`;
-    pplEl.title = `perplexity: ${ppl.toFixed(2)}\n` +
-                  `collapsed positions (top-1 prob > 0.95): ${col}/${n}\n` +
-                  `mean_logprob: ${j.mean_logprob.toFixed(3)}`;
+    let delta = null;
+    let basePpl = null;
+    if (baseJ) {
+      basePpl = baseJ.perplexity;
+      // Use log-perplexity difference so the number is small + additive.
+      // log(base) - log(self) = mean per-token KL-ish quantity.
+      delta = Math.log(basePpl) - Math.log(selfPpl);
+    }
+    // Color: red on collapse, else green/orange gradient on delta
+    // magnitude. Baseline lane (no controls) has no delta — just show
+    // ppl + col.
+    if (frac > 0.5) {
+      pplEl.style.color = 'var(--neg)';
+    } else if (delta !== null) {
+      const ad = Math.abs(delta);
+      pplEl.style.color = ad > 1.0 ? '#8f5' : ad > 0.3 ? '#cc8' : 'var(--mute)';
+    } else {
+      pplEl.style.color = 'var(--mute)';
+    }
+    if (delta !== null) {
+      const sign = delta >= 0 ? '+' : '';
+      pplEl.textContent =
+        `ppl ${selfPpl.toFixed(1)}→${basePpl.toFixed(1)} Δ${sign}${delta.toFixed(2)} col ${col}/${n}`;
+      pplEl.title =
+        `self-perplexity (scored under own controls):  ${selfPpl.toFixed(2)}\n` +
+        `baseline-perplexity (unsteered on same text): ${basePpl.toFixed(2)}\n` +
+        `log Δ = log(base) − log(self): ${delta.toFixed(3)}\n` +
+        `  ≈ mean per-token divergence the intervention survived through AR rollout.\n` +
+        `  large |Δ| = baseline would not have produced this; steering is real.\n` +
+        `  tiny |Δ| = rollout re-anchoring washed the intervention out.\n` +
+        `collapsed positions (top-1 prob > 0.95): ${col}/${n}`;
+    } else {
+      pplEl.textContent = `ppl=${selfPpl.toFixed(1)} · col=${col}/${n}`;
+      pplEl.title =
+        `perplexity: ${selfPpl.toFixed(2)}\n` +
+        `collapsed positions: ${col}/${n}\n` +
+        `(baseline lane — no intervention to compare against)`;
+    }
   } catch (e) {
     pplEl.textContent = 'score err';
   }
