@@ -873,8 +873,23 @@ async def control_construct_pca(req: Request) -> JSONResponse:
     # (mid-model-generation), which often manifests as degenerate token
     # repetition in small-intensity steered generations.
     capture_mode = str(body.get("capture_mode", "user_end")).strip()
-    if capture_mode not in ("user_end", "model_gen"):
-        raise HTTPException(400, f"capture_mode must be 'user_end' or 'model_gen'")
+    if capture_mode not in ("user_end", "model_gen", "rollout"):
+        raise HTTPException(400, f"capture_mode must be 'user_end', 'model_gen', or 'rollout'")
+    # rollout-mode specific knobs. K AR steps per seed. "rollout_prompt"
+    # is the user-turn instruction that precedes each seed; the model
+    # continues the seed + generates K more tokens, and we snap the
+    # all-layer residual at each generated position. Gives PCA a [N*K,
+    # HIDDEN] matrix sampled from the model's generation-time
+    # distribution (vs. the planning/meta-approach endpoint that
+    # user_end and model_gen single-position captures hit). Designed
+    # to avoid the "assistant-persona meta-behavior takeover" the
+    # other modes produce when the fitted direction is applied at
+    # generation time.
+    rollout_depth = int(body.get("rollout_depth", 16))
+    rollout_prompt = str(body.get("rollout_prompt",
+        "Continue the prose in the same style.")).strip()
+    if capture_mode == "rollout" and rollout_depth < 2:
+        raise HTTPException(400, "rollout_depth must be ≥ 2 for capture_mode=rollout")
     if not id_prefix or not positives or not negatives:
         raise HTTPException(400, "need id_prefix, positive (≥1), negative (≥1)")
     if not (0.0 < top_p <= 1.0):
@@ -897,7 +912,61 @@ async def control_construct_pca(req: Request) -> JSONResponse:
             return wrapped, False
         return example, chat_template
 
+    def rollout_residuals(seed: str) -> np.ndarray:
+        """Run rollout_depth AR steps on a seed and capture all-layer
+        residuals at each step. Returns [rollout_depth, NUM_LAYERS,
+        HIDDEN] fp32. Seed is framed as the start of the model's own
+        prose response to a generic continue-the-prose user prompt,
+        so each captured residual reflects the model's generation-time
+        state (conditioned on the seed's tonal class), not its
+        planning-time state. Uses pause/resume to prevent the pump
+        from racing past the position we're about to capture."""
+        wrapped = (f"{GEMMA_TURN_OPEN}user\n{rollout_prompt}{GEMMA_TURN_CLOSE}\n"
+                   f"{GEMMA_TURN_OPEN}model\n<|channel>thought\n<channel|>{seed}")
+        prompt_toks = g.tokenize(wrapped, add_bos=True)
+        sid = g.open_session(max_new_tokens=rollout_depth + 4)
+        try:
+            g.submit(sid, prompt_toks)
+            target_pos = len(prompt_toks)
+            # Poll position until prefill done + post-prefill sample happened.
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                if g.session_position(sid) >= target_pos: break
+                time.sleep(0.002)
+            g.session_pause(sid)
+            # Capture the residual at the end of prefill (first rollout step).
+            rows = np.zeros((rollout_depth, NUM_LAYERS, HIDDEN), dtype=np.float32)
+            rows[0] = np.frombuffer(g.get_all_layer_residuals(),
+                                    dtype=np.float16).astype(np.float32).reshape(NUM_LAYERS, HIDDEN)
+            # Tick K-1 more times; capture each post-tick residual.
+            for k in range(1, rollout_depth):
+                g.session_resume(sid)
+                target_pos += 1
+                d2 = time.time() + 10
+                while time.time() < d2:
+                    if g.session_position(sid) >= target_pos: break
+                    time.sleep(0.002)
+                g.session_pause(sid)
+                rows[k] = np.frombuffer(g.get_all_layer_residuals(),
+                                         dtype=np.float16).astype(np.float32).reshape(NUM_LAYERS, HIDDEN)
+            return rows
+        finally:
+            _close_session(sid)
+
     def capture_stack(examples: list[str]) -> np.ndarray:
+        if capture_mode == "rollout":
+            # Enable capture for the duration; each rollout_residuals
+            # call relies on gAllLayerCaptureBuf being populated every
+            # AR tick. Returns stacked rows with rollout dim flattened.
+            g.set_capture_all_layers(True)
+            try:
+                chunks = [rollout_residuals(ex) for ex in examples]
+                # Stack [n_examples, K, L, D] → [n_examples*K, L, D]
+                stacked = np.concatenate(chunks, axis=0)
+            finally:
+                g.set_capture_all_layers(False)
+            return stacked
+        # user_end / model_gen single-position paths unchanged.
         rows = []
         for ex in examples:
             text, use_chat = wrap_for_capture(ex)

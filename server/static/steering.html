@@ -175,13 +175,19 @@
         <input type="range" id="maxK" min="1" max="8" step="1" value="4">
         <span class="val" id="maxKVal">4</span>
       </div>
-      <div class="slider-row" title="where in a chat context the pos/neg residuals are sampled from. user_end: end of a user turn (the model is about to respond). model_gen: mid-model-generation (the model is producing this prose right now). model_gen often fixes degenerate-repetition pathologies in steered generations by matching the cvec's fit-time context to the application-time context.">
+      <div class="slider-row" title="where in a chat context the pos/neg residuals are sampled from. rollout is most principled: the model continues each seed for K tokens, we capture residuals at every generation step. fits directions sampled from the model's generation-time distribution, avoiding the planning/meta-approach axis that single-position captures pick up.">
         <label for="captureMode">capture</label>
         <select id="captureMode" style="flex:1; background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:3px; padding:0.25em 0.4em; font:inherit; font-size:0.78rem">
-          <option value="user_end">user_end (prose-after-user)</option>
-          <option value="model_gen">model_gen (mid-generation)</option>
+          <option value="rollout" selected>rollout (K gen-steps/seed)</option>
+          <option value="model_gen">model_gen (single, mid-gen)</option>
+          <option value="user_end">user_end (single, prose-after-user)</option>
         </select>
         <span></span>
+      </div>
+      <div class="slider-row" id="rolloutDepthRow">
+        <label for="rolloutDepth" title="K tokens generated per seed when capture_mode=rollout. Higher K gives more samples for PCA (cleaner fit) at linear compute cost (~30ms/step/seed).">rollout K</label>
+        <input type="range" id="rolloutDepth" min="4" max="32" step="2" value="16">
+        <span class="val" id="rolloutDepthVal">16</span>
       </div>
       <div style="display:flex; gap:0.4em; margin-top:0.4em">
         <button id="fitBtn" class="primary">fit intervention</button>
@@ -386,20 +392,35 @@ function showCurl(elId, method, path, body) {
 function preflightFitBody() {
   const positive = $('pos').value.split('\n').map(s => s.trim()).filter(Boolean);
   const negative = $('neg').value.split('\n').map(s => s.trim()).filter(Boolean);
-  return {
+  const body = {
     id_prefix: 'pca-fit',
     positive, negative,
     top_p: parseFloat($('topP').value),
     max_components_per_layer: parseInt($('maxK').value),
     capture_mode: $('captureMode').value,
   };
+  if (body.capture_mode === 'rollout') {
+    body.rollout_depth = parseInt($('rolloutDepth').value);
+  }
+  return body;
 }
+
+// Show/hide the rolloutDepth slider based on capture_mode.
+function refreshRolloutRow() {
+  $('rolloutDepthRow').style.display =
+    $('captureMode').value === 'rollout' ? '' : 'none';
+}
+$('captureMode').addEventListener('change', refreshRolloutRow);
+refreshRolloutRow();
+$('rolloutDepth').addEventListener('input', (e) => {
+  $('rolloutDepthVal').textContent = e.target.value;
+});
 
 // Live-update the fit curl hint whenever inputs change.
 function refreshFitCurl() {
   showCurl('fitCurl', 'POST', '/v1/control/construct_pca', preflightFitBody());
 }
-for (const id of ['pos','neg','topP','maxK','captureMode']) $(id).addEventListener('input', refreshFitCurl);
+for (const id of ['pos','neg','topP','maxK','captureMode','rolloutDepth']) $(id).addEventListener('input', refreshFitCurl);
 $('captureMode').addEventListener('change', refreshFitCurl);
 refreshFitCurl();
 
@@ -414,8 +435,14 @@ $('fitBtn').addEventListener('click', async () => {
     return;
   }
   $('fitBtn').disabled = true;
-  $('fitStatus').textContent =
-    `fitting: ${body.positive.length + body.negative.length} forward passes × ${NUM_LAYERS} layers…`;
+  const N = body.positive.length + body.negative.length;
+  if (body.capture_mode === 'rollout') {
+    $('fitStatus').textContent =
+      `fitting (rollout): ${N} seeds × ${body.rollout_depth} AR steps = ${N * body.rollout_depth} samples, ~${(N * body.rollout_depth * 0.035).toFixed(1)}s…`;
+  } else {
+    $('fitStatus').textContent =
+      `fitting: ${N} forward passes × ${NUM_LAYERS} layers…`;
+  }
   try {
     const t0 = performance.now();
     const r = await fetch('/v1/control/construct_pca', {

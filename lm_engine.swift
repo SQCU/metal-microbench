@@ -437,15 +437,25 @@ final class Session {
     // paused, wantsSlot returns false so the scheduler's pump skips
     // this session during tick(); caller drives progress via submit
     // + wait_position with no risk of an unwanted interleaved AR tick
-    // overwriting logits between a read and the next submit. Used by
-    // /v1/perplexity to teacher-force a completion one token at a
-    // time under controls without the pump racing past the position
-    // we just scored.
+    // overwriting logits between a read and the next submit.
+    //
+    // We remember the state we were in before pausing so resume
+    // restores it exactly. Otherwise: a .generating session with no
+    // chunk queue that we "resume to .priming" would cause AR step
+    // to call popArPrimingToken on an empty queue, get nil, and park
+    // the slot — no position advance, Python's wait_position hangs.
+    fileprivate var pausedStateCache: SessionState? = nil
     func pauseForExternal() {
-        if state == .generating || state == .priming { state = .paused }
+        if state == .generating || state == .priming {
+            pausedStateCache = state
+            state = .paused
+        }
     }
     func resumeFromExternalPause() {
-        if state == .paused { state = .priming }   // .priming so pump picks up chunks
+        if state == .paused {
+            state = pausedStateCache ?? .generating
+            pausedStateCache = nil
+        }
     }
     // Next KV-cache write position. k_len after a step == position + 1.
     fileprivate var position: Int = 0
