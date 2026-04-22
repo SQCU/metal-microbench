@@ -147,6 +147,13 @@ final class ActiveControl {
     let envelope: CvecEnvelope
     let polarity: Float         // +1 or -1 (or arbitrary multiplier)
     let mode: CvecMode          // additive or project
+    // For project-mode controls: the pre-write projection the kernel
+    // measured this tick, before coercing the residual to the target.
+    // This is the representation-engineering "natural activation
+    // level" — what projection the model was heading toward before
+    // our coerce overrode it. Populated by step() after each CB commit
+    // from gProjectMeasureBuf. Unused (nil) for additive mode.
+    var lastProjectMeasurement: Float? = nil
     // start{Position,Turn} are mutable so a gated trigger can RESTART
     // the envelope at an arbitrary later moment without allocating a
     // new ActiveControl. stop fields clear on restart.
@@ -500,7 +507,10 @@ final class Session {
         // Keep as ordered pairs so the JSON serializer has a stable order
         // and clients can correlate sample[i].name with their UI list.
         let detectors: [(name: String, intensity: Float)]
-        let effectors: [(cvecId: String, magnitude: Float)]
+        // effectors now carry a projection field: the pre-write natural
+        // activation level the project-mode kernel measured this tick,
+        // or nil for additive-mode controls.
+        let effectors: [(cvecId: String, magnitude: Float, projection: Float?)]
     }
     fileprivate var pendingSamples: [TokenSample] = []
 
@@ -544,11 +554,15 @@ final class Session {
         var dets: [(name: String, intensity: Float)] = []
         dets.reserveCapacity(detectors.count)
         for d in detectors { dets.append((name: d.name, intensity: d.lastIntensity)) }
-        var effs: [(cvecId: String, magnitude: Float)] = []
+        var effs: [(cvecId: String, magnitude: Float, projection: Float?)] = []
         effs.reserveCapacity(activeControls.count)
         for c in activeControls {
             let m = c.magnitudeAt(position: position, turn: turnIndex)
-            effs.append((cvecId: c.cvecId, magnitude: m))
+            // For project-mode controls, the projection field carries
+            // the pre-write natural activation level. For additive,
+            // projection is nil (the additive kernel doesn't measure).
+            effs.append((cvecId: c.cvecId, magnitude: m,
+                          projection: c.lastProjectMeasurement))
         }
         pendingSamples.append(TokenSample(token: token, position: position,
                                            detectors: dets, effectors: effs))
@@ -562,9 +576,19 @@ final class Session {
         for (i, s) in pendingSamples.enumerated() {
             if i > 0 { out += "," }
             let dets = s.detectors.map { "\"\(jsonEscape($0.name))\":\($0.intensity)" }.joined(separator: ",")
+            // Effectors carry magnitude (scheduled envelope value) +
+            // optional projection (pre-write natural activation,
+            // project-mode only). Projections are serialized under a
+            // separate "projections" key so additive-mode clients that
+            // only parse "effectors" keep working unchanged.
             let effs = s.effectors.map { "\"\(jsonEscape($0.cvecId))\":\($0.magnitude)" }.joined(separator: ",")
+            let projs = s.effectors.compactMap { (cid, _, pr) -> String? in
+                guard let p = pr else { return nil }
+                return "\"\(jsonEscape(cid))\":\(p)"
+            }.joined(separator: ",")
             out += "{\"token\":\(s.token),\"position\":\(s.position),"
-            out += "\"detectors\":{\(dets)},\"effectors\":{\(effs)}}"
+            out += "\"detectors\":{\(dets)},\"effectors\":{\(effs)},"
+            out += "\"projections\":{\(projs)}}"
         }
         out += "]"
         pendingSamples.removeAll(keepingCapacity: true)
@@ -1232,6 +1256,15 @@ final class LmEngine {
         // cross-tick side-chain, no in-CB coupling.
         let intP = gIntensityBuf.contents().bindMemory(to: Float.self,
                                                        capacity: B * MAX_DETECTORS_PER_SLOT)
+        // Project-mode measurement readback: the project kernel writes
+        // the pre-write projection into gProjectMeasureBuf at each
+        // control's measureOutSlot. The staging in step() assigned these
+        // slots by iterating activeControls in order and incrementing a
+        // per-session counter for project-mode controls. We replay the
+        // same iteration to map back from slot index to which
+        // ActiveControl receives the reading.
+        let projP = gProjectMeasureBuf.contents().bindMemory(to: Float.self,
+                                                              capacity: B * MAX_PROJECT_CONTROLS_PER_SLOT)
         let logCvec = ProcessInfo.processInfo.environment["LM_CVEC_LOG"] != nil
         for slot in 0..<B where realSlot[slot] {
             guard let sid = slotAssignment[slot],
@@ -1240,6 +1273,14 @@ final class LmEngine {
             for (i, d) in s.detectors.prefix(MAX_DETECTORS_PER_SLOT).enumerated() {
                 d.prevIntensity = d.lastIntensity
                 d.lastIntensity = intP[base + i]
+            }
+            // Project-mode pre-write projections. Replay staging order.
+            let projBase = slot * MAX_PROJECT_CONTROLS_PER_SLOT
+            var projIdx = 0
+            for c in s.activeControls where c.mode == .project {
+                if projIdx >= MAX_PROJECT_CONTROLS_PER_SLOT { break }
+                c.lastProjectMeasurement = projP[projBase + projIdx]
+                projIdx += 1
             }
             s.evaluateTriggers(position: s.position, turn: s.turnIndex,
                                 log: logCvec ? { print($0) } : nil)
