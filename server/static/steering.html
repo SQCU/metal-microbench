@@ -8,15 +8,13 @@
     color-scheme: dark;
     --bg: #0a0a0a; --panel: #121212; --border: #222;
     --text: #d4d4d4; --mute: #888; --accent: #6a9;
-    --det: #5cf;          /* detector blue */
-    --eff: #fa3;          /* effector orange */
-    --fire: #ffde47;      /* trigger-fire yellow */
-    --pos: #3a7;          /* positive intensity */
-    --neg: #d46;          /* negative intensity */
+    --focus: #ffde47;
+    --pos: #4bc27a; --neg: #d46;
   }
   html, body { margin:0; padding:0; background:var(--bg); color:var(--text);
     font-family: ui-monospace, 'SF Mono', Monaco, monospace; height:100%; }
   body { display:flex; flex-direction:column; height:100vh; overflow:hidden; }
+
   header {
     padding:0.7em 1.2em; border-bottom:1px solid var(--border);
     display:flex; justify-content:space-between; align-items:center;
@@ -26,95 +24,95 @@
   header .status { font-size:0.78rem; color:var(--mute); }
   header a { color:var(--accent); text-decoration:none; margin-left:0.8em; }
 
-  main.viewport {
-    flex:1; min-height:0; overflow:auto; display:grid;
-    grid-template-columns: 340px 1fr;
-    grid-template-rows: 1fr auto;
-    grid-template-areas: "config output" "config chart";
-    gap: 0; min-width:fit-content;
+  main {
+    flex:1; min-height:0; overflow:hidden; display:grid;
+    grid-template-columns: 360px 1fr;
   }
 
   .config {
-    grid-area: config; padding:0.9em; border-right:1px solid var(--border);
-    overflow:auto; background: #0c0c0c;
+    border-right:1px solid var(--border); overflow:auto;
+    background: #0c0c0c; padding:0.9em;
   }
+  .config section { margin-bottom:1em; padding-bottom:0.7em;
+    border-bottom:1px solid #1a1a1a; }
+  .config section:last-of-type { border-bottom:0; }
   .config h2 {
-    margin:0 0 0.5em 0; font-size:0.75rem; color:var(--mute);
+    margin:0 0 0.4em 0; font-size:0.72rem; color:var(--accent);
     text-transform:uppercase; letter-spacing:0.05em; font-weight:500;
   }
-  .config h2.detector { color: var(--det); }
-  .config h2.effector { color: var(--eff); }
-  .config h2.trigger  { color: var(--fire); }
-  .config section { margin-bottom:1.2em; padding-bottom:0.8em;
-    border-bottom:1px solid #1a1a1a; }
-  .config .row { display:flex; gap:0.4em; align-items:center; margin:0.3em 0; }
-  .config label { color:var(--mute); font-size:0.72rem; flex:0 0 6.5em; }
-  .config input, .config select, .config textarea {
+  .config label { color:var(--mute); font-size:0.72rem; }
+  .config textarea, .config input[type=text] {
     background:var(--panel); color:var(--text); border:1px solid var(--border);
-    border-radius:3px; padding:0.3em 0.4em; font:inherit; font-size:0.78rem;
-    flex:1; min-width:0;
+    border-radius:3px; padding:0.35em 0.45em; font:inherit; font-size:0.78rem;
+    width:100%; box-sizing:border-box; resize:vertical;
   }
-  .config textarea { width:100%; box-sizing:border-box; min-height:3.5em;
-    resize:vertical; font-size:0.82rem; }
-  .config .slider-row { display:flex; gap:0.3em; align-items:center; margin:0.25em 0; }
-  .config .slider-row label { flex:0 0 5em; }
-  .config .slider-row input[type=range] { flex:1; }
-  .config .slider-row .val { flex:0 0 3.5em; text-align:right; color:var(--text); font-size:0.75rem; }
-  .config button {
+  .config textarea { min-height:4em; font-size:0.74rem; line-height:1.4; }
+  .config textarea.prose { min-height:5.5em; }
+  .slider-row { display:grid; grid-template-columns: 5.5em 1fr 3.5em;
+    gap:0.4em; align-items:center; margin:0.35em 0; font-size:0.74rem; }
+  .slider-row input[type=range] { width:100%; }
+  .slider-row .val { text-align:right; color:var(--text); font-variant-numeric:tabular-nums; }
+
+  button {
     background:#1a2030; color:var(--text); border:1px solid var(--border);
-    border-radius:3px; padding:0.35em 0.7em; font:inherit; font-size:0.8rem;
+    border-radius:3px; padding:0.4em 0.9em; font:inherit; font-size:0.8rem;
     cursor:pointer;
   }
-  .config button.primary {
-    background:var(--det); color:#002; font-weight:700; border:0; padding:0.5em 1em;
+  button:hover:not(:disabled) { background:#2a3040; }
+  button:disabled { opacity:0.45; cursor:not-allowed; }
+  button.primary {
+    background:var(--accent); color:#002; font-weight:700; border:0;
+    padding:0.55em 1.1em; font-size:0.85rem;
   }
-  .config button.primary:disabled { background:#444; color:var(--mute); cursor:not-allowed; }
-  .config .hint { font-size:0.68rem; color:var(--mute); margin-top:0.2em; line-height:1.4; }
+  button.primary.hot { background: var(--focus); color:#202; }
+  .hint { font-size:0.68rem; color:var(--mute); line-height:1.45; margin-top:0.3em; }
+  .hint code { background:#1a1a1a; padding:0 0.25em; border-radius:2px; color:var(--text); }
 
-  .output {
-    grid-area: output; overflow:auto; padding:0.9em 1.2em;
-    font-size:0.92rem; line-height:1.8;
+  /* Heatmap of (layer × component_rank). */
+  .heatmap {
+    display:grid; grid-template-columns: 2em 1fr; gap:0.3em;
+    margin-top:0.4em; font-size:0.6rem;
   }
+  .heatmap .axis-y { display:flex; flex-direction:column;
+    justify-content:space-between; color:var(--mute); padding-right:0.1em; }
+  .heatmap .cells { display:grid; gap:1px; background:#000; padding:1px;
+    border-radius:2px; }
+  .heatmap .cell { aspect-ratio:1/1; min-height:8px; box-sizing:border-box;
+    border:1px solid transparent; cursor:help; }
+  .heatmap .cell.kept { border-color: var(--focus); }
+  .heatmap .xlabel { grid-column: 2; color:var(--mute); font-size:0.6rem;
+    padding-top:0.2em; display:flex; justify-content:space-around; }
+
+  /* Output area. */
+  .output { overflow:auto; padding:1em 1.4em; font-size:0.95rem; line-height:1.7; }
   .output .system {
-    font-size:0.74rem; color:var(--mute); margin-bottom:0.6em;
-    padding:0.3em 0.5em; background:var(--panel); border-left:3px solid var(--accent);
+    font-size:0.74rem; color:var(--mute); margin-bottom:0.8em;
+    padding:0.4em 0.6em; background:var(--panel); border-left:3px solid var(--accent);
     border-radius:2px;
   }
   .output .tokens {
-    font-family: ui-monospace, 'SF Mono', Monaco, monospace;
     white-space:pre-wrap; word-break:break-word;
+    font-family: ui-monospace, 'SF Mono', Monaco, monospace;
   }
-  .output .tok {
-    padding: 1px 2px; border-radius: 2px; position:relative;
-    transition: background 0.15s;
+  .output .tokens .tok {
+    padding: 1px 2px; border-radius: 2px; transition: background 0.1s;
   }
-  .output .tok.fire {
-    border-bottom: 2px solid var(--fire);
-  }
-  .output .tok:hover {
-    outline: 1px solid var(--accent);
-  }
+  .output .tokens .tok:hover { outline: 1px solid var(--accent); }
 
-  .chart {
-    grid-area: chart; border-top:1px solid var(--border);
-    background:#0c0c0c; padding:0.5em 1em 0.8em 1em; height: 220px;
-    overflow:hidden;
+  /* Curl hint — what the UI is doing on the wire. */
+  .curl-hint {
+    font-family: ui-monospace, 'SF Mono', Monaco, monospace;
+    font-size:0.68rem; background:#050505; color:#8aa; padding:0.5em 0.7em;
+    border-radius:3px; border:1px solid #1a1a1a; margin-top:0.4em;
+    white-space:pre-wrap; word-break:break-all; overflow:auto; max-height:6em;
   }
-  .chart h2 {
-    margin:0 0 0.3em 0; font-size:0.72rem; color:var(--mute);
-    text-transform:uppercase; letter-spacing:0.05em; font-weight:500;
-  }
-  .chart canvas { width:100%; height: calc(100% - 1.6em); display:block; }
 
   footer {
-    padding:0.4em 1em; border-top:1px solid var(--border); flex:none;
-    font-size:0.72rem; color:var(--mute); display:flex; gap:1.4em;
+    padding:0.4em 1.2em; border-top:1px solid var(--border); flex:none;
+    font-size:0.72rem; color:var(--mute); display:flex; gap:1.2em;
     flex-wrap:wrap; align-items:center;
   }
   footer .stat b { color:var(--text); font-weight:500; }
-  footer .stat.det b { color: var(--det); }
-  footer .stat.eff b { color: var(--eff); }
-  footer .stat.fire b { color: var(--fire); }
 </style>
 </head>
 <body>
@@ -131,651 +129,336 @@
   </div>
 </header>
 
-<main class="viewport">
+<main>
 
   <aside class="config">
+
     <section>
-      <h2>prompt</h2>
-      <textarea id="prompt">Describe a cat in three sentences.</textarea>
-      <div class="row" style="margin-top:0.3em">
+      <h2>contrastive pairs</h2>
+      <label class="hint">positive prose (one per line, ≥2):</label>
+      <textarea id="pos" class="prose" rows="4"></textarea>
+      <label class="hint" style="display:block;margin-top:0.4em">negative prose:</label>
+      <textarea id="neg" class="prose" rows="4"></textarea>
+      <div class="slider-row">
+        <label for="topP">top-p</label>
+        <input type="range" id="topP" min="0.50" max="0.99" step="0.01" value="0.80">
+        <span class="val" id="topPVal">0.80</span>
+      </div>
+      <div class="slider-row">
+        <label for="maxK" title="max components per layer">max PCs/L</label>
+        <input type="range" id="maxK" min="1" max="8" step="1" value="4">
+        <span class="val" id="maxKVal">4</span>
+      </div>
+      <div style="display:flex; gap:0.4em; margin-top:0.4em">
+        <button id="fitBtn" class="primary">fit intervention</button>
+        <button id="sampleBtn" title="load default joy-vs-dread pairs">sample</button>
+      </div>
+      <div class="hint" id="fitStatus" style="margin-top:0.3em">
+        click <b>sample</b> for defaults, then <b>fit intervention</b> (≈4s). the whole intervention is one POST: <code>/v1/control/construct_pca</code>.
+      </div>
+      <div id="fitCurl" class="curl-hint" style="display:none"></div>
+    </section>
+
+    <section id="interventionSection" style="display:none">
+      <h2>intervention <span id="fitSummary" style="text-transform:none;color:var(--mute);font-weight:400;font-size:0.68rem"></span></h2>
+      <div class="heatmap">
+        <div class="axis-y" id="heatmapYaxis"></div>
+        <div>
+          <div class="cells" id="heatmapCells"></div>
+          <div class="xlabel" id="heatmapXaxis"></div>
+        </div>
+      </div>
+      <div class="hint">
+        rows = layer · cols = component rank · brightness = eigenvalue fraction · <span style="color:var(--focus)">yellow frame</span> = kept (made the cumulative top-p cut).
+      </div>
+      <div class="slider-row" style="margin-top:0.6em">
+        <label for="intensity">intensity</label>
+        <input type="range" id="intensity" min="-3" max="3" step="0.1" value="1.0">
+        <span class="val" id="intensityVal">1.0</span>
+      </div>
+      <div class="hint">
+        each kept component's peakMagnitude = <code>scale × intensity</code>. negative intensity flips polarity — steer <em>away</em> from the positive class.
+      </div>
+    </section>
+
+    <section>
+      <h2>generate</h2>
+      <label class="hint">prompt:</label>
+      <textarea id="prompt" rows="3">Describe a cat in three sentences.</textarea>
+      <div class="slider-row">
         <label for="maxTok">max tokens</label>
-        <input type="number" id="maxTok" min="20" max="240" value="80">
+        <input type="range" id="maxTok" min="20" max="240" step="10" value="80">
+        <span class="val" id="maxTokVal">80</span>
       </div>
+      <button id="runBtn" class="primary hot" style="width:100%; margin-top:0.4em" disabled>
+        run steered
+      </button>
+      <div class="hint" id="runStatus" style="margin-top:0.3em">fit an intervention first.</div>
+      <div id="runCurl" class="curl-hint" style="display:none"></div>
     </section>
 
-    <section>
-      <h2>vectors</h2>
-      <div class="row" style="margin-bottom:0.3em">
-        <button id="elaraHauntBtn" style="background:var(--fire);color:#002;font-weight:700;border:0">
-          elara-haunt demo
-        </button>
-        <span class="hint" style="flex:1;margin:0 0 0 0.5em">
-          detect Elara-proximity, fire eerie effector on crossings
-        </span>
-      </div>
-      <div class="row" style="margin-bottom:0.3em">
-        <button id="narrativeDemoBtn" style="background:var(--accent);color:#002;font-weight:700;border:0">
-          narrative demo
-        </button>
-        <span class="hint" style="flex:1;margin:0 0 0 0.5em">
-          fantasy-detector ⊕ eerie-effector at L=20
-        </span>
-      </div>
-      <div class="row">
-        <button id="loadDemoBtn">random orthogonal demo</button>
-      </div>
-      <div class="hint" style="margin:0.6em 0">
-        <b>important:</b> detector and effector should be DIFFERENT cvecs.
-        using the same vector for both creates positive feedback — the effector
-        bumps the residual along the detector's axis, so intensity saturates
-        above threshold and the trigger never re-edges.
-      </div>
-
-      <h2 style="margin-top:0.8em;color:var(--accent)">construct from pairs</h2>
-      <div class="row">
-        <label for="cxId">new id</label>
-        <input type="text" id="cxId" value="my-direction" placeholder="e.g. joy-direction">
-      </div>
-      <div class="row">
-        <label for="cxLayer">layer</label>
-        <input type="number" id="cxLayer" min="0" max="29" value="15">
-      </div>
-      <label class="hint" style="display:block;margin-top:0.4em">positive examples (one per line):</label>
-      <textarea id="cxPos" rows="3" style="width:100%;box-sizing:border-box;font-size:0.74rem"
-        placeholder="joyful things&#10;someone laughing freely&#10;a warm sunny afternoon"></textarea>
-      <label class="hint" style="display:block;margin-top:0.4em">negative examples (one per line):</label>
-      <textarea id="cxNeg" rows="3" style="width:100%;box-sizing:border-box;font-size:0.74rem"
-        placeholder="gloomy things&#10;someone sobbing alone&#10;a cold bleak afternoon"></textarea>
-      <div class="row" style="margin-top:0.4em">
-        <button id="cxBuildBtn">construct</button>
-        <button id="cxAsDetBtn" title="construct and assign as detector">→ detector</button>
-        <button id="cxAsEffBtn" title="construct and assign as effector">→ effector</button>
-      </div>
-      <div class="hint" id="cxStatus" style="margin-top:0.3em">ready</div>
-      <div class="hint">
-        construct stores the vector under <code>new id</code>; use the <code>→ detector</code>
-        / <code>→ effector</code> buttons to build and auto-assign to the matching role.
-        <b>raw_norm</b> is a separation-strength readout (higher = more distinct direction).
-      </div>
-
-      <h2 style="margin-top:1.0em;color:var(--accent)">fit across model (PCA)</h2>
-      <div class="hint" style="margin-bottom:0.4em">
-        A single-layer cvec treats the residual stream as if the signal lives
-        at one depth. In practice it doesn't — contrastive variation is a
-        <em>pattern across (layer, principal-component) pairs</em>, with some
-        mid-stack layers contributing multiple components and many layers
-        contributing none. This fitter SVDs the pos-minus-neg deltas per
-        layer, flattens every (layer, PC) pair into one ranked list, and
-        keeps the top-K until cumulative eigenvalue crosses your chosen
-        threshold.
-      </div>
-      <div class="row">
-        <label for="pcaPrefix">id prefix</label>
-        <input type="text" id="pcaPrefix" value="pca-fit" placeholder="e.g. joy-pca">
-      </div>
-      <div class="row">
-        <label for="pcaTopP">top-p</label>
-        <input type="range" id="pcaTopP" min="0.5" max="0.99" step="0.01" value="0.8"
-          style="flex:1; min-width:100px">
-        <span id="pcaTopPVal" style="min-width:4em; text-align:right; font-variant-numeric:tabular-nums">0.80</span>
-      </div>
-      <div class="row">
-        <label for="pcaMaxK" title="max components per layer (hard cap; the fitter returns up to min(P, this))">max PCs/layer</label>
-        <input type="number" id="pcaMaxK" min="1" max="10" value="4" style="max-width:5em">
-      </div>
-      <div class="row" style="margin-top:0.4em">
-        <button id="pcaFitBtn">fit across model</button>
-        <label style="margin-left:0.6em"><input type="checkbox" id="pcaUse" disabled> use PCA fit for run</label>
-      </div>
-      <div class="hint" id="pcaStatus" style="margin-top:0.3em">uses the same positive/negative pairs as <code>construct from pairs</code> above. fit runs one forward pass per example; ~4s for 5+5 pairs on M5 Max.</div>
-      <div id="pcaResultsPanel" style="margin-top:0.5em; display:none">
-        <div class="hint" id="pcaSummary" style="margin-bottom:0.3em">—</div>
-        <div id="pcaHeatmap" style="display:grid; gap:1px; background:#000; padding:1px; border-radius:2px;"></div>
-        <div class="hint" style="margin-top:0.3em; font-size:0.66rem">
-          rows = layers (top-down 0..29) · columns = component rank (PC1, PC2, …) ·
-          brightness = eigenvalue fraction · <span style="color:#ffde47">yellow outline</span>
-          = made the top-p cut and is registered as a cvec · hover for (L, k, ev) detail.
-        </div>
-        <div class="row" style="margin-top:0.4em">
-          <label for="pcaIntensity">global intensity</label>
-          <input type="range" id="pcaIntensity" min="0" max="3" step="0.1" value="1.0"
-            style="flex:1; min-width:100px">
-          <span id="pcaIntensityVal" style="min-width:4em; text-align:right; font-variant-numeric:tabular-nums">1.0</span>
-        </div>
-        <div class="hint" style="font-size:0.66rem">
-          each component's peakMagnitude = scale × intensity, where scale = eigenvalue / max_eigenvalue.
-          intensity is the single knob that uniformly scales the whole fit.
-        </div>
-      </div>
-    </section>
-
-    <section>
-      <h2 class="detector">detector</h2>
-      <div class="row">
-        <label for="detEnabled">enabled</label>
-        <input type="checkbox" id="detEnabled" checked style="flex:0 0 auto">
-      </div>
-      <div class="row">
-        <label for="detName">name</label>
-        <input type="text" id="detName" value="d">
-      </div>
-      <div class="row">
-        <label for="detId">cvec id</label>
-        <input type="text" id="detId" value="demo-detector">
-      </div>
-      <div class="row">
-        <label for="detLayer">layer</label>
-        <input type="number" id="detLayer" min="0" max="29" value="15">
-      </div>
-    </section>
-
-    <section>
-      <h2 class="effector">effector (ADSR)</h2>
-      <div class="row">
-        <label for="effEnabled">enabled</label>
-        <input type="checkbox" id="effEnabled" checked style="flex:0 0 auto">
-      </div>
-      <div class="row">
-        <label for="effId">cvec id</label>
-        <input type="text" id="effId" value="demo-effector">
-      </div>
-      <div class="row">
-        <label for="effLayer">layer</label>
-        <input type="number" id="effLayer" min="0" max="29" value="15">
-      </div>
-      <div class="slider-row">
-        <label>peak</label>
-        <input type="range" id="effPeak" min="0" max="5" step="0.1" value="2.0">
-        <span class="val" id="effPeakVal">2.0</span>
-      </div>
-      <div class="slider-row">
-        <label>polarity</label>
-        <input type="range" id="effPol" min="-1" max="1" step="1" value="1">
-        <span class="val" id="effPolVal">+1</span>
-      </div>
-      <div class="slider-row">
-        <label>attack</label>
-        <input type="range" id="effAttack" min="0" max="40" step="1" value="3">
-        <span class="val" id="effAttackVal">3</span>
-      </div>
-      <div class="slider-row">
-        <label>decay</label>
-        <input type="range" id="effDecay" min="0" max="40" step="1" value="8">
-        <span class="val" id="effDecayVal">8</span>
-      </div>
-      <div class="slider-row">
-        <label>sustain</label>
-        <input type="range" id="effSustain" min="0" max="1" step="0.05" value="0">
-        <span class="val" id="effSustainVal">0.00</span>
-      </div>
-      <div class="slider-row">
-        <label>release</label>
-        <input type="range" id="effRelease" min="0" max="40" step="1" value="0">
-        <span class="val" id="effReleaseVal">0</span>
-      </div>
-      <div class="row">
-        <label for="effShape">shape</label>
-        <select id="effShape">
-          <option value="linear">linear</option>
-          <option value="exp-in">exp-in</option>
-          <option value="exp-out">exp-out</option>
-          <option value="cubic" selected>cubic</option>
-        </select>
-      </div>
-    </section>
-
-    <section>
-      <h2 class="trigger">trigger (detector → effector)</h2>
-      <div class="row">
-        <label for="trigEnabled">enabled</label>
-        <input type="checkbox" id="trigEnabled" checked style="flex:0 0 auto">
-      </div>
-      <div class="row">
-        <label for="trigCond">condition</label>
-        <select id="trigCond">
-          <option value="on-exceed" selected>on-exceed</option>
-          <option value="on-fall">on-fall</option>
-        </select>
-      </div>
-      <div class="slider-row">
-        <label>threshold</label>
-        <input type="range" id="trigTh" min="-60" max="60" step="0.5" value="1.0">
-        <span class="val" id="trigThVal">+1.00</span>
-      </div>
-      <div class="hint">
-        edge-triggered: fires once per rising/falling threshold crossing,
-        restarts the effector's ADSR from attack=0.
-      </div>
-    </section>
-
-    <button class="primary" id="runBtn">run</button>
   </aside>
 
   <div class="output">
     <div class="system" id="systemMsg">
-      hit <b>load demo vectors</b> first, then <b>run</b>. each token gets a
-      background tint proportional to detector intensity (red = negative
-      projection, green = positive). yellow underline = trigger fired at
-      that token. the chart below shows the per-token time series.
+      <b>2 clicks to see residual-stream steering in action:</b><br>
+      1. hit <b>sample</b> (loads a joy-vs-dread contrast) then <b>fit intervention</b> to fit the PCA across all 30 layers.<br>
+      2. hit <b>run steered</b> to generate with the fitted intervention applied.<br>
+      the <code>intensity</code> slider lets you re-run at different strengths (including negative = flipped polarity) without re-fitting. the curl-style boxes under each button show the exact API call they're making, so you can replicate from a terminal.
     </div>
     <div class="tokens" id="tokens"></div>
-  </div>
-
-  <div class="chart">
-    <h2>detector intensity (blue) · effector magnitude (orange) · triggers (yellow markers)</h2>
-    <canvas id="plot"></canvas>
   </div>
 
 </main>
 
 <footer>
   <span class="stat">tokens: <b id="fTokens">0</b></span>
-  <span class="stat det">detector range: <b id="fDetRange">—</b></span>
-  <span class="stat eff">effector range: <b id="fEffRange">—</b></span>
-  <span class="stat fire">trigger fires: <b id="fFires">0</b></span>
+  <span class="stat">rate: <b id="fRate">idle</b></span>
   <span class="stat">wall: <b id="fWall">—</b></span>
-  <span style="flex:1"></span>
-  <span class="stat">raw JSON per-token: hover a token to see its (token, intensity, magnitude) triple</span>
+  <span class="stat">components kept: <b id="fKept">—</b></span>
+  <span class="stat">captured variance: <b id="fVariance">—</b></span>
 </footer>
 
 <script>
+// ====================================================================
+// Minimal residual-stream steering UI:
+//   (1) fit a multi-layer multi-component PCA intervention from prose pairs
+//   (2) run a steered generation with that intervention
+// Each button = exactly one API call; its curl equivalent is shown below
+// the button so the UI is self-documenting.
+// ====================================================================
+
+const $ = id => document.getElementById(id);
+const NUM_LAYERS = 30;
+
 // --- server health ---
 async function checkHealth() {
   try {
     const r = await (await fetch('/health')).json();
-    statusText.textContent = r.status === 'ready' ? `ready · ${r.model}` : 'loading…';
-  } catch { statusText.textContent = 'bridge unreachable'; }
+    $('statusText').textContent = r.status === 'ready' ? `ready · ${r.model}` : 'loading…';
+  } catch { $('statusText').textContent = 'bridge unreachable'; }
 }
-const statusText = document.getElementById('statusText');
 setInterval(checkHealth, 3000); checkHealth();
 
-// --- UI wiring ---
-const $ = id => document.getElementById(id);
-for (const id of ['effPeak','effAttack','effDecay','effRelease']) {
-  $(id).addEventListener('input', () => { $(id + 'Val').textContent = $(id).value; });
-}
-$('effSustain').addEventListener('input', () => {
-  $('effSustainVal').textContent = parseFloat($('effSustain').value).toFixed(2);
-});
-$('effPol').addEventListener('input', () => {
-  const v = parseInt($('effPol').value);
-  $('effPolVal').textContent = v > 0 ? '+1' : (v < 0 ? '-1' : '0');
-});
-$('trigTh').addEventListener('input', () => {
-  const v = parseFloat($('trigTh').value);
-  $('trigThVal').textContent = (v >= 0 ? '+' : '') + v.toFixed(2);
-});
-
-$('loadDemoBtn').addEventListener('click', async () => {
-  const r = await fetch('/v1/demo/steering-vectors', { method: 'POST' });
-  if (r.ok) {
-    $('systemMsg').innerHTML = '<b>demo vectors registered.</b> now hit <b>run</b>.';
-  } else {
-    $('systemMsg').textContent = 'failed to register demo vectors';
-  }
-});
-
-// Pre-fill the constructor textareas with a mild contrastive pair so the
-// "construct" button works end-to-end on first click — the intervention
-// then has a legible meaning when tested on an unrelated cat-description
-// prompt (which is the default below).
-$('cxPos').value = [
+// --- Default prose contrast ---
+const DEFAULT_POS = [
   "A warm, sunny afternoon full of easy laughter and gentle conversation.",
   "She felt a wave of pure joy wash over her, bright and uncomplicated.",
   "The children ran through the sprinkler, shrieking with delight.",
   "He smiled softly, remembering the best day of his life.",
-].join('\n');
-$('cxNeg').value = [
+  "His laughter filled the room with pure delight.",
+];
+const DEFAULT_NEG = [
   "A cold, grey morning weighed down by a dull sense of dread.",
   "She felt a hollow ache in her chest, heavy and unshakeable.",
   "The room was silent except for the quiet sound of her crying.",
   "He stared at the floor, unable to remember anything worth smiling about.",
-].join('\n');
+  "Every shadow stretched longer than it should, and the air felt wrong.",
+];
+$('pos').value = DEFAULT_POS.join('\n');
+$('neg').value = DEFAULT_NEG.join('\n');
+$('sampleBtn').addEventListener('click', () => {
+  $('pos').value = DEFAULT_POS.join('\n');
+  $('neg').value = DEFAULT_NEG.join('\n');
+  $('fitStatus').textContent = 'defaults loaded. hit fit intervention.';
+});
 
-async function buildFromPairs(assignRole = null /* 'detector' | 'effector' | null */) {
-  const id = $('cxId').value.trim() || 'my-direction';
-  const layer = parseInt($('cxLayer').value) || 15;
-  const positive = $('cxPos').value.split('\n').map(s => s.trim()).filter(Boolean);
-  const negative = $('cxNeg').value.split('\n').map(s => s.trim()).filter(Boolean);
-  if (!positive.length || !negative.length) {
-    $('cxStatus').textContent = 'need ≥1 of each';
-    return;
-  }
-  for (const b of ['cxBuildBtn','cxAsDetBtn','cxAsEffBtn']) $(b).disabled = true;
-  $('cxStatus').textContent = `capturing ${positive.length + negative.length} residuals…`;
-  try {
-    const t0 = performance.now();
-    const resp = await fetch('/v1/control/construct', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, layer, positive, negative }),
-    });
-    const dt = ((performance.now() - t0) / 1000).toFixed(2);
-    if (!resp.ok) {
-      const err = await resp.text();
-      $('cxStatus').textContent = `error: ${err.slice(0, 120)}`;
-      return;
-    }
-    const j = await resp.json();
-    let roleNote = '';
-    if (assignRole === 'detector') {
-      $('detId').value = id; $('detLayer').value = layer;
-      roleNote = ' · assigned as detector';
-    } else if (assignRole === 'effector') {
-      $('effId').value = id; $('effLayer').value = layer;
-      roleNote = ' · assigned as effector';
-    }
-    $('cxStatus').innerHTML =
-      `registered <b>${j.id}</b> @ L${j.layer} in ${dt}s · raw_norm=${j.raw_norm.toFixed(2)}${roleNote}`;
-  } catch (e) {
-    $('cxStatus').textContent = `error: ${e.message || e}`;
-  } finally {
-    for (const b of ['cxBuildBtn','cxAsDetBtn','cxAsEffBtn']) $(b).disabled = false;
-  }
+// --- Slider value display wiring ---
+for (const [id, digits] of [['topP', 2], ['maxK', 0], ['intensity', 1], ['maxTok', 0]]) {
+  const el = $(id);
+  const upd = () => {
+    $(id + 'Val').textContent = digits === 0 ? el.value : parseFloat(el.value).toFixed(digits);
+  };
+  el.addEventListener('input', upd); upd();
 }
 
-$('cxBuildBtn').addEventListener('click', () => buildFromPairs(null));
-
-// ====================================================================
-// PCA fit across the whole model. Uses the same cxPos/cxNeg textareas
-// as the single-layer constructor above, but calls /v1/control/construct_pca
-// which returns a ranked list of (layer, component, eigenvalue, cvec_id)
-// tuples truncated at cumulative top_p.
-// ====================================================================
-const NUM_LAYERS = 30;
-const pcaState = {
-  components: null,       // server-returned list (attached when "use" checked)
-  allEigs: null,          // [NUM_LAYERS][max_k] grid for the heatmap
-  maxComponentsPerLayer: 4,
+// --- State ---
+const fit = {
+  components: null,        // [{layer, component, eigenvalue, cvec_id, scale}]
+  allEigs: null,           // [NUM_LAYERS][maxK] grid
+  maxK: 4,
   totalVariance: 0,
   capturedFraction: 0,
 };
+const run = {
+  samples: [],
+  tStart: null,
+  tokens: 0,
+};
 
-$('pcaTopP').addEventListener('input', (e) => {
-  $('pcaTopPVal').textContent = parseFloat(e.target.value).toFixed(2);
-});
-$('pcaIntensity').addEventListener('input', (e) => {
-  $('pcaIntensityVal').textContent = parseFloat(e.target.value).toFixed(1);
-});
+// Update the curl hint under a button so the user can see the exact
+// request we'd send if they clicked. If `null`, clears.
+function showCurl(elId, method, path, body) {
+  const el = $(elId);
+  if (body === null) { el.style.display = 'none'; return; }
+  const bodyStr = JSON.stringify(body, null, 2);
+  el.textContent = `curl -X ${method} http://localhost:8000${path} \\
+  -H 'Content-Type: application/json' \\
+  -d '${bodyStr.replaceAll("'", "'\\''")}'`;
+  el.style.display = 'block';
+}
 
-$('pcaFitBtn').addEventListener('click', async () => {
-  const positive = $('cxPos').value.split('\n').map(s => s.trim()).filter(Boolean);
-  const negative = $('cxNeg').value.split('\n').map(s => s.trim()).filter(Boolean);
-  if (positive.length < 2 || negative.length < 2) {
-    $('pcaStatus').textContent = 'need ≥2 of each (SVD degenerates on fewer samples)';
+function preflightFitBody() {
+  const positive = $('pos').value.split('\n').map(s => s.trim()).filter(Boolean);
+  const negative = $('neg').value.split('\n').map(s => s.trim()).filter(Boolean);
+  return {
+    id_prefix: 'pca-fit',
+    positive, negative,
+    top_p: parseFloat($('topP').value),
+    max_components_per_layer: parseInt($('maxK').value),
+  };
+}
+
+// Live-update the fit curl hint whenever inputs change.
+function refreshFitCurl() {
+  showCurl('fitCurl', 'POST', '/v1/control/construct_pca', preflightFitBody());
+}
+for (const id of ['pos','neg','topP','maxK']) $(id).addEventListener('input', refreshFitCurl);
+refreshFitCurl();
+
+// ====================================================================
+// Fit: one POST → server captures all-layer residuals, SVDs per layer,
+// returns ranked (layer, component) list truncated at cumulative top_p.
+// ====================================================================
+$('fitBtn').addEventListener('click', async () => {
+  const body = preflightFitBody();
+  if (body.positive.length < 2 || body.negative.length < 2) {
+    $('fitStatus').textContent = 'need ≥2 lines of each (SVD degenerates on fewer).';
     return;
   }
-  const id_prefix = $('pcaPrefix').value.trim() || 'pca-fit';
-  const top_p = parseFloat($('pcaTopP').value);
-  const max_components_per_layer = parseInt($('pcaMaxK').value) || 4;
-  pcaState.maxComponentsPerLayer = max_components_per_layer;
-
-  $('pcaFitBtn').disabled = true;
-  $('pcaStatus').textContent =
-    `fitting: ${positive.length + negative.length} forward passes × all ${NUM_LAYERS} layers…`;
+  $('fitBtn').disabled = true;
+  $('fitStatus').textContent =
+    `fitting: ${body.positive.length + body.negative.length} forward passes × ${NUM_LAYERS} layers…`;
   try {
     const t0 = performance.now();
-    const resp = await fetch('/v1/control/construct_pca', {
+    const r = await fetch('/v1/control/construct_pca', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id_prefix, positive, negative, top_p, max_components_per_layer }),
+      body: JSON.stringify(body),
     });
-    const dt = ((performance.now() - t0) / 1000).toFixed(2);
-    if (!resp.ok) {
-      const err = await resp.text();
-      $('pcaStatus').textContent = `error: ${err.slice(0, 240)}`;
+    if (!r.ok) {
+      $('fitStatus').textContent = `error: ${(await r.text()).slice(0, 240)}`;
       return;
     }
-    const j = await resp.json();
-    pcaState.components = j.components;
-    pcaState.allEigs = j.all_eigenvalues;
-    pcaState.totalVariance = j.total_variance;
-    pcaState.capturedFraction = j.captured_fraction;
+    const j = await r.json();
+    const dt = ((performance.now() - t0) / 1000).toFixed(2);
+    fit.components = j.components;
+    fit.allEigs = j.all_eigenvalues;
+    fit.maxK = body.max_components_per_layer;
+    fit.totalVariance = j.total_variance;
+    fit.capturedFraction = j.captured_fraction;
 
-    $('pcaSummary').innerHTML =
-      `fit in ${dt}s · <b>${j.components.length}</b> components kept across ` +
-      `<b>${new Set(j.components.map(c => c.layer)).size}</b> layers · ` +
-      `captured <b>${(j.captured_fraction * 100).toFixed(1)}%</b> of total variation ` +
-      `(top-p target = ${(top_p * 100).toFixed(0)}%). ` +
-      `each component registered as <code>${id_prefix}-Lxx-Ck</code>.`;
+    const kLayers = new Set(j.components.map(c => c.layer)).size;
+    $('fitSummary').textContent =
+      ` · ${j.components.length} comps across ${kLayers} layers · captured ${(j.captured_fraction * 100).toFixed(1)}%`;
+    $('fitStatus').innerHTML = `fit in ${dt}s — ready to run`;
+    $('fKept').textContent = j.components.length;
+    $('fVariance').textContent = (j.captured_fraction * 100).toFixed(1) + '%';
+    $('interventionSection').style.display = 'block';
     renderHeatmap();
-    $('pcaResultsPanel').style.display = 'block';
-    $('pcaUse').disabled = false;
-    $('pcaUse').checked = true;
+    $('runBtn').disabled = false;
+    $('runStatus').textContent = 'ready. hit run steered.';
+    refreshRunCurl();
   } catch (e) {
-    $('pcaStatus').textContent = `error: ${e.message || e}`;
+    $('fitStatus').textContent = `error: ${e.message || e}`;
   } finally {
-    $('pcaFitBtn').disabled = false;
-    $('pcaStatus').textContent = pcaState.components
-      ? `${pcaState.components.length} components ready · toggle "use PCA fit" + hit run`
-      : 'fit failed';
+    $('fitBtn').disabled = false;
   }
 });
 
+// ====================================================================
+// Heatmap: (NUM_LAYERS × maxK) cells, colored by eigenvalue fraction,
+// outlined in yellow if that (layer, component) made the top-p cut.
+// ====================================================================
 function renderHeatmap() {
-  const grid = $('pcaHeatmap');
-  grid.innerHTML = '';
-  const maxK = pcaState.maxComponentsPerLayer;
-  grid.style.gridTemplateColumns = `repeat(${maxK}, 1fr)`;
-  // Kept set (for yellow outline): map (layer, component) → true.
-  const kept = new Set();
-  for (const c of (pcaState.components || [])) {
-    kept.add(`${c.layer}:${c.component}`);
-  }
-  // Max eigenvalue across the whole grid for color scaling.
+  const cells = $('heatmapCells');
+  cells.innerHTML = '';
+  cells.style.gridTemplateColumns = `repeat(${fit.maxK}, 1fr)`;
+  const kept = new Set(fit.components.map(c => `${c.layer}:${c.component}`));
   let maxEv = 1e-9;
-  for (const row of pcaState.allEigs) for (const ev of row) {
-    if (ev > maxEv) maxEv = ev;
-  }
+  for (const row of fit.allEigs) for (const ev of row) if (ev > maxEv) maxEv = ev;
   for (let L = 0; L < NUM_LAYERS; L++) {
-    const row = pcaState.allEigs[L] || [];
-    for (let k = 0; k < maxK; k++) {
+    const row = fit.allEigs[L] || [];
+    for (let k = 0; k < fit.maxK; k++) {
       const ev = row[k] || 0;
-      const intensity = Math.sqrt(ev / maxEv);   // sqrt to boost low cells
-      const hue = 120;  // green
+      const intensity = Math.sqrt(Math.max(0, ev) / maxEv);
       const bg = ev > 0
-        ? `hsl(${hue} 60% ${Math.min(60, 8 + intensity * 45)}%)`
-        : '#0a0a0a';
+        ? `hsl(140 60% ${Math.min(60, 8 + intensity * 48)}%)`
+        : '#080808';
       const cell = document.createElement('div');
-      cell.style.cssText = `
-        background:${bg}; aspect-ratio:1/1; min-height:11px;
-        border: ${kept.has(`${L}:${k}`) ? '1px solid var(--focus)' : '1px solid transparent'};
-        box-sizing: border-box; cursor:help;
-      `;
-      const evStr = ev > 0 ? ev.toFixed(1) : '—';
-      cell.title = `L${L} PC${k+1}  eigenvalue=${evStr}${kept.has(`${L}:${k}`) ? '  · KEPT' : ''}`;
-      grid.appendChild(cell);
+      cell.className = 'cell' + (kept.has(`${L}:${k}`) ? ' kept' : '');
+      cell.style.background = bg;
+      cell.title = `L${L} PC${k+1} eigenvalue=${ev.toFixed(1)}` +
+                    (kept.has(`${L}:${k}`) ? '  · kept' : '');
+      cells.appendChild(cell);
     }
+  }
+  const yaxis = $('heatmapYaxis');
+  yaxis.innerHTML = '';
+  for (const L of ['L0', 'L15', 'L29']) {
+    const el = document.createElement('div');
+    el.textContent = L; yaxis.appendChild(el);
+  }
+  const xaxis = $('heatmapXaxis');
+  xaxis.innerHTML = '';
+  for (let k = 0; k < fit.maxK; k++) {
+    const el = document.createElement('div');
+    el.textContent = 'PC' + (k+1); xaxis.appendChild(el);
   }
 }
 
-// Compose the controls[] array the runBtn handler will send. Returns
-// [] when PCA fit isn't active. Each component becomes one ActiveControl
-// with peakMagnitude = scale × intensity; envelope is flat (full-on for
-// the whole session) so the fit reads as an "always-applied profile."
-// If you want ADSR over a PCA fit, that's a separate UI layer.
-function pcaControlsForRun() {
-  if (!pcaState.components || !$('pcaUse').checked) return null;
-  const intensity = parseFloat($('pcaIntensity').value);
-  const polarity = parseInt($('effPol').value) || 1;
-  return pcaState.components.map(c => ({
+// ====================================================================
+// Build the controls[] array for the run request.
+// ====================================================================
+function buildRunControls() {
+  if (!fit.components) return [];
+  const intensity = parseFloat($('intensity').value);
+  const polarity = intensity < 0 ? -1 : 1;
+  const absIntensity = Math.abs(intensity);
+  return fit.components.map(c => ({
     cvec_id: c.cvec_id,
     layer: c.layer,
     polarity,
-    peak_magnitude: c.scale * intensity,
-    attack: 0,
-    decay: 0,
-    sustain_level: 1.0,
-    release: 0,
-    shape: 'linear',
-    units: 'tokens',
+    peak_magnitude: c.scale * absIntensity,
+    attack: 0, decay: 0, sustain_level: 1.0, release: 0,
+    shape: 'linear', units: 'tokens',
   }));
 }
-$('cxAsDetBtn').addEventListener('click', () => buildFromPairs('detector'));
-$('cxAsEffBtn').addEventListener('click', () => buildFromPairs('effector'));
 
-$('elaraHauntBtn').addEventListener('click', async () => {
-  $('elaraHauntBtn').disabled = true;
-  $('systemMsg').textContent = 'screening elara-haunt vectors across all 30 layers (28 prompts)…';
-  try {
-    const t0 = performance.now();
-    const r = await fetch('/v1/demo/elara-haunt', { method: 'POST' });
-    if (!r.ok) {
-      $('systemMsg').textContent = 'build failed: ' + await r.text();
-      return;
-    }
-    const j = await r.json();
-    const dt = ((performance.now() - t0) / 1000).toFixed(2);
-    $('detId').value = j.detector.id; $('detLayer').value = j.detector.layer;
-    $('effId').value = j.effector.id; $('effLayer').value = j.effector.layer;
-    $('prompt').value = j.prompt;
-    // Envelope tuned to produce a short, perceptible "blip" after each
-    // trigger fire — attack 1 so it ramps immediately on detection,
-    // decay 10 back to zero so the effect doesn't linger forever.
-    $('effPeak').value = 3; $('effPeakVal').textContent = '3.0';
-    $('effAttack').value = 1; $('effAttackVal').textContent = '1';
-    $('effDecay').value = 10; $('effDecayVal').textContent = '10';
-    $('effSustain').value = 0; $('effSustainVal').textContent = '0.00';
-    $('effShape').value = 'cubic';
-    $('systemMsg').innerHTML =
-      `built elara-haunt in ${dt}s · ` +
-      `<b>${j.detector.id}</b> @ L${j.detector.layer} (score=${j.detector.score.toFixed(2)}) · ` +
-      `<b>${j.effector.id}</b> @ L${j.effector.layer} (score=${j.effector.score.toFixed(2)}). ` +
-      `hit <b>run</b> — the first run calibrates the threshold, the second shows the actual haunt.`;
-  } catch (e) {
-    $('systemMsg').textContent = 'error: ' + (e.message || e);
-  } finally {
-    $('elaraHauntBtn').disabled = false;
-  }
-});
-
-$('narrativeDemoBtn').addEventListener('click', async () => {
-  $('narrativeDemoBtn').disabled = true;
-  $('systemMsg').textContent = 'building narrative vectors (12 prompts through the engine)…';
-  try {
-    const t0 = performance.now();
-    const r = await fetch('/v1/demo/narrative-vectors', { method: 'POST' });
-    if (!r.ok) {
-      $('systemMsg').textContent = 'narrative demo build failed: ' + await r.text();
-      return;
-    }
-    const j = await r.json();
-    const dt = ((performance.now() - t0) / 1000).toFixed(2);
-    $('detId').value = j.detector.id; $('detLayer').value = j.layer;
-    $('effId').value = j.effector.id; $('effLayer').value = j.layer;
-    $('trigTh').value = j.suggested_threshold;
-    $('trigThVal').textContent = '+' + j.suggested_threshold.toFixed(2);
-    $('prompt').value = j.prompt;
-    // Sane defaults for the narrative demo envelope: peak 3, long
-    // decay so the effector's bite lingers for a few tokens.
-    $('effPeak').value = 3; $('effPeakVal').textContent = '3.0';
-    $('effAttack').value = 2; $('effAttackVal').textContent = '2';
-    $('effDecay').value = 12; $('effDecayVal').textContent = '12';
-    $('systemMsg').innerHTML =
-      `built narrative demo in ${dt}s · ` +
-      `<b>${j.detector.id}</b> (raw_norm=${j.detector.raw_norm.toFixed(2)}) · ` +
-      `<b>${j.effector.id}</b> (raw_norm=${j.effector.raw_norm.toFixed(2)}) · ` +
-      `suggested threshold ${j.suggested_threshold} · prompt pre-filled. hit <b>run</b>.`;
-  } catch (e) {
-    $('systemMsg').textContent = 'error: ' + (e.message || e);
-  } finally {
-    $('narrativeDemoBtn').disabled = false;
-  }
-});
-
-// --- run ---
-const state = {
-  samples: [],       // array of {token, text, position, detectors:{}, effectors:{}, fired:bool}
-  running: false,
-  tStart: null,
-};
-
-// Preflight: confirm the cvec ids the UI will reference are actually
-// registered on the server. If not, surface a specific "rebuild these
-// first" message instead of letting the chat request 400 opaquely.
-async function preflightCvecIds() {
-  try {
-    const r = await fetch('/v1/control/vectors');
-    if (!r.ok) return true;  // degrade gracefully, don't block the run
-    const { ids } = await r.json();
-    const have = new Set(ids);
-    const needed = [];
-    if ($('detEnabled').checked) needed.push(['detector', $('detId').value.trim()]);
-    if ($('effEnabled').checked) needed.push(['effector', $('effId').value.trim()]);
-    if ($('trigEnabled').checked && $('effEnabled').checked) {
-      needed.push(['trigger effector', $('effId').value.trim()]);
-    }
-    const missing = needed.filter(([_, id]) => id && !have.has(id));
-    if (missing.length > 0) {
-      const ml = missing.map(([role, id]) => `<b>${id}</b> (needed for ${role})`).join(', ');
-      const hl = ids.length ? `registered ids: ${ids.join(', ')}` : 'no cvecs registered yet';
-      $('systemMsg').innerHTML =
-        `missing cvecs: ${ml}. ${hl}. click <b>narrative demo</b> or <b>construct</b> to register.`;
-      return false;
-    }
-    return true;
-  } catch {
-    return true;
-  }
-}
-
-$('runBtn').addEventListener('click', async () => {
-  if (state.running) return;
-  if (!(await preflightCvecIds())) return;
-  state.running = true; state.tStart = performance.now();
-  $('runBtn').disabled = true;
-  state.samples = [];
-  $('tokens').innerHTML = '';
-  $('fFires').textContent = '0';
-
-  const detName = $('detName').value || 'd';
-  const effId   = $('effId').value || 'demo-effector';
-  const detId   = $('detId').value || 'demo-detector';
-
-  const body = {
+function buildRunBody() {
+  return {
     model: 'gemma-4-a4b-q4km',
-    max_tokens: parseInt($('maxTok').value) || 80,
+    max_tokens: parseInt($('maxTok').value),
     stream: true,
     messages: [{ role: 'user', content: $('prompt').value }],
-    controls: [],
-    detectors: [],
-    triggers: [],
+    controls: buildRunControls(),
   };
-  if ($('detEnabled').checked) {
-    body.detectors.push({ name: detName, cvec_id: detId, layer: parseInt($('detLayer').value) });
-  }
-  // PCA fit wins over single-effector when active: attach the whole
-  // ranked set of (layer, component) interventions instead of one
-  // hand-chosen cvec. The effector section's polarity knob still
-  // applies (sign flip); its ADSR knobs are ignored — the PCA flow
-  // uses a flat-always-on envelope because the concept here is
-  // "ride the fitted intervention through the whole generation,"
-  // not "trigger a transient effect."
-  const pcaControls = pcaControlsForRun();
-  if (pcaControls) {
-    for (const c of pcaControls) body.controls.push(c);
-  } else if ($('effEnabled').checked) {
-    body.controls.push({
-      cvec_id: effId,
-      layer: parseInt($('effLayer').value),
-      polarity: parseInt($('effPol').value),
-      peak_magnitude: parseFloat($('effPeak').value),
-      attack: parseFloat($('effAttack').value),
-      decay:  parseFloat($('effDecay').value),
-      sustain_level: parseFloat($('effSustain').value),
-      release: parseFloat($('effRelease').value),
-      shape: $('effShape').value,
-      units: 'tokens',
-    });
-  }
-  if ($('trigEnabled').checked && $('detEnabled').checked && $('effEnabled').checked) {
-    body.triggers.push({
-      detector_name: detName,
-      condition: $('trigCond').value,
-      threshold: parseFloat($('trigTh').value),
-      effector_cvec_id: effId,
-    });
-  }
+}
+
+function refreshRunCurl() {
+  if (!fit.components) { showCurl('runCurl', null, null, null); return; }
+  const body = buildRunBody();
+  // Stream false for the curl hint so the user gets a single JSON
+  // response they can eyeball. The UI itself keeps stream:true for
+  // smooth rendering.
+  showCurl('runCurl', 'POST', '/v1/chat/completions', {...body, stream: false});
+}
+for (const id of ['prompt','maxTok','intensity']) {
+  $(id).addEventListener('input', refreshRunCurl);
+}
+
+// ====================================================================
+// Run: stream the chat completion and render tokens as they arrive.
+// ====================================================================
+$('runBtn').addEventListener('click', async () => {
+  if (!fit.components) return;
+  $('runBtn').disabled = true;
+  $('tokens').innerHTML = '';
+  run.samples = []; run.tokens = 0; run.tStart = performance.now();
+  $('fTokens').textContent = '0'; $('fRate').textContent = '…'; $('fWall').textContent = '—';
+
+  const body = buildRunBody();
+  $('runStatus').textContent = `running with ${body.controls.length} intervention components…`;
 
   try {
     const resp = await fetch('/v1/chat/completions', {
@@ -784,18 +467,13 @@ $('runBtn').addEventListener('click', async () => {
       body: JSON.stringify(body),
     });
     if (!resp.ok) {
-      const body = await resp.text();
-      // Propagate the server's specific error ("no cvec registered for
-      // id=X", etc.) so the user can see WHICH cvec is missing and
-      // rebuild it — not a bare HTTP 400.
-      throw new Error(`HTTP ${resp.status}: ${body.slice(0, 240)}`);
+      $('runStatus').textContent = `HTTP ${resp.status}: ${(await resp.text()).slice(0, 240)}`;
+      return;
     }
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
     let buf = '';
-    let prevDet = null;
-    const trigTh = parseFloat($('trigTh').value);
-    const trigCond = $('trigCond').value;
+    const tokensEl = $('tokens');
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -807,196 +485,35 @@ $('runBtn').addEventListener('click', async () => {
         const payload = frame.slice(6);
         if (payload === '[DONE]') break;
         let j; try { j = JSON.parse(payload); } catch { continue; }
-        if (j.samples) {
-          for (const s of j.samples) {
-            const det = s.detectors?.[detName] ?? 0;
-            let fired = false;
-            if (prevDet !== null) {
-              if (trigCond === 'on-exceed' && prevDet <= trigTh && det > trigTh) fired = true;
-              if (trigCond === 'on-fall'   && prevDet >= trigTh && det < trigTh) fired = true;
-            }
-            prevDet = det;
-            state.samples.push({
-              token: s.token,
-              text: s.text ?? '?',
-              position: s.position,
-              detectors: s.detectors || {},
-              effectors: s.effectors || {},
-              fired,
-            });
-          }
-          renderTokens();
-          drawChart();
+        const text = j.choices?.[0]?.delta?.content;
+        if (text) {
+          const span = document.createElement('span');
+          span.className = 'tok';
+          span.textContent = text;
+          tokensEl.appendChild(span);
+          run.tokens += 1;
           updateFooter();
         }
       }
     }
+    const dt = (performance.now() - run.tStart) / 1000;
+    $('runStatus').innerHTML =
+      `generated <b>${run.tokens}</b> tokens in ${dt.toFixed(2)}s · ` +
+      `${(run.tokens / dt).toFixed(1)} tok/s · try adjusting intensity and re-running (no re-fit needed).`;
   } catch (e) {
-    $('systemMsg').textContent = 'error: ' + (e.message || e);
+    $('runStatus').textContent = `error: ${e.message || e}`;
   } finally {
-    state.running = false;
     $('runBtn').disabled = false;
     updateFooter();
-    autoCalibrateThreshold();
   }
 });
 
-// After a run, rescale the threshold slider's range to match the observed
-// detector intensity — raw dot products with a unit-norm cvec depend on
-// residual magnitude, which varies per-layer / per-model from ±3 at
-// early layers to ±60 deep in the stack. Fixed ranges are nearly always
-// wrong. Additionally, for edge-triggering to produce dynamics, the
-// threshold should sit near the MEDIAN of the observed distribution —
-// otherwise everything's above (0 rising edges) or below (no fires).
-function autoCalibrateThreshold() {
-  const detName = $('detName').value || 'd';
-  if (state.samples.length === 0) return;
-  const ds = state.samples.map(s => s.detectors[detName] ?? 0).sort((a, b) => a - b);
-  const lo = ds[0], hi = ds[ds.length - 1];
-  const median = ds[Math.floor(ds.length / 2)];
-  const pad = Math.max(0.5, (hi - lo) * 0.15);
-  const newMin = Math.floor((lo - pad) * 10) / 10;
-  const newMax = Math.ceil((hi + pad) * 10) / 10;
-  const th = $('trigTh');
-  th.min = String(newMin);
-  th.max = String(newMax);
-  th.step = String(Math.max(0.05, (newMax - newMin) / 120));
-  // If the user's current threshold is outside the observed range OR
-  // below the 10th percentile, snap to the median so the next run
-  // actually has edge crossings to work with. Otherwise leave their
-  // choice alone.
-  const cur = parseFloat(th.value);
-  const p10 = ds[Math.floor(ds.length * 0.1)];
-  const p90 = ds[Math.floor(ds.length * 0.9)];
-  if (cur < newMin || cur > newMax || cur < p10 || cur > p90) {
-    th.value = String(median);
-    $('trigThVal').textContent = (median >= 0 ? '+' : '') + median.toFixed(2);
-    $('systemMsg').innerHTML =
-      `auto-calibrated threshold to median (${median.toFixed(2)}) — tokens ` +
-      `range [${lo.toFixed(2)}, ${hi.toFixed(2)}]. click <b>run</b> again for ` +
-      `edge-triggered dynamics from that midpoint.`;
-  }
-}
-
-function renderTokens() {
-  const host = $('tokens');
-  host.innerHTML = '';
-  const detName = $('detName').value || 'd';
-  // scale intensity to a 0-1 brightness via soft-tanh
-  for (const s of state.samples) {
-    const det = s.detectors[detName] ?? 0;
-    const sigmoid = Math.tanh(det / 2);  // [-1, 1]
-    const bg = sigmoid > 0
-      ? `rgba(${0x3a}, ${0x77}, ${0x4a}, ${Math.min(0.6, sigmoid)})`
-      : `rgba(${0xd4}, ${0x40}, ${0x60}, ${Math.min(0.6, -sigmoid)})`;
-    const span = document.createElement('span');
-    span.className = 'tok' + (s.fired ? ' fire' : '');
-    span.style.background = bg;
-    span.textContent = s.text;
-    const effNames = Object.keys(s.effectors);
-    const effStr = effNames.length
-      ? effNames.map(k => `${k}=${s.effectors[k].toFixed(2)}`).join(' ')
-      : '';
-    span.title = `pos ${s.position} · ${detName}=${det.toFixed(3)}${effStr ? ' · ' + effStr : ''}${s.fired ? ' · TRIGGER' : ''}`;
-    host.appendChild(span);
-  }
-}
-
-// --- chart ---
-const plot = $('plot');
-const pctx = plot.getContext('2d');
-function drawChart() {
-  const dpr = window.devicePixelRatio || 1;
-  const cssW = plot.clientWidth, cssH = plot.clientHeight;
-  if (plot.width !== cssW * dpr || plot.height !== cssH * dpr) {
-    plot.width = cssW * dpr; plot.height = cssH * dpr;
-    pctx.setTransform(1, 0, 0, 1, 0, 0);
-    pctx.scale(dpr, dpr);
-  }
-  pctx.clearRect(0, 0, cssW, cssH);
-  if (state.samples.length === 0) return;
-  const detName = $('detName').value || 'd';
-  const effId = $('effId').value || 'demo-effector';
-  const n = state.samples.length;
-  const padL = 40, padR = 12, padT = 12, padB = 20;
-  const w = cssW - padL - padR, h = cssH - padT - padB;
-  // y-axis — combined range over det intensities and eff magnitudes, symmetric about 0
-  let maxAbs = 0.5;
-  for (const s of state.samples) {
-    maxAbs = Math.max(maxAbs, Math.abs(s.detectors[detName] ?? 0));
-    maxAbs = Math.max(maxAbs, Math.abs(s.effectors[effId] ?? 0));
-  }
-  const y0 = padT + h / 2;
-  // horizontal zero-line
-  pctx.strokeStyle = '#222'; pctx.beginPath();
-  pctx.moveTo(padL, y0); pctx.lineTo(cssW - padR, y0); pctx.stroke();
-  // threshold line (if trigger enabled)
-  if ($('trigEnabled').checked) {
-    const th = parseFloat($('trigTh').value);
-    const yT = y0 - (th / maxAbs) * (h / 2);
-    pctx.strokeStyle = 'rgba(255,222,71,0.4)';
-    pctx.setLineDash([4, 3]);
-    pctx.beginPath(); pctx.moveTo(padL, yT); pctx.lineTo(cssW - padR, yT); pctx.stroke();
-    pctx.setLineDash([]);
-  }
-  // detector line
-  pctx.strokeStyle = '#5cf'; pctx.lineWidth = 1.5;
-  pctx.beginPath();
-  for (let i = 0; i < n; i++) {
-    const x = padL + (i / Math.max(n - 1, 1)) * w;
-    const y = y0 - ((state.samples[i].detectors[detName] ?? 0) / maxAbs) * (h / 2);
-    if (i === 0) pctx.moveTo(x, y); else pctx.lineTo(x, y);
-  }
-  pctx.stroke();
-  // effector line
-  pctx.strokeStyle = '#fa3'; pctx.lineWidth = 1.5;
-  pctx.beginPath();
-  for (let i = 0; i < n; i++) {
-    const x = padL + (i / Math.max(n - 1, 1)) * w;
-    const y = y0 - ((state.samples[i].effectors[effId] ?? 0) / maxAbs) * (h / 2);
-    if (i === 0) pctx.moveTo(x, y); else pctx.lineTo(x, y);
-  }
-  pctx.stroke();
-  // trigger-fire markers
-  pctx.fillStyle = '#ffde47';
-  for (let i = 0; i < n; i++) {
-    if (!state.samples[i].fired) continue;
-    const x = padL + (i / Math.max(n - 1, 1)) * w;
-    pctx.fillRect(x - 1, padT, 2, h);
-  }
-  // y-axis labels
-  pctx.fillStyle = '#888'; pctx.font = '10px ui-monospace';
-  pctx.textAlign = 'right'; pctx.textBaseline = 'middle';
-  pctx.fillText('+' + maxAbs.toFixed(1), padL - 4, padT + 4);
-  pctx.fillText('0', padL - 4, y0);
-  pctx.fillText('-' + maxAbs.toFixed(1), padL - 4, padT + h - 4);
-  // x-axis
-  pctx.textAlign = 'center'; pctx.textBaseline = 'top';
-  pctx.fillText(`0`, padL, padT + h + 4);
-  pctx.fillText(`${n} tokens`, cssW - padR, padT + h + 4);
-}
-window.addEventListener('resize', drawChart);
-
-// --- footer ---
 function updateFooter() {
-  const detName = $('detName').value || 'd';
-  const effId = $('effId').value || 'demo-effector';
-  const n = state.samples.length;
-  $('fTokens').textContent = n;
-  if (n > 0) {
-    const ds = state.samples.map(s => s.detectors[detName] ?? 0);
-    const es = state.samples.map(s => s.effectors[effId] ?? 0);
-    $('fDetRange').textContent = `[${Math.min(...ds).toFixed(2)}, ${Math.max(...ds).toFixed(2)}]`;
-    $('fEffRange').textContent = `[${Math.min(...es).toFixed(2)}, ${Math.max(...es).toFixed(2)}]`;
-    $('fFires').textContent = String(state.samples.filter(s => s.fired).length);
-  } else {
-    $('fDetRange').textContent = '—';
-    $('fEffRange').textContent = '—';
-    $('fFires').textContent = '0';
-  }
-  if (state.tStart) {
-    const dt = ((state.running ? performance.now() : (state.tLastEnd ?? performance.now())) - state.tStart) / 1000;
-    $('fWall').textContent = dt.toFixed(2) + 's';
+  $('fTokens').textContent = String(run.tokens);
+  if (run.tStart) {
+    const dt = (performance.now() - run.tStart) / 1000;
+    $('fWall').textContent = dt.toFixed(1) + 's';
+    if (dt > 0.1) $('fRate').textContent = (run.tokens / dt).toFixed(0) + ' tok/s';
   }
 }
 </script>
