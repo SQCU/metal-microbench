@@ -111,6 +111,18 @@ def _pump_loop() -> None:
                 state.done = True
         if not did_work:
             time.sleep(idle_sleep)
+        else:
+            # Yield briefly so other FFI callers (kv snapshot pollers,
+            # /health, any HTTP handler that calls into gemma_ffi) get a
+            # chance to acquire ffiLock between our tight-loop reacquires.
+            # Without this, the pump's back-to-back FFI calls starve
+            # snapshot threads indefinitely: NSLock isn't strictly fair,
+            # and Python's GIL + thread scheduling compounds the effect.
+            # Empirically: ~30% throughput under 2Hz snapshot polling → 0%
+            # after adding this yield.
+            time.sleep(0.0005)  # 0.5 ms — one tick loses <2% but
+                                # snapshot handlers drop from ~120 ms to
+                                # one-tick latency.
 
 
 app = FastAPI(title="Gemma Metal Bridge", version="0.1")
@@ -328,34 +340,61 @@ _STATE_NAMES = {0: "idle", 1: "priming", 2: "generating", 3: "paused", 4: "done"
 
 
 @app.get("/v1/kv/snapshot")
-def kv_snapshot() -> JSONResponse:
-    """Per-session page ownership + per-page refcount. Clients poll this
-    during generation to render a live tenancy strip — pages with refcount>1
-    are shared across sessions (prefix-cache hit or explicit adoptKvFrom).
+def kv_snapshot(detail: bool = False) -> JSONResponse:
+    """Per-session page ownership stats. Clients poll this during generation
+    to render live tenancy — pages with refcount > 1 are shared across
+    sessions (prefix-cache hit or explicit adoptKvFrom).
+
+    Default shape (used by the demo UIs) is aggregate-only — page_count
+    and shared_count per session. This is O(sessions) FFI calls under one
+    ffiLock each.
+
+    Pass ?detail=1 to get the per-page (phys, refcount, shared_with)
+    list. That mode is O(sessions × pages) FFI calls and serializes
+    against the pump's g.tick() via ffiLock — polling it at 2 Hz during
+    active decoding collapses AR throughput ~4×. Use sparingly; the live
+    UI pollers should stay on the default aggregate path.
     """
-    sids = g.active_session_ids()
     sessions = []
-    for sid in sids:
-        snap = g.session_snapshot(sid)
-        if not snap:
-            continue
-        # Annotate each page with (refcount, other_owner_sids).
-        page_entries = []
-        for phys in snap["pages"]:
-            owners = g.page_owners(int(phys))
-            page_entries.append({
-                "phys": int(phys),
-                "refcount": len(owners),
-                "shared_with": [o for o in owners if o != snap["sid"]],
+    if detail:
+        # Per-page enumeration (O(sessions + pages) FFI calls). Pollers
+        # should NOT use this — it serializes against gemma_tick().
+        sids = g.active_session_ids()
+        for sid in sids:
+            snap = g.session_snapshot(sid)
+            if not snap:
+                continue
+            page_entries = []
+            for phys in snap["pages"]:
+                owners = g.page_owners(int(phys))
+                page_entries.append({
+                    "phys": int(phys),
+                    "refcount": len(owners),
+                    "shared_with": [o for o in owners if o != snap["sid"]],
+                })
+            sessions.append({
+                "sid": snap["sid"],
+                "position": snap["position"],
+                "state": _STATE_NAMES.get(snap["state"], "?"),
+                "page_count": len(page_entries),
+                "shared_count": sum(1 for p in page_entries if p["refcount"] > 1),
+                "pages": page_entries,
             })
-        sessions.append({
-            "sid": snap["sid"],
-            "position": snap["position"],
-            "state": _STATE_NAMES.get(snap["state"], "?"),
-            "page_count": len(page_entries),
-            "shared_count": sum(1 for p in page_entries if p["refcount"] > 1),
-            "pages": page_entries,
-        })
+    else:
+        # Bulk aggregate path — ONE FFI call returns every session's
+        # (sid, position, state, page_count, shared_count) under a
+        # single ffiLock acquisition. At 2 Hz polling this takes up to
+        # ~30 ms of tick-contention per second (one tick-length), down
+        # from 150+ ms in the naive per-page-owners path that starved
+        # AR decode ~3-4×.
+        for row in g.kv_snapshot_summary():
+            sessions.append({
+                "sid": row["sid"],
+                "position": row["position"],
+                "state": _STATE_NAMES.get(row["state"], "?"),
+                "page_count": row["page_count"],
+                "shared_count": row["shared_count"],
+            })
     return JSONResponse({
         "sessions": sessions,
         "page_size_tokens": 16,      # PAGE_SLIDE — constant for the demo

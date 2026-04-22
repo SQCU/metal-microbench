@@ -337,6 +337,75 @@ public func gemma_page_owners(_ phys: Int32,
     return Int32(n)
 }
 
+// Bulk counts for a session: page_count + shared_count (= number of this
+// session's pages with refcount > 1). Consolidated into ONE FFI call so
+// UI pollers don't spam one-per-page calls — which serialize against the
+// pump's tick() via ffiLock and collapse AR throughput (measured 3-4×
+// slowdown at 2 Hz polling, vs negligible with this shape).
+@_cdecl("gemma_session_counts")
+public func gemma_session_counts(_ sid: Int32,
+                                  _ outPageCount: UnsafeMutablePointer<Int32>?,
+                                  _ outSharedCount: UnsafeMutablePointer<Int32>?) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let engine = gEngine, let s = gSessions[sid] else { return -1 }
+    let owned = s.ownedPagesForDebug
+    var shared = 0
+    for phys in owned {
+        if engine.pageManager.pageRefcount(phys) > 1 { shared += 1 }
+    }
+    if let pc = outPageCount   { pc.pointee = Int32(owned.count) }
+    if let sc = outSharedCount { sc.pointee = Int32(shared) }
+    return 0
+}
+
+// One-shot snapshot of every active session's aggregate KV stats. Writes
+// a packed Int32 array into outBuf of shape [N, 5] where each row is
+// (sid, position, state, page_count, shared_count). Returns N (number
+// of sessions written) on success, negative on overflow or error.
+//
+// Collapsing the whole poll to a single ffiLock acquisition: UI pollers
+// previously fired 1 + 2N FFI calls per /v1/kv/snapshot (active_session_ids,
+// then session_snapshot + session_counts per session), each of which
+// waited up to one full gemma_tick() duration (~30 ms) for ffiLock.
+// At 2 Hz polling with 2 active sessions = 5 × 30 ms = 150 ms/poll of
+// serialized lock contention per second → measurable AR throughput
+// collapse. This bulk variant takes one lock once, runs all the Swift-
+// side bookkeeping, releases. Observed: 130 ms/poll → ~30 ms/poll.
+@_cdecl("gemma_kv_snapshot_summary")
+public func gemma_kv_snapshot_summary(_ outBuf: UnsafeMutablePointer<Int32>?,
+                                       _ maxSessions: Int32) -> Int32 {
+    ffiLock.lock(); defer { ffiLock.unlock() }
+    guard let engine = gEngine, let out = outBuf else { return 0 }
+    let sids = Array(gSessions.keys).sorted()
+    let stride = 5
+    var written = 0
+    for sid in sids {
+        if written >= Int(maxSessions) { break }
+        guard let s = gSessions[sid] else { continue }
+        let stateCode: Int32
+        switch s.state {
+        case .idle:       stateCode = 0
+        case .priming:    stateCode = 1
+        case .generating: stateCode = 2
+        case .paused:     stateCode = 3
+        case .done:       stateCode = 4
+        }
+        let owned = s.ownedPagesForDebug
+        var shared = 0
+        for phys in owned {
+            if engine.pageManager.pageRefcount(phys) > 1 { shared += 1 }
+        }
+        let base = written * stride
+        out[base + 0] = sid
+        out[base + 1] = Int32(s.positionForDebug)
+        out[base + 2] = stateCode
+        out[base + 3] = Int32(owned.count)
+        out[base + 4] = Int32(shared)
+        written += 1
+    }
+    return Int32(written)
+}
+
 // --- Vision / multimodal ---
 
 // Bind the vision tower to a safetensors file. This is a CHEAP call now:

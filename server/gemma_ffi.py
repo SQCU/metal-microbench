@@ -185,6 +185,19 @@ _lib.gemma_page_refcount.restype = C.c_int32
 _lib.gemma_page_owners.argtypes = [C.c_int32, C.POINTER(C.c_int32), C.c_int32]
 _lib.gemma_page_owners.restype = C.c_int32
 
+_lib.gemma_session_counts.argtypes = [
+    C.c_int32,                       # sid
+    C.POINTER(C.c_int32),            # out_page_count
+    C.POINTER(C.c_int32),            # out_shared_count
+]
+_lib.gemma_session_counts.restype = C.c_int32
+
+_lib.gemma_kv_snapshot_summary.argtypes = [
+    C.POINTER(C.c_int32),            # out_buf [N, 5]
+    C.c_int32,                       # max_sessions
+]
+_lib.gemma_kv_snapshot_summary.restype = C.c_int32
+
 
 # --- Public Python API ---
 
@@ -448,6 +461,33 @@ def page_owners(phys: int, max_n: int = 32) -> list[int]:
     buf = (C.c_int32 * max_n)()
     n = _lib.gemma_page_owners(int(phys), buf, max_n)
     return [buf[i] for i in range(n)] if n > 0 else []
+
+
+def session_counts(sid: int) -> tuple[int, int]:
+    """Return (page_count, shared_count) in one FFI call."""
+    pc = C.c_int32(0); sc = C.c_int32(0)
+    rc = _lib.gemma_session_counts(int(sid), C.byref(pc), C.byref(sc))
+    if rc < 0:
+        return (0, 0)
+    return (int(pc.value), int(sc.value))
+
+
+# Bulk snapshot. Returns a list of dicts, one per active session, without
+# making any other FFI calls. Prefer this for 2Hz UI pollers.
+def kv_snapshot_summary(max_sessions: int = 64) -> list[dict]:
+    buf = (C.c_int32 * (max_sessions * 5))()
+    n = _lib.gemma_kv_snapshot_summary(buf, max_sessions)
+    out = []
+    for i in range(n):
+        base = i * 5
+        out.append({
+            "sid": int(buf[base + 0]),
+            "position": int(buf[base + 1]),
+            "state": int(buf[base + 2]),
+            "page_count": int(buf[base + 3]),
+            "shared_count": int(buf[base + 4]),
+        })
+    return out
 
 
 # --- Control-vector API (Phase B) ---

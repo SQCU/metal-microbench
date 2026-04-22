@@ -81,6 +81,9 @@
     background:#1a2030; padding:1px 4px; border-radius:2px;
     font-size:0.62rem; color:#aef;
   }
+  .node .head .badge.kv {
+    background:#1a2a1e; color:#8f5; font-variant-numeric:tabular-nums;
+  }
   .node .seed {
     color:var(--mute); font-style:italic; font-size:0.68rem;
     margin-bottom:0.2em; overflow:hidden; text-overflow:ellipsis;
@@ -185,7 +188,15 @@
   <span class="stat">nodes: <b id="fNodes">0</b></span>
   <span class="stat">running: <b id="fRunning">0</b></span>
   <span class="stat">total tokens: <b id="fTokens">0</b></span>
-  <span class="stat">kv shared across slots: <b id="fShared">—</b></span>
+  <span class="stat">rate: <b id="fRate">idle</b></span>
+  <span class="stat">kv shared (now): <b id="fShared">—</b></span>
+  <!-- 30-second KV tenancy time-series. Dark area = total phys pages owned
+       across all active sessions; bright overlay = shared (refcount > 1)
+       pages. A fork run that hits the prefix cache shows a bright pulse
+       during the shared-prefix scan; the pulse's height is proportional
+       to (sessions × pair-adopted pages). -->
+  <svg id="tenancyStrip" width="320" height="40"
+    style="border:1px solid var(--border); background:#0e0e0e; border-radius:2px;"></svg>
   <span style="flex:1"></span>
   <span class="stat">click a node to focus · that node's "fork N" spawns children from its endpoint · root prompt is shared across every first-level branch</span>
 </footer>
@@ -207,11 +218,59 @@ const SEED_PACKS = {
 };
 
 // --- model ---
-// Each node: { id, parentId, depth, thread, seed, text, fullPrompt, status, tokens, ms, el }
+// Each node: { id, parentId, depth, thread, seed, text, fullPrompt, status, tokens, ms, el,
+//              sid,              // engine session id (from X-Gemma-Session-Id response header)
+//              kvSnapshots,      // [{t, pc, sc}] ring buffer of this session's tenancy readings
+//              peakShared,       // max shared_count over this session's life (= peak cache reuse)
+//              peakPages,        // max page_count over this session's life
+//              firstSharedObs,   // shared_count at the FIRST snapshot caught — = adoption count
+//              kvBadgeEl         // DOM span for the kv-reuse pin
+//            }
 // status: 'pending' | 'running' | 'done' | 'error'
 const nodes = new Map();
 let nextNodeId = 0;
 let focusedId = null;
+
+// Global tenancy time-series. Each pollKv tick appends a sample here; the
+// ring keeps the last KV_HISTORY_MS milliseconds. Rendered as the bottom
+// footer strip (drawTenancyStrip).
+const kvHistory = [];          // [{t, totalPages, totalShared, activeSessions}]
+const KV_HISTORY_MS = 30000;   // 30s window
+
+// Render loop. Engine can stream ~130 tok/s aggregate across branches;
+// rather than having each incoming token trigger 4 DOM writes + a
+// whole-node scan (which bottlenecks at ~60 tok/s visible rate and
+// drops frames under fork fan-out), stream-reader loops just mutate
+// in-memory state (n.text, n.tokens) and mark n.dirty. A single
+// requestAnimationFrame scheduler flushes all dirty nodes at display
+// rate (60fps). Net effect: engine runs at whatever rate it wants and
+// the browser catches up on its own tick, with no backpressure
+// propagating through the fetch queue.
+let rafPending = false;
+function scheduleFlush() {
+  if (rafPending) return;
+  rafPending = true;
+  requestAnimationFrame(flushAllDirty);
+}
+function flushAllDirty() {
+  rafPending = false;
+  let any = false;
+  for (const n of nodes.values()) {
+    if (!n.dirty) continue;
+    any = true;
+    if (n.bodyEl) {
+      n.bodyEl.textContent = displayText(n.text);
+      n.bodyEl.scrollTop = n.bodyEl.scrollHeight;
+    }
+    if (n.badgeEl) {
+      n.badgeEl.textContent = (n.status === 'running')
+        ? `${n.tokens}t`
+        : `${n.tokens}t·${n.ms}ms`;
+    }
+    n.dirty = false;
+  }
+  if (any) updateStats();
+}
 
 // --- UI elements ---
 const statusText = document.getElementById('statusText');
@@ -350,8 +409,20 @@ function renderNode(n) {
   tag.textContent = n.depth === 0 ? 'root' : `n${n.id}·d${n.depth}·t${n.thread}`;
   const badge = document.createElement('span'); badge.className = 'badge';
   badge.textContent = n.status === 'running' ? `${n.tokens}t` : (n.status === 'done' ? `${n.tokens}t·${n.ms}ms` : n.status);
+  // KV-reuse pin: "kv S/P" where S = peak shared phys pages, P = peak total
+  // phys pages this session owned. Each adopted slide page contributes 2
+  // phys pages (pair: slide-primary + full-sibling), so S is always even
+  // when pair-promotion is correctly wiring siblings together — a visible
+  // correctness signature. Hidden on the root (no engine session).
+  const kvBadge = document.createElement('span'); kvBadge.className = 'badge kv';
+  kvBadge.textContent = n.depth === 0
+    ? ''
+    : (n.peakPages > 0 ? `kv ${n.peakShared}/${n.peakPages}` : 'kv …');
+  kvBadge.title = 'peak shared / peak owned phys pages (each adopted slide page = 2 phys)';
   head.appendChild(tag); head.appendChild(badge);
+  if (kvBadge.textContent) head.appendChild(kvBadge);
   el.appendChild(head);
+  n.kvBadgeEl = kvBadge;
   if (n.seed) {
     const seedEl = document.createElement('div'); seedEl.className = 'seed';
     seedEl.textContent = '↪ ' + n.seed;
@@ -415,11 +486,33 @@ function runningCount() {
   let n = 0; for (const x of nodes.values()) if (x.status === 'running') n++;
   return n;
 }
+// Rolling token-rate estimator. Samples (t, cumulativeTokens) in a small
+// ring; rate = Δtokens / Δt across the window. Independent of KV polling
+// cadence — drives the "Z tok/s" footer readout so the user can see the
+// engine's actual aggregate throughput instead of inferring it from DOM
+// animation smoothness.
+const rateSamples = [];  // {t, totalTokens}
+const RATE_WINDOW_MS = 1500;
 function updateStats() {
   document.getElementById('fNodes').textContent = nodes.size;
   document.getElementById('fRunning').textContent = runningCount();
   let tot = 0; for (const x of nodes.values()) tot += x.tokens || 0;
   document.getElementById('fTokens').textContent = tot;
+  const now = performance.now();
+  rateSamples.push({t: now, totalTokens: tot});
+  const cutoff = now - RATE_WINDOW_MS;
+  while (rateSamples.length > 1 && rateSamples[0].t < cutoff) rateSamples.shift();
+  const el = document.getElementById('fRate');
+  if (el && rateSamples.length >= 2) {
+    const first = rateSamples[0], last = rateSamples[rateSamples.length - 1];
+    const dt = (last.t - first.t) / 1000;
+    const dn = last.totalTokens - first.totalTokens;
+    el.textContent = (dt > 0 && dn > 0)
+      ? `${(dn / dt).toFixed(0)} tok/s agg`
+      : 'idle';
+  } else if (el) {
+    el.textContent = 'idle';
+  }
 }
 
 // --- spin root ---
@@ -431,7 +524,10 @@ spinBtn.addEventListener('click', async () => {
     root = {
       id: nextNodeId++, parentId: null, depth: 0, thread: 0,
       seed: '', text: rootPrompt.value, status: 'done',
-      tokens: 0, ms: 0, bodyEl: null, badgeEl: null, el: null,
+      tokens: 0, ms: 0, bodyEl: null, badgeEl: null, kvBadgeEl: null, el: null,
+      // Root never runs as a session; KV fields stay nulls.
+      sid: null, kvSnapshots: [],
+      peakShared: 0, peakPages: 0, firstSharedObs: null,
     };
     nodes.set(root.id, root);
     focusedId = root.id;
@@ -458,7 +554,13 @@ async function forkFrom(parentId, count) {
       thread: i, seed: seeds[i] || '',
       text: '', fullPrompt: buildBranchPrompt(parentId, seeds[i] || ''),
       status: 'running', tokens: 0, ms: 0, error: null,
-      bodyEl: null, badgeEl: null, el: null,
+      bodyEl: null, badgeEl: null, kvBadgeEl: null, el: null,
+      // dirty: true ⇒ n.text/tokens changed since last RAF flush. Read by
+      // flushAllDirty() and reset to false after updating the DOM.
+      dirty: false,
+      // KV tenancy tracking (populated once sid is known + pollKv fires):
+      sid: null, kvSnapshots: [],
+      peakShared: 0, peakPages: 0, firstSharedObs: null,
     };
     nodes.set(n.id, n); newNodes.push(n);
   }
@@ -493,6 +595,14 @@ async function streamOne(n) {
       }),
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    // Server exposes the engine session id via this header. Capture it
+    // so pollKv can correlate /v1/kv/snapshot rows with nodes and
+    // record per-node tenancy history.
+    const sidHeader = resp.headers.get('X-Gemma-Session-Id');
+    if (sidHeader !== null && sidHeader !== undefined) {
+      n.sid = parseInt(sidHeader);
+      if (n.kvBadgeEl) n.kvBadgeEl.textContent = 'kv …';
+    }
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
     let buf = '';
@@ -510,40 +620,116 @@ async function streamOne(n) {
           const j = JSON.parse(payload);
           const delta = j.choices?.[0]?.text ?? j.choices?.[0]?.delta?.content;
           if (delta) {
+            // Hot path: mutate in-memory state only. DOM + stats
+            // updates are batched into the next requestAnimationFrame
+            // so the reader can run as fast as the server streams
+            // without starving the layout engine.
             n.text += delta; n.tokens += 1;
-            if (n.bodyEl) {
-              n.bodyEl.textContent = displayText(n.text);
-              n.bodyEl.scrollTop = n.bodyEl.scrollHeight;
-            }
-            if (n.badgeEl) n.badgeEl.textContent = `${n.tokens}t`;
-            updateStats();
+            n.dirty = true;
+            scheduleFlush();
           }
         } catch {}
       }
     }
     n.status = 'done'; n.ms = Math.round(performance.now() - t0);
-    if (n.badgeEl) n.badgeEl.textContent = `${n.tokens}t·${n.ms}ms`;
+    // Final flush: ensure the 'Nt·Xms' badge lands even if no tokens
+    // arrived in the last frame's window.
+    n.dirty = true; scheduleFlush();
   } catch (e) {
     n.status = 'error'; n.error = String(e); n.ms = Math.round(performance.now() - t0);
+    n.dirty = true; scheduleFlush();
   }
 }
 
 // --- kv tenancy poll (background) ---
+// Samples /v1/kv/snapshot at 2 Hz and maintains two things:
+//   1. Global ring buffer kvHistory — the last 30 s of (total_pages,
+//      shared_pages, active_sessions), rendered as the footer strip.
+//   2. Per-node rolling peak (peakShared, peakPages) — pinned as the
+//      kv-reuse badge on each node card. Peak sticks after the session
+//      closes so the user can see the reuse value AFTER a fork run.
+// Correlation: each node carries n.sid (captured from streamOne's
+// response header); snap.sessions[i].sid is the engine's session id.
 async function pollKv() {
   try {
     const snap = await (await fetch('/v1/kv/snapshot')).json();
-    let shared = 0, totalPages = 0;
+    const now = performance.now();
+    let totalPages = 0, totalShared = 0;
+    const activeSids = new Set();
     for (const s of snap.sessions || []) {
-      shared += s.shared_count || 0;
       totalPages += s.page_count || 0;
+      totalShared += s.shared_count || 0;
+      activeSids.add(s.sid);
     }
+    // Append + prune.
+    kvHistory.push({t: now, totalPages, totalShared, activeSessions: activeSids.size});
+    const cutoff = now - KV_HISTORY_MS;
+    while (kvHistory.length && kvHistory[0].t < cutoff) kvHistory.shift();
+
+    // Per-node correlation.
+    const sidToNode = new Map();
+    for (const n of nodes.values()) if (n.sid != null) sidToNode.set(n.sid, n);
+    for (const s of snap.sessions || []) {
+      const n = sidToNode.get(s.sid);
+      if (!n) continue;
+      n.kvSnapshots.push({t: now, pc: s.page_count || 0, sc: s.shared_count || 0});
+      // cap to 60 samples (= 30 s at 2 Hz — matches the global window)
+      if (n.kvSnapshots.length > 60) n.kvSnapshots.shift();
+      if (n.firstSharedObs === null) n.firstSharedObs = s.shared_count || 0;
+      if ((s.shared_count || 0) > n.peakShared) n.peakShared = s.shared_count || 0;
+      if ((s.page_count  || 0) > n.peakPages)  n.peakPages  = s.page_count  || 0;
+      if (n.kvBadgeEl && n.peakPages > 0) {
+        n.kvBadgeEl.textContent = `kv ${n.peakShared}/${n.peakPages}`;
+        if (n.kvBadgeEl.parentElement === null && n.el) {
+          // Badge wasn't appended during first render (kv was unknown);
+          // attach it now so the reuse value becomes visible.
+          const head = n.el.querySelector('.head');
+          if (head) head.appendChild(n.kvBadgeEl);
+        }
+      }
+    }
+
+    // Global strip.
     document.getElementById('fShared').textContent =
-      totalPages ? `${shared}/${totalPages} pages` : '—';
+      totalPages ? `${totalShared}/${totalPages} pages` : '—';
   } catch {}
+  drawTenancyStrip();
   // re-draw links periodically in case layout shifted
   drawLinks();
 }
 setInterval(pollKv, 500);
+
+// Draw the footer tenancy strip. X axis = last KV_HISTORY_MS ms, Y axis =
+// max(totalPages observed). Two stacked paths: outer = totalPages (muted
+// green fill), inner = totalShared (bright green fill). The ratio of
+// bright to muted at any point = instantaneous cache-reuse fraction; a
+// constant bright fill during a fork run means every session adopted
+// something. The curves sit on top of each other (not stacked).
+function drawTenancyStrip() {
+  const svg = document.getElementById('tenancyStrip');
+  if (!svg) return;
+  const W = svg.clientWidth || 320, H = svg.clientHeight || 40;
+  if (kvHistory.length === 0) { svg.innerHTML = ''; return; }
+  const now = performance.now();
+  const t0 = now - KV_HISTORY_MS;
+  let ymax = 1;
+  for (const s of kvHistory) if (s.totalPages > ymax) ymax = s.totalPages;
+  const xOf = (t) => ((t - t0) / KV_HISTORY_MS) * W;
+  const yOf = (v) => H - (v / ymax) * (H - 2);
+  const pathFor = (key) => {
+    // Filled area below the series curve.
+    let d = `M 0 ${H} `;
+    for (const s of kvHistory) d += `L ${xOf(s.t).toFixed(1)} ${yOf(s[key]).toFixed(1)} `;
+    d += `L ${W} ${H} Z`;
+    return d;
+  };
+  svg.innerHTML = `
+    <path d="${pathFor('totalPages')}"  fill="#1a2a1e" />
+    <path d="${pathFor('totalShared')}" fill="#4bc27a" opacity="0.9" />
+    <text x="4" y="10" fill="#8f5" font-size="9px">ymax=${ymax}</text>
+    <text x="${W-4}" y="10" text-anchor="end" fill="#666" font-size="9px">-30s</text>
+  `;
+}
 
 // Keyboard: enter fork-focused-node-by-4; esc unfocus; r resets if empty
 document.addEventListener('keydown', (e) => {
