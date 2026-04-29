@@ -1858,6 +1858,281 @@ kernel void dense_gemv_q8_0_btile_qkv_b4(
                                        tg, lid, sg_id);
 }
 
+// =============================================================================
+// Q8_0 RMSNorm + QKV kernel zoo OTF (on-the-fly normalize) at compile-time
+// fixed B_TILE ∈ {1, 2, 4, 8}.
+//
+// Same layout/grid/register-amortization story as the staging-based btile_qkv
+// above, but the RMSNorm fusion is split: phase 1 computes a per-batch
+// scalar inv_rms and stashes it in tg-mem (only B_TILE floats). Phase 3
+// reads x and gamma directly per element and applies normalize-on-the-fly,
+// so there's NO full-D h_norm tg-mem staging.
+//
+// tg-mem footprint: B_TILE×4B (inv_rms) + 16B (ss_stage) + 512B (partials)
+// = ~560B at B_TILE=8 vs 22.5 KB for the staging-based b4 variant.
+// This is what unlocks B_TILE=8 (the staging design overflowed the 32 KB
+// tg-mem cap at b8).
+//
+// Cost vs staging: phase 3 reads x and gamma per FMA element (extra L1/L2
+// traffic) and adds 1 mul per FMA (gamma scaling) instead of computing
+// h_norm once into tg-mem. At AR scales the L1-resident x and gamma
+// across the kb loop dominate; the otf math is hot-cache-amortized.
+template<uint B_TILE>
+inline void dense_gemv_q8_0_btile_qkv_otf_impl(
+    device const half* x,
+    device const half* gamma,
+    device const uchar* Wq_sw,
+    device const uchar* Wk_sw,
+    device const uchar* Wv_sw,
+    device half* out_q,
+    device half* out_k,
+    device half* out_v,
+    constant uint& D_in,
+    constant uint& Q_nb,
+    constant uint& K_nb,
+    constant uint& V_nb,
+    constant uint& D_out_q,
+    constant uint& D_out_k,
+    constant uint& D_out_v,
+    constant float& eps,
+    constant uint& numVecs,
+    threadgroup float (&inv_rms)[B_TILE],
+    threadgroup float (&ss_stage)[4],
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 34;
+    constexpr uint THREADS = 128;
+
+    uint slab = tg.x;
+    uint vec_block = tg.y;
+    uint v_base = vec_block * B_TILE;
+    if (v_base >= numVecs) return;
+    uint v_count = (numVecs - v_base < B_TILE) ? (numVecs - v_base) : B_TILE;
+
+    uint tid = lid.x;
+    uint lid_sg = tid % 32;
+
+    // Phase 1: per-batch RMS reduction. Compile-time-bounded loop unrolls;
+    // predicate body on (v < v_count).
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        uint b = v_base + v;
+        device const half* xb = x + b * D_in;
+        float local_ss = 0.0f;
+        for (uint i = tid; i < D_in; i += THREADS) {
+            float val = float(xb[i]);
+            local_ss += val * val;
+        }
+        float sg_ss = simd_sum(local_ss);
+        if (lid_sg == 0) ss_stage[sg_id] = sg_ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total_ss = ss_stage[0] + ss_stage[1] + ss_stage[2] + ss_stage[3];
+        if (tid == 0) {
+            inv_rms[v] = rsqrt(total_ss / float(D_in) + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Phase 2: route slab to Q/K/V projection.
+    uint n_block;
+    uint D_out;
+    device const uchar* W_sw;
+    device half* out;
+    if (slab < Q_nb) {
+        n_block = slab; D_out = D_out_q; W_sw = Wq_sw; out = out_q;
+    } else if (slab < Q_nb + K_nb) {
+        n_block = slab - Q_nb; D_out = D_out_k; W_sw = Wk_sw; out = out_k;
+    } else {
+        n_block = slab - Q_nb - K_nb; D_out = D_out_v; W_sw = Wv_sw; out = out_v;
+    }
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+    uint nbc = D_in / 32;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
+    uint kb_per_sg = nbc / N_SPLITS;
+    uint kb_begin = sg_id * kb_per_sg;
+    uint kb_end = kb_begin + kb_per_sg;
+
+    // Phase 3: GEMV with on-the-fly RMSNorm. B_TILE register accs.
+    float accs[B_TILE];
+    for (uint v = 0; v < B_TILE; ++v) accs[v] = 0.0f;
+    for (uint kb = kb_begin; kb < kb_end; ++kb) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        float d = float(*(device const half*)(blk));
+        device const char* qs = (device const char*)(blk + 2);
+        uint base_k = kb * 32;
+        for (uint p = 0; p < 32; ++p) {
+            float w_p = d * float(qs[p]);
+            float gamma_p = float(gamma[base_k + p]);
+            for (uint v = 0; v < B_TILE; ++v) {
+                if (v < v_count) {
+                    uint b = v_base + v;
+                    float x_val = float(x[b * D_in + base_k + p]);
+                    // Normalize-on-the-fly: x · inv_rms · gamma · w
+                    accs[v] += x_val * inv_rms[v] * gamma_p * w_p;
+                }
+            }
+        }
+    }
+
+    // Phase 4: per-batch reduction across N_SPLITS SGs and write outputs.
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        partials[sg_id][lid_sg] = accs[v];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            uint b = v_base + v;
+            out[b * D_out + n] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_q8_0_btile_qkv_otf_b1")]]
+kernel void dense_gemv_q8_0_btile_qkv_otf_b1(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]],
+    device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]],
+    device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]],
+    device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]],
+    constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]],
+    constant uint& V_nb         [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]],
+    constant uint& D_out_k      [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]],
+    constant float& eps         [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[1];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_q8_0_btile_qkv_otf_impl<1>(x, gamma, Wq_sw, Wk_sw, Wv_sw,
+                                           out_q, out_k, out_v,
+                                           D_in, Q_nb, K_nb, V_nb,
+                                           D_out_q, D_out_k, D_out_v,
+                                           eps, numVecs,
+                                           inv_rms, ss_stage, partials,
+                                           tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q8_0_btile_qkv_otf_b2")]]
+kernel void dense_gemv_q8_0_btile_qkv_otf_b2(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]],
+    device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]],
+    device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]],
+    device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]],
+    constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]],
+    constant uint& V_nb         [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]],
+    constant uint& D_out_k      [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]],
+    constant float& eps         [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[2];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_q8_0_btile_qkv_otf_impl<2>(x, gamma, Wq_sw, Wk_sw, Wv_sw,
+                                           out_q, out_k, out_v,
+                                           D_in, Q_nb, K_nb, V_nb,
+                                           D_out_q, D_out_k, D_out_v,
+                                           eps, numVecs,
+                                           inv_rms, ss_stage, partials,
+                                           tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q8_0_btile_qkv_otf_b4")]]
+kernel void dense_gemv_q8_0_btile_qkv_otf_b4(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]],
+    device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]],
+    device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]],
+    device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]],
+    constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]],
+    constant uint& V_nb         [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]],
+    constant uint& D_out_k      [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]],
+    constant float& eps         [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[4];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_q8_0_btile_qkv_otf_impl<4>(x, gamma, Wq_sw, Wk_sw, Wv_sw,
+                                           out_q, out_k, out_v,
+                                           D_in, Q_nb, K_nb, V_nb,
+                                           D_out_q, D_out_k, D_out_v,
+                                           eps, numVecs,
+                                           inv_rms, ss_stage, partials,
+                                           tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q8_0_btile_qkv_otf_b8")]]
+kernel void dense_gemv_q8_0_btile_qkv_otf_b8(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]],
+    device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]],
+    device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]],
+    device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]],
+    constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]],
+    constant uint& V_nb         [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]],
+    constant uint& D_out_k      [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]],
+    constant float& eps         [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[8];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_q8_0_btile_qkv_otf_impl<8>(x, gamma, Wq_sw, Wk_sw, Wv_sw,
+                                           out_q, out_k, out_v,
+                                           D_in, Q_nb, K_nb, V_nb,
+                                           D_out_q, D_out_k, D_out_v,
+                                           eps, numVecs,
+                                           inv_rms, ss_stage, partials,
+                                           tg, lid, sg_id);
+}
+
 // V7 family: same swizzled Q8_0 layout as V6, but each threadgroup
 // amortizes weight reads across VEC_TILE input vectors via per-thread
 // register accumulators (the same pattern V4 uses across B for AR).

@@ -186,6 +186,34 @@ func runLmARProfile(ggufPath: String) {
                                     DoutQ: H * HD, DoutK: KV_H * HD, DoutV: KV_H * HD,
                                     activeB: 4)
             })
+            // OTF (on-the-fly normalize) variants — full {1,2,4,8} coverage.
+            stages.append(runARStage("btile_qkv_otf_b1", layer: L) { cb in
+                let Wv = lw.attnV ?? lw.attnK
+                encGemvQ80BtileQKVOtf(cb, x: hidden, gammaBuf: lw.attnNorm,
+                                       Wq: lw.attnQ, Wk: lw.attnK, Wv: Wv,
+                                       outQ: q_out, outK: k_out, outV: v_out,
+                                       Din: HIDDEN,
+                                       DoutQ: H * HD, DoutK: KV_H * HD, DoutV: KV_H * HD,
+                                       activeB: 1)
+            })
+            stages.append(runARStage("btile_qkv_otf_b4", layer: L) { cb in
+                let Wv = lw.attnV ?? lw.attnK
+                encGemvQ80BtileQKVOtf(cb, x: hidden, gammaBuf: lw.attnNorm,
+                                       Wq: lw.attnQ, Wk: lw.attnK, Wv: Wv,
+                                       outQ: q_out, outK: k_out, outV: v_out,
+                                       Din: HIDDEN,
+                                       DoutQ: H * HD, DoutK: KV_H * HD, DoutV: KV_H * HD,
+                                       activeB: 4)
+            })
+            stages.append(runARStage("btile_qkv_otf_b8", layer: L) { cb in
+                let Wv = lw.attnV ?? lw.attnK
+                encGemvQ80BtileQKVOtf(cb, x: hidden, gammaBuf: lw.attnNorm,
+                                       Wq: lw.attnQ, Wk: lw.attnK, Wv: Wv,
+                                       outQ: q_out, outK: k_out, outV: v_out,
+                                       Din: HIDDEN,
+                                       DoutQ: H * HD, DoutK: KV_H * HD, DoutV: KV_H * HD,
+                                       activeB: 8)
+            })
 
             stages.append(runARStage("qkn_rope", layer: L) { cb in
                 encRMSNormG(cb, x: q_out, gammaBuf: lw.attnQNorm, out: q_out, D: HD, numVecs: B * H)
@@ -347,6 +375,7 @@ func runLmARProfile(ggufPath: String) {
     let stageOrder = ["embed",
                        "qkv", "qkv_b1", "qkv_v7_n1",
                        "btile_qkv_b1", "btile_qkv_b2", "btile_qkv_b4",
+                       "btile_qkv_otf_b1", "btile_qkv_otf_b4", "btile_qkv_otf_b8",
                        "qkn_rope", "kv_attn",
                        "oproj_norm", "oproj_norm_b1",
                        "btile_oproj_b1", "btile_oproj_b2", "btile_oproj_b4", "btile_oproj_b8",

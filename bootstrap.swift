@@ -94,11 +94,19 @@ let denseQ80BtileB1PSO = pso("dense_gemv_q8_0_btile_b1")
 let denseQ80BtileB2PSO = pso("dense_gemv_q8_0_btile_b2")
 let denseQ80BtileB4PSO = pso("dense_gemv_q8_0_btile_b4")
 let denseQ80BtileB8PSO = pso("dense_gemv_q8_0_btile_b8")
-// Q8_0 RMSNorm+QKV templated zoo. B_TILE=8 omitted (tg-mem cap); for
-// activeB > 4 the dispatcher falls back to V6 grid-shrink at numVecs.
+// Q8_0 RMSNorm+QKV templated zoo (staging-based — kept for reference).
+// B_TILE=8 omitted; tg-mem h_norm staging at b8 = 45 KB > 32 KB cap.
 let denseQ80BtileQkvB1PSO = pso("dense_gemv_q8_0_btile_qkv_b1")
 let denseQ80BtileQkvB2PSO = pso("dense_gemv_q8_0_btile_qkv_b2")
 let denseQ80BtileQkvB4PSO = pso("dense_gemv_q8_0_btile_qkv_b4")
+// Q8_0 RMSNorm+QKV templated zoo (on-the-fly normalize). Tg-mem usage
+// drops from h_norm staging's 5.6-22.5 KB to ~600 B (just B_TILE
+// inv_rms scalars + partials), so b8 fits cleanly. Cost: per-FMA
+// gamma+x re-read from L1/L2 instead of TG-mem h_norm broadcast.
+let denseQ80BtileQkvOtfB1PSO = pso("dense_gemv_q8_0_btile_qkv_otf_b1")
+let denseQ80BtileQkvOtfB2PSO = pso("dense_gemv_q8_0_btile_qkv_otf_b2")
+let denseQ80BtileQkvOtfB4PSO = pso("dense_gemv_q8_0_btile_qkv_otf_b4")
+let denseQ80BtileQkvOtfB8PSO = pso("dense_gemv_q8_0_btile_qkv_otf_b8")
 let denseQ80V5RmsPSO = pso("dense_gemv_q8_0_v5_rmsnorm")
 let denseQ80V6PSO    = pso("dense_gemv_q8_0_v6")
 let denseQ80V6RmsPSO = pso("dense_gemv_q8_0_v6_rmsnorm")
@@ -946,6 +954,63 @@ func encGemvQ80BtileQKV(_ cb: MTLCommandBuffer, x: MTLBuffer, gammaBuf: MTLBuffe
     case 2: pso = denseQ80BtileQkvB2PSO; bTile = 2
     default: pso = denseQ80BtileQkvB4PSO; bTile = 4    // activeB ∈ {3,4}
     }
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(pso)
+    enc.setBuffer(x, offset: 0, index: 0)
+    enc.setBuffer(gammaBuf, offset: 0, index: 1)
+    enc.setBuffer(Wq, offset: 0, index: 2)
+    enc.setBuffer(Wk, offset: 0, index: 3)
+    enc.setBuffer(Wv, offset: 0, index: 4)
+    enc.setBuffer(outQ, offset: 0, index: 5)
+    enc.setBuffer(outK, offset: 0, index: 6)
+    enc.setBuffer(outV, offset: 0, index: 7)
+    var du = UInt32(Din)
+    var qnb = UInt32(DoutQ / 32), knb = UInt32(DoutK / 32), vnb = UInt32(DoutV / 32)
+    var douq = UInt32(DoutQ), douk = UInt32(DoutK), douv = UInt32(DoutV)
+    var eps: Float = 1e-6
+    var nv = UInt32(activeB)
+    enc.setBytes(&du, length: 4, index: 8)
+    enc.setBytes(&qnb, length: 4, index: 9)
+    enc.setBytes(&knb, length: 4, index: 10)
+    enc.setBytes(&vnb, length: 4, index: 11)
+    enc.setBytes(&douq, length: 4, index: 12)
+    enc.setBytes(&douk, length: 4, index: 13)
+    enc.setBytes(&douv, length: 4, index: 14)
+    enc.setBytes(&eps, length: 4, index: 15)
+    enc.setBytes(&nv, length: 4, index: 16)
+    let totalSlabs = (DoutQ + DoutK + DoutV) / 32
+    let yBlocks = (activeB + bTile - 1) / bTile
+    enc.dispatchThreadgroups(MTLSize(width: totalSlabs, height: yBlocks, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// Q8_0 RMSNorm + QKV kernel-zoo dispatcher (OTF — on-the-fly normalize).
+// All four otf widths {1, 2, 4, 8} compile and run, but only b1 actually
+// beats V6 in measurement. V6's grid (totalSlabs × B) parallelism wins
+// over the otf "all-batches-in-one-TG" design at higher widths because
+// per-TG work scales with B_TILE while V6 spreads across 8 SMs cleanly.
+// Policy:
+//   activeB == 1 → otf_b1 (22% faster than V6 at numVecs=1)
+//   activeB >= 2 → V6 (with numVecs=activeB grid-shrink)
+// The b2/b4/b8 otf PSOs stay registered for future use if the structural
+// trade-off shifts (e.g., on bigger SMs or with weight-residency tricks).
+func encGemvQ80BtileQKVOtf(_ cb: MTLCommandBuffer, x: MTLBuffer, gammaBuf: MTLBuffer,
+                            Wq: MTLBuffer, Wk: MTLBuffer, Wv: MTLBuffer,
+                            outQ: MTLBuffer, outK: MTLBuffer, outV: MTLBuffer,
+                            Din: Int, DoutQ: Int, DoutK: Int, DoutV: Int,
+                            activeB: Int) {
+    precondition(activeB >= 1 && activeB <= 8, "activeB \(activeB) out of [1,8]")
+    if activeB > 1 {
+        encGemvQ80V6RmsnormQKV(cb, x: x, gammaBuf: gammaBuf,
+                                Wq: Wq, Wk: Wk, Wv: Wv,
+                                outQ: outQ, outK: outK, outV: outV,
+                                Din: Din, DoutQ: DoutQ, DoutK: DoutK, DoutV: DoutV,
+                                numVecs: activeB)
+        return
+    }
+    let pso = denseQ80BtileQkvOtfB1PSO
+    let bTile = 1
     let enc = cb.makeComputeCommandEncoder()!
     enc.setComputePipelineState(pso)
     enc.setBuffer(x, offset: 0, index: 0)
@@ -2299,16 +2364,19 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
         let Kc = w.K_caches[L]
         let Vc = w.V_caches[L]
 
-        // Fused Q/K/V: one RMSNorm of hidden (with attn_norm gamma), one h_norm
-        // TG-mem stage, then route each TG to Q/K/V projection by slab.
-        // Gemma-4 full-attn layers omit the V projection in GGUF — pass attnK
-        // as Wv so the kernel runs to completion; v_norm_noscale follows.
+        // Fused RMSNorm + Q/K/V projection — kernel-zoo dispatcher picks
+        // the OTF b1 specialization for activeB=1 (22% faster than V6 at
+        // numVecs=1) and falls back to V6 grid-shrink for activeB>1.
+        // Gemma-4 full-attn layers omit the V projection in GGUF — pass
+        // attnK as Wv so the kernel runs to completion; v_norm_noscale
+        // follows.
         let Wv = lw.attnV ?? lw.attnK
-        encGemvQ80V6RmsnormQKV(cb, x: hidden, gammaBuf: lw.attnNorm,
+        encGemvQ80BtileQKVOtf(cb, x: hidden, gammaBuf: lw.attnNorm,
                                 Wq: lw.attnQ, Wk: lw.attnK, Wv: Wv,
                                 outQ: q_out, outK: k_out, outV: v_out,
                                 Din: HIDDEN,
-                                DoutQ: H * HD, DoutK: KV_H * HD, DoutV: KV_H * HD)
+                                DoutQ: H * HD, DoutK: KV_H * HD, DoutV: KV_H * HD,
+                                activeB: aB)
 
         encRMSNormG(cb, x: q_out, gammaBuf: lw.attnQNorm, out: q_out, D: HD, numVecs: aB * H)
         encRope(cb, q_out, H: H, D: HD, rotary: rotary, theta: theta)
