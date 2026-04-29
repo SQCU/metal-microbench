@@ -172,6 +172,7 @@ func runLmPrefillProfile(ggufPath: String) {
                                     gateW: pre_gate_w, expertScaleBuf: lw.expertScale, numVecs: N)
                 encRouteCompactInto(cb, expertIds: pre_expert_ids, groupStart: pre_group_start,
                                      slotToken: pre_slot_token, batchSlots: pre_batch_slots,
+                                     activeExperts: active_exp,
                                      numVecs: N)
             })
 

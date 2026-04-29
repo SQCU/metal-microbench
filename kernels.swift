@@ -850,8 +850,14 @@ kernel void softmax_topk(
 // only consumes real-slot routings. For aB == B, behavior is identical
 // to V1. For aB < B, only the first aB slots' routings end up in
 // slot_token[]/batch_slots[] and group_start reflects their counts only.
-// active_exp remains the static identity map; MoE kernels dispatch the
-// full E_EXP grid and inactive experts (count==0) early-return as before.
+//
+// V3 ALSO writes a compact active_experts[] list (overwrites the
+// static identity map at runtime). For aB=1 with TOPK=8 distinct
+// routings, this packs the 8 active expert IDs into
+// active_experts[0..8) and pads the rest with sentinel E (= 128).
+// MoE kernels check the sentinel and early-return. Dispatcher passes
+// numActive = TOPK * aB so only the relevant TGs launch — saves
+// 120 wasted TG launches per slab at aB=1.
 kernel void route_compact(
     device const uint* expert_ids   [[buffer(0)]],   // [B*K]
     device uint* group_start        [[buffer(1)]],   // [E+1]
@@ -859,6 +865,7 @@ kernel void route_compact(
     device uint* batch_slots        [[buffer(3)]],   // [B*K]
     constant uint& aB               [[buffer(4)]],   // active batch count (was B)
     constant uint& K                [[buffer(5)]],
+    device uint* active_experts     [[buffer(6)]],   // [E] — overwritten with compact list + sentinel padding
     uint2 lid                       [[thread_position_in_threadgroup]])
 {
     constexpr uint E = 128;
@@ -876,14 +883,26 @@ kernel void route_compact(
     counts[e] = myCount;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Pass 2: thread 0 serializes the E=128 prefix sum into group_start.
+    // Pass 2: thread 0 serializes the E=128 prefix sum into group_start
+    // AND compacts the active expert IDs into active_experts[].
+    // Inactive experts get sentinel E (=128) which the MoE kernels
+    // recognize as "skip TG entirely".
     if (e == 0) {
         uint running = 0;
+        uint active_count = 0;
         for (uint i = 0; i < E; ++i) {
             group_start[i] = running;
             running += counts[i];
+            if (counts[i] > 0) {
+                active_experts[active_count] = i;
+                active_count += 1;
+            }
         }
         group_start[E] = running;
+        // Pad sentinel for [active_count, E).
+        for (uint i = active_count; i < E; ++i) {
+            active_experts[i] = E;     // sentinel = invalid expert
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -2740,6 +2759,7 @@ kernel void moe_gemv_q4k_v6(
     uint2 lid                           [[thread_position_in_threadgroup]])
 {
     uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
+    if (expert >= 128u) return;       // sentinel: route_compact pads tail with E=128
     uint n = n_block * 32 + t;
     if (n >= D_out) return;
     uint gb = group_start[expert]; uint ge = group_start[expert + 1];
@@ -2802,6 +2822,7 @@ kernel void moe_gemv_q5_1_v6(
     uint2 lid                           [[thread_position_in_threadgroup]])
 {
     uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
+    if (expert >= 128u) return;       // sentinel from route_compact tail padding
     uint n = n_block * 32 + t;
     if (n >= D_out) return;
     uint gb = group_start[expert]; uint ge = group_start[expert + 1];

@@ -1973,16 +1973,22 @@ func encSoftmaxTopkInto(_ cb: MTLCommandBuffer, logits: MTLBuffer,
 // The kernel takes B as a runtime arg, so pass B*qLen for prefill.
 // route_compact dispatch — `activeB` is passed to the kernel as the
 // active-batch count. Silenced slots [activeB, B) are skipped, so MoE
-// kernels see only real-slot routings in slot_token/group_start. Default
-// activeB=B preserves legacy behavior.
+// kernels see only real-slot routings in slot_token/group_start.
+//
+// V3: also writes a compact active_experts[] list (active expert IDs
+// up front, sentinel E_EXP=128 in the tail). MoE dispatchers can then
+// trim numActive to TOPK*activeB (or less) and rely on the sentinel
+// for any padding entries.
 func encRouteCompact(_ cb: MTLCommandBuffer, activeB: Int = B) {
     encRouteCompactInto(cb, expertIds: expert_ids, groupStart: group_start,
-                         slotToken: slot_token, batchSlots: batch_slots, numVecs: activeB)
+                         slotToken: slot_token, batchSlots: batch_slots,
+                         activeExperts: active_exp, numVecs: activeB)
 }
 
 func encRouteCompactInto(_ cb: MTLCommandBuffer, expertIds: MTLBuffer,
                           groupStart: MTLBuffer, slotToken: MTLBuffer,
-                          batchSlots: MTLBuffer, numVecs: Int) {
+                          batchSlots: MTLBuffer, activeExperts: MTLBuffer,
+                          numVecs: Int) {
     let enc = cb.makeComputeCommandEncoder()!
     enc.setComputePipelineState(routeCompactPSO)
     enc.setBuffer(expertIds, offset: 0, index: 0)
@@ -1992,6 +1998,7 @@ func encRouteCompactInto(_ cb: MTLCommandBuffer, expertIds: MTLBuffer,
     var bv = UInt32(numVecs), kv = UInt32(TOPK)
     enc.setBytes(&bv, length: 4, index: 4)
     enc.setBytes(&kv, length: 4, index: 5)
+    enc.setBuffer(activeExperts, offset: 0, index: 6)
     enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
     enc.endEncoding()
@@ -2558,18 +2565,21 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
                       to: dump, destinationOffset: 3 * HIDDEN * 2, size: HIDDEN * 2)
             blit.endEncoding()
         }
-        // numActive=E_EXP is the SAFE setting: route_compact populates
-        // active_experts[] sorted by EXPERT ID, not by slot, so slot 0's
-        // 8 TOPK experts may sit at any indices in [0, num_unique). To
-        // trim correctly we need either: (a) route_compact awareness of
-        // activeB to put slot-0's experts up front, or (b) a separate
-        // per-active-slot active list. Naive numActive=TOPK*aB produces
-        // garbage output (verified 2026-04-29). Future work.
+        // numActive trimmed via the compact active_experts list that
+        // route_compact (V3) writes. Layout:
+        //   active_experts[0 .. num_unique_active) — actual expert IDs
+        //   active_experts[num_unique_active .. E)  — sentinel E (=128)
+        // MoE V6 kernels check `if (expert >= 128) return;` so any TGs
+        // we launch beyond the actual unique-active count just sentinel-
+        // bail; the saving is the (E_EXP - TOPK*aB) wasted launches we
+        // never fire in the first place.
+        let aMoeNumActive = min(TOPK * aB, E_EXP)
         encMoeGemvQ4K(cb, hidden_norm, lw.moeGateUp, gate_up_fused,
-                      Din: HIDDEN, Dout: MOE_FUSED_DOUT, numActive: E_EXP, useV6: true)
-        encMoeGeluMulFused(cb, fused: gate_up_fused, out: gate_proj, N_half: MOE_INT, numSlots: TOTAL_SLOTS)
+                      Din: HIDDEN, Dout: MOE_FUSED_DOUT, numActive: aMoeNumActive, useV6: true)
+        encMoeGeluMulFused(cb, fused: gate_up_fused, out: gate_proj,
+                            N_half: MOE_INT, numSlots: TOPK * aB)
         encMoeGemvQ51(cb, gate_proj, lw.moeDown, moe_down_out,
-                      Din: MOE_INT, Dout: HIDDEN, numActive: E_EXP, useV6: true)
+                      Din: MOE_INT, Dout: HIDDEN, numActive: aMoeNumActive, useV6: true)
         if L == 0, let slotsDump = LM_DUMP_L0_MOE_SLOTS {
             let blit = cb.makeBlitCommandEncoder()!
             var off = 0
@@ -2895,6 +2905,7 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
                             gateW: pre_gate_w, expertScaleBuf: lw.expertScale, numVecs: N)
         encRouteCompactInto(cb, expertIds: pre_expert_ids, groupStart: pre_group_start,
                              slotToken: pre_slot_token, batchSlots: pre_batch_slots,
+                             activeExperts: active_exp,
                              numVecs: N)
 
         // MoE: pre_ffn_2(pre_hidden) → Q4_K gate_up → gelu*up → Q5_1 down → combine → post_ffn_2.
@@ -3219,6 +3230,7 @@ func encodeOnePrefillLayerSplit(_ w: LmWeights, L: Int, qLen: Int, sslot: Int) {
                             gateW: pre_gate_w, expertScaleBuf: lw.expertScale, numVecs: N)
         encRouteCompactInto(cb, expertIds: pre_expert_ids, groupStart: pre_group_start,
                              slotToken: pre_slot_token, batchSlots: pre_batch_slots,
+                             activeExperts: active_exp,
                              numVecs: N)
         encRMSNormG(cb, x: pre_hidden, gammaBuf: lw.preFfn2Norm, out: pre_hidden_norm,
                     D: HIDDEN, numVecs: N)
@@ -3340,6 +3352,7 @@ func encodeOnePrefillLayer(_ cb: MTLCommandBuffer, _ w: LmWeights, L: Int, qLen:
                         gateW: pre_gate_w, expertScaleBuf: lw.expertScale, numVecs: N)
     encRouteCompactInto(cb, expertIds: pre_expert_ids, groupStart: pre_group_start,
                          slotToken: pre_slot_token, batchSlots: pre_batch_slots,
+                         activeExperts: active_exp,
                          numVecs: N)
     encRMSNormG(cb, x: pre_hidden, gammaBuf: lw.preFfn2Norm, out: pre_hidden_norm,
                 D: HIDDEN, numVecs: N)
