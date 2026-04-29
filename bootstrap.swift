@@ -836,13 +836,16 @@ func encGemvV4P(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ W: MTLBuffer, _ out
 }
 
 func encGemvV4Softcap(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ W: MTLBuffer, _ out: MTLBuffer,
-                       Din: Int, Dout: Int, cap: Float) {
+                       Din: Int, Dout: Int, cap: Float, activeB: Int = B) {
     let enc = cb.makeComputeCommandEncoder()!
     enc.setComputePipelineState(gemvV4SoftcapPSO)
     enc.setBuffer(xbuf, offset: 0, index: 0)
     enc.setBuffer(W, offset: 0, index: 1)
     enc.setBuffer(out, offset: 0, index: 2)
-    var bv = UInt32(B), du = UInt32(Din), dou = UInt32(Dout), cv = cap
+    // bv = activeB so the kernel's `for b in 0..<B` inner loop runs only
+    // over real slots. MAX_B=8 hardcoded in the kernel sizes the per-thread
+    // accs[] array; passing activeB just early-exits the inner loop.
+    var bv = UInt32(activeB), du = UInt32(Din), dou = UInt32(Dout), cv = cap
     enc.setBytes(&bv, length: 4, index: 3)
     enc.setBytes(&du, length: 4, index: 4)
     enc.setBytes(&dou, length: 4, index: 5)
@@ -2738,9 +2741,13 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
     }
 
     // Final RMSNorm + fused fp16 unembed + final-logit softcap (cap=30.0).
-    encRMSNormG(cb, x: hidden, gammaBuf: w.outputNorm, out: hidden_norm, D: HIDDEN, numVecs: B)
+    // numVecs/activeB shrink to aB so only active slots get unembed work
+    // (each is a 1.4 GB weight read, so this cuts ~7 of 8 wasted reads
+    // when activeB=1). Inactive slot logits are stale but the engine
+    // only reads gpu_sampled_tokens[active_slot] anyway.
+    encRMSNormG(cb, x: hidden, gammaBuf: w.outputNorm, out: hidden_norm, D: HIDDEN, numVecs: aB)
     encGemvV4Softcap(cb, hidden_norm, w.unembedW, logits,
-                     Din: HIDDEN, Dout: VOCAB, cap: 30.0)
+                     Din: HIDDEN, Dout: VOCAB, cap: 30.0, activeB: aB)
 
     // Phase 2 of the dataflow-pipeline spec: GPU-side sampling. Reads
     // logits + per-slot sampling params (populated by step() before
