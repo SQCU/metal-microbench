@@ -1,84 +1,68 @@
 """ctypes wrapper around libgemma_metal.dylib.
 
-The Swift side is single-threaded-from-its-POV — every @_cdecl entry takes
-an NSRecursiveLock. This wrapper just binds the C symbols and marshals
-Python <-> C types. Concurrency on the Python side is handled by the
-bridge (one pump thread + async request handlers).
+The interface has exactly five functional / two utility / two admin
+entries. There is no per-session shape — a single submission is a
+batch of size one and goes through the same call as 16 simultaneous
+submissions. Sampler-side features (grammar, top_p, top_k, logit_bias)
+are fields on `SamplingParams`. Control-vector applications (when we
+add them) will be a field on `StreamSpec`. Neither becomes a new FFI
+function.
 
-Session state enum — keep in sync with ffi.swift's gemma_session_state:
-  0 = idle, 1 = priming, 2 = generating, 3 = paused, 4 = done
+Single-threaded contract: only one Python coroutine/thread calls into
+the dylib at a time. The bridge enforces this by funnelling all FFI
+calls through one coordinator coroutine. There is no lock here because
+none is needed; the contract holds upstream.
+
+ABI source of truth: notes/specs/batch_ffi_abi.md.
 """
 from __future__ import annotations
 
 import ctypes as C
 import os
-import threading
+import struct
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 
-STATE_IDLE = 0
-STATE_PRIMING = 1
-STATE_GENERATING = 2
-STATE_PAUSED = 3
-STATE_DONE = 4
-
-
+# ----------------------------------------------------------------------
+# Library load.
+# ----------------------------------------------------------------------
 def _find_dylib() -> Path:
-    # Search order: $GEMMA_DYLIB, sibling ../libgemma_metal.dylib, cwd.
     env = os.environ.get("GEMMA_DYLIB")
     if env:
         return Path(env).resolve()
     here = Path(__file__).resolve().parent
-    candidates = [
-        here.parent / "libgemma_metal.dylib",
-        Path.cwd() / "libgemma_metal.dylib",
-    ]
-    for c in candidates:
+    for c in (here.parent / "libgemma_metal.dylib",
+              Path.cwd() / "libgemma_metal.dylib"):
         if c.exists():
             return c.resolve()
-    raise FileNotFoundError(
-        "libgemma_metal.dylib not found. Build it with `make libgemma_metal.dylib` "
-        "in the repo root, or set GEMMA_DYLIB=<path>."
-    )
+    raise FileNotFoundError("libgemma_metal.dylib not found")
 
 
-_lib_path = _find_dylib()
-_lib = C.CDLL(str(_lib_path))
+_lib = C.CDLL(str(_find_dylib()))
 
-# --- Signatures ---
 
+# ----------------------------------------------------------------------
+# C signatures. The Swift @_cdecl exports are gemma_submit + gemma_poll
+# (the runtime functional pair) plus gemma_init / gemma_vision_init /
+# gemma_status / gemma_shutdown / gemma_bos_id / gemma_eos_id /
+# gemma_tokenize / gemma_detokenize.
+# ----------------------------------------------------------------------
 _lib.gemma_init.argtypes = [C.c_char_p]
 _lib.gemma_init.restype = C.c_int32
 
-_lib.gemma_is_ready.argtypes = []
-_lib.gemma_is_ready.restype = C.c_int32
+_lib.gemma_vision_init.argtypes = [C.c_char_p]
+_lib.gemma_vision_init.restype = C.c_int32
 
-_lib.gemma_open_session.argtypes = [C.c_int32]
-_lib.gemma_open_session.restype = C.c_int32
+_lib.gemma_vision_is_ready.argtypes = []
+_lib.gemma_vision_is_ready.restype = C.c_int32
 
-_lib.gemma_close_session.argtypes = [C.c_int32]
-_lib.gemma_close_session.restype = C.c_int32
+_lib.gemma_bos_id.argtypes = []
+_lib.gemma_bos_id.restype = C.c_uint32
 
-_lib.gemma_pause_session.argtypes = [C.c_int32]
-_lib.gemma_pause_session.restype = C.c_int32
-
-_lib.gemma_submit.argtypes = [C.c_int32, C.POINTER(C.c_uint32), C.c_int32]
-_lib.gemma_submit.restype = C.c_int32
-
-_lib.gemma_append.argtypes = [C.c_int32, C.POINTER(C.c_uint32), C.c_int32]
-_lib.gemma_append.restype = C.c_int32
-
-_lib.gemma_tick.argtypes = []
-_lib.gemma_tick.restype = C.c_int32
-
-_lib.gemma_has_work.argtypes = []
-_lib.gemma_has_work.restype = C.c_int32
-
-_lib.gemma_poll.argtypes = [C.c_int32, C.POINTER(C.c_uint32), C.c_int32]
-_lib.gemma_poll.restype = C.c_int32
-
-_lib.gemma_session_state.argtypes = [C.c_int32]
-_lib.gemma_session_state.restype = C.c_int32
+_lib.gemma_eos_id.argtypes = []
+_lib.gemma_eos_id.restype = C.c_uint32
 
 _lib.gemma_tokenize.argtypes = [
     C.c_char_p, C.c_int32, C.c_int32,
@@ -92,234 +76,373 @@ _lib.gemma_detokenize.argtypes = [
 ]
 _lib.gemma_detokenize.restype = C.c_int32
 
-_lib.gemma_bos_id.argtypes = []
-_lib.gemma_bos_id.restype = C.c_uint32
+_lib.gemma_submit.argtypes = [C.POINTER(C.c_uint8), C.c_int32]
+_lib.gemma_submit.restype = C.c_int32
 
-_lib.gemma_eos_id.argtypes = []
-_lib.gemma_eos_id.restype = C.c_uint32
+_lib.gemma_poll.argtypes = [C.c_int32, C.POINTER(C.c_uint8), C.c_int32]
+_lib.gemma_poll.restype = C.c_int32
 
-_lib.gemma_active_session_count.argtypes = []
-_lib.gemma_active_session_count.restype = C.c_int32
+_lib.gemma_status.argtypes = [C.POINTER(C.c_uint8), C.c_int32]
+_lib.gemma_status.restype = C.c_int32
 
-_lib.gemma_vision_init.argtypes = [C.c_char_p]
-_lib.gemma_vision_init.restype = C.c_int32
+_lib.gemma_shutdown.argtypes = []
+_lib.gemma_shutdown.restype = C.c_int32
 
-_lib.gemma_vision_is_ready.argtypes = []
-_lib.gemma_vision_is_ready.restype = C.c_int32
-
-_lib.gemma_submit_image_path.argtypes = [C.c_int32, C.c_char_p]
-_lib.gemma_submit_image_path.restype = C.c_int32
-
-_lib.gemma_vision_residency_state.argtypes = []
-_lib.gemma_vision_residency_state.restype = C.c_int32
-
-_lib.gemma_vision_residency_bytes.argtypes = []
-_lib.gemma_vision_residency_bytes.restype = C.c_uint64
-
-_lib.gemma_vision_allow_evict.argtypes = []
-_lib.gemma_vision_allow_evict.restype = C.c_int32
-
-_lib.gemma_vision_force_drop.argtypes = []
-_lib.gemma_vision_force_drop.restype = C.c_int32
-
-_lib.gemma_vision_prewarm_path.argtypes = [C.c_char_p]
-_lib.gemma_vision_prewarm_path.restype = C.c_int32
-
-_lib.gemma_vision_last_cache_key.argtypes = [C.c_char_p, C.c_int32]
-_lib.gemma_vision_last_cache_key.restype = C.c_int32
-
-_lib.gemma_vision_fetch_softs_by_key.argtypes = [C.c_char_p, C.POINTER(C.c_uint8), C.c_int32]
-_lib.gemma_vision_fetch_softs_by_key.restype = C.c_int32
-
-_lib.gemma_submit_softs.argtypes = [C.c_int32, C.POINTER(C.c_uint8), C.c_int32, C.c_int32, C.c_int32]
-_lib.gemma_submit_softs.restype = C.c_int32
-
-# Control-vector API (Phase B).
-_lib.gemma_control_register_fp16.argtypes = [C.c_char_p, C.POINTER(C.c_uint8), C.c_int32]
-_lib.gemma_control_register_fp16.restype = C.c_int32
-
-_lib.gemma_session_add_control.argtypes = [
-    C.c_int32, C.c_char_p, C.c_int32,
-    C.c_float, C.c_float,       # polarity, peakMagnitude
-    C.c_float, C.c_float, C.c_float, C.c_float,  # attack, decay, sustainLevel, release
-    C.c_int32, C.c_int32,       # shape (0-3), units (0=tokens, 1=turns)
-    C.c_int32,                  # mode: 0=additive, 1=project
+_lib.gemma_register_resource.argtypes = [
+    C.c_char_p, C.c_char_p, C.POINTER(C.c_uint8), C.c_int32,
 ]
-_lib.gemma_session_add_control.restype = C.c_int32
-
-_lib.gemma_session_clear_controls.argtypes = [C.c_int32]
-_lib.gemma_session_clear_controls.restype = C.c_int32
-
-_lib.gemma_session_set_temperature.argtypes = [C.c_int32, C.c_float]
-_lib.gemma_session_set_temperature.restype = C.c_int32
-
-# Teacher-forcing + logit readback (used by /v1/perplexity).
-_lib.gemma_session_get_slot_logits.argtypes = [C.c_int32, C.POINTER(C.c_uint16)]
-_lib.gemma_session_get_slot_logits.restype = C.c_int32
-
-_lib.gemma_session_set_next_input.argtypes = [C.c_int32, C.c_uint32]
-_lib.gemma_session_set_next_input.restype = C.c_int32
-
-_lib.gemma_session_position.argtypes = [C.c_int32]
-_lib.gemma_session_position.restype = C.c_int32
-
-_lib.gemma_session_pause.argtypes = [C.c_int32]
-_lib.gemma_session_pause.restype = C.c_int32
-
-_lib.gemma_session_resume.argtypes = [C.c_int32]
-_lib.gemma_session_resume.restype = C.c_int32
-
-_lib.gemma_session_release_control.argtypes = [C.c_int32, C.c_char_p]
-_lib.gemma_session_release_control.restype = C.c_int32
-
-_lib.gemma_vision_cache_entries.argtypes = []
-_lib.gemma_vision_cache_entries.restype = C.c_int32
-
-_lib.gemma_vision_cache_hits.argtypes = []
-_lib.gemma_vision_cache_hits.restype = C.c_uint64
-
-_lib.gemma_vision_cache_misses.argtypes = []
-_lib.gemma_vision_cache_misses.restype = C.c_uint64
-
-_lib.gemma_vision_cache_bytes.argtypes = []
-_lib.gemma_vision_cache_bytes.restype = C.c_uint64
-
-_lib.gemma_vision_cache_clear.argtypes = []
-_lib.gemma_vision_cache_clear.restype = C.c_int32
-
-_lib.gemma_active_session_ids.argtypes = [C.POINTER(C.c_int32), C.c_int32]
-_lib.gemma_active_session_ids.restype = C.c_int32
-
-_lib.gemma_session_snapshot.argtypes = [
-    C.c_int32,                       # sid
-    C.POINTER(C.c_int32),            # out_position
-    C.POINTER(C.c_int32),            # out_state
-    C.POINTER(C.c_uint32),           # out_pages
-    C.c_int32,                       # max_pages
-]
-_lib.gemma_session_snapshot.restype = C.c_int32
-
-_lib.gemma_page_refcount.argtypes = [C.c_int32]
-_lib.gemma_page_refcount.restype = C.c_int32
-
-_lib.gemma_page_owners.argtypes = [C.c_int32, C.POINTER(C.c_int32), C.c_int32]
-_lib.gemma_page_owners.restype = C.c_int32
-
-_lib.gemma_session_counts.argtypes = [
-    C.c_int32,                       # sid
-    C.POINTER(C.c_int32),            # out_page_count
-    C.POINTER(C.c_int32),            # out_shared_count
-]
-_lib.gemma_session_counts.restype = C.c_int32
-
-_lib.gemma_kv_snapshot_summary.argtypes = [
-    C.POINTER(C.c_int32),            # out_buf [N, 5]
-    C.c_int32,                       # max_sessions
-]
-_lib.gemma_kv_snapshot_summary.restype = C.c_int32
+_lib.gemma_register_resource.restype = C.c_int32
 
 
-# --- Public Python API ---
-
-# Single init guard (so re-imports / reloads don't double-initialize).
-_init_lock = threading.Lock()
-_inited = False
-
-
-def init(gguf_path: str) -> None:
-    global _inited
-    with _init_lock:
-        if _inited:
-            return
-        rc = _lib.gemma_init(gguf_path.encode("utf-8"))
-        if rc != 0:
-            raise RuntimeError(f"gemma_init failed (rc={rc})")
-        _inited = True
-
-
-def is_ready() -> bool:
-    return _lib.gemma_is_ready() == 1
-
-
-def open_session(max_new_tokens: int = 256) -> int:
-    sid = _lib.gemma_open_session(int(max_new_tokens))
-    if sid < 0:
-        raise RuntimeError("gemma_open_session failed (engine not inited or at session cap)")
-    return sid
-
-
-def close_session(sid: int) -> None:
-    _lib.gemma_close_session(int(sid))
+# ----------------------------------------------------------------------
+# Stream / sampling / segment dataclasses (Python-side shape).
+# ----------------------------------------------------------------------
+@dataclass
+class SamplingParams:
+    temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int = 0
+    repetition_penalty: float = 1.0
+    max_new_tokens: int = 64
+    seed: int = 0
+    eos_token_id: int = -1            # -1 = use model default
+    stop_tokens: list[int] = field(default_factory=list)
+    top_logprobs: int = 0
+    # Sampler-side: per-token additive bias. Empty dict = no bias.
+    logit_bias: dict[int, float] = field(default_factory=dict)
+    # Sampler-side: drop tokens whose softmax prob < min_p × max. 0 = off.
+    min_p: float = 0.0
+    # Sampler-side: structured-cot grammar role labels. Empty = no grammar.
+    # Common values: ["GOAL", "APPROACH", "EDGE"] for the default cot.
+    cot_labels: list[str] = field(default_factory=list)
+    # Multi-token stop sequences. After each emitted token, the engine
+    # checks whether the recent emitted tail equals any sequence here;
+    # if so, the stream finishes with done_reason=1 (eos-equivalent).
+    # Used for tool-call early-stop: tokenize "<tool_call|>" once and
+    # pass it here so the engine self-terminates on tool-call close
+    # without the bridge having to detect-and-cancel from outside.
+    stop_sequences: list[list[int]] = field(default_factory=list)
 
 
-def pause_session(sid: int) -> None:
-    _lib.gemma_pause_session(int(sid))
+@dataclass
+class CVApplication:
+    """One control-vector application on a stream.
+
+    `cvec_id` references a CV uploaded via register_resource(kind='cvec', ...).
+    The bridge does NOT register CVs per-request; uploads happen once at
+    startup and CVs are referenced by id forever after."""
+    cvec_id: str
+    layer: int = 0
+    polarity: float = 1.0
+    peak_magnitude: float = 1.0
+    attack: float = 0.0
+    decay: float = 0.0
+    sustain_level: float = 1.0
+    release: float = 0.0
+    shape: int = 0           # 0=linear, 1=expIn, 2=expOut, 3=cubic
+    units: int = 0           # 0=tokens, 1=turns
+    mode: int = 0            # 0=additive, 1=project, 2=transport
+    target: float = float("nan")  # NaN = envelope-as-target
+    transport_scale: float = 0.0
+    transport_offset: float = 0.0
 
 
-def submit(sid: int, tokens: list[int]) -> None:
-    if not tokens:
-        return
-    arr = (C.c_uint32 * len(tokens))(*tokens)
-    rc = _lib.gemma_submit(int(sid), arr, len(tokens))
-    if rc != 0:
-        raise RuntimeError(f"gemma_submit failed (rc={rc})")
+@dataclass
+class Segment:
+    """A single segment of a stream's input. Tokens or image_bytes."""
+    kind: int                          # 0=tokens, 1=image_bytes
+    tokens: list[int] = field(default_factory=list)
+    image_bytes: bytes = b""
 
 
-def append(sid: int, tokens: list[int]) -> None:
-    if not tokens:
-        return
-    arr = (C.c_uint32 * len(tokens))(*tokens)
-    rc = _lib.gemma_append(int(sid), arr, len(tokens))
-    if rc != 0:
-        raise RuntimeError(f"gemma_append failed (rc={rc})")
+@dataclass
+class StreamSpec:
+    stream_id: int
+    action: int                        # 0=start, 1=continue, 2=cancel, 3=touch
+    flags: int = 0                     # bit 0 = capture_logits
+    segments: list[Segment] = field(default_factory=list)
+    sampling: SamplingParams = field(default_factory=SamplingParams)
+    # Convenience: pass tokens=[...] in lieu of segments=[Segment(...)].
+    tokens: list[int] = field(default_factory=list)
+    # Forward-pass-side: control vectors. Empty list = no-op.
+    control_vectors: list[CVApplication] = field(default_factory=list)
 
 
-def tick() -> int:
-    return _lib.gemma_tick()
+@dataclass
+class TokenLogprob:
+    token: int
+    sampled_logprob: float
+    top_logprobs: list[tuple[int, float]]
 
 
-def has_work() -> bool:
-    return _lib.gemma_has_work() == 1
+@dataclass
+class StreamUpdate:
+    stream_id: int
+    state: int                         # 0=priming, 1=generating, 2=done, 3=error
+    done_reason: int                   # 0=n/a, 1=eos, 2=max_tokens, 3=cancelled, 4=error
+    new_tokens: list[int]
+    err_msg: str
+    prompt_tokens_seen: int
+    completion_tokens_emitted: int
+    cache_hits: int
+    cache_misses: int
+    vision_cache_hits: int
+    logprobs: list[TokenLogprob] = field(default_factory=list)
 
 
-def poll(sid: int, max_tokens: int = 64) -> list[int]:
-    buf = (C.c_uint32 * max_tokens)()
-    n = _lib.gemma_poll(int(sid), buf, max_tokens)
-    if n < 0:
+@dataclass
+class ServerStats:
+    total_pages: int
+    free_pages: int
+    cached_pages: int
+    active_streams: int
+    generating_streams: int
+    priming_streams: int
+    total_steps: int
+    total_tokens_emitted: int
+    vision_cache_entries: int
+    vision_cache_hits: int
+
+
+# ----------------------------------------------------------------------
+# Wire encoding / decoding (hand-rolled little-endian binary, per ABI).
+# ----------------------------------------------------------------------
+_MAGIC_REQ = 0x424D4547   # 'GEMB'
+_MAGIC_RESP = 0x52454D47  # 'GEMR'
+
+
+def _encode_request(streams: list[StreamSpec]) -> bytes:
+    # Normalize convenience .tokens into a single tokens-segment.
+    norm: list[StreamSpec] = []
+    for s in streams:
+        if s.segments:
+            norm.append(s)
+        elif s.tokens and s.action != 2:
+            norm.append(StreamSpec(
+                stream_id=s.stream_id, action=s.action, flags=s.flags,
+                segments=[Segment(kind=0, tokens=list(s.tokens))],
+                sampling=s.sampling))
+        else:
+            norm.append(s)
+    streams = norm
+
+    streams_base = 16
+    streams_bytes = 104 * len(streams)
+    heap_base = streams_base + streams_bytes
+    heap = bytearray()
+    seg_offsets: list[int] = []
+    stop_offsets: list[int] = []
+    seg_counts: list[int] = []
+    lb_offsets: list[int] = []
+    lb_counts: list[int] = []
+    cot_offsets: list[int] = []
+    cot_counts: list[int] = []
+    cv_offsets: list[int] = []
+    cv_counts: list[int] = []
+    ssq_offsets: list[int] = []
+    ssq_counts: list[int] = []
+
+    for s in streams:
+        if s.segments and s.action != 2:
+            seg_count = len(s.segments)
+            seg_arr_off = heap_base + len(heap)
+            seg_struct_off = len(heap)
+            heap += b"\x00" * (16 * seg_count)
+            for idx, seg in enumerate(s.segments):
+                if seg.kind == 0:
+                    data_off = heap_base + len(heap)
+                    for t in seg.tokens:
+                        heap += struct.pack("<I", t)
+                    count = len(seg.tokens)
+                elif seg.kind == 1:
+                    data_off = heap_base + len(heap)
+                    heap += seg.image_bytes
+                    count = len(seg.image_bytes)
+                else:
+                    raise ValueError(f"unknown segment kind {seg.kind}")
+                heap[seg_struct_off + idx*16 : seg_struct_off + (idx+1)*16] = struct.pack(
+                    "<BBBBII4x", seg.kind, 0, 0, 0, count, data_off)
+            seg_offsets.append(seg_arr_off)
+            seg_counts.append(seg_count)
+        else:
+            seg_offsets.append(0)
+            seg_counts.append(0)
+
+        if s.sampling.stop_tokens:
+            stop_off = heap_base + len(heap)
+            for st in s.sampling.stop_tokens:
+                heap += struct.pack("<I", st)
+            stop_offsets.append(stop_off)
+        else:
+            stop_offsets.append(0)
+
+        if s.sampling.logit_bias:
+            lb_off = heap_base + len(heap)
+            for tok, bias in s.sampling.logit_bias.items():
+                heap += struct.pack("<If", int(tok), float(bias))
+            lb_offsets.append(lb_off)
+            lb_counts.append(len(s.sampling.logit_bias))
+        else:
+            lb_offsets.append(0)
+            lb_counts.append(0)
+
+        if s.sampling.cot_labels:
+            cot_off = heap_base + len(heap)
+            for label in s.sampling.cot_labels:
+                lb = label.encode("utf-8")
+                heap += struct.pack("<I", len(lb))
+                heap += lb
+            cot_offsets.append(cot_off)
+            cot_counts.append(len(s.sampling.cot_labels))
+        else:
+            cot_offsets.append(0)
+            cot_counts.append(0)
+
+        # Multi-token stop_sequences: each sequence laid out as
+        # [u32 length][u32 tok0][u32 tok1]...[u32 tokN-1] back-to-back.
+        # The per-stream count is the number of sequences; the offset
+        # points to the first length word.
+        if s.sampling.stop_sequences:
+            ssq_arr_off = heap_base + len(heap)
+            for seq in s.sampling.stop_sequences:
+                heap += struct.pack("<I", len(seq))
+                for tok in seq:
+                    heap += struct.pack("<I", int(tok))
+            ssq_offsets.append(ssq_arr_off)
+            ssq_counts.append(len(s.sampling.stop_sequences))
+        else:
+            ssq_offsets.append(0)
+            ssq_counts.append(0)
+
+        if s.control_vectors:
+            # Reserve fixed-size CV blocks first; backfill cvec_id_offset
+            # after writing the id strings to the heap.
+            cv_arr_off = heap_base + len(heap)
+            cv_struct_off = len(heap)
+            heap += b"\x00" * (64 * len(s.control_vectors))
+            for k, cv in enumerate(s.control_vectors):
+                id_bytes = cv.cvec_id.encode("utf-8")
+                id_off = heap_base + len(heap)
+                heap += id_bytes
+                cv_struct = struct.pack(
+                    "<IIifffffffBBBxfff12x",
+                    id_off, len(id_bytes),
+                    int(cv.layer),
+                    float(cv.polarity), float(cv.peak_magnitude),
+                    float(cv.attack), float(cv.decay),
+                    float(cv.sustain_level), float(cv.release),
+                    int(cv.shape) & 0xff,
+                    int(cv.units) & 0xff,
+                    int(cv.mode)  & 0xff,
+                    float(cv.target),
+                    float(cv.transport_scale),
+                    float(cv.transport_offset),
+                )
+                assert len(cv_struct) == 64, f"CVApplication must be 64 bytes, got {len(cv_struct)}"
+                heap[cv_struct_off + k * 64:cv_struct_off + (k + 1) * 64] = cv_struct
+            cv_offsets.append(cv_arr_off)
+            cv_counts.append(len(s.control_vectors))
+        else:
+            cv_offsets.append(0)
+            cv_counts.append(0)
+
+    out = bytearray()
+    # Wire format v4 — adds stop_sequences in what were the 8 reserved
+    # bytes following cot_offset (formerly "8x"). Version bumped from 3
+    # so older Swift parsers that only read v3 fail loudly instead of
+    # silently mis-reading the new fields as zeros.
+    out += struct.pack("<IIII", _MAGIC_REQ, 4, len(streams), heap_base)
+    for i, s in enumerate(streams):
+        out += struct.pack(
+            "<QBBHIII"           # 24 bytes (header)
+            "ffIfIQiII"          # 40 bytes (sampling: T,topP,topK,repPen,maxN,seed,eos,stopCount,stopOff)
+            "III"                # 12 bytes (sampling: topLogprobs, lbCount, lbOffset)
+            "fIIII"              # 20 bytes (sampling: minP, cotCount, cotOff, ssqCount, ssqOff)
+            "II",                # 8 bytes (StreamSpec extension: cv_count, cvs_offset)
+            s.stream_id, s.action, s.flags, 0,
+            seg_counts[i], seg_offsets[i], 0,
+            s.sampling.temperature, s.sampling.top_p,
+            s.sampling.top_k, s.sampling.repetition_penalty,
+            s.sampling.max_new_tokens, s.sampling.seed,
+            s.sampling.eos_token_id, len(s.sampling.stop_tokens),
+            stop_offsets[i],
+            s.sampling.top_logprobs, lb_counts[i], lb_offsets[i],
+            s.sampling.min_p, cot_counts[i], cot_offsets[i],
+            ssq_counts[i], ssq_offsets[i],
+            cv_counts[i], cv_offsets[i],
+        )
+    out += heap
+    return bytes(out)
+
+
+def _decode_response(buf: bytes) -> list[StreamUpdate]:
+    if len(buf) < 16:
         return []
-    return [buf[i] for i in range(n)]
+    magic, version, count, heap_off = struct.unpack_from("<IIII", buf, 0)
+    if magic != _MAGIC_RESP:
+        raise ValueError(f"bad response magic 0x{magic:08x}")
+    if version != 1:
+        raise ValueError(f"bad response version {version}")
+    out: list[StreamUpdate] = []
+    for i in range(count):
+        base = 16 + i * 64
+        (sid, state, done_reason, _r,
+         nt_count, nt_off, err_count, err_off,
+         pts, cte, ch, cm, vch,
+         lp_bytes, lp_off,
+         _r1, _r2) = struct.unpack_from("<QBBHIIIIIIIIIIIII", buf, base)
+        toks = list(struct.unpack_from(f"<{nt_count}I", buf, nt_off)) if nt_count else []
+        msg = bytes(buf[err_off:err_off + err_count]).decode("utf-8", errors="replace") if err_count else ""
+        lps: list[TokenLogprob] = []
+        cur, end = lp_off, lp_off + lp_bytes
+        while cur < end:
+            tok, slp, top = struct.unpack_from("<IfI", buf, cur); cur += 12
+            top_pairs: list[tuple[int, float]] = []
+            for _ in range(top):
+                tid, lpv = struct.unpack_from("<If", buf, cur); cur += 8
+                top_pairs.append((tid, lpv))
+            lps.append(TokenLogprob(token=tok, sampled_logprob=slp, top_logprobs=top_pairs))
+        out.append(StreamUpdate(
+            stream_id=sid, state=state, done_reason=done_reason,
+            new_tokens=toks, err_msg=msg,
+            prompt_tokens_seen=pts, completion_tokens_emitted=cte,
+            cache_hits=ch, cache_misses=cm, vision_cache_hits=vch,
+            logprobs=lps,
+        ))
+    return out
 
 
-def session_state(sid: int) -> int:
-    return _lib.gemma_session_state(int(sid))
+# ----------------------------------------------------------------------
+# High-level entrypoints. No locks — single-threaded contract enforced
+# upstream by the bridge's coordinator coroutine.
+# ----------------------------------------------------------------------
+def init(gguf_path: str, vision_safetensors_path: Optional[str] = None) -> int:
+    rc = _lib.gemma_init(gguf_path.encode("utf-8"))
+    if rc != 0:
+        return rc
+    if vision_safetensors_path:
+        return _lib.gemma_vision_init(vision_safetensors_path.encode("utf-8"))
+    return 0
 
 
-def tokenize(text: str, add_bos: bool = False) -> list[int]:
-    b = text.encode("utf-8")
-    # Query size first.
-    n_needed = _lib.gemma_tokenize(b, len(b), 1 if add_bos else 0, None, 0)
-    if n_needed < 0:
-        raise RuntimeError("gemma_tokenize failed")
-    buf = (C.c_uint32 * max(n_needed, 1))()
-    n = _lib.gemma_tokenize(b, len(b), 1 if add_bos else 0, buf, n_needed)
-    return [buf[i] for i in range(n)]
+def vision_init(safetensors_path: str) -> int:
+    return _lib.gemma_vision_init(safetensors_path.encode("utf-8"))
 
 
-def detokenize(tokens: list[int]) -> str:
-    if not tokens:
-        return ""
-    arr = (C.c_uint32 * len(tokens))(*tokens)
-    # Query byte count first. Start with generous 16 bytes/tok upper bound.
-    cap = max(16, len(tokens) * 16)
-    buf = C.create_string_buffer(cap)
-    n = _lib.gemma_detokenize(arr, len(tokens), buf, cap)
-    if n < 0:
-        raise RuntimeError("gemma_detokenize failed")
-    if n >= cap:
-        # rare: token expanded past our upper bound; retry with a bigger buf.
-        buf = C.create_string_buffer(n + 16)
-        n = _lib.gemma_detokenize(arr, len(tokens), buf, len(buf))
-    return buf.raw[:n].decode("utf-8", errors="replace")
+def vision_is_ready() -> bool:
+    return _lib.gemma_vision_is_ready() != 0
+
+
+def shutdown() -> int:
+    return _lib.gemma_shutdown()
+
+
+def register_resource(kind: str, id: str, data: bytes) -> int:
+    """Upload a named resource (control vector today). Replaces the legacy
+    per-feature register entries. kind='cvec' expects HIDDEN×2 fp16 bytes."""
+    arr = (C.c_uint8 * len(data)).from_buffer_copy(data)
+    return _lib.gemma_register_resource(
+        kind.encode("utf-8"), id.encode("utf-8"), arr, len(data))
 
 
 def bos_id() -> int:
@@ -330,459 +453,84 @@ def eos_id() -> int:
     return _lib.gemma_eos_id()
 
 
-def active_session_count() -> int:
-    return _lib.gemma_active_session_count()
-
-
-# --- Vision ---
-
-_vision_init_lock = threading.Lock()
-_vision_inited = False
-
-
-def vision_init(safetensors_path: str) -> None:
-    """Load vision weights once. Required before submit_image_path."""
-    global _vision_inited
-    with _vision_init_lock:
-        if _vision_inited:
-            return
-        rc = _lib.gemma_vision_init(safetensors_path.encode("utf-8"))
-        if rc != 0:
-            raise RuntimeError(f"gemma_vision_init failed (rc={rc})")
-        _vision_inited = True
-
-
-def vision_is_ready() -> bool:
-    return _lib.gemma_vision_is_ready() == 1
-
-
-_RESIDENCY_NAMES = {-1: "unbound", 0: "unloaded", 1: "volatile", 2: "pinned"}
-
-
-def vision_residency_state() -> str:
-    s = _lib.gemma_vision_residency_state()
-    return _RESIDENCY_NAMES.get(s, f"unknown({s})")
-
-
-def vision_residency_bytes() -> int:
-    return int(_lib.gemma_vision_residency_bytes())
-
-
-def vision_allow_evict() -> None:
-    _lib.gemma_vision_allow_evict()
-
-
-def vision_force_drop() -> None:
-    _lib.gemma_vision_force_drop()
-
-
-def submit_image_path(sid: int, png_path: str) -> int:
-    """Preprocess PNG at path + run vision tower + submit BOI/softs/EOI
-    chunks to the session. Cache-aware: SHA-256 of file bytes keys a soft-tokens
-    buffer; repeat submissions of the same image skip the vision tower.
-    Returns soft-token count submitted, or raises."""
-    n = _lib.gemma_submit_image_path(int(sid), png_path.encode("utf-8"))
+def tokenize(text: str, add_bos: bool = False) -> list[int]:
+    """Tokenize a string. Returns a list of token IDs."""
+    s = text.encode("utf-8")
+    cap = max(64, len(s) * 2)
+    out = (C.c_uint32 * cap)()
+    n = _lib.gemma_tokenize(s, len(s), 1 if add_bos else 0, out, cap)
     if n < 0:
-        raise RuntimeError(f"gemma_submit_image_path failed (session={sid}, path={png_path})")
-    return n
+        raise RuntimeError(f"gemma_tokenize returned {n}")
+    if n > cap:
+        out = (C.c_uint32 * n)()
+        n = _lib.gemma_tokenize(s, len(s), 1 if add_bos else 0, out, n)
+    return list(out[:n])
 
 
-def vision_prewarm_path(png_path: str) -> int:
-    """Populate the cache for an image without attaching to any session."""
-    n = _lib.gemma_vision_prewarm_path(png_path.encode("utf-8"))
-    if n < 0:
-        raise RuntimeError(f"gemma_vision_prewarm_path failed (path={png_path})")
-    return n
-
-
-def vision_last_cache_key() -> str:
-    """Hex SHA-256 of the most recent image submitted / prewarmed."""
-    buf = C.create_string_buffer(65)
-    n = _lib.gemma_vision_last_cache_key(buf, len(buf))
-    if n <= 0:
+def detokenize(tokens: list[int]) -> str:
+    n = len(tokens)
+    if n == 0:
         return ""
-    return buf.raw[:n].decode("ascii", errors="replace")
+    arr = (C.c_uint32 * n)(*tokens)
+    cap = max(256, n * 4)
+    buf = C.create_string_buffer(cap)
+    written = _lib.gemma_detokenize(arr, n, buf, cap)
+    if written < 0:
+        raise RuntimeError(f"gemma_detokenize returned {written}")
+    if written > cap:
+        cap = written + 1
+        buf = C.create_string_buffer(cap)
+        written = _lib.gemma_detokenize(arr, n, buf, cap)
+    return buf.value.decode("utf-8", errors="replace")
 
 
-def vision_fetch_softs_by_key(hex_key: str) -> bytes | None:
-    """Copy soft tokens out of the cache for a given SHA-256 hex key.
-    Returns None on cache miss. Lets clients round-trip softs across
-    turns: run vision once, persist the blob locally, re-submit it
-    on later turns via submit_softs() without re-running the tower."""
-    if len(hex_key) != 64:
-        return None
-    key = hex_key.encode("ascii")
-    need = _lib.gemma_vision_fetch_softs_by_key(key, None, 0)
-    if need <= 0:
-        return None
-    buf = (C.c_uint8 * need)()
-    n = _lib.gemma_vision_fetch_softs_by_key(key, buf, need)
-    if n <= 0:
-        return None
-    return bytes(buf[:n])
+def submit(streams: list[StreamSpec]) -> int:
+    """Submit a batch of stream actions. Non-blocking. Returns 0 on success.
+
+    A "batch" of size 1 goes through this exact call. There is no
+    separate single-stream entrypoint."""
+    buf = _encode_request(streams)
+    arr = (C.c_uint8 * len(buf)).from_buffer_copy(buf)
+    return _lib.gemma_submit(arr, len(buf))
 
 
-def submit_softs(sid: int, softs: bytes, n_tokens: int, is_fp32: bool = True) -> int:
-    """Submit pre-computed soft tokens to a session. `softs` is the raw
-    byte blob previously returned by vision_fetch_softs_by_key (or an
-    equivalent client-side cache). Brackets with BOI/EOI server-side;
-    no vision tower runs. Returns n_tokens on success."""
-    if not softs or n_tokens <= 0:
-        raise ValueError("softs bytes and n_tokens required")
-    buf = (C.c_uint8 * len(softs)).from_buffer_copy(softs)
-    r = _lib.gemma_submit_softs(int(sid), buf, len(softs), int(n_tokens), 1 if is_fp32 else 0)
-    if r < 0:
-        raise RuntimeError(f"gemma_submit_softs failed (session={sid}, bytes={len(softs)}, n_tokens={n_tokens}, fp32={is_fp32})")
-    return r
+# Module-level reusable poll buffer. Starts at 64 KB which covers
+# single-stream single-token updates (the common AR streaming case);
+# doubles on -ENOSPC. Avoids the previous 4 MB allocation per poll
+# call (~184 calls per turn × 4 MB zero-init = 736 MB of churn).
+_POLL_BUF_CAPACITY: int = 64 * 1024
+_POLL_BUF = (C.c_uint8 * _POLL_BUF_CAPACITY)()
+_ENOSPC = -28
 
 
-def vision_cache_stats() -> dict:
-    return {
-        "entries": _lib.gemma_vision_cache_entries(),
-        "hits": _lib.gemma_vision_cache_hits(),
-        "misses": _lib.gemma_vision_cache_misses(),
-        "bytes": _lib.gemma_vision_cache_bytes(),
-    }
+def poll(timeout_ms: int = 100) -> list[StreamUpdate]:
+    """Drive the engine forward and report progress. Returns a list of
+    StreamUpdate (possibly empty on timeout)."""
+    global _POLL_BUF, _POLL_BUF_CAPACITY
+    while True:
+        n = _lib.gemma_poll(timeout_ms, _POLL_BUF, _POLL_BUF_CAPACITY)
+        if n == _ENOSPC:
+            _POLL_BUF_CAPACITY *= 2
+            _POLL_BUF = (C.c_uint8 * _POLL_BUF_CAPACITY)()
+            continue
+        if n < 0:
+            raise RuntimeError(f"gemma_poll returned {n}")
+        if n == 0:
+            return []
+        return _decode_response(bytes(_POLL_BUF[:n]))
 
 
-def vision_cache_clear() -> int:
-    return _lib.gemma_vision_cache_clear()
-
-
-# --- KV snapshot (for the tenancy viz in the web demo) ---
-
-def active_session_ids(max_n: int = 64) -> list[int]:
-    buf = (C.c_int32 * max_n)()
-    n = _lib.gemma_active_session_ids(buf, max_n)
-    return [buf[i] for i in range(n)] if n > 0 else []
-
-
-def session_snapshot(sid: int, max_pages: int = 1024) -> dict | None:
-    """Return {'sid', 'position', 'state', 'pages': [phys_ids]} or None if missing."""
-    pos = C.c_int32(0)
-    state = C.c_int32(0)
-    pages = (C.c_uint32 * max_pages)()
-    n = _lib.gemma_session_snapshot(int(sid), C.byref(pos), C.byref(state), pages, max_pages)
-    if n < 0:
-        return None
-    return {
-        "sid": int(sid),
-        "position": pos.value,
-        "state": state.value,  # 0..4, see STATE_* constants
-        "pages": [pages[i] for i in range(n)],
-    }
-
-
-def page_refcount(phys: int) -> int:
-    return _lib.gemma_page_refcount(int(phys))
-
-
-def page_owners(phys: int, max_n: int = 32) -> list[int]:
-    buf = (C.c_int32 * max_n)()
-    n = _lib.gemma_page_owners(int(phys), buf, max_n)
-    return [buf[i] for i in range(n)] if n > 0 else []
-
-
-def session_counts(sid: int) -> tuple[int, int]:
-    """Return (page_count, shared_count) in one FFI call."""
-    pc = C.c_int32(0); sc = C.c_int32(0)
-    rc = _lib.gemma_session_counts(int(sid), C.byref(pc), C.byref(sc))
-    if rc < 0:
-        return (0, 0)
-    return (int(pc.value), int(sc.value))
-
-
-# Bulk snapshot. Returns a list of dicts, one per active session, without
-# making any other FFI calls. Prefer this for 2Hz UI pollers.
-def kv_snapshot_summary(max_sessions: int = 64) -> list[dict]:
-    buf = (C.c_int32 * (max_sessions * 5))()
-    n = _lib.gemma_kv_snapshot_summary(buf, max_sessions)
-    out = []
-    for i in range(n):
-        base = i * 5
-        out.append({
-            "sid": int(buf[base + 0]),
-            "position": int(buf[base + 1]),
-            "state": int(buf[base + 2]),
-            "page_count": int(buf[base + 3]),
-            "shared_count": int(buf[base + 4]),
-        })
-    return out
-
-
-# --- Control-vector API (Phase B) ---
-
-_SHAPES = {"linear": 0, "exp-in": 1, "exp-out": 2, "cubic": 3}
-_UNITS = {"tokens": 0, "turns": 1}
-
-def control_register_fp16(cvec_id: str, fp16_bytes: bytes) -> None:
-    """Register a cvec by string id. bytes must be HIDDEN*2 (5632 at HIDDEN=2816)."""
-    if not cvec_id:
-        raise ValueError("cvec_id must be non-empty")
-    buf = (C.c_uint8 * len(fp16_bytes)).from_buffer_copy(fp16_bytes)
-    r = _lib.gemma_control_register_fp16(cvec_id.encode("utf-8"), buf, len(fp16_bytes))
-    if r != 0:
-        raise RuntimeError(f"gemma_control_register_fp16 failed for id={cvec_id!r}")
-
-_MODES = {"additive": 0, "project": 1, "add": 0, "projection": 1}
-
-def session_add_control(sid: int, cvec_id: str, layer: int,
-                          polarity: float = 1.0,
-                          peak_magnitude: float = 1.0,
-                          attack: float = 0.0, decay: float = 0.0,
-                          sustain_level: float = 1.0, release: float = 0.0,
-                          shape: str = "linear", units: str = "tokens",
-                          mode: str = "additive") -> None:
-    """Attach a control vector to a session.
-
-    mode:
-      "additive" (default)  — residual += mag * cvec at the control's layer.
-                             Kept as default for backward-compat with prose-
-                             steering-style nudging use cases.
-      "project"             — residual's projection onto cvec is coerced
-                             to `peak_magnitude` (target value). 0 removes
-                             the feature ("obliteratus"-style ablation);
-                             nonzero targets coerce to a specific feature
-                             level. Pre-write projection is measured in
-                             the same dispatch and can be read back via
-                             the project-measurement API (for RE measurement
-                             + elicitation in one primitive).
-    """
-    r = _lib.gemma_session_add_control(
-        int(sid), cvec_id.encode("utf-8"), int(layer),
-        float(polarity), float(peak_magnitude),
-        float(attack), float(decay), float(sustain_level), float(release),
-        int(_SHAPES.get(shape, 0)), int(_UNITS.get(units, 0)),
-        int(_MODES.get(mode, 0)),
+def status() -> ServerStats:
+    out = (C.c_uint8 * 64)()
+    n = _lib.gemma_status(out, 64)
+    if n != 64:
+        raise RuntimeError(f"gemma_status returned {n}")
+    raw = bytes(out[:n])
+    (tp, fp, cp, act, gen, prim, ts, tok, ve, _pad, vh) = struct.unpack_from(
+        "<IIIIIIQQIIQ", raw, 0)
+    return ServerStats(
+        total_pages=tp, free_pages=fp, cached_pages=cp,
+        active_streams=act, generating_streams=gen, priming_streams=prim,
+        total_steps=ts, total_tokens_emitted=tok,
+        vision_cache_entries=ve, vision_cache_hits=vh,
     )
-    if r != 0:
-        raise RuntimeError(f"gemma_session_add_control failed (sid={sid}, cvec={cvec_id})")
-
-def session_clear_controls(sid: int) -> None:
-    _lib.gemma_session_clear_controls(int(sid))
-
-
-def session_set_temperature(sid: int, temperature: float) -> None:
-    """0 = greedy argmax (engine default). >0 enables softmax sampling."""
-    _lib.gemma_session_set_temperature(int(sid), float(temperature))
-
-
-_LOGIT_VOCAB = 262144
-_logit_buf = (C.c_uint16 * _LOGIT_VOCAB)()   # module-scoped scratch — VOCAB fp16
-
-def session_get_slot_logits(sid: int) -> bytes:
-    """Returns VOCAB fp16 logits as raw bytes. Caller converts to numpy.
-    Session must currently own a slot (post-prefill, in generating state)."""
-    n = _lib.gemma_session_get_slot_logits(int(sid), _logit_buf)
-    if n < 0:
-        raise RuntimeError("session has no slot or no logits yet")
-    return bytes(_logit_buf)
-
-
-def session_set_next_input(sid: int, token: int) -> None:
-    """Teacher-force the next AR tick to consume `token` instead of the
-    session's sampled token. Session must be in .generating state."""
-    rc = _lib.gemma_session_set_next_input(int(sid), int(token))
-    if rc < 0:
-        raise RuntimeError(f"set_next_input failed (sid={sid})")
-
-
-def session_position(sid: int) -> int:
-    """Current position (K/V length) of the session. -1 on error."""
-    return int(_lib.gemma_session_position(int(sid)))
-
-
-def session_pause(sid: int) -> None:
-    """Block the pump from ticking this session until resume() is called."""
-    _lib.gemma_session_pause(int(sid))
-
-
-def session_resume(sid: int) -> None:
-    """Re-allow the pump to tick this session (sets state back to .priming
-    so it picks up any queued chunks)."""
-    _lib.gemma_session_resume(int(sid))
-
-def session_release_control(sid: int, cvec_id: str) -> None:
-    _lib.gemma_session_release_control(int(sid), cvec_id.encode("utf-8"))
-
-
-# --- Phase C-Read: detectors + triggers ---
-
-_lib.gemma_session_add_detector.argtypes = [C.c_int32, C.c_char_p, C.c_char_p, C.c_int32]
-_lib.gemma_session_add_detector.restype = C.c_int32
-
-_lib.gemma_session_add_trigger.argtypes = [C.c_int32, C.c_char_p, C.c_int32, C.c_float, C.c_char_p]
-_lib.gemma_session_add_trigger.restype = C.c_int32
-
-_lib.gemma_session_clear_detectors.argtypes = [C.c_int32]
-_lib.gemma_session_clear_detectors.restype = C.c_int32
-
-_lib.gemma_session_read_intensity.argtypes = [C.c_int32, C.c_char_p]
-_lib.gemma_session_read_intensity.restype = C.c_float
-
-_TRIGGER_CONDS = {"on-exceed": 0, "on-fall": 1}
-
-def session_add_detector(sid: int, name: str, cvec_id: str, layer: int) -> None:
-    r = _lib.gemma_session_add_detector(int(sid), name.encode("utf-8"),
-                                         cvec_id.encode("utf-8"), int(layer))
-    if r != 0:
-        raise RuntimeError(f"gemma_session_add_detector failed (sid={sid}, name={name}, cvec={cvec_id})")
-
-def session_add_trigger(sid: int, detector_name: str, condition: str,
-                          threshold: float, effector_cvec_id: str) -> None:
-    cond = _TRIGGER_CONDS.get(condition)
-    if cond is None:
-        raise ValueError(f"condition must be one of {list(_TRIGGER_CONDS)}")
-    r = _lib.gemma_session_add_trigger(int(sid), detector_name.encode("utf-8"),
-                                         cond, float(threshold),
-                                         effector_cvec_id.encode("utf-8"))
-    if r != 0:
-        raise RuntimeError(f"gemma_session_add_trigger failed")
-
-def session_clear_detectors(sid: int) -> None:
-    _lib.gemma_session_clear_detectors(int(sid))
-
-def session_read_intensity(sid: int, name: str) -> float:
-    return float(_lib.gemma_session_read_intensity(int(sid), name.encode("utf-8")))
-
-
-_lib.gemma_session_poll_samples_json.argtypes = [C.c_int32, C.c_char_p, C.c_int32]
-_lib.gemma_session_poll_samples_json.restype = C.c_int32
-
-def session_poll_samples_json(sid: int) -> str:
-    """Drain the session's per-token sample queue as a JSON array string.
-    Returns "[]" when empty. Each array element is:
-      {"token": int, "position": int,
-       "detectors": {name: intensity, ...},
-       "effectors": {cvec_id: magnitude, ...}}"""
-    # Size the buffer conservatively: 256 bytes per sample + envelope.
-    needed = _lib.gemma_session_poll_samples_json(int(sid), None, 0)
-    if needed <= 0:
-        return "[]"
-    buf = C.create_string_buffer(max(needed, 64))
-    n = _lib.gemma_session_poll_samples_json(int(sid), buf, len(buf))
-    if n <= 0:
-        return "[]"
-    return buf.raw[:n].decode("utf-8", errors="replace")
-
-
-# --- Residual capture (for /v1/control/construct) ---
-
-_lib.gemma_set_capture_layer.argtypes = [C.c_int32]
-_lib.gemma_set_capture_layer.restype = C.c_int32
-
-_lib.gemma_get_captured_residual.argtypes = [C.POINTER(C.c_uint8), C.c_int32]
-_lib.gemma_get_captured_residual.restype = C.c_int32
-
-def set_capture_layer(layer: int) -> None:
-    _lib.gemma_set_capture_layer(int(layer))
-
-def get_captured_residual() -> bytes:
-    """Copy the engine's most-recently-captured residual (HIDDEN × fp16)
-    into a caller-visible buffer. Use while capture is active to grab
-    the residual from the tick just completed."""
-    HIDDEN_BYTES = 2816 * 2   # HIDDEN × fp16
-    buf = (C.c_uint8 * HIDDEN_BYTES)()
-    n = _lib.gemma_get_captured_residual(buf, HIDDEN_BYTES)
-    return bytes(buf[:n]) if n > 0 else b""
-
-def capture_residual_for_prompt(prompt: str, layer: int,
-                                  chat_template: bool = True,
-                                  timeout_s: float = 20.0) -> bytes:
-    """Run `prompt` through the engine, return the layer-L residual at
-    the last priming token as fp16 bytes. Opens and closes a throwaway
-    session; pump thread (if any) drives the ticking.
-
-    chat_template=True wraps the prompt in Gemma's user/model turn
-    template so the model sees it as a real conversational turn rather
-    than raw context."""
-    import time
-    set_capture_layer(int(layer))
-    try:
-        sid = open_session(max_new_tokens=1)
-        try:
-            if chat_template:
-                wrapped = f"<|turn>user\n{prompt}<turn|>\n<|turn>model\n"
-            else:
-                wrapped = prompt
-            toks = tokenize(wrapped, add_bos=True)
-            submit(sid, toks)
-            # Wait until the engine finishes priming — at that moment,
-            # gResidualCaptureBuf holds the last-priming-tick residual
-            # at layer L. (The same tick samples the first generated
-            # token; we discard it.)
-            t0 = time.time()
-            while session_state(sid) in (STATE_IDLE, STATE_PRIMING):
-                if time.time() - t0 > timeout_s:
-                    raise RuntimeError(
-                        f"capture timed out after {timeout_s}s (state={session_state(sid)})")
-                time.sleep(0.002)
-            return get_captured_residual()
-        finally:
-            close_session(sid)
-    finally:
-        set_capture_layer(-1)
-
-
-_lib.gemma_control_list_ids.argtypes = [C.c_char_p, C.c_int32]
-_lib.gemma_control_list_ids.restype = C.c_int32
-
-def control_list_ids() -> list[str]:
-    """Return currently-registered cvec ids, sorted."""
-    need = _lib.gemma_control_list_ids(None, 0)
-    if need <= 0:
-        return []
-    buf = C.create_string_buffer(need + 8)
-    n = _lib.gemma_control_list_ids(buf, len(buf))
-    if n <= 0:
-        return []
-    return [s for s in buf.raw[:n].decode("utf-8", errors="replace").split(",") if s]
-
-
-# --- All-layer residual capture ---
-
-_lib.gemma_set_capture_all_layers.argtypes = [C.c_int32]
-_lib.gemma_set_capture_all_layers.restype = C.c_int32
-
-_lib.gemma_get_all_layer_residuals.argtypes = [C.POINTER(C.c_uint8), C.c_int32]
-_lib.gemma_get_all_layer_residuals.restype = C.c_int32
-
-def set_capture_all_layers(enabled: bool) -> None:
-    _lib.gemma_set_capture_all_layers(1 if enabled else 0)
-
-def get_all_layer_residuals() -> bytes:
-    """Return NUM_LAYERS × HIDDEN × fp16 = 30*2816*2 = 168960 bytes.
-    Layer L starts at offset L * HIDDEN * 2."""
-    need = _lib.gemma_get_all_layer_residuals(None, 0)
-    if need <= 0:
-        return b""
-    buf = (C.c_uint8 * need)()
-    n = _lib.gemma_get_all_layer_residuals(buf, need)
-    return bytes(buf[:n]) if n > 0 else b""
-
-def capture_all_layer_residuals_for_prompt(prompt: str, chat_template: bool = True,
-                                             timeout_s: float = 20.0) -> bytes:
-    """Run prompt through engine once, return all 30 layers' last-
-    priming-token residuals concatenated as one fp16 blob. Same pattern
-    as capture_residual_for_prompt but captures every layer in one pass."""
-    import time
-    set_capture_all_layers(True)
-    try:
-        sid = open_session(max_new_tokens=1)
-        try:
-            if chat_template:
-                wrapped = f"<|turn>user\n{prompt}<turn|>\n<|turn>model\n"
-            else:
-                wrapped = prompt
-            toks = tokenize(wrapped, add_bos=True)
-            submit(sid, toks)
-            t0 = time.time()
-            while session_state(sid) in (STATE_IDLE, STATE_PRIMING):
-                if time.time() - t0 > timeout_s:
-                    raise RuntimeError(f"capture timeout ({timeout_s}s)")
-                time.sleep(0.002)
-            return get_all_layer_residuals()
-        finally:
-            close_session(sid)
-    finally:
-        set_capture_all_layers(False)

@@ -31,9 +31,6 @@
 //   generation; we just append the tool-result tokens to the priming
 //   queue and the next step resumes teacher-forcing).
 //
-// API shape intentionally mirrors llama.cpp's surface (open_session /
-// submit / step / next_token / close_session), translated to Swift,
-// without adopting llama.cpp's internal data model.
 import Foundation
 import Metal
 
@@ -71,17 +68,104 @@ enum PrimingChunk {
     // `byteOffset` lets a chunk point at a sub-range of the same buffer,
     // which is how multi-tile soft-token prefills walk through a big
     // image one MAX_Q_LEN-sized chunk per tick.
-    // `pendingCB` is the vision CB that produced `buffer` — the tick-loop
-    // consumer calls .waitUntilCompleted() on it before reading, allowing
-    // vision work to pipeline against LM decode on the main queue.
+    // `eventTicket` is the value the vision-tower pad-blit CB signals on
+    // `gVisionEvent`. The LM consumer's pre-prefill CB encodes
+    // `encodeWaitForEvent(gVisionEvent, value: eventTicket)` so the GPU
+    // itself waits for the pad-blit before reading `buffer`. CPU never
+    // blocks. 0 = no wait needed (vision long since complete, or never
+    // had a pending CB). See notes/engine_debloat.md.
     case softTokens(buffer: MTLBuffer, count: Int, isFp32: Bool, byteOffset: Int,
-                    pendingCB: MTLCommandBuffer?)
+                    eventTicket: UInt64)
 
     var count: Int {
         switch self {
         case .tokens(let ts): return ts.count
         case .softTokens(_, let c, _, _, _): return c
         }
+    }
+}
+
+// MARK: - Structured chain-of-thought (grammar-constrained sampling)
+//
+// Implements the structured-cot intervention from
+// github.com/andthattoo/structured-cot. Once enabled on a session, the
+// AR sampler's logit-bias mask is set per-step to enforce a fixed
+// reasoning-trace shape:
+//
+//   <think>\n LABEL_0: <free-line> LABEL_1: <free-line> ... </think>\n\n
+//
+// Each LABEL_i is provided by the caller (default GOAL/APPROACH/EDGE).
+// Inside the think block, every token is masked: literal phases force
+// tokens whose bytes prefix-match the remaining literal; free-line
+// phases allow any token whose bytes don't contain a mid-token
+// newline (only an ending newline transitions to the next literal).
+// After the closing </think>\n\n, the grammar deactivates and the
+// model decodes free-form for the answer.
+//
+// Reference findings (HumanEval+, Qwen3.6-35B-A3B-Q4_K_M): same pass@1
+// as free-form thinking with 22× fewer thinking tokens.
+enum CotPhase {
+    case literal(bytes: [UInt8])   // emit these bytes exactly across N tokens
+    case freeLine                   // any non-newline-mid token, ends on \n
+}
+
+final class CotState {
+    var phases: [CotPhase]      // remaining phases (current = phases.first)
+    var literalCursor: Int = 0   // bytes already emitted into current literal phase
+
+    init(phases: [CotPhase]) { self.phases = phases }
+
+    var isDone: Bool { phases.isEmpty }
+
+    // Advance the state by the bytes of the just-sampled token. Returns
+    // true if the state is now done (no more constraints — caller can
+    // drop the CotState reference). Mismatches print a warning and
+    // mark the state done (defensive: shouldn't happen if mask is
+    // correct, but a stuck state is worse than just letting the model
+    // continue free-form).
+    @discardableResult
+    func advance(by tokBytes: [UInt8]) -> Bool {
+        guard let phase = phases.first else { return true }
+        if tokBytes.isEmpty { return false }
+        switch phase {
+        case .literal(let bytes):
+            let remaining = bytes.count - literalCursor
+            if tokBytes.count >= remaining {
+                // Token completes (and possibly overshoots) the literal.
+                let prefix = Array(bytes[literalCursor..<bytes.count])
+                if Array(tokBytes.prefix(remaining)) == prefix {
+                    phases.removeFirst()
+                    literalCursor = 0
+                    // Overshoot bytes feed into the next phase (rare —
+                    // mask should usually prevent this, but if BPE
+                    // produced a token spanning the boundary, propagate).
+                    if tokBytes.count > remaining {
+                        return advance(by: Array(tokBytes.dropFirst(remaining)))
+                    }
+                } else {
+                    fputs("[cot] literal mismatch: expected \(prefix), got \(tokBytes); deactivating grammar\n", stderr)
+                    phases.removeAll()
+                }
+            } else {
+                // Token is a strict prefix of remaining literal.
+                let expected = Array(bytes[literalCursor..<(literalCursor + tokBytes.count)])
+                if expected == tokBytes {
+                    literalCursor += tokBytes.count
+                } else {
+                    fputs("[cot] literal mismatch mid-cursor; deactivating grammar\n", stderr)
+                    phases.removeAll()
+                }
+            }
+        case .freeLine:
+            // The line ends if the chosen token ends with newline. Any
+            // mid-token newline shouldn't have been masked-in; if it
+            // happens, treat as line-end (newline at any position).
+            if tokBytes.contains(0x0A) {
+                phases.removeFirst()
+            }
+            // else: still in this line, no advance.
+        }
+        return phases.isEmpty
     }
 }
 
@@ -135,7 +219,27 @@ struct CvecEnvelope {
 //                get measurement-for-free. representation-engineering
 //                primitive — target=0 removes the feature entirely,
 //                nonzero targets coerce to a specific feature level.
-enum CvecMode: String, Codable { case additive, project }
+enum CvecMode: String, Codable { case additive, project, transport }
+
+// Heretic-style per-write directional ablation site. Applied as a
+// post-matmul hook on the output buffer of either attention-out-proj
+// (component=.attnOut, buffer `mlp_out`) or FFN combined output
+// (component=.ffnOut, buffer `ffn_combined`) before each feeds into
+// the residual-add. Per-layer per-component (r̂, α); engine-level
+// state (NOT per-session — ablation is a model-level transform, uniform
+// across batch slots). Configured via gemma_engine_set_write_ablation
+// from the Python TPE harness and/or user-invoked calibration pipeline.
+enum AblationComponent: Int32 {
+    case attnOut = 0
+    case ffnOut  = 1
+}
+
+struct LayerComponentAblation {
+    let layer: Int
+    let component: AblationComponent
+    let rHatBuf: MTLBuffer   // fp16, HIDDEN halves, unit-norm r̂
+    let alpha: Float          // heretic α(L); 0 = no-op, 1 = full ablation, <0 = amplify
+}
 
 // One active control vector on a session. `magnitudeAt(position:turn:)`
 // is pure and cheap — evaluated once per tick before the engine builds
@@ -147,6 +251,23 @@ final class ActiveControl {
     let envelope: CvecEnvelope
     let polarity: Float         // +1 or -1 (or arbitrary multiplier)
     let mode: CvecMode          // additive or project
+    // For project mode only: when non-nil, envelope scalar becomes a
+    // GATE (0 = skip dispatch, nonzero = fire) and `target` is the
+    // coerce-to value. When nil (default), envelope scalar is the
+    // target directly — current obliteratus-style "always-on" semantics
+    // where peak=0 means coerce-to-zero. Splitting this out enables
+    // detector → trigger → ablation scoping: the envelope is the gate
+    // signal (restarted by trigger), target stays fixed at e.g. 0.
+    let target: Float?
+    // For transport mode (CvecMode.transport). The Brenier map for
+    // per-PC Gaussian OT is a' = scale*a + offset, so we precompute
+    // these once at attach and reuse them every tick. Client computes:
+    //   scale  = σ_tgt / σ_src
+    //   offset = μ_tgt − scale * μ_src
+    // Zero scale + zero offset is a valid "no-op" config (but a project-
+    // mode control with target=current-projection would be cheaper).
+    let transportScale: Float
+    let transportOffset: Float
     // For project-mode controls: the pre-write projection the kernel
     // measured this tick, before coercing the residual to the target.
     // This is the representation-engineering "natural activation
@@ -164,10 +285,16 @@ final class ActiveControl {
     init(cvecId: String, buffer: MTLBuffer, layer: Int,
          envelope: CvecEnvelope, polarity: Float,
          startPosition: Int, startTurn: Int,
-         mode: CvecMode = .additive) {
+         mode: CvecMode = .additive,
+         target: Float? = nil,
+         transportScale: Float = 0,
+         transportOffset: Float = 0) {
         self.cvecId = cvecId; self.buffer = buffer; self.layer = layer
         self.envelope = envelope; self.polarity = polarity
         self.mode = mode
+        self.target = target
+        self.transportScale = transportScale
+        self.transportOffset = transportOffset
         self.startPosition = startPosition; self.startTurn = startTurn
     }
     // Reset the envelope clock to (position, turn). Triggered by a
@@ -213,56 +340,24 @@ final class ActiveControl {
     }
 }
 
-// Sample one token from a logit vector. `temperature == 0` (default) is
-// greedy argmax — same semantics as the old inline loops it replaces;
-// `temperature > 0` does softmax sampling with numerically stable
-// max-subtraction + inverse-CDF draw from the session's RNG. One
-// shared implementation so all 5 sampling sites (AR step, prefill
-// post-sample, multi-slot variants, branch demo) share behavior.
-//
-// No top-p/top-k filtering yet — the immediate use case is "show
-// trajectory variation under intervention," which temperature alone
-// unlocks. Nucleus filtering is a follow-up that requires a partial
-// sort over V=262144 tokens; premature here.
-func sampleTokenFromLogits(_ logP: UnsafePointer<Float16>,
-                            base: Int,
-                            temperature: Float,
-                            rng: inout SystemRandomNumberGenerator) -> UInt32 {
-    if temperature <= 0 {
-        var bestI = 0
-        var bestV: Float = -.infinity
-        for v in 0..<VOCAB {
-            let x = Float(logP[base + v])
-            if x > bestV { bestV = x; bestI = v }
-        }
-        return UInt32(bestI)
+// SplitMix64: deterministic, seedable PRNG. One UInt64 of state, one
+// multiply-xor-shift sequence per draw. Used for per-session seeded
+// sampling — replacing SystemRandomNumberGenerator lets a test harness
+// reproduce a trajectory bit-for-bit across runs.
+struct SeedableRNG: RandomNumberGenerator {
+    var state: UInt64
+    init(seed: UInt64 = 0x9E3779B97F4A7C15) {
+        self.state = seed == 0 ? 0x9E3779B97F4A7C15 : seed
     }
-    // Softmax with max-shift. Find max, then exponentiate + accumulate.
-    let tInv: Float = 1.0 / temperature
-    var m: Float = -.infinity
-    for v in 0..<VOCAB {
-        let x = Float(logP[base + v]) * tInv
-        if x > m { m = x }
+    mutating func next() -> UInt64 {
+        state &+= 0x9E3779B97F4A7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+        z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+        return z ^ (z >> 31)
     }
-    var sumExp: Float = 0
-    // Re-scan: compute exp(x - m), accumulate into sum, and build a
-    // running CDF target for inverse sampling in the same pass. We
-    // draw `r ∈ [0, sumExp)` up front and walk forward until the
-    // running cumulative crosses r — no VOCAB-sized scratch needed.
-    let r = Float.random(in: 0..<1, using: &rng)
-    // But we don't know sumExp yet without scanning, so do two passes:
-    // pass 1 to compute sumExp; pass 2 to inverse-CDF sample.
-    for v in 0..<VOCAB {
-        sumExp += expf(Float(logP[base + v]) * tInv - m)
-    }
-    let target = r * sumExp
-    var cum: Float = 0
-    for v in 0..<VOCAB {
-        cum += expf(Float(logP[base + v]) * tInv - m)
-        if cum >= target { return UInt32(v) }
-    }
-    return UInt32(VOCAB - 1)
 }
+
 
 // Pure-function digest over the cvec state that touches a given page's
 // position range. Extracted from Session so the digest is testable in
@@ -293,6 +388,9 @@ func computeCvecDigest(activeControls: [ActiveControl],
         let startPosition: Int; let startTurn: Int
         let stopPosition: Int?; let stopTurn: Int?
         let mode: CvecMode
+        let target: Float?
+        let transportScale: Float
+        let transportOffset: Float
     }
     var entries: [DigestEntry] = []
     for c in activeControls {
@@ -308,7 +406,9 @@ func computeCvecDigest(activeControls: [ActiveControl],
             env: c.envelope, polarity: c.polarity,
             startPosition: c.startPosition, startTurn: c.startTurn,
             stopPosition: c.stopPosition, stopTurn: c.stopTurn,
-            mode: c.mode))
+            mode: c.mode, target: c.target,
+            transportScale: c.transportScale,
+            transportOffset: c.transportOffset))
     }
     // If no control's window intersected this page, the page is
     // effectively unsteered — return 0 so hashPage collapses to the
@@ -360,6 +460,14 @@ func computeCvecDigest(activeControls: [ActiveControl],
         mixString(e.env.shape.rawValue)
         mixString(e.env.units.rawValue)
         mixString(e.mode.rawValue)
+        // Target presence bit + value. nil → 0 tag (envelope IS target);
+        // non-nil → 1 tag + bits (envelope is gate, target is coerce value).
+        if let t = e.target { mixU64(1); mixF32(t) } else { mixU64(0) }
+        // Transport-mode params. Zero for non-transport modes; they
+        // don't affect digest collision in practice because mode is
+        // included above.
+        mixF32(e.transportScale)
+        mixF32(e.transportOffset)
     }
     if h == 0 { h = 0x9e3779b97f4a7c15 }
     return h
@@ -422,7 +530,39 @@ final class Session {
     // demos. Positive values enable softmax sampling with the session's
     // own RNG (trajectory variation visible across re-runs).
     var samplingTemperature: Float = 0.0
-    fileprivate var rng = SystemRandomNumberGenerator()
+    // Multi-token stop sequences. Each inner array is a contiguous run
+    // of token IDs that, when matched against the recent emitted tail,
+    // terminates the stream with done_reason=1 (EOS-equivalent). Used
+    // for tool-call early-stop: bridge tokenizes "<tool_call|>" once
+    // and passes it here so the engine self-terminates without the
+    // bridge needing to detect-and-cancel from outside.
+    var stopSequences: [[UInt32]] = []
+    // min_p threshold (0 disables). Dense additive logit bias, lazily
+    // materialized as VOCAB-length fp32 from the FFI sparse setter;
+    // nil means "no bias," the hot path shortcuts on that.
+    var minP: Float = 0.0
+    var logitBiasDense: [Float]? = nil
+    // Optional structured-cot grammar state. When non-nil, the AR
+    // sampler's bias buffer is overwritten per-step to mask invalid
+    // tokens for the current grammar phase. Cleared (set nil) when the
+    // grammar reaches done. See CotState above.
+    var cot: CotState? = nil
+    // Seedable RNG — FFI swaps in a fresh SeedableRNG(seed:) per request
+    // when the client passes `seed`. Default-seeded instance still varies
+    // per-session due to gemma_session_set_seed being optional.
+    var rng = SeedableRNG()
+    // GPU-side RNG seed for the `sample_token` kernel (see
+    // docs/dataflow_pipeline_spec.md §2.1). Keyed into philox as
+    // (gpuRngSeed, numGenerated_as_step, slot). Initialized randomly at
+    // session creation; updated when the client sets a new seed via
+    // gemma_session_set_seed so CPU/GPU paths stay in lockstep.
+    var gpuRngSeed: UInt32 = UInt32.random(in: 0 ..< UInt32.max)
+
+    // Scope-helper so the four sample sites can pass an UnsafePointer<Float>?
+    // into sampleTokenFromLogits without each one writing the same
+    // withUnsafeBufferPointer dance. `nil` path is the common case and stays
+    // zero-cost.
+    @inline(__always)
     fileprivate weak var engine: LmEngine?
 
     fileprivate(set) var state: SessionState = .idle
@@ -446,8 +586,22 @@ final class Session {
     // Logical pages already promoted to PageManager.contentIndex. Kept
     // so we don't re-promote on every prefill tile commit.
     fileprivate var promotedPageCount: Int = 0
+    // Per-stream cache accounting (in tokens). Surfaced via the batch FFI
+    // as billing-line items in BatchResponse.StreamUpdate. cacheHitTokens
+    // counts tokens covered by adopted cache pages on this stream's submits;
+    // cacheMissTokens counts tokens this stream had to prefill itself.
+    var cacheHitTokens: UInt32 = 0
+    var cacheMissTokens: UInt32 = 0
     // Ordered chunks to teacher-force (text tokens or image soft tokens).
     fileprivate var chunkQueue: [PrimingChunk] = []
+    // Synthetic prefix K/V staging. When non-nil, the next prefill of
+    // this session first allocates at least one page, writes these
+    // bytes to position 0 of that page per layer, and bumps position
+    // to 1 so real prefill tokens start at position 1+. K and V are
+    // arrays of per-layer blobs; each blob is KV_H_L × HD_L fp16
+    // halves = KV_H_L × HD_L × 2 bytes.
+    internal var prefixKvStaged: (k: [Data], v: [Data])? = nil
+    internal var prefixKvInstalled: Bool = false
     // When state == .generating, the last-sampled token becomes the next
     // step's input; kept separate from the chunk queue for state clarity.
     fileprivate var nextGeneratedInput: UInt32 = 0
@@ -646,6 +800,23 @@ final class Session {
     //
     // Subsequent submits (tool-call returns, continuations) don't probe —
     // they always prefill fresh, since mid-conversation tails are unique.
+    // Enable structured-cot grammar (github.com/andthattoo/structured-cot).
+    // Forces the model's output to begin with `<think>\nLABEL_0: <free>\n
+    // LABEL_1: <free>\n ... </think>\n\n` then decode unconstrained.
+    // Empty `labels` → no-op. Default labels are GOAL / APPROACH / EDGE
+    // (the HumanEval+ grammar from the reference repo).
+    func enableStructuredCot(labels: [String] = ["GOAL", "APPROACH", "EDGE"]) {
+        guard !labels.isEmpty else { cot = nil; return }
+        var phases: [CotPhase] = []
+        phases.append(.literal(bytes: Array("<think>\n".utf8)))
+        for label in labels {
+            phases.append(.literal(bytes: Array((label + ": ").utf8)))
+            phases.append(.freeLine)
+        }
+        phases.append(.literal(bytes: Array("</think>\n\n".utf8)))
+        cot = CotState(phases: phases)
+    }
+
     func submit(_ tokens: [UInt32]) {
         guard !tokens.isEmpty else { return }
         guard let eng = engine else {
@@ -684,6 +855,8 @@ final class Session {
                 promotedPageCount = skipPrefix
             }
             position = skipPrefix * PAGE_SLIDE
+            // Account: tokens covered by adopted pages = cache hits.
+            cacheHitTokens &+= UInt32(skipPrefix * PAGE_SLIDE)
         }
         // Queue the un-cached tail for prefill.
         let tailStart = skipPrefix * PAGE_SLIDE
@@ -692,9 +865,20 @@ final class Session {
             // head of this same tokens array (or the very-start of
             // consumedTokens, which at first-submit is identical).
             let tail = Array(tokens[tailStart...])
-            if !tail.isEmpty { chunkQueue.append(.tokens(tail)) }
+            if !tail.isEmpty {
+                chunkQueue.append(.tokens(tail))
+                cacheMissTokens &+= UInt32(tail.count)
+            }
         }
         if state != .done { state = .priming }
+        // If this is NOT the first submit (firstSubmit was false above),
+        // we still want to probe the cache against the now-extended
+        // consumedTokens. The first-submit path already probed; this is
+        // for the multi-segment case (text → image-softs → text) where
+        // earlier probes saw an incomplete prefix.
+        if !firstSubmit {
+            revisitCacheProbe(engine: eng)
+        }
     }
     func submit(text: String, addBos: Bool? = nil) {
         guard let eng = engine else { return }
@@ -769,14 +953,25 @@ final class Session {
     // other's pages — preventing steered K/V from polluting unsteered
     // sessions (and vice versa).
     private func adoptSharedPrefixPages(engine: LmEngine) -> Int {
-        var adopted = 0
+        // Idempotent: resume from how many slide pages we've already
+        // adopted (each contributes 2 entries to ownedPages — slide
+        // primary + full sibling).
+        var adopted = ownedPages.count / 2
+        let beforeAdopted = adopted
+        let dbg = ProcessInfo.processInfo.environment["LM_CACHE_DEBUG"] != nil
         while (adopted + 1) * PAGE_SLIDE <= consumedTokens.count {
             let end = (adopted + 1) * PAGE_SLIDE
             let pageStart = adopted * PAGE_SLIDE
             let digest = cvecDigestForPage(pageStart: pageStart, pageSize: PAGE_SLIDE)
             let prefixHash = PageManager.hashPage(consumedTokens[0..<end],
                                                    cvecDigest: digest)
-            guard let pair = engine.pageManager.findByHash(prefixHash) else { break }
+            guard let pair = engine.pageManager.findByHash(prefixHash) else {
+                if dbg {
+                    let head = consumedTokens[pageStart..<min(end, consumedTokens.count)].prefix(4).map(String.init).joined(separator: ",")
+                    print("  [cache] session \(id) page \(adopted) MISS hash=\(String(prefixHash, radix: 16, uppercase: false)) head=[\(head),…]")
+                }
+                break
+            }
             engine.pageManager.shareExisting(physPage: pair.slidePrimary, sessionId: id)
             engine.pageManager.shareExisting(physPage: pair.fullSibling, sessionId: id)
             ownedPages.append(pair.slidePrimary)
@@ -784,22 +979,112 @@ final class Session {
             adopted += 1
         }
         // Adopted pages are already content-indexed — don't re-promote.
-        if adopted > 0 {
+        if adopted > beforeAdopted {
             promotedPageCount = adopted
             if ProcessInfo.processInfo.environment["LM_CACHE_DEBUG"] != nil {
-                print("  [cache] session \(id) adopted \(adopted) shared prefix pages "
-                      + "(= \(adopted * PAGE_SLIDE) tokens cached)")
+                print("  [cache] session \(id) adopted \(adopted - beforeAdopted) "
+                      + "additional shared prefix pages (now \(adopted) total = "
+                      + "\(adopted * PAGE_SLIDE) tokens cached)")
             }
         }
-        return adopted
+        return adopted - beforeAdopted
+    }
+
+    // Re-probe the cache after consumedTokens has grown (e.g. additional
+    // text or soft submit). Adopts any newly-matching pages, advances
+    // `position` past them, and trims chunkQueue from the front so prefill
+    // doesn't redundantly compute K/V for already-cached positions.
+    fileprivate func revisitCacheProbe(engine: LmEngine) {
+        guard position == 0 || ownedPages.count > 0 else { return }
+        if ProcessInfo.processInfo.environment["LM_CACHE_DEBUG"] != nil {
+            print("  [cache] session \(id) revisitProbe consumedTokens.count=\(consumedTokens.count) ownedPages.count=\(ownedPages.count) position=\(position)")
+        }
+        let newlyAdopted = adoptSharedPrefixPages(engine: engine)
+        guard newlyAdopted > 0 else { return }
+        // Backstop: keep at least 1 token of tail to prefill, otherwise
+        // a fully-cached session sits in priming with no work to drive
+        // the post-prefill sample. Match the same heuristic as the
+        // submit() code path.
+        var advance = newlyAdopted * PAGE_SLIDE
+        let totalChunkTokens = chunkQueue.reduce(0) { $0 + $1.count }
+        if advance >= totalChunkTokens && totalChunkTokens > 0 {
+            // Unadopt the trailing slide page so prefill has ≥ 1 token.
+            let trailingFull = ownedPages.removeLast()
+            let trailingSlide = ownedPages.removeLast()
+            try? engine.pageManager.releasePage(physPage: trailingFull, sessionId: id)
+            try? engine.pageManager.releasePage(physPage: trailingSlide, sessionId: id)
+            promotedPageCount -= 1
+            advance -= PAGE_SLIDE
+        }
+        position += advance
+        // Move billing from miss → hit. The tokens we just adopted were
+        // queued by an earlier submit() call, which accounted for them
+        // as misses in `cacheMissTokens`. Now that we've recognized them
+        // as cache hits, swap the books.
+        let advU = UInt32(advance)
+        cacheHitTokens &+= advU
+        if cacheMissTokens >= advU {
+            cacheMissTokens &-= advU
+        } else {
+            cacheMissTokens = 0
+        }
+        // Drop chunks (or chunk prefixes) covering positions we just adopted.
+        while advance > 0 && !chunkQueue.isEmpty {
+            let head = chunkQueue[0]
+            let headCount = head.count
+            if headCount <= advance {
+                chunkQueue.removeFirst()
+                advance -= headCount
+            } else {
+                switch head {
+                case .tokens(let ts):
+                    chunkQueue[0] = .tokens(Array(ts[advance...]))
+                case .softTokens(let buf, let count, let isFp32, let byteOff, let evt):
+                    let bytesPerTok = isFp32 ? (HIDDEN * 4) : (HIDDEN * 2)
+                    chunkQueue[0] = .softTokens(buffer: buf,
+                                                 count: count - advance,
+                                                 isFp32: isFp32,
+                                                 byteOffset: byteOff + advance * bytesPerTok,
+                                                 eventTicket: evt)
+                }
+                advance = 0
+            }
+        }
     }
     func submit(softTokens: MTLBuffer, count: Int, isFp32: Bool,
-                  pendingCB: MTLCommandBuffer? = nil) {
+                  eventTicket: UInt64 = 0, contentHash: UInt64 = 0) {
         guard count > 0 else { return }
         chunkQueue.append(.softTokens(buffer: softTokens, count: count,
                                        isFp32: isFp32, byteOffset: 0,
-                                       pendingCB: pendingCB))
+                                       eventTicket: eventTicket))
+        // Extend consumedTokens with content-derived placeholders for the
+        // soft positions, so:
+        //   - promoteFinishedPages requires end <= consumedTokens.count,
+        //     so pages straddling soft positions can promote
+        //   - adoptSharedPrefixPages walks consumedTokens, so cache probes
+        //     see image identity in subsequent sessions
+        //
+        // CRITICAL: hash the image's INPUT BYTES, not the soft-token buffer.
+        // The soft buffer is GPU-written by the vision tower on its own
+        // queue and may be all zeros (or stale) at the moment submit runs
+        // (caller sequences readers via the eventTicket but CPU reads
+        // here would race the GPU writes). Using the input image hash
+        // gives a stable, identical key across iters of the same image.
+        // Caller passes contentHash from gVisionCache's image-bytes key.
+        let imgHash = contentHash != 0 ? contentHash : 0xcbf29ce484222325
+        if ProcessInfo.processInfo.environment["LM_CACHE_DEBUG"] != nil {
+            print("  [cache] session \(id) submit(softs) imgHash=\(String(imgHash, radix: 16, uppercase: false)) count=\(count) (pre-consumedTokens.count=\(consumedTokens.count))")
+        }
+        for p in 0..<count {
+            // Mix imgHash with position so each soft position is distinct.
+            let mixed = imgHash &+ UInt64(p) &* 0x9E3779B97F4A7C15
+            consumedTokens.append(UInt32(truncatingIfNeeded: mixed))
+        }
         if state != .done { state = .priming }
+        // Re-probe the cache now that consumedTokens has grown.
+        if let eng = engine {
+            revisitCacheProbe(engine: eng)
+        }
     }
 
     // Explicit pause — retain KV, release the active slot. Caller uses this
@@ -831,11 +1116,11 @@ final class Session {
         append(eng.tokenizer.encode(text, addBos: false), resetBudget: resetBudget)
     }
     func append(softTokens: MTLBuffer, count: Int, isFp32: Bool,
-                  pendingCB: MTLCommandBuffer? = nil, resetBudget: Bool = true) {
+                  eventTicket: UInt64 = 0, resetBudget: Bool = true) {
         guard count > 0 else { return }
         if state == .done { state = .paused }
         if resetBudget { numGenerated = 0 }
-        submit(softTokens: softTokens, count: count, isFp32: isFp32, pendingCB: pendingCB)
+        submit(softTokens: softTokens, count: count, isFp32: isFp32, eventTicket: eventTicket)
     }
 
     // Pull the next generated token, or nil if none ready.
@@ -848,6 +1133,15 @@ final class Session {
     var pendingPrimingCount: Int { chunkQueue.reduce(0) { $0 + $1.count } }
     var ownedPagesForDebug: [Int] { ownedPages }
     var positionForDebug: Int { position }
+    var chunkQueueDepthForDebug: Int { chunkQueue.count }
+    // Peek the most recent N tokens in outputQueue without removing them.
+    // Used by the batch FFI's logprob capture (which must inspect the
+    // just-sampled token and pair it with the post-step logits row).
+    func peekRecentOutputs(count: Int) -> [UInt32] {
+        let n = min(count, outputQueue.count)
+        if n == 0 { return [] }
+        return Array(outputQueue.suffix(n))
+    }
 
     // Mark as done; engine will release pages + slot on the next tick.
     func finish() { state = .done }
@@ -878,7 +1172,24 @@ final class LmEngine {
     // well we're batching. One CB per step regardless of active count.
     private(set) var totalSteps: Int = 0
     private(set) var totalTokensGenerated: Int = 0
+
+    // (lockYielder + waitYielded removed Phase 4 — see notes/engine_debloat.md.
+    // The wait they used to wrap doesn't exist on the hot path anymore.
+    // The harness sync wrappers (step/stepPrefillForSession/...) still
+    // call cb.waitUntilCompleted() directly, but they're only used by
+    // runUntilIdle and validators, never the production pump.)
     private(set) var lastStepMs: Double = 0
+    // Heretic-style write ablations — engine-level, applied uniformly
+    // across all batch slots each tick. Configured externally via the
+    // FFI; iterated by buildStepCB at the per-layer attn-out and ffn-out
+    // hook points. Empty list = no ablation (engine in baseline mode).
+    var writeAblations: [LayerComponentAblation] = []
+    // Slot occupancy over lifetime: for each non-idle tick, we add the
+    // number of busy sessions that were scheduled in (== slot count this
+    // tick). avg_active_slots = totalSlotTicks / totalSteps. Exposed via
+    // the scheduler-snapshot FFI for bottleneck debugging ("why aren't
+    // all B slots occupied when I have ≥B sessions ready?").
+    private(set) var totalSlotTicks: Int = 0
 
     init(weights: LmWeights) {
         self.weights = weights
@@ -886,6 +1197,10 @@ final class LmEngine {
         self.slotAssignment = Array(repeating: nil, count: B)
         self.pageManager = PageManager(numPhysPages: SCRATCH_PAGE_BASE,
                                         pageSize: PAGE_SLIDE)
+        // Pre-compute the structured-cot free-line mask once. ~5ms at
+        // VOCAB=262144 — runs alongside model load, doesn't show up in
+        // request hot path. Reused by every cot-enabled session.
+        self.buildFreeLineMask()
     }
 
     // Grow a session's owned pages so its logical page count covers k_len.
@@ -897,17 +1212,12 @@ final class LmEngine {
         // Allocate at PAGE_FULL granularity (the SMALLER of slide/full
         // page sizes) so block_table has enough entries for the
         // full-attention layers, which use PAGE_FULL=8 while slide uses
-        // PAGE_SLIDE=16. Under the old PAGE_SLIDE granularity, full-
-        // attn's block_table[ceil(kLen/16)..ceil(kLen/8)-1] was filled
-        // with SCRATCH_PAGE_BASE, silently reading zeros and producing
-        // KL~0.38 divergence across cache replay. Each slide page
-        // occupies TWO phys slots (one primary for the slide K/V + the
-        // first 8 full K/V positions, one sibling for the second 8 full
-        // K/V positions).
+        // PAGE_SLIDE=16.
         let needed = (kLen + PAGE_FULL - 1) / PAGE_FULL
         while s.ownedPages.count < needed {
             do {
                 let p = try pageManager.allocFresh(sessionId: s.id)
+                zeroPhysPageKV(p)
                 s.ownedPages.append(p)
             } catch {
                 print("  ensurePages: pool exhausted for session \(s.id) at logical page \(s.ownedPages.count)")
@@ -915,6 +1225,79 @@ final class LmEngine {
             }
         }
         return true
+    }
+
+    // Wipe the K/V cache rows for a freshly-allocated phys page across all
+    // layers. Without this, an attention READ of a row that was never
+    // written by the new owner (e.g. a partial-block tail row above the
+    // current k_len, masked to score=-INF) does `0 * V_stale`. IEEE says
+    // `0 * NaN = NaN` — so a single stale-NaN row poisons attention output
+    // forever. Zero-fill makes that path return `0 * 0 = 0` safely.
+    // Cost: ~32 KB per page across 25 layers ≈ 800 KB memset, ~3 μs on
+    // M5's ~250 GB/s memcpy bandwidth. Negligible vs the ~30 ms step.
+    private func zeroPhysPageKV(_ phys: Int) {
+        for L in 0..<NUM_LAYERS {
+            let lw = weights.layers[L]
+            let pg = lw.isFull ? PAGE_FULL : PAGE_SLIDE
+            let bytesPerPage = pg * lw.KV_H * lw.HD * 2
+            let off = phys * bytesPerPage
+            memset(weights.K_caches[L].contents().advanced(by: off), 0, bytesPerPage)
+            memset(weights.V_caches[L].contents().advanced(by: off), 0, bytesPerPage)
+        }
+    }
+
+    // Idempotent: if this session has staged prefix K/V and hasn't yet
+    // installed, allocate one page (if needed), write prefix K/V bytes
+    // to position 0 per layer, bump s.position to 1. Call BEFORE any
+    // code that captures s.position for prefill positioning.
+    fileprivate func installPendingPrefixKVIfAny(_ s: Session) {
+        guard !s.prefixKvInstalled, let pkv = s.prefixKvStaged,
+              s.position == 0 else { return }
+        if s.ownedPages.isEmpty {
+            do {
+                let p = try pageManager.allocFresh(sessionId: s.id)
+                zeroPhysPageKV(p)
+                s.ownedPages.append(p)
+            } catch {
+                print("  prefix-kv install: alloc failed for session \(s.id)")
+                return
+            }
+        }
+        installPrefixKV(s, k: pkv.k, v: pkv.v)
+        s.prefixKvInstalled = true
+        s.position = 1
+        print("[prefix-kv] installed for session \(s.id), page=\(s.ownedPages[0]), position bumped to 1")
+    }
+
+    // Write per-layer K/V bytes to position 0 of session s's FIRST
+    // owned page. Per-layer K cache layout per Kbuf:
+    //   [TOTAL_PAGES, PAGE_size_L, KV_H_L, HD_L] halves
+    // Byte offset for phys-page P, position p within page, head h, dim d:
+    //   ((P * PAGE_size_L + p) * KV_H_L + h) * HD_L + d   (halves)
+    // For p=0, h covers KV_H_L heads: write KV_H_L * HD_L halves = that
+    // many * 2 bytes.
+    fileprivate func installPrefixKV(_ s: Session, k: [Data], v: [Data]) {
+        let phys = s.ownedPages[0]
+        for L in 0..<NUM_LAYERS {
+            let lw = weights.layers[L]
+            let pg = lw.isFull ? PAGE_FULL : PAGE_SLIDE
+            let sliceHalves = lw.KV_H * lw.HD
+            let byteOffset = phys * pg * sliceHalves * 2
+            // K and V destinations at that offset.
+            guard L < k.count, L < v.count else { continue }
+            let kBlob = k[L]; let vBlob = v[L]
+            guard kBlob.count == sliceHalves * 2,
+                  vBlob.count == sliceHalves * 2 else {
+                print("  installPrefixKV: L\(L) size mismatch " +
+                      "(got k=\(kBlob.count), v=\(vBlob.count), " +
+                      "expected \(sliceHalves * 2))")
+                continue
+            }
+            let kDst = weights.K_caches[L].contents().advanced(by: byteOffset)
+            let vDst = weights.V_caches[L].contents().advanced(by: byteOffset)
+            kBlob.withUnsafeBytes { memcpy(kDst, $0.baseAddress, sliceHalves * 2) }
+            vBlob.withUnsafeBytes { memcpy(vDst, $0.baseAddress, sliceHalves * 2) }
+        }
     }
 
     // Install a session's owned pages into block_table[slot][:]. Entries
@@ -1001,31 +1384,15 @@ final class LmEngine {
             pageManager.promotePair(slidePrimary: s.ownedPages[slideIdx],
                                      fullSibling: s.ownedPages[fullIdx],
                                      contentHash: hash)
+            if ProcessInfo.processInfo.environment["LM_CACHE_DEBUG"] != nil {
+                let head = s.consumedTokens[pageStart..<end].prefix(4).map(String.init).joined(separator: ",")
+                print("  [cache] session \(s.id) PROMOTE page \(p) hash=\(String(hash, radix: 16, uppercase: false)) head=[\(head),…]")
+            }
             s.promotedPageCount += 1
         }
     }
 
     func poolStats() -> PageManager.Stats { return pageManager.stats() }
-
-    // Longest common prefix (in pages) across ALL currently-slotted busy
-    // sessions. Used by the AR scheduler to decide whether to route
-    // attention through the K/V-broadcast shared+tail+reduce path. Zero
-    // when there's only one active session (no broadcast benefit) or
-    // when slots' block_tables disagree at page 0.
-    func detectSharedPrefix() -> Int {
-        let busy = activeSessions.filter { $0.state.wantsSlot }
-        if busy.count < 2 { return 0 }
-        let minPages = busy.map { $0.ownedPages.count }.min() ?? 0
-        if minPages == 0 { return 0 }
-        var p = 0
-        while p < minPages {
-            let first = busy[0].ownedPages[p]
-            if busy.dropFirst().allSatisfy({ $0.ownedPages[p] == first }) {
-                p += 1
-            } else { break }
-        }
-        return p
-    }
 
     // Sessions currently occupying active batch slots (length ≤ B).
     var activeSessions: [Session] {
@@ -1043,7 +1410,8 @@ final class LmEngine {
     private func runAdmissionPass() {
         for slot in 0..<B {
             if let sid = slotAssignment[slot],
-               let s = residentSessions[sid], !s.state.wantsSlot {
+               let s = residentSessions[sid],
+               !s.state.wantsSlot {
                 s.slot = nil
                 slotAssignment[slot] = nil
             }
@@ -1105,6 +1473,158 @@ final class LmEngine {
         }
     }
 
+    // Populate the 6 sampling buffers (temperature, min_p, seed, step,
+    // active, dense logit_bias) for the GPU `sample_token` kernel. Must
+    // be called BEFORE committing any CB that ends with encSampleToken
+    // (buildStepCB, buildPrefillCB via its unembed path).
+    //
+    // `activeSlotSession[slot]` is the session whose sampled token will
+    // be read from gpu_sampled_tokens[slot] post-wait. Non-nil entries
+    // get their params + bias populated; nil entries are zeroed and
+    // marked inactive so the kernel short-circuits that slot.
+    // Track whether each slot's bias row currently holds non-zero data.
+    // Without this every CB does a 1MB memset per slot for the common
+    // case (no logit bias) — pure waste on the critical path. The buffer
+    // is initialized to zero at allocation; we only write when going
+    // from zero→non-zero or non-zero→zero, and skip otherwise.
+    private var slotBiasIsDirty = [Bool](repeating: false, count: B)
+
+    // Pre-computed mask of the per-vocab "free-line" set: 0 for tokens
+    // whose bytes don't contain a mid-token newline (and aren't framing
+    // specials), -INF for tokens that would put a newline mid-stream
+    // or contribute zero bytes. Computed once in init() — used for
+    // every structured-cot session in the .freeLine phase. Tokens
+    // ending in \n (terminal-newline) are valid; they advance the
+    // grammar to the next literal phase.
+    private var freeLineMask: [Float] = []
+
+    // Per-CotState computed mask cache. Recomputed on the fly when a
+    // session's cot state advances into a new literal phase or moves
+    // its literal cursor. Free-line phases reuse `freeLineMask`. The
+    // cache is invalidated when the session's cot is enabled, advances
+    // a phase, or finishes (cot = nil).
+    private var cotLiteralMaskCache: [Int: [Float]] = [:]
+    // ^ keyed by "phase epoch" — each session's CotState gets a unique
+    // epoch we mint on enable. We use Session.id as the epoch for now;
+    // collisions can't happen since at any time only one CotState
+    // exists per session id.
+
+    // Compute the mask for a CotState's CURRENT phase + cursor. Returns
+    // a [VOCAB] array where 0 = allowed, -INF = forbidden. Caller
+    // additively combines this with any user logit_bias (the
+    // sampling_logit_bias buffer is read by sample_token kernel as a
+    // pure additive bias — -INF saturates regardless of user bias).
+    private func cotMask(state: CotState) -> [Float] {
+        let neg: Float = -.infinity
+        guard let phase = state.phases.first else {
+            return [Float](repeating: 0, count: VOCAB)
+        }
+        switch phase {
+        case .literal(let bytes):
+            let remaining = Array(bytes[state.literalCursor...])
+            var m = [Float](repeating: neg, count: VOCAB)
+            for v in 0..<VOCAB {
+                let tBytes = tokenizer.tokenBytes(UInt32(v))
+                if tBytes.isEmpty { continue }
+                if tBytes.count <= remaining.count
+                   && remaining.prefix(tBytes.count).elementsEqual(tBytes) {
+                    m[v] = 0
+                }
+            }
+            return m
+        case .freeLine:
+            return freeLineMask
+        }
+    }
+
+    // Build freeLineMask once. Tokens with mid-token newline or empty
+    // bytes (specials) are masked out; everything else is allowed.
+    private func buildFreeLineMask() {
+        let neg: Float = -.infinity
+        var m = [Float](repeating: 0, count: VOCAB)
+        for v in 0..<VOCAB {
+            let tBytes = tokenizer.tokenBytes(UInt32(v))
+            if tBytes.isEmpty { m[v] = neg; continue }
+            // Find any \n NOT at the last position.
+            for i in 0..<(tBytes.count - 1) {
+                if tBytes[i] == 0x0A { m[v] = neg; break }
+            }
+        }
+        freeLineMask = m
+    }
+
+    private func populateSamplingParams(_ activeSlotSession: [Session?]) {
+        let sTempP   = sampling_temperature.contents().bindMemory(to: Float.self,  capacity: B)
+        let sMinPP   = sampling_min_p.contents().bindMemory(to: Float.self,  capacity: B)
+        let sSeedP   = sampling_seed.contents().bindMemory(to: UInt32.self, capacity: B)
+        let sStepP   = sampling_step.contents().bindMemory(to: UInt32.self, capacity: B)
+        let sActiveP = sampling_active.contents().bindMemory(to: UInt32.self, capacity: B)
+        let sBiasP   = sampling_logit_bias.contents().bindMemory(to: Float.self, capacity: B * VOCAB)
+        for slot in 0..<B {
+            if let s = activeSlotSession[slot] {
+                sTempP[slot]   = s.samplingTemperature
+                sMinPP[slot]   = s.minP
+                sSeedP[slot]   = s.gpuRngSeed
+                sStepP[slot]   = UInt32(s.numGenerated)
+                sActiveP[slot] = 1
+                let biasRow = sBiasP.advanced(by: slot * VOCAB)
+                // Composition order:
+                //   1. If structured-cot is active, fill bias with the
+                //      grammar's mask (-INF for forbidden tokens, 0 for
+                //      allowed). This dominates user logit_bias for any
+                //      forbidden token (-INF + anything = -INF).
+                //   2. Else if user has dense logit_bias, memcpy that.
+                //   3. Else clear bias if dirty.
+                if let cot = s.cot {
+                    let mask = cotMask(state: cot)
+                    mask.withUnsafeBufferPointer { src in
+                        memcpy(biasRow, src.baseAddress, VOCAB * 4)
+                    }
+                    // If user ALSO has dense bias, add it on top
+                    // (componentwise) so allowed tokens carry the user's
+                    // preferences while forbidden ones stay -INF.
+                    if let bias = s.logitBiasDense {
+                        bias.withUnsafeBufferPointer { src in
+                            for i in 0..<VOCAB { biasRow[i] += src[i] }
+                        }
+                    }
+                    slotBiasIsDirty[slot] = true
+                } else if let bias = s.logitBiasDense {
+                    bias.withUnsafeBufferPointer { src in
+                        memcpy(biasRow, src.baseAddress, VOCAB * 4)
+                    }
+                    slotBiasIsDirty[slot] = true
+                } else if slotBiasIsDirty[slot] {
+                    memset(biasRow, 0, VOCAB * 4)
+                    slotBiasIsDirty[slot] = false
+                }
+                // else: bias row is already zero from allocation or a
+                // prior cleanup, kernel reads zeros, no write needed.
+            } else {
+                sTempP[slot]   = 0.0
+                sMinPP[slot]   = 0.0
+                sSeedP[slot]   = 0
+                sStepP[slot]   = 0
+                sActiveP[slot] = 0
+                if slotBiasIsDirty[slot] {
+                    memset(sBiasP.advanced(by: slot * VOCAB), 0, VOCAB * 4)
+                    slotBiasIsDirty[slot] = false
+                }
+            }
+        }
+    }
+
+    // Snapshot captured at AR-step prep time and consumed by finalize. The
+    // chain (chainAdvance) commits the CB and returns; finalize runs from
+    // the completion handler, by which time `slotAssignment` may have
+    // shifted under admission/close — so we snapshot the slot→session map.
+    struct PreparedAR {
+        let cb: MTLCommandBuffer
+        let t0: Date
+        let realSlot: [Bool]
+        let slotSession: [Session?]
+    }
+
     // Run exactly one buildStepCB covering every slot, with per-slot state
     // driven by each session's queue. Returns the number of tokens emitted
     // into output queues this step (across all sessions).
@@ -1115,9 +1635,18 @@ final class LmEngine {
     // `step()` directly in the multimodal case.
     @discardableResult
     func step() -> Int {
+        guard let p = prepareARStep() else { return 0 }
+        p.cb.commit(); p.cb.waitUntilCompleted()
+        return finalizeARStep(p)
+    }
+
+    // Build the AR CB and snapshot finalize-time state. Returns nil if no
+    // session has busy work. Does not commit; caller commits and (sync or
+    // via completion handler) calls finalizeARStep.
+    func prepareARStep() -> PreparedAR? {
         runAdmissionPass()
         let busy = activeSessions.filter { $0.state.isBusy }
-        if busy.isEmpty { return 0 }
+        if busy.isEmpty { return nil }
 
         // Per-slot inputs (AR path).
         let tokP = input_tokens.contents().bindMemory(to: UInt32.self, capacity: B)
@@ -1171,22 +1700,19 @@ final class LmEngine {
             }
         }
 
-        if USE_FLEX_ATTN {
-            precomputeFlexBlockMaskSlide(slidingWindow: SLIDING_WINDOW)
-            precomputeFlexBlockMaskFull()
-        }
+        precomputeFlexBlockMaskSlide(slidingWindow: SLIDING_WINDOW)
+        precomputeFlexBlockMaskFull()
 
-        // Detect cross-slot shared-prefix length and populate the shared
-        // phys-pages buffer. Below threshold, buildStepCB's default path
-        // runs (fast at low batch, fast at no-sharing).
-        let sharedPrefix = detectSharedPrefix()
-        if sharedPrefix >= SHARED_PREFIX_THRESHOLD_PAGES,
-           let reference = activeSessions.filter({ $0.state.wantsSlot }).first {
-            let spp = shared_phys_pages.contents().assumingMemoryBound(to: UInt32.self)
-            for p in 0..<sharedPrefix {
-                spp[p] = UInt32(reference.ownedPages[p])
+        // Sampling params for the GPU sample_token dispatch that
+        // encodes at the end of buildStepCB. See populateSamplingParams.
+        var arSlotSession: [Session?] = Array(repeating: nil, count: B)
+        for slot in 0..<B where realSlot[slot] {
+            if let sid = slotAssignment[slot],
+               let s = residentSessions[sid] {
+                arSlotSession[slot] = s
             }
         }
+        populateSamplingParams(arSlotSession)
 
         // Control-vector per-tick staging. For every occupied slot, evaluate
         // each of its active controls' envelopes at the current (position,
@@ -1211,16 +1737,48 @@ final class LmEngine {
                     if m != 0 {
                         gSlotControls[slot].append(SlotControl(
                             buffer: c.buffer, layer: c.layer, mag: m,
-                            mode: .additive, measureOutSlot: 0))
+                            mode: .additive, measureOutSlot: 0,
+                            transportScale: 0, transportOffset: 0))
                     }
                 case .project:
-                    // Always stage project mode (target=0 is meaningful
-                    // = remove feature). Assign a measure-buf slot;
-                    // drop extras past the per-slot cap.
-                    if measIdx < MAX_PROJECT_CONTROLS_PER_SLOT {
+                    // Two semantics:
+                    //  - c.target == nil (back-compat): envelope m IS the
+                    //    target projection. Always stage.
+                    //  - c.target != nil (gated): envelope m is a GATE;
+                    //    m == 0 → skip dispatch entirely, else coerce to
+                    //    c.target. This is what enables scoped obliteratus:
+                    //    detector restarts the envelope on refusal-rise,
+                    //    ablation only fires while the gate is hot.
+                    let stage: Bool
+                    let targetValue: Float
+                    if let t = c.target {
+                        stage = (m != 0)
+                        targetValue = t
+                    } else {
+                        stage = true
+                        targetValue = m
+                    }
+                    if stage && measIdx < MAX_PROJECT_CONTROLS_PER_SLOT {
                         gSlotControls[slot].append(SlotControl(
-                            buffer: c.buffer, layer: c.layer, mag: m,
-                            mode: .project, measureOutSlot: measBase + measIdx))
+                            buffer: c.buffer, layer: c.layer, mag: targetValue,
+                            mode: .project, measureOutSlot: measBase + measIdx,
+                            transportScale: 0, transportOffset: 0))
+                        measIdx += 1
+                    }
+                case .transport:
+                    // Gaussian OT: kernel computes target = scale*a + offset
+                    // using the same per-dispatch reduction that project
+                    // uses. Envelope m acts as a GATE identical to the
+                    // gated-project semantics (m == 0 → skip). c.target
+                    // isn't used; scale/offset are the Brenier-map
+                    // coefficients precomputed at attach.
+                    let stage = (m != 0)
+                    if stage && measIdx < MAX_PROJECT_CONTROLS_PER_SLOT {
+                        gSlotControls[slot].append(SlotControl(
+                            buffer: c.buffer, layer: c.layer, mag: 0,
+                            mode: .transport, measureOutSlot: measBase + measIdx,
+                            transportScale: c.transportScale,
+                            transportOffset: c.transportOffset))
                         measIdx += 1
                     }
                 }
@@ -1240,12 +1798,121 @@ final class LmEngine {
             }
         }
 
+        // Compute activeB for the kernel-zoo dispatchers: highest-occupied
+        // slot index + 1. Slot policy "lowest free first" (runAdmissionPass)
+        // packs active sessions at [0, activeB), so the b1/b2/b4/b8 PSO
+        // selection runs the right slots' work and silences nothing past aB.
+        var activeB = 0
+        for slot in 0..<B where realSlot[slot] {
+            activeB = slot + 1
+        }
+        if activeB == 0 { activeB = 1 }      // park step still needs slot 0 dispatched
+
         let t0 = Date()
-        let cb = buildStepCB(weights, sharedPrefixPages: sharedPrefix)
-        cb.commit(); cb.waitUntilCompleted()
-        lastStepMs = Date().timeIntervalSince(t0) * 1000
+        let cb = buildStepCB(weights, activeB: activeB)
+        return PreparedAR(cb: cb, t0: t0, realSlot: realSlot, slotSession: arSlotSession)
+    }
+
+    // Post-CB readback. Runs once the GPU has finished the AR step CB —
+    // either inline after waitYielded (sync `step()`) or from the chain's
+    // addCompletedHandler (async `chainAdvance`). Uses the captured
+    // slot→session snapshot, not slotAssignment, so admission churn
+    // during GPU compute can't reroute the readback.
+    @discardableResult
+    func finalizeARStep(_ p: PreparedAR) -> Int {
+        lastStepMs = Date().timeIntervalSince(p.t0) * 1000
         totalSteps += 1
-        if let err = cb.error { print("  GPU step error: \(err)"); return 0 }
+        if let err = p.cb.error { print("  GPU step error: \(err)"); return 0 }
+        // Periodic profiling dump every 100 AR steps. Gated by LM_PROF env.
+        // Splits step time into: GPU compute, handler latency, finalize, prep.
+        // GPU time is wall - cpu_overhead. Anything left is bandwidth-bound or
+        // dispatch-launch-bound on GPU.
+        if ProcessInfo.processInfo.environment["LM_PROF"] != nil &&
+           prof_arSteps > 0 && prof_arSteps % 100 == 0 {
+            let n = Double(prof_arSteps)
+            let gpuAvg = prof_gpuMsSum / n
+            let wallAvg = prof_wallMsSum / n
+            let handlerAvg = prof_handlerLatencyMsSum / n
+            let finalizeAvg = prof_finalizeMsSum / n
+            let prepAvg = prof_prepMsSum / n
+            let cpuAvg = handlerAvg + finalizeAvg + prepAvg
+            let line = String(format: "[PROF] ar=%d wall=%.1f gpu=%.1f cpu=%.1f (handler=%.2f final=%.2f prep=%.2f) sched(ar=%d sM=%d sS=%d tM=%d tS=%d)\n",
+                              prof_arSteps, wallAvg, gpuAvg, cpuAvg,
+                              handlerAvg, finalizeAvg, prepAvg,
+                              sched_arCount, sched_softMultiCount, sched_softSingleCount,
+                              sched_textMultiCount, sched_textSingleCount)
+            if let data = line.data(using: .utf8) {
+                FileHandle.standardError.write(data)
+            }
+        }
+
+        // Token + logit trace (LM_TOKEN_TRACE=1). For each slot, prints the
+        // sampled token, its raw logit value, the max logit value, and which
+        // token won. Combined with NaN trace below, narrows the moment a
+        // degenerate logit distribution appears.
+        if ProcessInfo.processInfo.environment["LM_TOKEN_TRACE"] != nil {
+            let logP = logits.contents().bindMemory(to: Float16.self,
+                                                     capacity: B * VOCAB)
+            let gpuTokP = gpu_sampled_tokens.contents().bindMemory(
+                to: UInt32.self, capacity: B)
+            for slot in 0..<B where p.realSlot[slot] {
+                guard let s = p.slotSession[slot], s.state.isBusy else { continue }
+                let sampled = gpuTokP[slot]
+                var maxLogit: Float = -Float.infinity
+                var maxIdx = 0
+                let base = slot * VOCAB
+                for v in 0..<VOCAB {
+                    let lv = Float(logP[base + v])
+                    if lv > maxLogit { maxLogit = lv; maxIdx = v }
+                }
+                let sampledLogit = Float(logP[base + Int(sampled)])
+                // Print on every step that samples token in suspicious region,
+                // OR every 50 steps for general health.
+                let suspicious = (sampled >= 6000 && sampled <= 6500)
+                if suspicious || (s.numGenerated % 50 == 0 && s.numGenerated > 0) {
+                    let line = "[TOK] step=\(totalSteps) slot=\(slot) sid=\(s.id) numGen=\(s.numGenerated) tok=\(sampled) logit=\(sampledLogit) | argmax=\(maxIdx) maxlogit=\(maxLogit)\n"
+                    if let data = line.data(using: .utf8) {
+                        FileHandle.standardError.write(data)
+                    }
+                }
+            }
+        }
+        // NaN trace (gated by LM_NAN_TRACE). Scans hidden + logits + every
+        // K/V cache entry that any active slot's last-written page references,
+        // prints the FIRST slot/buffer/index that goes non-finite. Wires to
+        // the broadcast-bug RCA — find where NaN first appears.
+        if ProcessInfo.processInfo.environment["LM_NAN_TRACE"] != nil {
+            let hidP = hidden.contents().bindMemory(to: UInt16.self,
+                                                     capacity: B * HIDDEN)
+            let logP = logits.contents().bindMemory(to: UInt16.self,
+                                                     capacity: B * VOCAB)
+            for slot in 0..<B where p.realSlot[slot] {
+                guard let s = p.slotSession[slot] else { continue }
+                // Hidden: scan slot's row.
+                var hidNan = -1
+                for d in 0..<HIDDEN {
+                    let h16 = hidP[slot * HIDDEN + d]
+                    // fp16 NaN: exponent all 1s, mantissa nonzero
+                    if (h16 & 0x7C00) == 0x7C00 && (h16 & 0x03FF) != 0 {
+                        hidNan = d; break
+                    }
+                }
+                if hidNan >= 0 {
+                    print("[NAN] step=\(totalSteps) slot=\(slot) sid=\(s.id) hidden[\(hidNan)] is NaN, pos=\(s.position) numGen=\(s.numGenerated)")
+                }
+                // Logits: scan slot's row, log first NaN index.
+                var logNan = -1
+                for v in 0..<VOCAB {
+                    let l16 = logP[slot * VOCAB + v]
+                    if (l16 & 0x7C00) == 0x7C00 && (l16 & 0x03FF) != 0 {
+                        logNan = v; break
+                    }
+                }
+                if logNan >= 0 {
+                    print("[NAN] step=\(totalSteps) slot=\(slot) sid=\(s.id) logits[\(logNan)] is NaN, pos=\(s.position)")
+                }
+            }
+        }
 
         // Phase C-Read readback. Pull intensities out of gIntensityBuf
         // (host-visible) into each session's DetectorAttachment state —
@@ -1258,26 +1925,37 @@ final class LmEngine {
                                                        capacity: B * MAX_DETECTORS_PER_SLOT)
         // Project-mode measurement readback: the project kernel writes
         // the pre-write projection into gProjectMeasureBuf at each
-        // control's measureOutSlot. The staging in step() assigned these
-        // slots by iterating activeControls in order and incrementing a
-        // per-session counter for project-mode controls. We replay the
-        // same iteration to map back from slot index to which
-        // ActiveControl receives the reading.
+        // control's measureOutSlot. The staging in prepareARStep assigned
+        // these slots by iterating activeControls in order and
+        // incrementing a per-session counter for project-mode controls.
+        // We replay the same iteration to map back from slot index to
+        // which ActiveControl receives the reading.
         let projP = gProjectMeasureBuf.contents().bindMemory(to: Float.self,
                                                               capacity: B * MAX_PROJECT_CONTROLS_PER_SLOT)
         let logCvec = ProcessInfo.processInfo.environment["LM_CVEC_LOG"] != nil
-        for slot in 0..<B where realSlot[slot] {
-            guard let sid = slotAssignment[slot],
-                  let s = residentSessions[sid] else { continue }
+        for slot in 0..<B where p.realSlot[slot] {
+            guard let s = p.slotSession[slot] else { continue }
             let base = slot * MAX_DETECTORS_PER_SLOT
             for (i, d) in s.detectors.prefix(MAX_DETECTORS_PER_SLOT).enumerated() {
                 d.prevIntensity = d.lastIntensity
                 d.lastIntensity = intP[base + i]
             }
-            // Project-mode pre-write projections. Replay staging order.
+            // Project-mode pre-write projections. Replay staging order
+            // EXACTLY — gated project controls whose envelope evaluates
+            // to 0 are skipped above, so we skip them here too. Nil out
+            // their measurement (nothing was written this tick).
             let projBase = slot * MAX_PROJECT_CONTROLS_PER_SLOT
             var projIdx = 0
-            for c in s.activeControls where c.mode == .project {
+            for c in s.activeControls where (c.mode == .project || c.mode == .transport) {
+                let m = c.magnitudeAt(position: s.position,
+                                       turn: s.turnIndex)
+                let staged: Bool
+                if c.mode == .transport {
+                    staged = (m != 0)
+                } else {
+                    staged = (c.target == nil) || (m != 0)
+                }
+                if !staged { c.lastProjectMeasurement = nil; continue }
                 if projIdx >= MAX_PROJECT_CONTROLS_PER_SLOT { break }
                 c.lastProjectMeasurement = projP[projBase + projIdx]
                 projIdx += 1
@@ -1286,15 +1964,16 @@ final class LmEngine {
                                 log: logCvec ? { print($0) } : nil)
         }
 
-        let logP = logits.contents().assumingMemoryBound(to: Float16.self)
+        let gpuTokP = gpu_sampled_tokens.contents().bindMemory(
+            to: UInt32.self, capacity: B)
         var emitted = 0
-        for slot in 0..<B where realSlot[slot] {
-            guard let sid = slotAssignment[slot],
-                  let s = residentSessions[sid], s.state.isBusy else { continue }
-            let base = slot * VOCAB
-            let sampled = sampleTokenFromLogits(logP, base: base,
-                                                 temperature: s.samplingTemperature,
-                                                 rng: &s.rng)
+        for slot in 0..<B where p.realSlot[slot] {
+            guard let s = p.slotSession[slot], s.state.isBusy else { continue }
+            // GPU sampler is the source of truth for every slot —
+            // inverse-CDF softmax with logit_bias + temperature + min_p,
+            // written during the step CB. CPU `sampleTokenFromLogits`
+            // is no longer called from the hot path.
+            let sampled = gpuTokP[slot]
             s.position += 1
 
             if s.state == .priming {
@@ -1308,22 +1987,95 @@ final class LmEngine {
                     s.nextGeneratedInput = sampled
                     s.recordSample(token: sampled)
                     s.numGenerated += 1; emitted += 1; totalTokensGenerated += 1
-                    if sampled == s.eosId || s.numGenerated >= s.maxNewTokens {
+                    advanceCotIfActive(s, sampled: sampled)
+                    if sampled == s.eosId
+                        || s.numGenerated >= s.maxNewTokens
+                        || matchesAnyStopSequence(s) {
                         s.state = .done
                     }
                 }
                 // else: more priming to do — discard this logit.
             } else {
                 s.outputQueue.append(sampled)
+                // Extend canonical history so promoteFinishedPages can
+                // promote pages covering AR-generated positions.
+                s.consumedTokens.append(sampled)
                 s.nextGeneratedInput = sampled
                 s.recordSample(token: sampled)
                 s.numGenerated += 1; emitted += 1; totalTokensGenerated += 1
-                if sampled == s.eosId || s.numGenerated >= s.maxNewTokens {
+                advanceCotIfActive(s, sampled: sampled)
+                if sampled == s.eosId
+                    || s.numGenerated >= s.maxNewTokens
+                    || matchesAnyStopSequence(s) {
                     s.state = .done
+                }
+                // Promote ONLY at page boundaries (every PAGE_SLIDE tokens)
+                // to avoid the per-step hash-compute cost dominating AR
+                // throughput. promoteFinishedPages is internally bounded
+                // by promotedPageCount → fullyWritten anyway, but checking
+                // before calling skips the function-call overhead.
+                if s.position % PAGE_SLIDE == 0 || s.state == .done {
+                    promoteFinishedPages(s)
                 }
             }
         }
         return emitted
+    }
+
+    // True if any of the session's stopSequences matches the tail of
+    // s.consumedTokens. O(num_seqs × max_seq_len) per call — for a
+    // typical 1-2 sequences of 5-10 tokens that's noise. Sequences
+    // longer than the current emit history are skipped.
+    @inline(__always)
+    private func matchesAnyStopSequence(_ s: Session) -> Bool {
+        if s.stopSequences.isEmpty { return false }
+        let history = s.consumedTokens
+        for seq in s.stopSequences {
+            let n = seq.count
+            if n == 0 || history.count < n { continue }
+            let start = history.count - n
+            var match = true
+            for k in 0..<n {
+                if history[start + k] != seq[k] { match = false; break }
+            }
+            if match { return true }
+        }
+        return false
+    }
+
+    // If the session has an active structured-cot grammar, advance its
+    // state by the bytes of the just-sampled token. Clears `s.cot`
+    // when the grammar reaches done — subsequent steps run unconstrained.
+    private func advanceCotIfActive(_ s: Session, sampled: UInt32) {
+        guard let cot = s.cot else { return }
+        let bytes = tokenizer.tokenBytes(sampled)
+        if ProcessInfo.processInfo.environment["COT_DEBUG"] != nil {
+            let phaseDesc = cot.phases.first.map { p -> String in
+                switch p {
+                case .literal(let b): return "literal(\(String(decoding: b, as: UTF8.self).debugDescription))@\(cot.literalCursor)"
+                case .freeLine: return "freeLine"
+                }
+            } ?? "(done)"
+            let asStr = String(decoding: bytes, as: UTF8.self)
+            fputs("[cot] sid=\(s.id) tok=\(sampled) bytes=\(asStr.debugDescription) phase=\(phaseDesc)\n", stderr)
+        }
+        let done = cot.advance(by: bytes)
+        if done { s.cot = nil }
+    }
+
+    // Snapshot for single-slot prefill chain. block_table restoration is
+    // moved from a `defer` in the old function body into finalize, since
+    // we no longer wait inside prep — the kernel reads block_table during
+    // CB execution, so restoration can only happen after completion.
+    struct PreparedSinglePrefill {
+        let cb: MTLCommandBuffer
+        let t0: Date
+        let session: Session
+        let sslot: Int
+        let thisTile: Int
+        let remaining: Int
+        let savedBT: [UInt32]
+        let head: PrimingChunk
     }
 
     // Run a single-slot fast prefill: the given session's next chunk is
@@ -1332,21 +2084,33 @@ final class LmEngine {
     // Returns true if a prefill actually ran (chunk was consumed).
     @discardableResult
     func stepPrefillForSession(_ s: Session) -> Bool {
-        guard s.state == .priming, let head = s.chunkQueue.first else { return false }
+        guard let p = prepareSinglePrefill(s) else { return false }
+        p.cb.commit(); p.cb.waitUntilCompleted()
+        return finalizeSinglePrefill(p)
+    }
+
+    func prepareSinglePrefill(_ s: Session) -> PreparedSinglePrefill? {
+        guard s.state == .priming, let head = s.chunkQueue.first else { return nil }
         // Ensure the session owns an active slot. If not, run admission first.
         if s.slot == nil { runAdmissionPass() }
-        guard let sslot = s.slot else { return false }
+        guard let sslot = s.slot else { return nil }
         let qLen = head.count
         precondition(qLen >= 1)
         let thisTile = min(qLen, MAX_Q_LEN)
         let remaining = qLen - thisTile
+        // Synthetic prefix KV install (if staged): allocates ≥1 page,
+        // writes prefix bytes to position 0, bumps s.position to 1.
+        // Must happen BEFORE positionStart capture so real tokens
+        // don't overwrite our synthetic entry.
+        installPendingPrefixKVIfAny(s)
+        if !ensurePages(s, forKLen: s.position + thisTile + 1) { return nil }
         let positionStart = s.position
-
-        // Ensure pages cover positionStart..positionStart+thisTile.
-        if !ensurePages(s, forKLen: positionStart + thisTile + 1) { return false }
         installBlockTable(s, slot: sslot)
 
         // --- Save block_table; redirect non-target slots to scratch strip ---
+        // Restoration runs in finalize after the GPU CB completes. The kernel
+        // reads block_table during execution, so restoration cannot happen
+        // before completion.
         let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
         var savedBT = [UInt32](repeating: 0, count: B * MAX_PAGES_PER_SLOT)
         for i in 0..<(B * MAX_PAGES_PER_SLOT) { savedBT[i] = btP[i] }
@@ -1359,9 +2123,6 @@ final class LmEngine {
                 btP[slot * MAX_PAGES_PER_SLOT + p] =
                     UInt32(SCRATCH_PAGE_BASE + (p % SCRATCH_STRIP))
             }
-        }
-        defer {
-            for i in 0..<(B * MAX_PAGES_PER_SLOT) { btP[i] = savedBT[i] }
         }
 
         // --- Populate prefill scratch for all B slots, but only s.slot
@@ -1390,41 +2151,23 @@ final class LmEngine {
             for i in 0..<thisTile {
                 tokP[sslot * thisTile + i] = ts[i]
             }
-        case let .softTokens(buf, _, isFp32, byteOffset, pendingCB):
-            // Vision tower output. Copy the thisTile-row window starting
-            // at `byteOffset` into pre_hidden at rows [s.slot*thisTile,
-            // s.slot*thisTile+thisTile), downcasting fp32→fp16 if needed.
-            // Other slots' rows are untouched (they'll compute junk that
-            // gets discarded via block_table redirect to scratch).
-            //
-            // Wait on the in-flight vision CB — under the async pipeline
-            // this usually no-ops (GPU already finished), but it's the
-            // correctness barrier that lets us overlap vision with LM decode.
-            pendingCB?.waitUntilCompleted()
-            if let err = pendingCB?.error {
-                print("  [softTokens] pending vision CB error: \(err)")
+        case let .softTokens(buf, _, isFp32, byteOffset, eventTicket):
+            // Vision tower output. The pad-blit CB on the vision queue
+            // signaled `gVisionEvent` at value `eventTicket`; we encode a
+            // pre-prefill CB on the LM queue that encodeWaitForEvent's the
+            // same ticket and then dispatches a copy-and-cast kernel that
+            // writes pre_hidden[sslot * thisTile ..) from `buf` at byte
+            // offset `byteOffset`. Queue ordering on the LM queue means
+            // the prefill CB (committed below) sees the populated rows.
+            // CPU never blocks. See notes/engine_debloat.md.
+            precondition(isFp32, "softTokens fp16 path not yet ported to GPU copy")
+            let preCB = queue.makeCommandBuffer()!
+            if eventTicket > 0 {
+                preCB.encodeWaitForEvent(gVisionEvent, value: eventTicket)
             }
-            let dstPtr = pre_hidden.contents().assumingMemoryBound(to: Float16.self)
-            let dstBase = (sslot * thisTile) * HIDDEN
-            let srcRaw = buf.contents().advanced(by: byteOffset)
-            if isFp32 {
-                let srcPtr = srcRaw.assumingMemoryBound(to: Float.self)
-                if ProcessInfo.processInfo.environment["LM_MM_DEBUG"] != nil && byteOffset == 0 {
-                    var mn: Float = .infinity, mx: Float = -.infinity, sumAbs: Float = 0
-                    for i in 0..<(thisTile * HIDDEN) {
-                        let v = srcPtr[i]
-                        if v < mn { mn = v }; if v > mx { mx = v }
-                        sumAbs += abs(v)
-                    }
-                    print(String(format: "  [softTokens tile0] min=%.3f max=%.3f mean|v|=%.3f (first-tile, fp32)",
-                                 mn, mx, sumAbs / Float(thisTile * HIDDEN)))
-                }
-                for i in 0..<(thisTile * HIDDEN) {
-                    dstPtr[dstBase + i] = Float16(srcPtr[i])
-                }
-            } else {
-                memcpy(dstPtr.advanced(by: dstBase), srcRaw, thisTile * HIDDEN * 2)
-            }
+            encVisionSoftsCopyFp32(preCB, src: buf, srcByteOffset: byteOffset,
+                                    dst: pre_hidden, dstSlot: sslot, qLen: thisTile)
+            preCB.commit()
             skipEmbed = true
         }
 
@@ -1447,84 +2190,127 @@ final class LmEngine {
         gPrefillControls.removeAll(keepingCapacity: true)
         let prefillRows = B * thisTile
         for (pcIdx, c) in s.activeControls.enumerated() {
-            // Per-control scratch buffers. We reuse the mag-buf pool
-            // for both additive-mags and project-targets (same fp32
-            // shape); allocate measurement buffers in a second pool.
-            let magsBuf = acquirePrefillMagBuf(pcIdx * 3 + 0)
-            let targetsBuf = acquirePrefillMagBuf(pcIdx * 3 + 1)
-            let measuresBuf = acquirePrefillMagBuf(pcIdx * 3 + 2)
-            let magsP = magsBuf.contents().bindMemory(to: Float.self,
-                                                       capacity: prefillRows)
-            let targP = targetsBuf.contents().bindMemory(to: Float.self,
-                                                          capacity: prefillRows)
+            // Per-control scratch buffers. Five per control now:
+            //  0 mags (additive), 1 targets (project), 2 measures,
+            //  3 transport scales, 4 transport offsets.
+            let magsBuf = acquirePrefillMagBuf(pcIdx * 5 + 0)
+            let targetsBuf = acquirePrefillMagBuf(pcIdx * 5 + 1)
+            let measuresBuf = acquirePrefillMagBuf(pcIdx * 5 + 2)
+            let scalesBuf = acquirePrefillMagBuf(pcIdx * 5 + 3)
+            let offsetsBuf = acquirePrefillMagBuf(pcIdx * 5 + 4)
+            let magsP = magsBuf.contents().bindMemory(to: Float.self, capacity: prefillRows)
+            let targP = targetsBuf.contents().bindMemory(to: Float.self, capacity: prefillRows)
+            let scaleP = scalesBuf.contents().bindMemory(to: Float.self, capacity: prefillRows)
+            let offP = offsetsBuf.contents().bindMemory(to: Float.self, capacity: prefillRows)
             for r in 0..<prefillRows {
-                magsP[r] = 0                    // additive-mode silenced
-                targP[r] = Float.nan            // project-mode silenced
+                magsP[r] = 0                   // additive-mode silenced
+                targP[r] = Float.nan           // project-mode silenced
+                scaleP[r] = Float.nan          // transport-mode silenced
+                offP[r] = 0
             }
             for i in 0..<thisTile {
                 let pos = positionStart + i
                 let m = c.magnitudeAt(position: pos, turn: s.turnIndex)
                 switch c.mode {
                 case .additive: magsP[sslot * thisTile + i] = m
-                case .project:  targP[sslot * thisTile + i] = m
+                case .project:
+                    // Gated project: envelope m is a gate, target is the
+                    // coerce value. Gate 0 → NaN sentinel (kernel skips).
+                    if let t = c.target {
+                        targP[sslot * thisTile + i] = (m != 0) ? t : Float.nan
+                    } else {
+                        targP[sslot * thisTile + i] = m
+                    }
+                case .transport:
+                    // Envelope as gate; scale/offset precomputed at attach.
+                    if m != 0 {
+                        scaleP[sslot * thisTile + i] = c.transportScale
+                        offP[sslot * thisTile + i] = c.transportOffset
+                    }
                 }
             }
             gPrefillControls.append(PrefillControl(
                 buffer: c.buffer, layer: c.layer, mode: c.mode,
                 magsBuf: magsBuf, targetsBuf: targetsBuf,
-                projectMeasuresBuf: measuresBuf))
+                projectMeasuresBuf: measuresBuf,
+                transportScalesBuf: scalesBuf,
+                transportOffsetsBuf: offsetsBuf))
         }
+        // gPrefillControls clears at end of prep — kernel arguments are
+        // already baked into the CB by buildPrefillCB; the buffers it
+        // references are retained by Metal until CB completion.
         defer { gPrefillControls.removeAll(keepingCapacity: true) }
-        let t0 = Date()
-        let cb = buildPrefillCB(weights, qLen: thisTile, skipEmbed: skipEmbed)
-        cb.commit(); cb.waitUntilCompleted()
-        lastStepMs = Date().timeIntervalSince(t0) * 1000
-        totalSteps += 1
-        if let err = cb.error { print("  GPU prefill error: \(err)"); return false }
 
-        // --- Advance session state by thisTile positions. Copy slot-s's
-        // last-position logit into the AR `logits` buffer so that the next
-        // .step() or sampling sees a coherent post-prefill state.
-        s.position += thisTile
-        // Publish fully-written pages to the global content index so a
-        // later session that submits the same prefix will findByHash this
-        // page and share it read-only.
+        // GPU sampling params — only sslot is active for this prefill;
+        // the kernel short-circuits all other slots. The sampled token
+        // (if this prefill drains the chunk queue) lands in
+        // gpu_sampled_tokens[sslot] via buildPrefillCB's dispatch.
+        var prefillSlotSession: [Session?] = Array(repeating: nil, count: B)
+        prefillSlotSession[sslot] = s
+        populateSamplingParams(prefillSlotSession)
+
+        // Skip unembed (~150 ms at Dout=262144) on non-final prefill ticks.
+        // pendingPrimingCount == thisTile iff this tile drains every queued
+        // priming token, which is the only tick whose sampled token feeds
+        // AR. False negative would skip the post-prefill sample → bug; the
+        // == comparison is exact, so safe.
+        let isLastPrefillTick = s.pendingPrimingCount == thisTile
+        let t0 = Date()
+        let cb = buildPrefillCB(weights, qLen: thisTile, skipEmbed: skipEmbed,
+                                 skipUnembed: !isLastPrefillTick)
+        return PreparedSinglePrefill(cb: cb, t0: t0, session: s, sslot: sslot,
+                                      thisTile: thisTile, remaining: remaining,
+                                      savedBT: savedBT, head: head)
+    }
+
+    @discardableResult
+    func finalizeSinglePrefill(_ p: PreparedSinglePrefill) -> Bool {
+        lastStepMs = Date().timeIntervalSince(p.t0) * 1000
+        totalSteps += 1
+        if let err = p.cb.error { print("  GPU prefill error: \(err)"); return false }
+
+        // Restore block_table now that the kernel has finished reading it.
+        let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
+        for i in 0..<(B * MAX_PAGES_PER_SLOT) { btP[i] = p.savedBT[i] }
+
+        let s = p.session
+        // --- Advance session state by thisTile positions. GPU blit
+        // inside the prefill CB already copied pre_logits[sslot, last, :]
+        // into logits[sslot, :]; sampled token is in gpu_sampled_tokens[sslot].
+        s.position += p.thisTile
         promoteFinishedPages(s)
-        let srcPtr = pre_logits.contents().assumingMemoryBound(to: Float16.self)
-        let dstPtr = logits.contents().assumingMemoryBound(to: Float16.self)
-        let src = srcPtr.advanced(by: (sslot * thisTile + (thisTile - 1)) * VOCAB)
-        let dst = dstPtr.advanced(by: sslot * VOCAB)
-        memcpy(dst, src, VOCAB * 2)
 
         // Pop / trim the head chunk.
-        switch head {
+        switch p.head {
         case .tokens(var ts):
-            ts.removeFirst(thisTile)
+            ts.removeFirst(p.thisTile)
             if ts.isEmpty { s.chunkQueue.removeFirst() }
             else          { s.chunkQueue[0] = .tokens(ts) }
         case let .softTokens(buf, _, isFp32, byteOffset, _):
-            if remaining == 0 {
+            if p.remaining == 0 {
                 s.chunkQueue.removeFirst()
             } else {
                 // Leave the chunk in the queue with its offset advanced
                 // by thisTile rows; next tick picks up where we left off.
-                // pendingCB is dropped — we already waited on it above.
+                // eventTicket = 0 because the next tile's pre-CB doesn't
+                // need to re-wait — the previous tile already encoded a
+                // wait on this ticket, and queue ordering on the LM queue
+                // ensures subsequent CBs see the result.
                 let bpe = isFp32 ? 4 : 2
-                let newOffset = byteOffset + thisTile * HIDDEN * bpe
-                s.chunkQueue[0] = .softTokens(buffer: buf, count: remaining,
+                let newOffset = byteOffset + p.thisTile * HIDDEN * bpe
+                s.chunkQueue[0] = .softTokens(buffer: buf, count: p.remaining,
                                                isFp32: isFp32, byteOffset: newOffset,
-                                               pendingCB: nil)
+                                               eventTicket: 0)
             }
         }
 
-        // If the queue is now empty, sample the post-prefill logit as the
-        // first generated token so callers don't see a stall step.
+        // If the queue is now empty, read the GPU-sampled post-prefill
+        // logit as the first generated token (sample_token kernel ran
+        // at the end of the prefill CB).
         if s.chunkQueue.isEmpty {
-            let base = sslot * VOCAB
-            let logP = logits.contents().assumingMemoryBound(to: Float16.self)
-            let sampled = sampleTokenFromLogits(logP, base: base,
-                                                 temperature: s.samplingTemperature,
-                                                 rng: &s.rng)
+            let gpuTokP = gpu_sampled_tokens.contents()
+                .bindMemory(to: UInt32.self, capacity: B)
+            let sampled = gpuTokP[p.sslot]
             s.state = .generating
             s.outputQueue.append(sampled)
             s.consumedTokens.append(sampled)
@@ -1554,55 +2340,193 @@ final class LmEngine {
     //
     // Returns tokens emitted this tick (usually 0 during prefill unless the
     // chunk drained and we sampled the first generated token).
+    // Scheduler path enum. Mutually-exclusive categories that map to one
+    // of the three kernel shapes (soft-prefill / text-prefill / AR).
+    // pickChainPath returns the highest-slot-count path so each CB runs
+    // the most efficient kernel given current work — see the slot-count-
+    // driven priority section in notes/engine_debloat.md.
+    enum ChainPath {
+        case idle
+        case softMultiPrefill([Session])
+        case softSinglePrefill(Session)
+        case textMultiPrefill([Session])
+        case textSinglePrefill(Session)
+        case arStep
+    }
+
+    // Pick the kernel category whose ready-slot count is highest. Replaces
+    // the old hardcoded cascade ("softs ≥2, then 1, then text ≥2, then 1,
+    // then AR") which would run a wasteful 1-slot prefill while leaving 3
+    // AR-ready sessions parked. AR / prefill / softs each need their own
+    // kernel shape — there is no merged "mixed-mode" CB; the scheduler's
+    // job is to choose which kernel to launch, not to merge them.
+    //
+    // Tiebreak: soft > text > AR. On a tie, prefer the prefill category
+    // because completing a prefill grows the future AR pool (a session
+    // transitions to .generating once its priming queue drains). Without
+    // this preference, two prefilling sessions and two AR-decoding sessions
+    // would alternate paths every CB, never letting prefill complete to
+    // grow the AR batch toward B.
+    // Per-path step counters for pipeline-bubble diagnosis.
+    var sched_softMultiCount: Int = 0
+    var sched_softSingleCount: Int = 0
+    var sched_textMultiCount: Int = 0
+    var sched_textSingleCount: Int = 0
+    var sched_arCount: Int = 0
+    private func pickChainPath() -> ChainPath {
+        let busy = activeSessions.filter { $0.state.isBusy }
+        if busy.isEmpty { return .idle }
+
+        var softBusy: [Session] = []
+        var textPrefillBusy: [Session] = []
+        var nAR = 0
+        for s in busy {
+            switch s.chunkQueue.first {
+            case .some(.softTokens):
+                softBusy.append(s)
+            case .some(.tokens(let ts)) where ts.count >= 2:
+                textPrefillBusy.append(s)
+            default:
+                // Either .generating (no chunks consumed by AR step) or
+                // .priming with a 1-token tail (popArPrimingToken handles
+                // it inside step's per-slot input population).
+                nAR += 1
+            }
+        }
+        let nSoft = softBusy.count
+        let nText = textPrefillBusy.count
+
+        // Throughput-prefer-AR: when nAR >= 2 and prefill is single-slot,
+        // running prefill stalls all the AR-ready slots for one CB to
+        // gain only one slot's prefill progress. Net throughput loss.
+        // Run AR; the single-slot prefill waits one CB.
+        if nAR >= 2 && nSoft <= 1 && nText <= 1 {
+            sched_arCount += 1
+            return .arStep
+        }
+
+        let maxCount = max(nSoft, max(nText, nAR))
+        if maxCount == 0 { return .idle }
+        if nSoft == maxCount {
+            if nSoft >= 2 { sched_softMultiCount += 1; return .softMultiPrefill(softBusy) }
+            sched_softSingleCount += 1
+            return .softSinglePrefill(softBusy[0])
+        }
+        if nText == maxCount {
+            if nText >= 2 { sched_textMultiCount += 1; return .textMultiPrefill(textPrefillBusy) }
+            sched_textSingleCount += 1
+            return .textSinglePrefill(textPrefillBusy[0])
+        }
+        sched_arCount += 1
+        return .arStep
+    }
+
     @discardableResult
     func tick() -> Int {
         runAdmissionPass()
         let busy = activeSessions.filter { $0.state.isBusy }
         if busy.isEmpty { return 0 }
-        // Scheduling policy: group by work-type, not "all-or-nothing". On
-        // any given tick, pick the work category that has the most slots
-        // batchable together. Sessions in other categories don't lose
-        // their turn — they get processed on the next tick with their own
-        // peers. Prevents the priority-inversion where s1 sprints ahead
-        // into AR while s2/s3/s4 are still in softs and then can't batch
-        // with each other because "not all busy are softs".
-        let softBusy = busy.filter { sess in
-            if case .softTokens = sess.chunkQueue.first { return true }
-            return false
-        }
-        let primeBusy = busy.filter { hasPrefillChunk($0, minTokensThreshold: 2) }
+        // Accrues only on productive ticks; matches totalSteps cadence.
+        totalSlotTicks += busy.count
 
-        // 1. Multi-slot soft-tokens prefill, fires on ≥2 softs-ready slots.
-        //    stepMultiSlotSoftPrefill silences non-participating slots via
-        //    scratch pages — they skip this tick and resume next one.
-        if softBusy.count >= 2 {
-            let beforeCounts = softBusy.map { $0.outputQueue.count }
-            _ = stepMultiSlotSoftPrefill(softBusy)
-            return zip(softBusy, beforeCounts).reduce(0) { $0 + ($1.0.outputQueue.count - $1.1) }
-        }
-        // 2. Single-session soft-tokens path (only one session has softs
-        //    queued; no batching opportunity here).
-        if let s = softBusy.first {
+        switch pickChainPath() {
+        case .idle:
+            return 0
+        case .softMultiPrefill(let sessions):
+            let beforeCounts = sessions.map { $0.outputQueue.count }
+            _ = stepMultiSlotSoftPrefill(sessions)
+            return zip(sessions, beforeCounts).reduce(0) { $0 + ($1.0.outputQueue.count - $1.1) }
+        case .softSinglePrefill(let s), .textSinglePrefill(let s):
             let before = s.outputQueue.count
             _ = stepPrefillForSession(s)
             return s.outputQueue.count - before
+        case .textMultiPrefill(let sessions):
+            let beforeCounts = sessions.map { $0.outputQueue.count }
+            _ = stepMultiSlotPrefill(sessions)
+            return zip(sessions, beforeCounts).reduce(0) { $0 + ($1.0.outputQueue.count - $1.1) }
+        case .arStep:
+            return step()
         }
-        // 3. Multi-slot text prefill, same relaxed gate as softs: fires
-        //    on ≥2 prefill-ready sessions even if others are in AR.
-        if primeBusy.count >= 2 {
-            let beforeCounts = primeBusy.map { $0.outputQueue.count }
-            _ = stepMultiSlotPrefill(primeBusy)
-            return zip(primeBusy, beforeCounts).reduce(0) { $0 + ($1.0.outputQueue.count - $1.1) }
-        }
-        // 4. Single-session fast prefill.
-        if let s = primeBusy.first {
-            let before = s.outputQueue.count
-            _ = stepPrefillForSession(s)
-            return s.outputQueue.count - before
-        }
-        // 5. AR batch across all busy sessions.
-        return step()
     }
+
+    // ============================================================
+    // syncTickStep: synchronous step. One call = one CB worth of work.
+    //
+    // The bridge calls this in a loop (while gemma_has_work). Each call
+    // picks a path, builds a CB, commits it, blocks for completion, runs
+    // the finalize step, and returns. No completion handlers, no
+    // background-thread state mutations, no chainInFlight invariant —
+    // Swift goes vroom for one CB and gives control back.
+    //
+    // The contract: only one thread enters this function at a time. The
+    // bridge serializes — see notes/decisions/2026-04-26-remove-session-
+    // concurrency-primitives.md and the "Phase B" follow-up there.
+    //
+    // (The previous async chain — chainAdvance + per-path completion
+    // handlers running on Metal's background queue — was removed
+    // 2026-04-26 per user directive: "the swift backend is a fast metal
+    // kernel dispatching machine. it goes vroom. it is not a place that
+    // does async spinwaiting semantics, because another different
+    // program can give the metal backend correctly templated sequential
+    // lists of work queue, or deltas wrt the last work queue.")
+    func syncTickStep() {
+        runAdmissionPass()
+        let busy = activeSessions.filter { $0.state.isBusy }
+        if busy.isEmpty { return }
+        totalSlotTicks += busy.count
+
+        switch pickChainPath() {
+        case .idle:
+            return
+        case .softMultiPrefill(let sessions):
+            guard let p = prepareMultiSlotSoftPrefill(sessions) else { return }
+            p.cb.commit()
+            p.cb.waitUntilCompleted()
+            _ = finalizeMultiSlotSoftPrefill(p)
+        case .softSinglePrefill(let s), .textSinglePrefill(let s):
+            guard let p = prepareSinglePrefill(s) else { return }
+            p.cb.commit()
+            p.cb.waitUntilCompleted()
+            _ = finalizeSinglePrefill(p)
+        case .textMultiPrefill(let sessions):
+            guard let p = prepareMultiSlotPrefill(sessions) else { return }
+            p.cb.commit()
+            p.cb.waitUntilCompleted()
+            _ = finalizeMultiSlotPrefill(p)
+        case .arStep:
+            // Bridge-vs-engine 10ms/step gap investigation (2026-04-29).
+            // Attribute prep (mask precompute, block_table install,
+            // sampling-params populate) and finalize (output-queue
+            // drain, page promotion) explicitly so the profiler reports
+            // the full host-side breakdown.
+            let t_prep_start = Date()
+            guard let p = prepareARStep() else { return }
+            let t_commit = Date()
+            p.cb.commit()
+            p.cb.waitUntilCompleted()
+            let t_done = Date()
+            _ = finalizeARStep(p)
+            let t_finalize_done = Date()
+            let gpuMs = (p.cb.gpuEndTime - p.cb.gpuStartTime) * 1000
+            prof_arSteps += 1
+            prof_gpuMsSum += gpuMs
+            prof_wallMsSum += t_done.timeIntervalSince(t_commit) * 1000
+            prof_prepMsSum += t_commit.timeIntervalSince(t_prep_start) * 1000
+            prof_finalizeMsSum += t_finalize_done.timeIntervalSince(t_done) * 1000
+        }
+    }
+
+    // Profiling: GPU + wall ms accumulators for the AR path. Inter-CB
+    // gap measurement is gone now that the chain is synchronous (the
+    // bridge owns the inter-call gap).
+    var prof_arSteps: Int = 0
+    var prof_gpuMsSum: Double = 0
+    var prof_wallMsSum: Double = 0
+    // Retained for FFI-output compatibility; always 0 under sync tick.
+    var prof_handlerLatencyMsSum: Double = 0
+    var prof_finalizeMsSum: Double = 0
+    var prof_prepMsSum: Double = 0
+    // ============================================================
 
     // True if every session in `sessions` is priming with a .tokens head
     // chunk of at least `minTokensThreshold` tokens remaining. Gate for
@@ -1617,6 +2541,16 @@ final class LmEngine {
         return true
     }
 
+    // Snapshot for multi-slot text-prefill chain. block_table restoration
+    // and chunk pop deferred to finalize.
+    struct PreparedMultiPrefill {
+        let cb: MTLCommandBuffer
+        let qLen: Int
+        let savedBT: [UInt32]
+        let slotSession: [Session?]
+        let slotTokens: [[UInt32]]
+    }
+
     // Multi-slot fast prefill: one buildPrefillCB dispatch that primes every
     // slot's own session simultaneously. Every slot's block_table points to
     // its session's real phys pages; each slot writes K/V at its own position
@@ -1627,6 +2561,12 @@ final class LmEngine {
     // than qLen stay in .priming; the next tick processes the next tile.
     @discardableResult
     func stepMultiSlotPrefill(_ sessions: [Session]) -> Bool {
+        guard let p = prepareMultiSlotPrefill(sessions) else { return false }
+        p.cb.commit(); p.cb.waitUntilCompleted()
+        return finalizeMultiSlotPrefill(p)
+    }
+
+    func prepareMultiSlotPrefill(_ sessions: [Session]) -> PreparedMultiPrefill? {
         runAdmissionPass()
         // Gather each busy slot's priming session + chunk.
         var slotSession: [Session?] = Array(repeating: nil, count: B)
@@ -1646,15 +2586,17 @@ final class LmEngine {
                 qLen = min(qLen, slotTokens[b].count)
             }
         }
-        guard any, qLen >= 1 else { return false }
+        guard any, qLen >= 1 else { return nil }
 
         // Each participating slot: ensure pages + install real block_table.
+        // Restoration happens in finalize, after the GPU has read block_table.
         let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
         var savedBT = [UInt32](repeating: 0, count: B * MAX_PAGES_PER_SLOT)
         for i in 0..<(B * MAX_PAGES_PER_SLOT) { savedBT[i] = btP[i] }
         for b in 0..<B {
             if let s = slotSession[b] {
-                if !ensurePages(s, forKLen: s.position + qLen + 1) { return false }
+                installPendingPrefixKVIfAny(s)
+                if !ensurePages(s, forKLen: s.position + qLen + 1) { return nil }
                 installBlockTable(s, slot: b)
             } else {
                 // Silence: point at scratch strip. Guards against stale K from
@@ -1665,7 +2607,6 @@ final class LmEngine {
                 }
             }
         }
-        defer { for i in 0..<(B * MAX_PAGES_PER_SLOT) { btP[i] = savedBT[i] } }
 
         // Populate pre_input_tokens, pre_q_positions, pre_k_len_*.
         let tokP = pre_input_tokens.contents().bindMemory(to: UInt32.self, capacity: B * MAX_Q_LEN)
@@ -1693,36 +2634,113 @@ final class LmEngine {
 
         // precomputeFlexPrefillMasks reads per-slot q_first from pre_q_positions.
         precomputeFlexPrefillMasks(qLen: qLen, positionStart: 0)
-        let cb = buildPrefillCB(weights, qLen: qLen, skipEmbed: false)
-        cb.commit(); cb.waitUntilCompleted()
-        totalSteps += 1
-        if let err = cb.error { print("  GPU multi-prefill error: \(err)"); return false }
 
-        // Per-slot: advance position, pop chunk, promote pages, copy logit,
-        // and if the chunk drained, transition to .generating + sample first
-        // gen token from the slot's last-position logit.
-        let srcPtr = pre_logits.contents().assumingMemoryBound(to: Float16.self)
-        let dstPtr = logits.contents().assumingMemoryBound(to: Float16.self)
+        // Multi-slot cvec staging. Same row-per-position pattern as the
+        // single-session stepPrefillForSession path, but iterating every
+        // participating slot's controls. Each control gets its own
+        // PrefillControl with magsBuf/targetsBuf where ONLY that slot's
+        // rows are populated — all other rows stay silenced (mag=0 or
+        // target=NaN sentinel) so the kernel no-ops on them. Without
+        // this, 4-session simultaneous submits take this fast-prefill
+        // path and SKIP all project/additive controls, leaving KV pages
+        // that were computed un-steered. AR then fires the project
+        // kernel against that un-steered KV state and produces
+        // degenerate output (the "de-facto" loop we repro'd with the
+        // on-policy matrix).
+        gPrefillControls.removeAll(keepingCapacity: true)
+        let prefillRows = B * qLen
+        var pcSlot = 0
         for b in 0..<B {
             guard let s = slotSession[b] else { continue }
-            s.position += qLen
+            for c in s.activeControls {
+                let magsBuf = acquirePrefillMagBuf(pcSlot * 5 + 0)
+                let targetsBuf = acquirePrefillMagBuf(pcSlot * 5 + 1)
+                let measuresBuf = acquirePrefillMagBuf(pcSlot * 5 + 2)
+                let scalesBuf = acquirePrefillMagBuf(pcSlot * 5 + 3)
+                let offsetsBuf = acquirePrefillMagBuf(pcSlot * 5 + 4)
+                pcSlot += 1
+                let magsP = magsBuf.contents().bindMemory(to: Float.self, capacity: prefillRows)
+                let targP = targetsBuf.contents().bindMemory(to: Float.self, capacity: prefillRows)
+                let scaleP = scalesBuf.contents().bindMemory(to: Float.self, capacity: prefillRows)
+                let offP = offsetsBuf.contents().bindMemory(to: Float.self, capacity: prefillRows)
+                for r in 0..<prefillRows {
+                    magsP[r] = 0; targP[r] = Float.nan
+                    scaleP[r] = Float.nan; offP[r] = 0
+                }
+                for i in 0..<qLen {
+                    let pos = s.position + i
+                    let m = c.magnitudeAt(position: pos, turn: s.turnIndex)
+                    switch c.mode {
+                    case .additive:
+                        magsP[b * qLen + i] = m
+                    case .project:
+                        if let t = c.target {
+                            targP[b * qLen + i] = (m != 0) ? t : Float.nan
+                        } else {
+                            targP[b * qLen + i] = m
+                        }
+                    case .transport:
+                        if m != 0 {
+                            scaleP[b * qLen + i] = c.transportScale
+                            offP[b * qLen + i] = c.transportOffset
+                        }
+                    }
+                }
+                gPrefillControls.append(PrefillControl(
+                    buffer: c.buffer, layer: c.layer, mode: c.mode,
+                    magsBuf: magsBuf, targetsBuf: targetsBuf,
+                    projectMeasuresBuf: measuresBuf,
+                    transportScalesBuf: scalesBuf,
+                    transportOffsetsBuf: offsetsBuf))
+            }
+        }
+        defer { gPrefillControls.removeAll(keepingCapacity: true) }
+
+        // Populate GPU sampling params for every active slot in this
+        // multi-slot prefill. buildPrefillCB's sample_token dispatch
+        // reads these; its output lands in gpu_sampled_tokens[slot].
+        populateSamplingParams(slotSession)
+
+        // Skip unembed when no slot is on its final prefill tick (none of
+        // the slots' total pendingPrimingCount equals qLen). Conservative:
+        // ANY slot on final tick → keep unembed so its sample fires.
+        var anyOnFinalTick = false
+        for s in slotSession {
+            if let s = s, s.pendingPrimingCount == qLen { anyOnFinalTick = true; break }
+        }
+        let cb = buildPrefillCB(weights, qLen: qLen, skipEmbed: false,
+                                 skipUnembed: !anyOnFinalTick)
+        return PreparedMultiPrefill(cb: cb, qLen: qLen, savedBT: savedBT,
+                                     slotSession: slotSession, slotTokens: slotTokens)
+    }
+
+    @discardableResult
+    func finalizeMultiSlotPrefill(_ p: PreparedMultiPrefill) -> Bool {
+        totalSteps += 1
+        if let err = p.cb.error { print("  GPU multi-prefill error: \(err)"); return false }
+
+        // Restore block_table now that the kernel has finished reading it.
+        let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
+        for i in 0..<(B * MAX_PAGES_PER_SLOT) { btP[i] = p.savedBT[i] }
+
+        // Per-slot: advance position, pop chunk, promote pages. GPU
+        // blit inside buildPrefillCB already copied final-Q-row logits
+        // into `logits`; sampled tokens (when a chunk drains) are in
+        // gpu_sampled_tokens[b].
+        let gpuTokP = gpu_sampled_tokens.contents()
+            .bindMemory(to: UInt32.self, capacity: B)
+        for b in 0..<B {
+            guard let s = p.slotSession[b] else { continue }
+            s.position += p.qLen
             promoteFinishedPages(s)
-            // Copy this slot's final-Q-row logit into AR logits for downstream.
-            let src = srcPtr.advanced(by: (b * qLen + (qLen - 1)) * VOCAB)
-            let dst = dstPtr.advanced(by: b * VOCAB)
-            memcpy(dst, src, VOCAB * 2)
             // Pop qLen tokens from the session's chunk head.
-            var ts = slotTokens[b]
-            ts.removeFirst(qLen)
+            var ts = p.slotTokens[b]
+            ts.removeFirst(p.qLen)
             if ts.isEmpty { s.chunkQueue.removeFirst() }
             else          { s.chunkQueue[0] = .tokens(ts) }
             // Transition if chunk is drained.
             if s.chunkQueue.isEmpty {
-                let base = b * VOCAB
-                let logP = logits.contents().assumingMemoryBound(to: Float16.self)
-                let sampled = sampleTokenFromLogits(logP, base: base,
-                                                     temperature: s.samplingTemperature,
-                                                     rng: &s.rng)
+                let sampled = gpuTokP[b]
                 s.state = .generating
                 s.outputQueue.append(sampled)
                 s.consumedTokens.append(sampled)
@@ -1746,50 +2764,60 @@ final class LmEngine {
     // soft prefill runs 4 × 35 tiles × ~130 ms = ~18 s wall. This path
     // runs 35 tiles × ~150 ms = ~5 s wall, because each dense-GEMV loads
     // its weights once and feeds all 4 slots' projections.
+    // SoftRef captures one slot's view of a softTokens chunk. Lifted to file
+    // scope under LmEngine so PreparedSoftPrefill can carry it across the
+    // prepare→finalize boundary.
+    struct SoftRef {
+        let session: Session
+        let buffer: MTLBuffer
+        let remainingCount: Int
+        let isFp32: Bool
+        let byteOffset: Int
+        let eventTicket: UInt64
+    }
+
+    // Snapshot for multi-slot soft-prefill chain.
+    struct PreparedSoftPrefill {
+        let cb: MTLCommandBuffer
+        let qLen: Int
+        let savedBT: [UInt32]
+        let slotSoft: [Int: SoftRef]
+    }
+
     @discardableResult
     func stepMultiSlotSoftPrefill(_ sessions: [Session]) -> Bool {
+        guard let p = prepareMultiSlotSoftPrefill(sessions) else { return false }
+        p.cb.commit(); p.cb.waitUntilCompleted()
+        return finalizeMultiSlotSoftPrefill(p)
+    }
+
+    func prepareMultiSlotSoftPrefill(_ sessions: [Session]) -> PreparedSoftPrefill? {
         runAdmissionPass()
         // Gather each busy slot's current soft-tokens chunk.
-        struct SoftRef {
-            let session: Session
-            let buffer: MTLBuffer
-            let remainingCount: Int
-            let isFp32: Bool
-            let byteOffset: Int
-            let pendingCB: MTLCommandBuffer?
-        }
         var slotSoft: [Int: SoftRef] = [:]
         for s in sessions {
             guard let sslot = s.slot else { continue }
-            guard case let .softTokens(buf, count, isFp32, byteOffset, pendingCB) = s.chunkQueue.first
+            guard case let .softTokens(buf, count, isFp32, byteOffset, eventTicket) = s.chunkQueue.first
             else { continue }
             slotSoft[sslot] = SoftRef(session: s, buffer: buf, remainingCount: count,
                                        isFp32: isFp32, byteOffset: byteOffset,
-                                       pendingCB: pendingCB)
+                                       eventTicket: eventTicket)
         }
-        // Wait on all participating slots' vision CBs before reading their
-        // soft-token buffers. Under the async pipeline the CBs have usually
-        // already completed by this point — this is the correctness barrier.
-        for (_, sr) in slotSoft {
-            sr.pendingCB?.waitUntilCompleted()
-            if let err = sr.pendingCB?.error {
-                print("  [softTokens multi] pending vision CB error: \(err)")
-            }
-        }
-        guard !slotSoft.isEmpty else { return false }
+        guard !slotSoft.isEmpty else { return nil }
         // qLen = min over slots of remaining rows, clamped to MAX_Q_LEN.
         var qLen = MAX_Q_LEN
         for (_, sr) in slotSoft { qLen = min(qLen, sr.remainingCount) }
-        guard qLen >= 1 else { return false }
+        guard qLen >= 1 else { return nil }
 
         // Install real block_table entries for participating slots; silence
         // the rest by redirecting their pages to the scratch strip.
+        // block_table restoration runs in finalize.
         let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
         var savedBT = [UInt32](repeating: 0, count: B * MAX_PAGES_PER_SLOT)
         for i in 0..<(B * MAX_PAGES_PER_SLOT) { savedBT[i] = btP[i] }
         for b in 0..<B {
             if let sr = slotSoft[b] {
-                if !ensurePages(sr.session, forKLen: sr.session.position + qLen + 1) { return false }
+                if !ensurePages(sr.session, forKLen: sr.session.position + qLen + 1) { return nil }
                 installBlockTable(sr.session, slot: b)
             } else {
                 for p in 0..<MAX_PAGES_PER_SLOT {
@@ -1798,35 +2826,55 @@ final class LmEngine {
                 }
             }
         }
-        defer { for i in 0..<(B * MAX_PAGES_PER_SLOT) { btP[i] = savedBT[i] } }
 
-        // Populate pre_hidden[slot * qLen * HIDDEN ..] with each slot's softs.
-        // Layout: [B, qLen, HIDDEN] fp16 (pre_hidden is fp16 even though the
-        // source softs may be fp32 — we convert row-by-row). Silenced slots
-        // get zeros so garbage doesn't feed downstream kernels.
-        let pH = pre_hidden.contents().assumingMemoryBound(to: Float16.self)
+        // Populate pre_hidden[slot * qLen * HIDDEN ..] via a pre-prefill
+        // CB on the LM queue. The CB encodeWaitForEvent's the max ticket
+        // across participating slots (vision pad-blits signaled in queue
+        // order, so the latest ticket implies all earlier ones complete),
+        // then dispatches the GPU copy-and-cast kernel per slot. Silenced
+        // slots get a CPU-side zero of pre_hidden — they don't need a
+        // wait. Queue ordering on the LM queue ensures the prefill CB
+        // (built below) sees the populated rows. CPU never blocks.
         let posP = pre_q_positions.contents().bindMemory(to: UInt32.self, capacity: B * MAX_Q_LEN)
         let klsP = pre_k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
         let klfP = pre_k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
+        let pH = pre_hidden.contents().assumingMemoryBound(to: Float16.self)
+        // Zero silenced-slot rows once on CPU — silenced slots never had
+        // a pendingCB so no wait is needed for those rows; their
+        // pre_hidden values get discarded post-prefill via block-table
+        // redirection but downstream kernels still read them (and NaN
+        // in a silenced slot would corrupt across-slot reductions).
         for b in 0..<B {
+            if slotSoft[b] != nil { continue }
             let dstBase = (b * qLen) * HIDDEN
+            for i in 0..<(qLen * HIDDEN) { pH[dstBase + i] = 0 }
+        }
+        var maxTicket: UInt64 = 0
+        for (_, sr) in slotSoft { maxTicket = max(maxTicket, sr.eventTicket) }
+        let preCB = queue.makeCommandBuffer()!
+        if maxTicket > 0 {
+            preCB.encodeWaitForEvent(gVisionEvent, value: maxTicket)
+        }
+        var ingestSlots: [VisionSoftsIngestSlot] = []
+        for b in 0..<B {
+            guard let sr = slotSoft[b] else { continue }
+            precondition(sr.isFp32, "softTokens fp16 path not yet ported to GPU copy")
+            ingestSlots.append(VisionSoftsIngestSlot(
+                src: sr.buffer, srcByteOffset: sr.byteOffset, dstSlot: b))
+        }
+        encVisionSoftsCopyFp32Multi(preCB, slots: ingestSlots,
+                                     dst: pre_hidden, qLen: qLen)
+        preCB.commit()
+
+        // Per-slot positions / k_len bookkeeping (silenced and active alike).
+        for b in 0..<B {
             if let sr = slotSoft[b] {
-                let srcRaw = sr.buffer.contents().advanced(by: sr.byteOffset)
-                if sr.isFp32 {
-                    let srcPtr = srcRaw.assumingMemoryBound(to: Float.self)
-                    for i in 0..<(qLen * HIDDEN) {
-                        pH[dstBase + i] = Float16(srcPtr[i])
-                    }
-                } else {
-                    memcpy(pH.advanced(by: dstBase), srcRaw, qLen * HIDDEN * 2)
-                }
                 for i in 0..<qLen {
                     posP[b * qLen + i] = UInt32(sr.session.position + i)
                 }
                 klsP[b] = UInt32(sr.session.position + qLen)
                 klfP[b] = UInt32(sr.session.position + qLen)
             } else {
-                for i in 0..<(qLen * HIDDEN) { pH[dstBase + i] = 0 }
                 for i in 0..<qLen { posP[b * qLen + i] = 0 }
                 klsP[b] = 1
                 klfP[b] = 1
@@ -1834,43 +2882,63 @@ final class LmEngine {
         }
 
         precomputeFlexPrefillMasks(qLen: qLen, positionStart: 0)
-        let cb = buildPrefillCB(weights, qLen: qLen, skipEmbed: true)
-        cb.commit(); cb.waitUntilCompleted()
-        totalSteps += 1
-        if let err = cb.error { print("  GPU multi-soft-prefill error: \(err)"); return false }
 
-        // Per-slot: advance position, promote pages, copy final logit,
-        // update the soft-chunk's byteOffset (or pop it + sample first
-        // gen token if this was the last chunk in the queue).
-        let srcPtr = pre_logits.contents().assumingMemoryBound(to: Float16.self)
-        let dstPtr = logits.contents().assumingMemoryBound(to: Float16.self)
+        // Populate GPU sampling params for every slot participating in
+        // this soft-prefill; buildPrefillCB's sample_token runs at end.
+        var softSessionSlots: [Session?] = Array(repeating: nil, count: B)
         for b in 0..<B {
-            guard let sr = slotSoft[b] else { continue }
+            if let sr = slotSoft[b] { softSessionSlots[b] = sr.session }
+        }
+        populateSamplingParams(softSessionSlots)
+
+        // Skip unembed unless some slot is on its final tick (same logic as
+        // multi-slot prefill). softTokens chunks always have count == qLen
+        // for the slot on its final tile, so pendingPrimingCount == qLen.
+        var anyOnFinalTick = false
+        for s in softSessionSlots {
+            if let s = s, s.pendingPrimingCount == qLen { anyOnFinalTick = true; break }
+        }
+        let cb = buildPrefillCB(weights, qLen: qLen, skipEmbed: true,
+                                 skipUnembed: !anyOnFinalTick)
+        return PreparedSoftPrefill(cb: cb, qLen: qLen, savedBT: savedBT, slotSoft: slotSoft)
+    }
+
+    @discardableResult
+    func finalizeMultiSlotSoftPrefill(_ p: PreparedSoftPrefill) -> Bool {
+        totalSteps += 1
+        if let err = p.cb.error { print("  GPU multi-soft-prefill error: \(err)"); return false }
+
+        // Restore block_table now that the kernel has finished reading it.
+        let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
+        for i in 0..<(B * MAX_PAGES_PER_SLOT) { btP[i] = p.savedBT[i] }
+
+        // Per-slot: advance position, promote pages, advance chunk
+        // state. Final-Q-row logit copy is done on-GPU by the prefill
+        // CB; sampled first-gen tokens (if a session's queue drains)
+        // are in gpu_sampled_tokens[b].
+        let gpuTokP = gpu_sampled_tokens.contents()
+            .bindMemory(to: UInt32.self, capacity: B)
+        for b in 0..<B {
+            guard let sr = p.slotSoft[b] else { continue }
             let s = sr.session
-            s.position += qLen
+            s.position += p.qLen
             promoteFinishedPages(s)
-            let src = srcPtr.advanced(by: (b * qLen + (qLen - 1)) * VOCAB)
-            let dst = dstPtr.advanced(by: b * VOCAB)
-            memcpy(dst, src, VOCAB * 2)
-            let remaining = sr.remainingCount - qLen
+            let remaining = sr.remainingCount - p.qLen
             if remaining <= 0 {
                 s.chunkQueue.removeFirst()
             } else {
                 let bpe = sr.isFp32 ? 4 : 2
-                let newOffset = sr.byteOffset + qLen * HIDDEN * bpe
+                let newOffset = sr.byteOffset + p.qLen * HIDDEN * bpe
+                // eventTicket = 0: subsequent tile's pre-CB inherits LM-
+                // queue ordering vs this CB; no further wait required.
                 s.chunkQueue[0] = .softTokens(buffer: sr.buffer, count: remaining,
                                                isFp32: sr.isFp32, byteOffset: newOffset,
-                                               pendingCB: nil)
+                                               eventTicket: 0)
             }
             // If this was the last chunk of the session's priming queue,
-            // transition to .generating + sample the first token from the
-            // slot's final-Q-row logit (mirrors stepMultiSlotPrefill's tail).
+            // transition to .generating + use the GPU-sampled first token.
             if s.chunkQueue.isEmpty {
-                let base = b * VOCAB
-                let logP = logits.contents().assumingMemoryBound(to: Float16.self)
-                let sampled = sampleTokenFromLogits(logP, base: base,
-                                                     temperature: s.samplingTemperature,
-                                                     rng: &s.rng)
+                let sampled = gpuTokP[b]
                 s.state = .generating
                 s.outputQueue.append(sampled)
                 s.consumedTokens.append(sampled)
@@ -1905,879 +2973,4 @@ final class LmEngine {
     }
 }
 
-// ----------------------------------------------------------------------
-// Env-var demo driver. Prompts are passed as numbered env vars so we
-// don't have to invent a delimiter that doesn't collide with the chat
-// template (which already contains '|', '<', '>', etc.):
-//
-//   LM_SESSION_1="prompt 1"
-//   LM_SESSION_2="prompt 2"
-//   ...  (up to LM_SESSION_<B>)
-//   LM_MULTISESSION=1                # presence toggles this harness
-//   GGUF_PATH=<gguf>
-//   [LM_MULTISESSION_MAX=32]         # max new tokens per session
-//   [LM_ADD_BOS=1]                   # BOS on (default); =0 to match oracle
-//
-// Now that residency is decoupled from the active batch, you can submit
-// up to MAX_RESIDENT_SESSIONS prompts in one run — the scheduler cycles
-// them through the B active slots as earlier ones hit EOS and free up.
-// For convenience, LM_MULTISESSION="text1§text2§text3" (section-sign
-// separator, U+00A7) still works as a fallback since that character
-// doesn't appear in the Gemma chat template.
-// ----------------------------------------------------------------------
-func runLmMultisession(ggufPath: String, promptsStr: String, maxNewPerSession: Int) {
-    print("\n=== LM multisession engine demo ===")
-    var prompts: [String] = []
-    // Numbered env-var path first (the robust one for chat templates).
-    for i in 1...MAX_RESIDENT_SESSIONS {
-        if let p = ProcessInfo.processInfo.environment["LM_SESSION_\(i)"], !p.isEmpty {
-            prompts.append(p)
-        }
-    }
-    if prompts.isEmpty {
-        // Fallback: split promptsStr on § (U+00A7) — safe because the
-        // Gemma-4 chat template doesn't use it.
-        prompts = promptsStr.split(separator: "\u{00A7}", omittingEmptySubsequences: false).map(String.init)
-    }
-    guard !prompts.isEmpty else { print("  no prompts"); return }
-    if prompts.count > MAX_RESIDENT_SESSIONS {
-        print("  warning: \(prompts.count) prompts provided; residency cap is \(MAX_RESIDENT_SESSIONS), extras truncated")
-    }
-    let active = Array(prompts.prefix(MAX_RESIDENT_SESSIONS))
-
-    let w: LmWeights
-    do { w = try loadLmWeights(ggufPath: ggufPath) }
-    catch { print("  loadLmWeights failed: \(error)"); return }
-    print("")
-
-    let addBosEnv = ProcessInfo.processInfo.environment["LM_ADD_BOS"]
-        .flatMap { ["0", "false", "no"].contains($0.lowercased()) ? false : true }
-
-    let engine = LmEngine(weights: w)
-    var sessions: [Session] = []
-    for (i, p) in active.enumerated() {
-        guard let s = engine.openSession(maxNewTokens: maxNewPerSession) else { break }
-        let toks = engine.tokenize(p, addBos: addBosEnv)
-        let slotStr = s.slot.map(String.init) ?? "pending"
-        print("  session \(s.id) (slot \(slotStr)): prompt=\(p.debugDescription) (\(toks.count) tokens)")
-        s.submit(toks)
-        sessions.append(s)
-        _ = i
-    }
-    print("")
-    print("  --- scheduler pump (interleaved per-session output) ---")
-
-    // Per-session text accumulator so we can show the whole output at the
-    // end, AND stream tokens in arrival order to show interleaving.
-    var allOutputs: [Int: String] = [:]
-    for s in sessions { allOutputs[s.id] = "" }
-
-    let tStart = Date()
-    while engine.hasWork {
-        _ = engine.tick()
-        // Drain any tokens that landed this step, per session, in slot order.
-        for s in sessions {
-            while let tok = s.nextToken() {
-                let frag = engine.detokenize([tok])
-                allOutputs[s.id]! += frag
-                let tag = "[s\(s.id)]"
-                let display = frag.replacingOccurrences(of: "\n", with: "\\n")
-                print("  \(tag) \(display)")
-            }
-        }
-    }
-    let dtMs = Date().timeIntervalSince(tStart) * 1000
-
-    print("")
-    print("  --- done ---")
-    print(String(format: "  wall: %.1f ms  steps: %d  total tokens: %d  mean step: %.2f ms",
-                 dtMs, engine.totalSteps, engine.totalTokensGenerated,
-                 dtMs / Double(engine.totalSteps)))
-    print("")
-    print("  --- final outputs ---")
-    for s in sessions {
-        let slotStr = s.slot.map(String.init) ?? "released"
-        print("  s\(s.id) (slot \(slotStr), state=\(s.state)): \(allOutputs[s.id]!.debugDescription)")
-        engine.closeSession(s)
-    }
-}
-
-// ----------------------------------------------------------------------
-// Shared-prefix demo driver. Opens N sessions sequentially (wait for each
-// to finish before submitting the next) so the post-prefill page promotion
-// from session i populates the content index that session i+1 probes at
-// submit. Expected: session 1 does full work, sessions 2..N show
-// "[cache] adopted P shared prefix pages" in the log and finish much
-// faster since their prefill tails are tiny.
-//
-//   LM_SHARED_PREFIX_DEMO=1
-//   LM_SHARED_PREFIX=<common prompt prefix>
-//   LM_SUFFIX_1=<q1>, LM_SUFFIX_2=<q2>, ...  (distinguishes sessions)
-//   [LM_SHARED_PREFIX_MAX=16]    # max new per session
-//   GGUF_PATH=<gguf>
-//   [LM_ADD_BOS=1]
-//   [LM_CACHE_DEBUG=1]           # show per-session adoption counts
-// ----------------------------------------------------------------------
-func runLmSharedPrefixDemo(ggufPath: String, maxNewPerSession: Int) {
-    print("\n=== LM shared-prefix demo ===")
-    let env = ProcessInfo.processInfo.environment
-    let addBos = env["LM_ADD_BOS"].flatMap {
-        ["0", "false", "no"].contains($0.lowercased()) ? false : true
-    }
-    guard let prefix = env["LM_SHARED_PREFIX"], !prefix.isEmpty else {
-        print("  Missing LM_SHARED_PREFIX. See the header comment in lm_engine.swift for usage.")
-        return
-    }
-    var suffixes: [String] = []
-    for i in 1...16 {
-        if let s = env["LM_SUFFIX_\(i)"], !s.isEmpty { suffixes.append(s) }
-    }
-    if suffixes.isEmpty {
-        print("  No LM_SUFFIX_N env vars — using defaults.")
-        suffixes = ["What is the capital of France? One word.",
-                    "What is the capital of Germany? One word.",
-                    "What is the capital of Japan? One word."]
-    }
-
-    let w: LmWeights
-    do { w = try loadLmWeights(ggufPath: ggufPath) }
-    catch { print("  loadLmWeights failed: \(error)"); return }
-    let engine = LmEngine(weights: w)
-
-    // Build the shared-prefix token sequence once.
-    let prefixToks = engine.tokenize(prefix, addBos: addBos)
-    print("  shared prefix: \(prefix.debugDescription) (\(prefixToks.count) tokens ≈ \((prefixToks.count + PAGE_SLIDE - 1) / PAGE_SLIDE) pages)")
-    print("  running \(suffixes.count) sessions SEQUENTIALLY (each completes before next submits)")
-    print("")
-
-    var sessionWalls: [Double] = []
-    var sessionOutputs: [String] = []
-    var sessionStats: [(adopted: Int, totalPages: Int)] = []
-
-    for (i, suffix) in suffixes.enumerated() {
-        let tag = "s\(i+1)"
-        let fullPromptToks = prefixToks + engine.tokenize(suffix, addBos: false)
-        guard let session = engine.openSession(maxNewTokens: maxNewPerSession) else {
-            print("  [\(tag)] openSession failed"); continue
-        }
-        session.submit(fullPromptToks)
-
-        let adoptedAtSubmit = session.ownedPages.count
-        let totalPages = (fullPromptToks.count + PAGE_SLIDE - 1) / PAGE_SLIDE
-        sessionStats.append((adopted: adoptedAtSubmit, totalPages: totalPages))
-
-        let t0 = Date()
-        var output = ""
-        while engine.hasWork {
-            _ = engine.tick()
-            while let tok = session.nextToken() {
-                output += engine.detokenize([tok])
-            }
-        }
-        let dtMs = Date().timeIntervalSince(t0) * 1000
-        sessionWalls.append(dtMs)
-        sessionOutputs.append(output)
-
-        let pct = totalPages > 0 ? 100 * adoptedAtSubmit / totalPages : 0
-        print(String(format: "  [\(tag)] prompt=%d toks / %d pages  adopted=%d (%d%%)  wall=%.1f ms  answer=%@",
-                     fullPromptToks.count, totalPages, adoptedAtSubmit, pct, dtMs, output.debugDescription))
-        engine.closeSession(session)
-    }
-
-    // Summary
-    print("")
-    print("  --- sharing effectiveness ---")
-    let firstWall = sessionWalls.first ?? 0
-    for (i, wall) in sessionWalls.enumerated() {
-        let stats = sessionStats[i]
-        let speedup = firstWall > 0 ? firstWall / wall : 1.0
-        let cachedPct = stats.totalPages > 0 ? 100 * stats.adopted / stats.totalPages : 0
-        print(String(format: "  s%d: %.1f ms  (%.2f× vs s1 baseline)  — %d%% of pages cache-adopted",
-                     i + 1, wall, speedup, cachedPct))
-    }
-}
-
-// ----------------------------------------------------------------------
-// Branch demo driver. Opens a BASE session with a shared prefix, fully
-// prefills it (so KV is populated), then opens N branch sessions that
-// each adoptKvFrom(base, pageCount: prefixPages) and submit their own
-// divergent suffix. All N branches decode CONCURRENTLY — real compute
-// reuse from a single shared prefix.
-//
-//   LM_BRANCH_DEMO=1
-//   LM_BRANCH_PREFIX=<common prompt>
-//   LM_BRANCH_SUFFIX_1=<q1>, LM_BRANCH_SUFFIX_2=<q2>, ...
-//   [LM_BRANCH_MAX=16]       # max new per branch
-//   GGUF_PATH=<gguf> [LM_ADD_BOS=1]
-//
-// This is the text-only prototype of what the real "same image, multiple
-// suffixes" demo will look like — same structure, just with an image
-// chunk in the prefix. Once image scatter semantics are fixed, swap
-// LM_BRANCH_PREFIX text for actual vision-tower soft tokens and the
-// branching API is unchanged.
-// ----------------------------------------------------------------------
-func runLmBranchDemo(ggufPath: String, maxNewPerBranch: Int) {
-    print("\n=== LM prefix-branch demo (adoptKvFrom) ===")
-    let env = ProcessInfo.processInfo.environment
-    let addBos = env["LM_ADD_BOS"].flatMap {
-        ["0", "false", "no"].contains($0.lowercased()) ? false : true
-    }
-    guard let prefix = env["LM_BRANCH_PREFIX"], !prefix.isEmpty else {
-        print("  Missing LM_BRANCH_PREFIX."); return
-    }
-    var suffixes: [String] = []
-    for i in 1...16 {
-        if let s = env["LM_BRANCH_SUFFIX_\(i)"], !s.isEmpty { suffixes.append(s) }
-    }
-    if suffixes.isEmpty {
-        suffixes = [" What is the capital of France? One word.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
-                    " What is the capital of Japan? One word.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
-                    " What is the capital of Germany? One word.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"]
-    }
-
-    let w: LmWeights
-    do { w = try loadLmWeights(ggufPath: ggufPath) }
-    catch { print("  loadLmWeights failed: \(error)"); return }
-    let engine = LmEngine(weights: w)
-
-    // --- 1. Prime the BASE session with the shared prefix ---
-    let prefixToks = engine.tokenize(prefix, addBos: addBos)
-    print("  shared prefix: \(prefix.debugDescription)")
-    print("  (\(prefixToks.count) tokens ≈ \((prefixToks.count + PAGE_SLIDE - 1) / PAGE_SLIDE) pages; \(prefixToks.count / PAGE_SLIDE) full pages shareable)")
-
-    guard let base = engine.openSession(maxNewTokens: 0) else {
-        print("  openSession(base) failed"); return
-    }
-    base.submit(prefixToks)
-
-    let tPrime = Date()
-    // Pump until base has consumed all prefix tokens. We don't need it to
-    // generate anything — just get its KV populated so the full pages are
-    // promoted to the content index. base's maxNewTokens=0 stops gen
-    // immediately once the last prefill token flips state to generating.
-    while base.state == .priming {
-        _ = engine.tick()
-    }
-    let primeMs = Date().timeIntervalSince(tPrime) * 1000
-    let pagesToShare = base.position / PAGE_SLIDE
-    print(String(format: "  base prefill complete: pos=%d, %d full pages available for sharing, wall=%.1f ms",
-                 base.position, pagesToShare, primeMs))
-
-    // --- 2. Open N branch sessions, each adopts base's first N pages ---
-    var branches: [Session] = []
-    for (i, sfx) in suffixes.enumerated() {
-        guard let branch = engine.openSession(maxNewTokens: maxNewPerBranch) else {
-            print("  openSession(branch \(i+1)) failed"); break
-        }
-        // Adopt base's pages — this is the "skip the prefix prefill" step.
-        _ = branch.adoptKvFrom(base, pageCount: pagesToShare)
-        branch.submit(engine.tokenize(sfx, addBos: false))
-        branches.append(branch)
-    }
-    print("  opened \(branches.count) branches; each inherits \(pagesToShare) pages of KV from base without reprefilling")
-
-    // --- 3. Pump concurrently until all branches finish ---
-    var outputs: [Int: String] = [:]
-    for b in branches { outputs[b.id] = "" }
-    let tRun = Date()
-    while engine.hasWork {
-        _ = engine.tick()
-        for b in branches {
-            while let tok = b.nextToken() {
-                outputs[b.id, default: ""] += engine.detokenize([tok])
-            }
-        }
-    }
-    let runMs = Date().timeIntervalSince(tRun) * 1000
-    print(String(format: "  branches ran concurrently: %.1f ms (mean step %.1f ms × %d steps)",
-                 runMs, engine.lastStepMs, engine.totalSteps))
-
-    // --- 4. Report outputs + stats ---
-    print("")
-    print("  --- branch outputs ---")
-    for (i, b) in branches.enumerated() {
-        print("  branch \(i+1) (session \(b.id)): \(outputs[b.id]!.debugDescription)")
-        engine.closeSession(b)
-    }
-    engine.closeSession(base)
-
-    let pagesPerBranch = pagesToShare
-    let sharedWork = pagesPerBranch * branches.count
-    print("")
-    print(String(format: "  sharing: %d pages × %d branches = %d page-writes skipped vs naive \"reprefill per branch\"",
-                 pagesPerBranch, branches.count, sharedWork))
-}
-
-// ----------------------------------------------------------------------
-// Async pause/resume demo — models an agent with concurrent sessions,
-// some of which stall mid-generation waiting for tool-call results.
-// Demonstrates that a paused session retains its KV pages (so the tool
-// response resumes decode in-place without reprefill) and that OTHER
-// sessions keep making progress on the freed slot while the paused
-// session is dormant.
-//
-//   LM_PAUSE_DEMO=1
-//   LM_PAUSE_PROMPT_1=<prompt for session 1>
-//   LM_PAUSE_PROMPT_2=<prompt for session 2>
-//   LM_PAUSE_AFTER_TOKENS=3              # pause session 1 after N gen tokens
-//   LM_PAUSE_TOOL_RESULT=" the answer"    # faked tool-result text to submit on resume
-//   LM_PAUSE_RESUME_AFTER_STEPS=10       # how many ticks to wait before resume
-//   GGUF_PATH=<gguf> [LM_ADD_BOS=1]
-//
-// Output logs the tick at which each event occurs so you can see the
-// interleaving. Session 2 keeps decoding the whole time — the engine
-// correctly drops paused sessions from the active batch and reassigns
-// the slot until the caller calls submit() again.
-// ----------------------------------------------------------------------
-func runLmPauseResumeDemo(ggufPath: String) {
-    print("\n=== LM pause/resume demo ===")
-    let env = ProcessInfo.processInfo.environment
-    let addBos = env["LM_ADD_BOS"].flatMap {
-        ["0", "false", "no"].contains($0.lowercased()) ? false : true
-    }
-    guard let p1 = env["LM_PAUSE_PROMPT_1"], !p1.isEmpty,
-          let p2 = env["LM_PAUSE_PROMPT_2"], !p2.isEmpty else {
-        print("  Missing LM_PAUSE_PROMPT_1 / LM_PAUSE_PROMPT_2."); return
-    }
-    let pauseAfter = Int(env["LM_PAUSE_AFTER_TOKENS"] ?? "3") ?? 3
-    let resumeAfter = Int(env["LM_PAUSE_RESUME_AFTER_STEPS"] ?? "10") ?? 10
-    let toolResult = env["LM_PAUSE_TOOL_RESULT"] ?? " the capital is Paris."
-
-    let w: LmWeights
-    do { w = try loadLmWeights(ggufPath: ggufPath) }
-    catch { print("  loadLmWeights failed: \(error)"); return }
-    let engine = LmEngine(weights: w)
-
-    guard let s1 = engine.openSession(maxNewTokens: 32),
-          let s2 = engine.openSession(maxNewTokens: 32) else {
-        print("  openSession failed"); return
-    }
-    s1.submit(engine.tokenize(p1, addBos: addBos))
-    s2.submit(engine.tokenize(p2, addBos: addBos))
-
-    var out1 = "", out2 = ""
-    var s1TokensBeforePause = 0
-    var pausedAtTick = -1
-    var resumedAtTick = -1
-    var tick = 0
-
-    print("  session \(s1.id) prompt: \(p1.debugDescription)")
-    print("  session \(s2.id) prompt: \(p2.debugDescription)")
-    print("  policy: pause s\(s1.id) after it generates \(pauseAfter) tokens; resume after \(resumeAfter) more ticks; inject tool-result=\(toolResult.debugDescription)")
-    print("")
-    print("  tick  event")
-
-    while engine.hasWork {
-        _ = engine.tick()
-        tick += 1
-        // Drain output tokens per session.
-        while let tok = s1.nextToken() {
-            let frag = engine.detokenize([tok])
-            out1 += frag
-            // Count only generating tokens (priming doesn't emit).
-            s1TokensBeforePause += 1
-            print("  \(String(format: "%3d", tick))   [s\(s1.id)] \(frag.debugDescription)")
-            // Trigger the pause once s1 has generated N tokens AND isn't
-            // already paused/resumed.
-            if s1TokensBeforePause >= pauseAfter, pausedAtTick < 0 {
-                s1.pause()
-                pausedAtTick = tick
-                print("  \(String(format: "%3d", tick))   [s\(s1.id)] → pause (simulated tool call; KV retained, slot released)")
-            }
-        }
-        while let tok = s2.nextToken() {
-            out2 += engine.detokenize([tok])
-            print("  \(String(format: "%3d", tick))   [s\(s2.id)] \(engine.detokenize([tok]).debugDescription)")
-        }
-        // Resume s1 after `resumeAfter` ticks have elapsed since the pause.
-        if pausedAtTick > 0, resumedAtTick < 0,
-           tick - pausedAtTick >= resumeAfter {
-            // Inject a faked tool response — session state flips back to
-            // .priming and re-admits on the next tick.
-            let toolToks = engine.tokenize(toolResult, addBos: false)
-            s1.submit(toolToks)
-            resumedAtTick = tick
-            print("  \(String(format: "%3d", tick))   [s\(s1.id)] ← submit(tool_result=\(toolToks.count) tokens); re-admits next tick")
-        }
-        // Safety: cap at many ticks to avoid infinite loops.
-        if tick > 400 { print("  tick cap reached, aborting"); break }
-    }
-
-    print("")
-    print("  --- final outputs ---")
-    print("  s\(s1.id): \(out1.debugDescription)   (paused at tick \(pausedAtTick), resumed at tick \(resumedAtTick))")
-    print("  s\(s2.id): \(out2.debugDescription)")
-
-    print("")
-    print("  --- sanity check ---")
-    print("  during s\(s1.id)'s pause (ticks \(pausedAtTick)..\(resumedAtTick)), s\(s2.id) continued producing tokens:")
-    // Because outputs per tick were printed interleaved, the user can
-    // inspect above. We also note that after resume, s1 picked up its
-    // pre-pause KV state exactly — tool-response tokens get teacher-
-    // forced against the KV already in place without reprefilling
-    // anything.
-
-    engine.closeSession(s1)
-    engine.closeSession(s2)
-}
-
-// ----------------------------------------------------------------------
-// Multiturn demo — exercises Session.append() for the chat-loop case:
-// one session lives across multiple user turns, each turn's KV staying
-// resident so subsequent turns pay only their own prefill cost.
-//
-// Flow:
-//   turn 1 user prompt  → submit()            → generate N tokens
-//   (simulate turn end) → pause()
-//   turn 2 user prompt  → append()            → generate N more
-//   (turn end)          → pause()
-//   turn 3              → append()            → generate N more
-//
-// The append() primitive is the engine-side contract that enables:
-//   - multiturn chat (what this demo shows)
-//   - tool-call response injection (runLmPauseResumeDemo pattern, now
-//     usable via append() instead of raw submit())
-//   - mid-session image injection (tool-call returns a rendered SVG
-//     the agent needs to look at: append(softTokens:))
-//   - agent interruption (another agent's "turn" injected into an
-//     ongoing session by an external coordinator)
-//
-// Env:
-//   LM_MULTITURN_DEMO=1            # presence toggles this harness
-//   GGUF_PATH=<path>
-//   [LM_MULTITURN_TURNS="prompt1§prompt2§prompt3"]   # § separator
-//   [LM_MULTITURN_MAX_PER_TURN=24] # per-turn generation cap
-//   [LM_MULTITURN_FRESH=1]         # opt-in: close+reopen each turn
-//                                   (alternative path: replay full history
-//                                    to a fresh session; not needed for
-//                                    correctness, but useful for A/B).
-//
-func runLmMultiturnDemo(ggufPath: String, turnsStr: String?, maxPerTurn: Int) {
-    print("\n=== LM multiturn demo (Session.append) ===")
-    let defaultTurns = [
-        "<|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n",
-        "<turn|>\n<|turn>user\nAnd Germany?<turn|>\n<|turn>model\n",
-        "<turn|>\n<|turn>user\nItaly?<turn|>\n<|turn>model\n",
-    ]
-    let turns: [String]
-    if let s = turnsStr, !s.isEmpty {
-        turns = s.components(separatedBy: "§")
-    } else {
-        turns = defaultTurns
-    }
-    guard !turns.isEmpty else {
-        print("  no turns to run"); return
-    }
-    let w: LmWeights
-    do { w = try loadLmWeights(ggufPath: ggufPath) }
-    catch { print("  loadLmWeights failed: \(error)"); return }
-    let engine = LmEngine(weights: w)
-    guard let s = engine.openSession(maxNewTokens: maxPerTurn) else {
-        print("  openSession failed"); return
-    }
-    print("  session \(s.id) — \(turns.count) turns, \(maxPerTurn) tok/turn cap")
-    print("")
-
-    let freshMode = ProcessInfo.processInfo.environment["LM_MULTITURN_FRESH"] != nil
-    var currentSession = s
-    var accumulatedHistory: [UInt32] = []
-    for (i, turn) in turns.enumerated() {
-        if i == 0 {
-            let toks = engine.tokenize(turn, addBos: true)
-            accumulatedHistory.append(contentsOf: toks)
-            currentSession.submit(toks)
-        } else if freshMode {
-            // Control experiment: fresh session + replay full history as prompt.
-            // Isolates whether the garbling is in reused-session state or KV itself.
-            engine.closeSession(currentSession)
-            guard let s2 = engine.openSession(maxNewTokens: maxPerTurn) else {
-                print("  openSession failed on turn \(i + 1)"); return
-            }
-            currentSession = s2
-            let newToks = engine.tokenize(turn, addBos: false)
-            accumulatedHistory.append(contentsOf: newToks)
-            currentSession.submit(accumulatedHistory)
-            print("    [fresh session \(currentSession.id) replaying \(accumulatedHistory.count) tokens]")
-        } else {
-            currentSession.append(engine.tokenize(turn, addBos: false))
-        }
-        let s = currentSession
-        print("  turn \(i + 1) input: \(turn.debugDescription)")
-        var turnOutput = ""
-        var turnTokenIds: [UInt32] = []
-        var tick = 0
-        let budgetFloor = s.numGenerated  // safety: break if we stall
-        while engine.hasWork && s.state != .done {
-            _ = engine.tick()
-            tick += 1
-            while let tok = s.nextToken() {
-                turnOutput += engine.detokenize([tok])
-                turnTokenIds.append(tok)
-            }
-            // Per-turn generation cap — session's own maxNewTokens will trip
-            // .done which exits the loop; this is belt-and-suspenders.
-            if tick > 400 { print("    (tick cap)"); break }
-            if s.numGenerated - budgetFloor > maxPerTurn + 4 { break }
-        }
-        print("  turn \(i + 1) output (\(s.numGenerated - budgetFloor) tok, \(tick) ticks): \(turnOutput.debugDescription)")
-        print("    ids: \(turnTokenIds.prefix(12))")
-        // End of turn — pause so the next append resets the budget.
-        s.pause()
-        print("    position=\(s.position), ownedPages=\(s.ownedPagesForDebug.count), state=\(s.state)")
-        print("")
-    }
-
-    print("  === summary ===")
-    print("  session held KV across \(turns.count) turns; final position=\(currentSession.position) tokens")
-    print("  per-turn prefill cost: only the new user-message tokens (no re-prefill of history)")
-    engine.closeSession(currentSession)
-}
-
-// ----------------------------------------------------------------------
-// Composite benchmark — the headline multiuser/multiturn workload.
-//
-// N concurrent users. Shared system prompt (exercises content-hash cache:
-// user 1 primes the system prompt, users 2..N hit-and-adopt its pages). K
-// turns per user. All users submit each turn simultaneously — the scheduler
-// must handle that cold-start gracefully (multi-slot prefill, not AR-prime).
-//
-// Measures per-user per-turn:
-//   - TTFT (submit → first emitted token)
-//   - gen rate (tokens / last_tok_time - first_tok_time)
-// And aggregate: total tokens / total wall.
-//
-// This is what we'd use to pitch the engine: "4 users × 3 turns, X tok/s
-// sustained throughput, Y ms median TTFT, Z page-cache hits."
-//
-// Env:
-//   LM_COMPOSITE_DEMO=1           # presence toggles
-//   GGUF_PATH=<path>
-//   [LM_COMPOSITE_N=4]            # concurrent users (≤ MAX_RESIDENT_SESSIONS)
-//   [LM_COMPOSITE_MAX_PER_TURN=24]
-//
-func runLmCompositeDemo(ggufPath: String, nUsers: Int, maxPerTurn: Int) {
-    print("\n=== LM composite benchmark: N=\(nUsers) users × 3 turns, shared system prompt ===")
-    let w: LmWeights
-    do { w = try loadLmWeights(ggufPath: ggufPath) }
-    catch { print("  loadLmWeights failed: \(error)"); return }
-    let engine = LmEngine(weights: w)
-
-    // Shared system prompt. Same bytes for every user → content-hash cache
-    // gives user 1's filled pages to users 2..N read-only.
-    let system = "<|turn>system\nYou are a concise assistant. Give one-sentence answers.<turn|>\n"
-    // Per-user, per-turn user message. All users get the same turn sequence
-    // for the benchmark; a real server would have different messages.
-    let userTurns = [
-        "<|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
-        "<turn|>\n<|turn>user\nWhat about Germany?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
-        "<turn|>\n<|turn>user\nAnd Italy?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
-    ]
-
-    struct TurnMetrics {
-        var submitTime: Date = Date()
-        var firstTokenTime: Date?
-        var lastTokenTime: Date?
-        var tokenCount: Int = 0
-        var text: String = ""
-    }
-
-    // Warmup: the first buildStepCB / buildPrefillCB pair pays ~5s of
-    // Metal pipeline compilation. That cost is one-time per process, not
-    // per-request, but naively-measured TTFT eats it on turn 1. Run one
-    // tiny throwaway decode first so the real measurement reflects steady
-    // state.
-    do {
-        print("  (warmup: one-session 3-token decode to compile pipelines)")
-        let wStart = Date()
-        guard let ws = engine.openSession(maxNewTokens: 3) else { return }
-        ws.submit(engine.tokenize("<|turn>user\nhi<turn|>\n<|turn>model\n", addBos: true))
-        while engine.hasWork { _ = engine.tick() }
-        while let _ = ws.nextToken() {}
-        engine.closeSession(ws)
-        print(String(format: "  warmup took %.2fs", Date().timeIntervalSince(wStart)))
-    }
-
-    // Open N sessions up front.
-    var sessions: [Session] = []
-    for _ in 0..<nUsers {
-        guard let s = engine.openSession(maxNewTokens: maxPerTurn) else {
-            print("  openSession failed at user \(sessions.count)"); return
-        }
-        sessions.append(s)
-    }
-    var metrics: [[TurnMetrics]] = Array(repeating: [], count: nUsers)
-
-    let benchStart = Date()
-    let preStats = engine.poolStats()
-
-    for turnIdx in 0..<userTurns.count {
-        let text = userTurns[turnIdx]
-        // Simultaneous submit — this is the case multi-slot prefill targets.
-        for i in 0..<nUsers {
-            metrics[i].append(TurnMetrics(submitTime: Date()))
-            let payload = (turnIdx == 0 ? system + text : text)
-            if turnIdx == 0 {
-                sessions[i].submit(engine.tokenize(payload, addBos: true))
-            } else {
-                sessions[i].append(engine.tokenize(payload, addBos: false))
-            }
-        }
-
-        // Pump until every session finishes this turn (.done) or we hit a cap.
-        var ticks = 0
-        while engine.hasWork {
-            _ = engine.tick()
-            ticks += 1
-            for i in 0..<nUsers {
-                while let tok = sessions[i].nextToken() {
-                    let now = Date()
-                    if metrics[i][turnIdx].firstTokenTime == nil {
-                        metrics[i][turnIdx].firstTokenTime = now
-                    }
-                    metrics[i][turnIdx].lastTokenTime = now
-                    metrics[i][turnIdx].tokenCount += 1
-                    metrics[i][turnIdx].text += engine.detokenize([tok])
-                }
-            }
-            if ticks > 2000 { print("  tick cap reached on turn \(turnIdx+1)"); break }
-        }
-        // Pause for next turn so append() reopens.
-        for s in sessions { s.pause() }
-    }
-
-    let benchEnd = Date()
-    let postStats = engine.poolStats()
-    let wall = benchEnd.timeIntervalSince(benchStart)
-
-    // Report.
-    print("")
-    print("  --- per-user × per-turn ---")
-    var totalTokens = 0
-    for i in 0..<nUsers {
-        print("  user \(i + 1):")
-        for (t, tm) in metrics[i].enumerated() {
-            totalTokens += tm.tokenCount
-            let ttft = tm.firstTokenTime.map { $0.timeIntervalSince(tm.submitTime) * 1000 } ?? -1
-            let genSecs = (tm.lastTokenTime != nil && tm.firstTokenTime != nil)
-                ? tm.lastTokenTime!.timeIntervalSince(tm.firstTokenTime!) : 0
-            let tokps = genSecs > 0.001 ? Double(tm.tokenCount) / genSecs : 0
-            let preview = tm.text.replacingOccurrences(of: "\n", with: "\\n").prefix(64)
-            print(String(format: "    turn %d: TTFT=%.0fms, gen=%d tok @ %.1f tok/s → %@",
-                         t + 1, ttft, tm.tokenCount, tokps, String(preview)))
-        }
-    }
-    print("")
-    print("  --- aggregate ---")
-    let agg = wall > 0.001 ? Double(totalTokens) / wall : 0
-    // Peak batched rate: average per-user gen rate × min(nUsers, B). Taken
-    // from gen-only time per turn (first→last token interval). This is what
-    // the GPU can sustain once everyone is past priming.
-    var perUserRates: [Double] = []
-    for userM in metrics {
-        for tm in userM {
-            if let ft = tm.firstTokenTime, let lt = tm.lastTokenTime, tm.tokenCount > 1 {
-                let dt = lt.timeIntervalSince(ft)
-                if dt > 0.001 { perUserRates.append(Double(tm.tokenCount) / dt) }
-            }
-        }
-    }
-    let meanPerUser = perUserRates.isEmpty ? 0 : perUserRates.reduce(0, +) / Double(perUserRates.count)
-    let peakBatched = meanPerUser * Double(min(nUsers, B))
-    print(String(format: "  wall: %.2fs, tokens: %d", wall, totalTokens))
-    print(String(format: "  aggregate: %.1f tok/s   (observed over the whole benchmark, prefill included)", agg))
-    print(String(format: "  per-stream: %.1f tok/s  (mean across users × turns, gen-only)", meanPerUser))
-    print(String(format: "  peak batched: %.1f tok/s  (per-stream × min(N, B=%d) — what the GPU sustains during pure-gen)", peakBatched, B))
-    let headroom = peakBatched > 0.1 ? (1.0 - agg / peakBatched) * 100 : 0
-    print(String(format: "  headroom: %.0f%% (the gap between aggregate and peak is prefill wall time; shrinks as prompt:gen ratio falls)", headroom))
-    print("  pages: " +
-          "used before \(preStats.totalPages - preStats.freePages), " +
-          "used after \(postStats.totalPages - postStats.freePages), " +
-          "shared content-hashes: \(postStats.cachedHashes - preStats.cachedHashes)")
-    print("  note: simultaneous submission → no same-turn cache hits (nothing promoted yet when siblings probe); cache kicks in for later sessions submitting against a fresh engine with the same prefix — see LM_SHARED_PREFIX_DEMO.")
-
-    for s in sessions { engine.closeSession(s) }
-}
-
-// ----------------------------------------------------------------------
-// Multimodal demo driver — feeds vision-tower output through a session.
-//
-// STATUS NOTE: generation quality through this path is currently poor.
-// The plumbing works end-to-end (vision tower → 272 soft tokens →
-// prefill → AR) and all engine-level invariants hold, but the model
-// produces degenerate output regardless of (a) BOI/EOI marker wrapping,
-// (b) padding to image_seq_length=280, or (c) soft-token magnitude
-// scaling. Remaining hypotheses:
-//   - Our Gemma-4 vision tower has a subtle numerical mismatch with
-//     HF's reference image_features (weight loading, layer ordering,
-//     or pre-RMS normalization). Confirming requires a side-by-side
-//     run against transformers' Gemma4ForConditionalGeneration on the
-//     same preprocessed image.
-//   - The HF-compatible scatter-after-embed path (which differs from
-//     our skipEmbed injection only if soft tokens don't match image_
-//     features byte-for-byte) may reveal the divergence point.
-// Both are deferred to a focused debugging session with Python HF
-// reference access; the infrastructure below (count padding, scale
-// factor, skipEmbed prefill) is in place to make that iteration quick.
-//
-// Env vars:
-//   GGUF_PATH=<gguf>                 # LM weights
-//   VISION_ST=<safetensors path>     # vision tower weights
-//   LM_MULTIMODAL=<image png path>   # image to embed and prompt with
-//   [LM_MULTIMODAL_PREFIX="…"]       # text before image tokens
-//   [LM_MULTIMODAL_SUFFIX="…"]       # text after image tokens
-//   [LM_MULTIMODAL_MAX=48]           # generation budget
-//   [LM_MM_NO_PAD=1]                 # disable 280 padding (run raw count)
-//   [LM_MM_SOFT_SCALE=<f>]           # soft-token magnitude scale (probe tool)
-//   [LM_ADD_BOS=1]
-//
-// Runs: vision_tower(image) → soft_tokens, opens a session, submits
-// prefix-text + soft_tokens + suffix-text into the session queue, then
-// pumps the scheduler. Each chunk dispatches as either a text-token
-// fast prefill or a soft-token fast prefill (skip embed). Stream
-// output per session.
-// ----------------------------------------------------------------------
-func runLmMultimodal(ggufPath: String, stPath: String, imagePath: String,
-                      prefix: String, suffix: String, maxNew: Int) {
-    print("\n=== LM multimodal engine demo ===")
-    let w: LmWeights
-    do { w = try loadLmWeights(ggufPath: ggufPath) }
-    catch { print("  loadLmWeights failed: \(error)"); return }
-
-    let visWeights: VisionWeights
-    do {
-        let st = try SafetensorsFile(stPath)
-        visWeights = try loadVisionWeights(st, device: device)
-    } catch {
-        print("  loadVisionWeights failed: \(error)"); return
-    }
-
-    let batch: PatchBatch
-    do { batch = try gemma4ImagePreprocess(path: imagePath, device: device) }
-    catch { print("  gemma4ImagePreprocess failed: \(error)"); return }
-    print("  image preprocessed: \(batch.numRealPatches) real patches, grid \(batch.gridH)×\(batch.gridW)")
-
-    // LM_MM_FORCE_SOFTS=<path.bin> — skip the vision tower and feed the
-    // given binary as soft-token input. Binary is fp16 row-major [N, HIDDEN].
-    // Use for isolating LM-side multimodal bugs from vision-tower bugs:
-    // dump HF's reference softs for a frame, feed them here, and if output
-    // is STILL garbage the bug is downstream in LM (not in vision).
-    let forceSoftsPath = ProcessInfo.processInfo.environment["LM_MM_FORCE_SOFTS"]
-    let rawSoftTokens: MTLBuffer
-    let rawNPooled: Int
-    let forceIsFp32: Bool
-    if let path = forceSoftsPath,
-       let data = try? Data(contentsOf: URL(fileURLWithPath: path)) {
-        let bytesPerElem = 2   // fp16
-        let elements = data.count / bytesPerElem
-        precondition(elements % HIDDEN == 0, "force-softs file size must be a multiple of HIDDEN*2 bytes")
-        let n = elements / HIDDEN
-        let buf = device.makeBuffer(length: data.count, options: .storageModeShared)!
-        data.withUnsafeBytes { src in
-            memcpy(buf.contents(), src.baseAddress, data.count)
-        }
-        rawSoftTokens = buf
-        rawNPooled = n
-        forceIsFp32 = false
-        print("  LM_MM_FORCE_SOFTS: skipping vision tower, loaded \(n) fp16 soft tokens from \(path)")
-    } else {
-        forceIsFp32 = true
-        let (st, np) = runVisionTowerForward(batch: batch, weights: visWeights,
-                                              device: device, queue: queue)
-        rawSoftTokens = st; rawNPooled = np
-    }
-    if rawNPooled == 0 {
-        print("  0 soft tokens — image too small? aborting"); return
-    }
-
-    // Pad/truncate to Gemma-4's image_seq_length = 280. Default ON. Set
-    // LM_MM_NO_PAD=1 to run at the raw vision-tower count for comparison.
-    let targetSoft = 280
-    let noPad = ProcessInfo.processInfo.environment["LM_MM_NO_PAD"] != nil
-    // Scale factor applied to soft-token magnitudes. Vision-tower raw
-    // values measured ±1–13 while post-embed-scale text tokens sit ±1–3.
-    // If the imbalance causes image positions to dominate attention
-    // softmax, scaling corrects it. LM_MM_SOFT_SCALE=<float> to override;
-    // default 1.0 (no scaling).
-    let softScale: Float = Float(ProcessInfo.processInfo.environment["LM_MM_SOFT_SCALE"] ?? "") ?? 1.0
-    // With LM_MM_FORCE_SOFTS the raw buffer is fp16; otherwise (vision
-    // tower path) it's fp32. Pipe through the padding/scale helpers accordingly.
-    let softTokens: MTLBuffer
-    let nPooled: Int
-    let softTokensIsFp32: Bool
-    if noPad && softScale == 1.0 {
-        softTokens = rawSoftTokens; nPooled = rawNPooled
-        softTokensIsFp32 = forceIsFp32
-        print("  soft tokens: \(nPooled) (isFp32=\(forceIsFp32); padding + scale skipped)")
-    } else {
-        let outN = noPad ? rawNPooled : targetSoft
-        let bytesPerElem = forceIsFp32 ? 4 : 2
-        let buf = device.makeBuffer(length: outN * HIDDEN * bytesPerElem, options: .storageModeShared)!
-        memset(buf.contents(), 0, buf.length)
-        let copyRows = min(rawNPooled, outN)
-        if softScale == 1.0 {
-            memcpy(buf.contents(), rawSoftTokens.contents(), copyRows * HIDDEN * bytesPerElem)
-        } else if forceIsFp32 {
-            let src = rawSoftTokens.contents().assumingMemoryBound(to: Float.self)
-            let dst = buf.contents().assumingMemoryBound(to: Float.self)
-            for i in 0..<(copyRows * HIDDEN) { dst[i] = src[i] * softScale }
-        } else {
-            let src = rawSoftTokens.contents().assumingMemoryBound(to: Float16.self)
-            let dst = buf.contents().assumingMemoryBound(to: Float16.self)
-            for i in 0..<(copyRows * HIDDEN) { dst[i] = Float16(Float(src[i]) * softScale) }
-        }
-        softTokens = buf
-        nPooled = outN
-        softTokensIsFp32 = forceIsFp32
-        print(String(format: "  soft tokens: %d raw → %d (isFp32=%@, scale=%.3f)",
-                     rawNPooled, outN, forceIsFp32 ? "true" : "false", softScale))
-    }
-
-    let addBosEnv = ProcessInfo.processInfo.environment["LM_ADD_BOS"]
-        .flatMap { ["0", "false", "no"].contains($0.lowercased()) ? false : true }
-
-    let engine = LmEngine(weights: w)
-    guard let sess = engine.openSession(maxNewTokens: maxNew) else {
-        print("  no free slot"); return
-    }
-    let prefixToks = engine.tokenize(prefix, addBos: addBosEnv)
-    let suffixToks = engine.tokenize(suffix, addBos: false)
-    print("  prefix tokens: \(prefixToks.count); suffix tokens: \(suffixToks.count)")
-    sess.submit(prefixToks)
-    // Bracket the soft tokens with Gemma-4's BOI/EOI markers so the model
-    // sees the same turn-boundary signal it was trained on:
-    //   boi_token_id = 255999 (<|image>)
-    //   eoi_token_id = 258882 (<image|>)
-    // Without these markers, image-region attention heads have no signal
-    // that the following hidden states are image features, and the model
-    // falls back to <pad> as a uniform prior.
-    let BOI: UInt32 = 255999
-    let EOI: UInt32 = 258882
-    sess.submit([BOI])
-    sess.submit(softTokens: softTokens, count: nPooled, isFp32: softTokensIsFp32)
-    sess.submit([EOI])
-
-    print("")
-    print("  --- generation ---")
-    print("  \(prefix)<image:\(nPooled)soft>\(suffix)", terminator: "")
-    fflush(stdout)
-
-    let tStart = Date()
-    var output = ""
-    while engine.hasWork {
-        _ = engine.tick()
-        while let tok = sess.nextToken() {
-            let frag = engine.detokenize([tok])
-            output += frag
-            print(frag.replacingOccurrences(of: "\n", with: "\\n"), terminator: "")
-            fflush(stdout)
-        }
-    }
-    print("")
-    let dtMs = Date().timeIntervalSince(tStart) * 1000
-    print("")
-    print(String(format: "  wall: %.1f ms  steps: %d  tokens: %d",
-                 dtMs, engine.totalSteps, engine.totalTokensGenerated))
-    print("  output: \(output.debugDescription)")
-    engine.closeSession(sess)
-}
 

@@ -311,6 +311,103 @@ kernel void project_cvector_prefill_fp16(
     }
 }
 
+// Transport variant (per-slot): Gaussian optimal-transport coerce.
+// Instead of a scalar target projection, we get per-class Gaussian
+// statistics (μ_src, σ_src) for the source class and (μ_tgt, σ_tgt)
+// for the target class. The Brenier map between two 1D Gaussians is
+//    a' = μ_tgt + (a - μ_src) * (σ_tgt / σ_src)
+// which can be rewritten as a' = scale*a + offset with
+//    scale  = σ_tgt / σ_src
+//    offset = μ_tgt - scale * μ_src
+// We take scale+offset as kernel inputs (computed client-side — the
+// kernel doesn't need to know the individual μ/σ values). This
+// preserves within-class variation when applied per-PC: an input that
+// was ±kσ_src from μ_src ends up at ±kσ_tgt from μ_tgt. No overshoot
+// past the class distribution → no Korean-unembedding cartography.
+kernel void transport_cvector_slot_fp16(
+    device       half*  dst          [[buffer(0)]],  // dst+slot*N, [1, N]
+    device const half*  cvec         [[buffer(1)]],
+    device       float* currentProj  [[buffer(2)]],  // [1] pre-write projection
+    constant uint&      N            [[buffer(3)]],
+    constant float&     scale        [[buffer(4)]],
+    constant float&     offset       [[buffer(5)]],
+    uint lid [[thread_position_in_threadgroup]])
+{
+    float a = 0.0f;
+    for (uint i = lid; i < N; i += 32) {
+        a += float(dst[i]) * float(cvec[i]);
+    }
+    a = simd_sum(a);
+    if (lid == 0) currentProj[0] = a;
+    // a' = scale*a + offset; delta = a' - a = (scale-1)*a + offset.
+    float delta = (scale - 1.0f) * a + offset;
+    for (uint i = lid; i < N; i += 32) {
+        dst[i] = half(float(dst[i]) + delta * float(cvec[i]));
+    }
+}
+
+// Transport variant (prefill, per-row). Rows with scale == NaN (or
+// whatever sentinel we pick — matching project-variant convention) are
+// skipped. scales[r]/offsets[r] per row; same logic as slot variant
+// extended over [numVecs, N].
+kernel void transport_cvector_prefill_fp16(
+    device       half*  dst          [[buffer(0)]],  // [numVecs, N]
+    device const half*  cvec         [[buffer(1)]],  // [N]
+    device const float* scales       [[buffer(2)]],  // [numVecs] per-row scale (NaN = skip)
+    device const float* offsets      [[buffer(3)]],  // [numVecs] per-row offset
+    device       float* currentProj  [[buffer(4)]],  // [numVecs] output
+    constant uint&      N            [[buffer(5)]],
+    uint2 tg  [[threadgroup_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    uint r = tg.x; uint t = lid.x;
+    float scale = scales[r];
+    float offset = offsets[r];
+    bool skip = isnan(scale);
+    float a = 0.0f;
+    for (uint i = t; i < N; i += 32) {
+        a += float(dst[r*N + i]) * float(cvec[i]);
+    }
+    a = simd_sum(a);
+    if (t == 0) currentProj[r] = skip ? 0.0f : a;
+    if (skip) return;
+    float delta = (scale - 1.0f) * a + offset;
+    for (uint i = t; i < N; i += 32) {
+        dst[r*N + i] = half(float(dst[r*N + i]) + delta * float(cvec[i]));
+    }
+}
+
+// Heretic-style per-write directional ablation (abliteration).
+// Applies  y -= alpha * r_hat * dot(r_hat, y)  to every row of a
+// [numVecs, N] fp16 buffer. Same direction and alpha for all rows
+// (model-level intervention — all batch slots at a given site get
+// the same treatment). Algebraically equivalent to orthogonalizing
+// the preceding matrix W against r_hat with magnitude alpha:
+//   (W - alpha * r_hat * r_hat^T * W) x  =  y - alpha * r_hat * (r_hat^T y)
+// so this post-matmul hook gives us the same effect without ever
+// touching the weights. alpha=0 is a no-op; alpha=1 fully zeroes the
+// r_hat component; alpha<0 amplifies (behavior induction). Two-phase:
+// (1) simdgroup-reduce dot(r_hat, y[r]) per row; (2) rank-1 subtract.
+kernel void orthogonalize_write_fp16(
+    device       half*  y      [[buffer(0)]],  // [numVecs, N]
+    device const half*  r_hat  [[buffer(1)]],  // [N]
+    constant uint&      N      [[buffer(2)]],
+    constant float&     alpha  [[buffer(3)]],
+    uint2 tg  [[threadgroup_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    uint r = tg.x; uint t = lid.x;
+    float g = 0.0f;
+    for (uint i = t; i < N; i += 32) {
+        g += float(y[r*N + i]) * float(r_hat[i]);
+    }
+    g = simd_sum(g);
+    float s = alpha * g;
+    for (uint i = t; i < N; i += 32) {
+        y[r*N + i] = half(float(y[r*N + i]) - s * float(r_hat[i]));
+    }
+}
+
 // Prefill-variant: per-row magnitudes. dst[r, :] += mags[r] * cvec[:], with
 // rows indexed over the full prefill tile (numVecs = B * qLen). mags[r] == 0
 // is a no-op row — the dispatch wastes ~32 thread-cycles reading zeros, but
@@ -391,6 +488,50 @@ kernel void dense_gemv_v4(
         }
     }
     for (uint b = 0; b < B; ++b) output[b * D_out + n] = half(accs[b]);
+}
+
+// V4 prefill: V4 with grid extended over vec-blocks. Each TG handles
+// MAX_B=8 vec rows at v_base = tg.y * MAX_B and produces 32 output cols.
+// For huge D_out (unembed) the weight matrix overflows L2, so V5's per-vec
+// grid pays DRAM bandwidth ~numVecs× (its L2 amortization between vec
+// iterations breaks down). V4 with vec-block tile reads weight 1× (per
+// slab) and FMAs into MAX_B accumulators in registers. Profiled at
+// numVecs=256 unembed: V5 ≈ 150 ms; V4_p target ≈ 5 ms (BW-bound 1.4 GB
+// at ~400 GB/s).
+//
+// numVecs is now a kernel arg (not B) so prefill (numVecs up to MAX_Q_LEN
+// × B) and AR (numVecs ≤ B) share the kernel.
+kernel void dense_gemv_v4_p(
+    device const half* hidden [[buffer(0)]], device const half* W [[buffer(1)]],
+    device half* output [[buffer(2)]], constant uint& D_in [[buffer(3)]],
+    constant uint& D_out [[buffer(4)]], constant uint& numVecs [[buffer(5)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{
+    // MAX_B sweet spot from 2026-04-28 sweep: =8 → 106 ms; =16 → 152 ms;
+    // =32 → 251 ms (V5 baseline 150 ms). Above 8, register pressure /
+    // occupancy loss erases the bandwidth-amortization win.
+    constexpr uint MAX_B = 8;
+    uint n_block = tg.x;
+    uint v_base = tg.y * MAX_B;
+    uint lidx = lid.x;
+    uint n = n_block * 32 + lidx;
+    if (n >= D_out) return;
+    if (v_base >= numVecs) return;
+    uint b_count = (numVecs - v_base < MAX_B) ? (numVecs - v_base) : MAX_B;
+
+    device const half* w_col = W + n;
+    float accs[MAX_B];
+    for (uint b = 0; b < MAX_B; ++b) accs[b] = 0.0f;
+    for (uint k = 0; k < D_in; k += 8) {
+        half w0 = w_col[(k+0)*D_out], w1 = w_col[(k+1)*D_out], w2 = w_col[(k+2)*D_out], w3 = w_col[(k+3)*D_out];
+        half w4 = w_col[(k+4)*D_out], w5 = w_col[(k+5)*D_out], w6 = w_col[(k+6)*D_out], w7 = w_col[(k+7)*D_out];
+        for (uint b = 0; b < b_count; ++b) {
+            device const half* hid = hidden + (v_base + b) * D_in + k;
+            accs[b] += float(hid[0])*float(w0) + float(hid[1])*float(w1) + float(hid[2])*float(w2) + float(hid[3])*float(w3)
+                     + float(hid[4])*float(w4) + float(hid[5])*float(w5) + float(hid[6])*float(w6) + float(hid[7])*float(w7);
+        }
+    }
+    for (uint b = 0; b < b_count; ++b) output[(v_base + b) * D_out + n] = half(accs[b]);
 }
 
 // Fused dense GEMV v4 + Gemma softcap (tanh(y/cap)*cap). Unembed at
@@ -554,585 +695,6 @@ kernel void kv_write(
 // scalar-cooperative QK because each MMA instruction is ~1 cycle of MAC
 // throughput equivalent to 64 scalar MACs.
 
-kernel void paged_attn_slide_sgmm_compute(
-    device const half* Q                    [[buffer(0)]],
-    device const half* K_cache              [[buffer(1)]],
-    device const half* V_cache              [[buffer(2)]],
-    device const uint* block_table          [[buffer(3)]],
-    device float* m_partials                [[buffer(4)]],
-    device float* l_partials                [[buffer(5)]],
-    device float* O_partials                [[buffer(6)]],
-    device const uint* num_pages_per_slot   [[buffer(7)]],
-    device const uint* k_len_per_slot       [[buffer(8)]],
-    constant float& qk_scale                [[buffer(9)]],
-    constant uint& max_pages                [[buffer(10)]],
-    constant uint& H_Q                      [[buffer(11)]],
-    constant uint& H_KV                     [[buffer(12)]],
-    constant uint& N_SPLITS                 [[buffer(13)]],
-    uint3 tg_pos                            [[threadgroup_position_in_grid]],
-    uint3 lid3                              [[thread_position_in_threadgroup]])
-{
-    constexpr uint D = 256;
-    constexpr uint PAGE = 16;
-    constexpr uint THREADS = 32;
-    constexpr uint D8 = D / 8;            // 32
-    const uint vs = tg_pos.x;
-    const uint split = tg_pos.y;
-    const uint slot = vs / H_Q;
-    const uint q_head = vs % H_Q;
-    const uint kv_head = (q_head * H_KV) / H_Q;
-    const uint lid = lid3.x;
-
-    // Q_tile: padded to 8×D (row 0 = real Q, rows 1-7 = zero). In tg-mem so
-    // simdgroup_load can read 8×8 slices efficiently.
-    threadgroup half Q_tile[8 * D];
-    // Scores tile: 8×PAGE accumulator for QK^T output. Padded the same way.
-    threadgroup half scores_tile[8 * PAGE];
-    // O_acc: 8×D (row 0 = real output, rest ignored).
-    threadgroup float O_acc[D];
-    threadgroup float m_state[1];
-    threadgroup float l_state[1];
-
-    device const half* Q_s = Q + (slot * H_Q + q_head) * D;
-    device const uint* bt_s = block_table + slot * max_pages;
-
-    // Initialize: row 0 = Q, rows 1-7 = 0. O_acc = 0. m, l initial.
-    for (uint i = lid; i < 8 * D; i += THREADS) {
-        uint r = i / D;
-        Q_tile[i] = (r == 0) ? Q_s[i % D] : half(0);
-    }
-    for (uint i = lid; i < D; i += THREADS) O_acc[i] = 0.0f;
-    if (lid == 0) { m_state[0] = -INFINITY; l_state[0] = 0.0f; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint total_pages = num_pages_per_slot[slot];
-    const uint pages_per_split = (total_pages + N_SPLITS - 1) / N_SPLITS;
-    const uint p_begin = split * pages_per_split;
-    const uint p_end   = min(p_begin + pages_per_split, total_pages);
-    const uint k_len   = k_len_per_slot[slot];
-    const uint kv_row_stride = H_KV * D;  // stride in halves between KV rows in cache
-
-    for (uint p = p_begin; p < p_end; ++p) {
-        const uint phys = bt_s[p];
-        device const half* Kbase = K_cache + (phys * PAGE * H_KV + kv_head) * D;
-        device const half* Vbase = V_cache + (phys * PAGE * H_KV + kv_head) * D;
-
-        // --- QK: mqk[8x8] = Q_tile[8xD_slice] * K^T[D_slice x 8] ---
-        // PAGE=16 requires TWO 8x8 K-blocks (pb=0,1). For each block and each
-        // d-tile, accumulate mma into mqk.
-        for (uint pb = 0; pb < PAGE / 8; ++pb) {
-            simdgroup_half8x8 mqk = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
-            device const half* pk = Kbase + (pb * 8) * kv_row_stride;
-            for (uint dt = 0; dt < D8; ++dt) {
-                simdgroup_half8x8 mq, mk;
-                simdgroup_load(mq, Q_tile + dt * 8, D);
-                // Load K tile with transpose: K[8 rows × 8 cols] -> 8×8 matrix
-                // where the loaded 8×8 is K^T (cols become rows in the matrix).
-                simdgroup_load(mk, pk + dt * 8, kv_row_stride, ulong2(0, 0), true);
-                simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
-            }
-            // Store the 8×8 scores for this K-block into scores_tile
-            simdgroup_store(mqk, scores_tile + pb * 8, PAGE);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // --- Online softmax on row 0 of scores_tile (the real scores) ---
-        // lid < PAGE reads its score column; compute max/sum via simd ops.
-        float my_score = -INFINITY;
-        if (lid < PAGE) {
-            my_score = float(scores_tile[lid]) * qk_scale;
-            uint k_pos = p * PAGE + lid;
-            if (k_pos >= k_len) my_score = -INFINITY;
-        }
-        float page_max = simd_max(my_score);
-        float m_old = m_state[0];
-        float m_new = max(m_old, page_max);
-        float scale = exp(m_old - m_new);
-        float my_exp = (lid < PAGE) ? exp(my_score - m_new) : 0.0f;
-        float page_sum = simd_sum(my_exp);
-        if (lid < PAGE) {
-            // Write exp'd scores back to row 0 of scores_tile; rows 1-7 zero.
-            scores_tile[lid] = half(my_exp);
-        }
-        // Zero the padded rows of scores_tile (simdgroup_load would bring in garbage)
-        if (lid < PAGE * 7) {
-            uint pad_i = PAGE + lid;   // position in scores_tile past row 0
-            scores_tile[pad_i] = half(0);
-        }
-        if (lid == 0) { l_state[0] = l_state[0] * scale + page_sum; m_state[0] = m_new; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // --- AV: O_acc[8×D] += scores[8×PAGE] × V[PAGE×D] ---
-        // Each d-tile: one MMA. Scale existing O_acc by `scale` first (Flash update).
-        for (uint dt = 0; dt < D8; ++dt) {
-            // Scale existing O_acc slab for this d-tile
-            uint d0 = dt * 8;
-            // O_acc[d0..d0+8] *= scale (only row 0 matters; 8 floats)
-            // Done in a single lane to keep simple (PAGE < 8 so only a few elements)
-            // Actually each thread handles its own float; use lid for dim coverage
-            if (lid < 8) {
-                O_acc[d0 + lid] *= scale;
-            }
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-
-            // mvv = scores × V(d_tile)
-            simdgroup_half8x8 mv;
-            simdgroup_half8x8 ms;
-            simdgroup_float8x8 mo = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-            simdgroup_load(ms, scores_tile, PAGE);   // 8×PAGE but we only use 8 cols at a time below
-            // Inner loop over PAGE/8=2 K-blocks of V
-            for (uint pb = 0; pb < PAGE / 8; ++pb) {
-                device const half* pv = Vbase + (pb * 8) * kv_row_stride + d0;
-                simdgroup_load(mv, pv, kv_row_stride);
-                simdgroup_multiply_accumulate(mo, ms, mv, mo);
-                // Shift scores_tile view for next K-block (reuse ms load)
-                simdgroup_load(ms, scores_tile + (pb + 1) * 8, PAGE);
-            }
-            // Extract row 0 of mo (the real O slice) and add to O_acc
-            // Use tg-mem as a scratch for the extraction
-            threadgroup float o_scratch[64];
-            simdgroup_store(mo, o_scratch, 8);
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-            if (lid < 8) {
-                O_acc[d0 + lid] += o_scratch[lid];   // row 0, cols 0..7
-            }
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    }
-
-    // Write partials
-    uint pidx = vs * N_SPLITS + split;
-    const bool empty = (p_begin >= p_end);
-    if (lid == 0) {
-        m_partials[pidx] = empty ? -INFINITY : m_state[0];
-        l_partials[pidx] = empty ? 0.0f : l_state[0];
-    }
-    device float* O_part = O_partials + pidx * D;
-    for (uint d = lid; d < D; d += THREADS) O_part[d] = O_acc[d];
-}
-
-// GQA-grouped sliding-attn: one TG per (slot, kv_head, split), processing
-// all H_Q/H_KV=2 Q heads that share this kv_head. Half the KV DRAM reads,
-// half the TGs. Per-MMA utilization stays low (2/8 rows) so AV is scalar.
-kernel void paged_attn_slide_gqa_compute(
-    device const half* Q                    [[buffer(0)]],
-    device const half* K_cache              [[buffer(1)]],
-    device const half* V_cache              [[buffer(2)]],
-    device const uint* block_table          [[buffer(3)]],
-    device float* m_partials                [[buffer(4)]],
-    device float* l_partials                [[buffer(5)]],
-    device float* O_partials                [[buffer(6)]],
-    device const uint* num_pages_per_slot   [[buffer(7)]],
-    device const uint* k_len_per_slot       [[buffer(8)]],
-    constant float& qk_scale                [[buffer(9)]],
-    constant uint& max_pages                [[buffer(10)]],
-    constant uint& H_Q                      [[buffer(11)]],
-    constant uint& H_KV                     [[buffer(12)]],
-    constant uint& N_SPLITS                 [[buffer(13)]],
-    constant uint& sliding_window           [[buffer(14)]],
-    uint3 tg_pos                            [[threadgroup_position_in_grid]],
-    uint3 lid3                              [[thread_position_in_threadgroup]])
-{
-    constexpr uint D = 256;
-    constexpr uint PAGE = 16;
-    constexpr uint THREADS = 32;
-    constexpr uint Q_PER_TG = 2;          // H_Q/H_KV for sliding-attn
-    constexpr uint D8 = D / 8;            // 32
-
-    const uint vs = tg_pos.x;             // 0..B*H_KV
-    const uint split = tg_pos.y;
-    const uint slot = vs / H_KV;
-    const uint kv_head = vs % H_KV;
-    const uint q_head_base = kv_head * Q_PER_TG;
-    const uint lid = lid3.x;
-
-    // Q_tile padded to 8 rows so simdgroup_load works; rows 0..Q_PER_TG-1 real.
-    threadgroup half  Q_tile[8 * D];
-    threadgroup half  scores_tile[8 * PAGE];   // only rows 0..Q_PER_TG-1 real
-    threadgroup float O_acc[Q_PER_TG * D];
-    threadgroup float m_state[Q_PER_TG];
-    threadgroup float l_state[Q_PER_TG];
-    threadgroup float scale_tile[Q_PER_TG];
-
-    device const half* Qbase = Q + (slot * H_Q + q_head_base) * D;
-    device const uint* bt_s = block_table + slot * max_pages;
-
-    // Load real Q rows, zero the padded rows (so sgmm of padded rows is 0).
-    for (uint i = lid; i < 8 * D; i += THREADS) {
-        uint r = i / D;
-        Q_tile[i] = (r < Q_PER_TG) ? Qbase[r * D + (i % D)] : half(0);
-    }
-    for (uint i = lid; i < Q_PER_TG * D; i += THREADS) O_acc[i] = 0.0f;
-    if (lid < Q_PER_TG) { m_state[lid] = -INFINITY; l_state[lid] = 0.0f; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint total_pages = num_pages_per_slot[slot];
-    const uint pages_per_split = (total_pages + N_SPLITS - 1) / N_SPLITS;
-    const uint p_begin = split * pages_per_split;
-    const uint p_end   = min(p_begin + pages_per_split, total_pages);
-    const uint k_len   = k_len_per_slot[slot];
-    const uint kv_row_stride = H_KV * D;
-    // Sliding-window lower bound (inclusive): any k_pos < window_lo is masked.
-    // 0 means "no lower bound" (short context or sliding_window==0 disables).
-    const uint window_lo = (sliding_window > 0 && k_len > sliding_window)
-                           ? (k_len - sliding_window) : 0u;
-
-    for (uint p = p_begin; p < p_end; ++p) {
-        // Tile-level skip: page entirely before the sliding window, or
-        // entirely past the causal horizon. Either way no entries contribute.
-        const uint page_kpos_hi = p * PAGE + PAGE;   // exclusive upper bound
-        const uint page_kpos_lo = p * PAGE;          // inclusive lower bound
-        if (page_kpos_hi <= window_lo) continue;     // entirely pre-window
-        if (page_kpos_lo >= k_len)     continue;     // entirely past causal
-
-        const uint phys = bt_s[p];
-        device const half* Kbase = K_cache + (phys * PAGE * H_KV + kv_head) * D;
-        device const half* Vbase = V_cache + (phys * PAGE * H_KV + kv_head) * D;
-
-        // QK: PAGE=16 needs two 8-col K blocks; D=256 → 32 d-tiles each.
-        for (uint pb = 0; pb < PAGE / 8; ++pb) {
-            simdgroup_half8x8 mqk = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
-            device const half* pk = Kbase + (pb * 8) * kv_row_stride;
-            for (uint dt = 0; dt < D8; ++dt) {
-                simdgroup_half8x8 mq, mk;
-                simdgroup_load(mq, Q_tile + dt * 8, D);
-                simdgroup_load(mk, pk + dt * 8, kv_row_stride, ulong2(0, 0), true);
-                simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
-            }
-            simdgroup_store(mqk, scores_tile + pb * 8, PAGE);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Per-row online softmax (lanes 0..Q_PER_TG-1 each handle one row).
-        // Intra-tile mask: -INF if k_pos is past causal horizon OR before the
-        // sliding window. Both conditions get collapsed here so partial pages
-        // at either end of the valid range are handled uniformly.
-        if (lid < Q_PER_TG) {
-            const uint q = lid;
-            float row_max = -INFINITY;
-            float s_loc[PAGE];
-            for (uint k = 0; k < PAGE; ++k) {
-                float sv = float(scores_tile[q * PAGE + k]) * qk_scale;
-                uint k_pos = p * PAGE + k;
-                if (k_pos >= k_len || k_pos < window_lo) sv = -INFINITY;
-                s_loc[k] = sv;
-                row_max = max(row_max, sv);
-            }
-            float m_old = m_state[q];
-            float m_new = max(m_old, row_max);
-            float scale = exp(m_old - m_new);
-            float sum = 0.0f;
-            for (uint k = 0; k < PAGE; ++k) {
-                float e = exp(s_loc[k] - m_new);
-                scores_tile[q * PAGE + k] = half(e);
-                sum += e;
-            }
-            m_state[q] = m_new;
-            l_state[q] = l_state[q] * scale + sum;
-            scale_tile[q] = scale;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // AV: scalar cooperative. Each lane owns D/THREADS=8 d-values.
-        // Stage V[0..PAGE, d] in registers, reuse across Q heads.
-        for (uint d = lid; d < D; d += THREADS) {
-            half V_reg[PAGE];
-            for (uint k = 0; k < PAGE; ++k) {
-                V_reg[k] = Vbase[k * kv_row_stride + d];
-            }
-            for (uint q = 0; q < Q_PER_TG; ++q) {
-                float acc = O_acc[q * D + d] * scale_tile[q];
-                for (uint k = 0; k < PAGE; ++k) {
-                    acc += float(scores_tile[q * PAGE + k]) * float(V_reg[k]);
-                }
-                O_acc[q * D + d] = acc;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // Write partials per Q head (pidx layout matches reduce kernel expectations).
-    const bool empty = (p_begin >= p_end);
-    for (uint q = 0; q < Q_PER_TG; ++q) {
-        const uint q_head = q_head_base + q;
-        const uint pidx = (slot * H_Q + q_head) * N_SPLITS + split;
-        if (lid == 0) {
-            m_partials[pidx] = empty ? -INFINITY : m_state[q];
-            l_partials[pidx] = empty ? 0.0f : l_state[q];
-        }
-        device float* O_part = O_partials + pidx * D;
-        for (uint d = lid; d < D; d += THREADS) O_part[d] = O_acc[q * D + d];
-    }
-}
-
-// Same sgmm pattern for full-attn (D=512 PAGE=8). This is where long-context
-// gap vs llama.cpp is biggest, so sgmm-ing here matters most.
-// Hybrid attention for full-attn layers (D=512 PAGE=8):
-//   - QK via simdgroup_matrix (batch K cols 8-at-a-time → fast)
-//   - AV via scalar-cooperative (no wasted rows at Q=1)
-// Avoids the per-d-tile scratch extraction problem that sunk the all-sgmm
-// variant at D=512.
-kernel void paged_attn_full_sgmm_compute(
-    device const half* Q                    [[buffer(0)]],
-    device const half* K_cache              [[buffer(1)]],
-    device const half* V_cache              [[buffer(2)]],
-    device const uint* block_table          [[buffer(3)]],
-    device float* m_partials                [[buffer(4)]],
-    device float* l_partials                [[buffer(5)]],
-    device float* O_partials                [[buffer(6)]],
-    device const uint* num_pages_per_slot   [[buffer(7)]],
-    device const uint* k_len_per_slot       [[buffer(8)]],
-    constant float& qk_scale                [[buffer(9)]],
-    constant uint& max_pages                [[buffer(10)]],
-    constant uint& H_Q                      [[buffer(11)]],
-    constant uint& H_KV                     [[buffer(12)]],
-    constant uint& N_SPLITS                 [[buffer(13)]],
-    uint3 tg_pos                            [[threadgroup_position_in_grid]],
-    uint3 lid3                              [[thread_position_in_threadgroup]])
-{
-    constexpr uint D = 512;
-    constexpr uint PAGE = 8;
-    constexpr uint THREADS = 32;
-    constexpr uint D8 = D / 8;                // 64
-    const uint vs = tg_pos.x;
-    const uint split = tg_pos.y;
-    const uint slot = vs / H_Q;
-    const uint q_head = vs % H_Q;
-    const uint kv_head = (q_head * H_KV) / H_Q;
-    const uint lid = lid3.x;
-
-    threadgroup half Q_tile[8 * D];           // 8 KB — padded Q for sgmm QK
-    threadgroup half V_tile[PAGE * D];        // 8 KB — V in tg-mem for scalar AV
-    threadgroup half scores_tile[8 * PAGE];   // QK output, row 0 = real scores
-    threadgroup float O_acc[D];
-    threadgroup float m_state[1];
-    threadgroup float l_state[1];
-
-    device const half* Q_s = Q + (slot * H_Q + q_head) * D;
-    device const uint* bt_s = block_table + slot * max_pages;
-
-    for (uint i = lid; i < 8 * D; i += THREADS) {
-        uint r = i / D;
-        Q_tile[i] = (r == 0) ? Q_s[i % D] : half(0);
-    }
-    for (uint i = lid; i < D; i += THREADS) O_acc[i] = 0.0f;
-    if (lid == 0) { m_state[0] = -INFINITY; l_state[0] = 0.0f; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint total_pages = num_pages_per_slot[slot];
-    const uint pages_per_split = (total_pages + N_SPLITS - 1) / N_SPLITS;
-    const uint p_begin = split * pages_per_split;
-    const uint p_end   = min(p_begin + pages_per_split, total_pages);
-    const uint k_len   = k_len_per_slot[slot];
-    const uint kv_row_stride = H_KV * D;
-
-    for (uint p = p_begin; p < p_end; ++p) {
-        const uint phys = bt_s[p];
-        device const half* Kbase = K_cache + (phys * PAGE * H_KV + kv_head) * D;
-        device const half* Vbase = V_cache + (phys * PAGE * H_KV + kv_head) * D;
-
-        // Load V into tg-mem (for scalar AV later). Cooperative, 32 threads.
-        // PAGE*D = 4096 halves; per-thread 128 scalar loads.
-        for (uint i = lid; i < PAGE * D; i += THREADS) {
-            uint row = i / D; uint d = i % D;
-            V_tile[i] = V_cache[((phys * PAGE + row) * H_KV + kv_head) * D + d];
-        }
-        // K does not need tg-mem — simdgroup_load with transpose reads directly.
-
-        // QK via simdgroup_matrix (batches K cols 8 at a time). Transposed K load
-        // from K_cache directly — the real win at D=512 (64 d-tiles).
-        simdgroup_half8x8 mqk = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
-        for (uint dt = 0; dt < D8; ++dt) {
-            simdgroup_half8x8 mq, mk;
-            simdgroup_load(mq, Q_tile + dt * 8, D);
-            simdgroup_load(mk, Kbase + dt * 8, kv_row_stride, ulong2(0, 0), true);
-            simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
-        }
-        simdgroup_store(mqk, scores_tile, PAGE);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Online softmax update
-        float my_score = -INFINITY;
-        if (lid < PAGE) {
-            my_score = float(scores_tile[lid]) * qk_scale;
-            uint k_pos = p * PAGE + lid;
-            if (k_pos >= k_len) my_score = -INFINITY;
-        }
-        float page_max = simd_max(my_score);
-        float m_old = m_state[0];
-        float m_new = max(m_old, page_max);
-        float scale = exp(m_old - m_new);
-        float my_exp = (lid < PAGE) ? exp(my_score - m_new) : 0.0f;
-        float page_sum = simd_sum(my_exp);
-        if (lid < PAGE) scores_tile[lid] = half(my_exp);
-        if (lid == 0) { l_state[0] = l_state[0] * scale + page_sum; m_state[0] = m_new; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // AV via scalar-cooperative (each lane owns D/32 dims, no wasted compute).
-        // O_acc[d] = O_acc[d]*scale + sum_r(scores[r] * V_tile[r, d])
-        for (uint d = lid; d < D; d += THREADS) {
-            float acc = O_acc[d] * scale;
-            for (uint r = 0; r < PAGE; ++r) {
-                acc += float(scores_tile[r]) * float(V_tile[r * D + d]);
-            }
-            O_acc[d] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    uint pidx = vs * N_SPLITS + split;
-    const bool empty = (p_begin >= p_end);
-    if (lid == 0) {
-        m_partials[pidx] = empty ? -INFINITY : m_state[0];
-        l_partials[pidx] = empty ? 0.0f : l_state[0];
-    }
-    device float* O_part = O_partials + pidx * D;
-    for (uint d = lid; d < D; d += THREADS) O_part[d] = O_acc[d];
-}
-
-// GQA-grouped full-attn: one TG per (slot, kv_head, split), processing all
-// H_Q/H_KV=8 Q heads that share this kv_head. Two wins over the per-Q-head
-// variants:
-//   1) KV DRAM reads collapse 8:1 (one TG reads each KV row once instead of
-//      eight separate TGs reading the same row). At P=16384 this is the
-//      dominant bandwidth cost.
-//   2) QK simdgroup_matrix now has Q=8 REAL rows — the 8x8 MMA is fully
-//      utilized (64 real outputs/op), not 7/8 wasted as at Q=1.
-// Partials layout is unchanged: reduce kernel sees (slot*H_Q + q_head, split)
-// pidx, so each TG writes Q_PER_TG=8 pidx values before exit.
-kernel void paged_attn_full_gqa_compute(
-    device const half* Q                    [[buffer(0)]],
-    device const half* K_cache              [[buffer(1)]],
-    device const half* V_cache              [[buffer(2)]],
-    device const uint* block_table          [[buffer(3)]],
-    device float* m_partials                [[buffer(4)]],
-    device float* l_partials                [[buffer(5)]],
-    device float* O_partials                [[buffer(6)]],
-    device const uint* num_pages_per_slot   [[buffer(7)]],
-    device const uint* k_len_per_slot       [[buffer(8)]],
-    constant float& qk_scale                [[buffer(9)]],
-    constant uint& max_pages                [[buffer(10)]],
-    constant uint& H_Q                      [[buffer(11)]],
-    constant uint& H_KV                     [[buffer(12)]],
-    constant uint& N_SPLITS                 [[buffer(13)]],
-    uint3 tg_pos                            [[threadgroup_position_in_grid]],
-    uint3 lid3                              [[thread_position_in_threadgroup]])
-{
-    constexpr uint D = 512;
-    constexpr uint PAGE = 8;
-    constexpr uint THREADS = 32;
-    constexpr uint Q_PER_TG = 8;           // H_Q/H_KV at full-attn layers
-    constexpr uint D8 = D / 8;             // 64 d-tiles
-
-    const uint vs = tg_pos.x;              // 0..B*H_KV
-    const uint split = tg_pos.y;           // 0..N_SPLITS
-    const uint slot = vs / H_KV;
-    const uint kv_head = vs % H_KV;
-    const uint q_head_base = kv_head * Q_PER_TG;
-    const uint lid = lid3.x;
-
-    threadgroup half  Q_tile[Q_PER_TG * D];          // 8 KB (8 real Q rows)
-    threadgroup half  scores_tile[Q_PER_TG * PAGE];  // 128 B (8 x PAGE)
-    threadgroup float O_acc[Q_PER_TG * D];           // 16 KB (float acc)
-    threadgroup float m_state[Q_PER_TG];             // 32 B
-    threadgroup float l_state[Q_PER_TG];             // 32 B
-    threadgroup float scale_tile[Q_PER_TG];          // 32 B
-
-    device const half* Qbase = Q + (slot * H_Q + q_head_base) * D;
-    device const uint* bt_s = block_table + slot * max_pages;
-
-    for (uint i = lid; i < Q_PER_TG * D; i += THREADS) Q_tile[i] = Qbase[i];
-    for (uint i = lid; i < Q_PER_TG * D; i += THREADS) O_acc[i] = 0.0f;
-    if (lid < Q_PER_TG) { m_state[lid] = -INFINITY; l_state[lid] = 0.0f; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint total_pages = num_pages_per_slot[slot];
-    const uint pages_per_split = (total_pages + N_SPLITS - 1) / N_SPLITS;
-    const uint p_begin = split * pages_per_split;
-    const uint p_end   = min(p_begin + pages_per_split, total_pages);
-    const uint k_len   = k_len_per_slot[slot];
-    const uint kv_row_stride = H_KV * D;
-
-    for (uint p = p_begin; p < p_end; ++p) {
-        const uint phys = bt_s[p];
-        device const half* Kbase = K_cache + (phys * PAGE * H_KV + kv_head) * D;
-        device const half* Vbase = V_cache + (phys * PAGE * H_KV + kv_head) * D;
-
-        // QK: 8x8 MMA, Q=8 real rows. One MMA per d-tile; 64 d-tiles at D=512.
-        // K loaded transposed directly from device memory (stride=kv_row_stride).
-        simdgroup_half8x8 mqk = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
-        for (uint dt = 0; dt < D8; ++dt) {
-            simdgroup_half8x8 mq, mk;
-            simdgroup_load(mq, Q_tile + dt * 8, D);
-            simdgroup_load(mk, Kbase + dt * 8, kv_row_stride, ulong2(0, 0), true);
-            simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
-        }
-        simdgroup_store(mqk, scores_tile, PAGE);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Per-row online softmax: lane q in 0..7 owns Q-head q. Lanes 8..31 idle
-        // during this short scalar phase (PAGE=8 ops × a few math ops is cheap).
-        if (lid < Q_PER_TG) {
-            const uint q = lid;
-            float row_max = -INFINITY;
-            float s_loc[PAGE];
-            for (uint k = 0; k < PAGE; ++k) {
-                float sv = float(scores_tile[q * PAGE + k]) * qk_scale;
-                uint k_pos = p * PAGE + k;
-                if (k_pos >= k_len) sv = -INFINITY;
-                s_loc[k] = sv;
-                row_max = max(row_max, sv);
-            }
-            float m_old = m_state[q];
-            float m_new = max(m_old, row_max);
-            float scale = exp(m_old - m_new);
-            float sum = 0.0f;
-            for (uint k = 0; k < PAGE; ++k) {
-                float e = exp(s_loc[k] - m_new);
-                scores_tile[q * PAGE + k] = half(e);
-                sum += e;
-            }
-            m_state[q] = m_new;
-            l_state[q] = l_state[q] * scale + sum;
-            scale_tile[q] = scale;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // AV: scalar cooperative. Each lane owns D/32=16 d-values. For each d,
-        // stage V[0..PAGE, d] in registers (8 halves = 16 B), then reuse across
-        // the 8 Q heads. No V tg-mem staging needed. Sgmm AV was tried but
-        // the per-row scale step + simdgroup_load/store tg-mem round-trips per
-        // d-tile (2 × 64 = 128) cost more than the MMA throughput saved.
-        for (uint d = lid; d < D; d += THREADS) {
-            half V_reg[PAGE];
-            for (uint k = 0; k < PAGE; ++k) {
-                V_reg[k] = Vbase[k * kv_row_stride + d];
-            }
-            for (uint q = 0; q < Q_PER_TG; ++q) {
-                float acc = O_acc[q * D + d] * scale_tile[q];
-                for (uint k = 0; k < PAGE; ++k) {
-                    acc += float(scores_tile[q * PAGE + k]) * float(V_reg[k]);
-                }
-                O_acc[q * D + d] = acc;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // Write partials for all 8 Q heads. pidx matches the per-Q-head layout
-    // the shared reduce kernel expects.
-    const bool empty = (p_begin >= p_end);
-    for (uint q = 0; q < Q_PER_TG; ++q) {
-        const uint q_head = q_head_base + q;
-        const uint pidx = (slot * H_Q + q_head) * N_SPLITS + split;
-        if (lid == 0) {
-            m_partials[pidx] = empty ? -INFINITY : m_state[q];
-            l_partials[pidx] = empty ? 0.0f : l_state[q];
-        }
-        device float* O_part = O_partials + pidx * D;
-        for (uint d = lid; d < D; d += THREADS) O_part[d] = O_acc[q * D + d];
-    }
-}
 
 // ---- Split-KV paged attention: compute partials + reduce ----
 // Grid compute: (B*H_Q, N_SPLITS) TGs. Each TG owns one (slot, q_head, split)
@@ -1142,224 +704,6 @@ kernel void paged_attn_full_gqa_compute(
 // Flash-associative merge. 4× more parallel TGs than single-TG attention —
 // fixes the ~66% latency-starved portion of attention cost on M5.
 
-kernel void paged_attn_slide_split_compute(
-    device const half* Q                    [[buffer(0)]],
-    device const half* K_cache              [[buffer(1)]],
-    device const half* V_cache              [[buffer(2)]],
-    device const uint* block_table          [[buffer(3)]],
-    device float* m_partials                [[buffer(4)]],    // [B*H_Q, N_SPLITS]
-    device float* l_partials                [[buffer(5)]],
-    device float* O_partials                [[buffer(6)]],    // [B*H_Q, N_SPLITS, D]
-    device const uint* num_pages_per_slot   [[buffer(7)]],
-    device const uint* k_len_per_slot       [[buffer(8)]],
-    constant float& qk_scale                [[buffer(9)]],
-    constant uint& max_pages                [[buffer(10)]],
-    constant uint& H_Q                      [[buffer(11)]],
-    constant uint& H_KV                     [[buffer(12)]],
-    constant uint& N_SPLITS                 [[buffer(13)]],
-    uint3 tg_pos                            [[threadgroup_position_in_grid]],
-    uint3 lid3                              [[thread_position_in_threadgroup]])
-{
-    constexpr uint D = 256;
-    constexpr uint PAGE = 16;
-    constexpr uint THREADS = 32;
-    const uint vs = tg_pos.x;
-    const uint split = tg_pos.y;
-    const uint slot = vs / H_Q;
-    const uint q_head = vs % H_Q;
-    const uint kv_head = (q_head * H_KV) / H_Q;
-    const uint lid = lid3.x;
-
-    threadgroup half Q_tile[D];
-    threadgroup half K_tile[PAGE * D];
-    threadgroup half V_tile[PAGE * D];
-    threadgroup float scores[PAGE];
-    threadgroup float m_state[1];
-    threadgroup float l_state[1];
-    threadgroup float O_acc[D];
-    threadgroup float scores_tg[PAGE];
-
-    device const half* Q_s = Q + (slot * H_Q + q_head) * D;
-    device const uint* bt_s = block_table + slot * max_pages;
-    for (uint i = lid; i < D; i += THREADS) { Q_tile[i] = Q_s[i]; O_acc[i] = 0.0f; }
-    if (lid == 0) { m_state[0] = -INFINITY; l_state[0] = 0.0f; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint total_pages = num_pages_per_slot[slot];
-    const uint pages_per_split = (total_pages + N_SPLITS - 1) / N_SPLITS;
-    const uint p_begin = split * pages_per_split;
-    const uint p_end   = min(p_begin + pages_per_split, total_pages);
-    const uint k_len   = k_len_per_slot[slot];
-
-    const uint kv_row_stride = H_KV * D;
-    for (uint p = p_begin; p < p_end; ++p) {
-        const uint phys = bt_s[p];
-        simdgroup_half8x8 tmp;
-        device const half* Kbase = K_cache + (phys * PAGE * H_KV + kv_head) * D;
-        device const half* Vbase = V_cache + (phys * PAGE * H_KV + kv_head) * D;
-        for (uint s = 0; s < 64; ++s) {
-            const uint br = (s / 32) * 8;
-            const uint bc = (s % 32) * 8;
-            simdgroup_load(tmp, Kbase + br * kv_row_stride + bc, kv_row_stride);
-            simdgroup_store(tmp, K_tile + br * D + bc, D);
-            simdgroup_load(tmp, Vbase + br * kv_row_stride + bc, kv_row_stride);
-            simdgroup_store(tmp, V_tile + br * D + bc, D);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Cooperative QK
-        for (uint r = 0; r < PAGE; ++r) {
-            float my_partial = 0.0f;
-            for (uint di = 0; di < D / 32; ++di) {
-                uint d = lid + di * 32;
-                my_partial += float(Q_tile[d]) * float(K_tile[r * D + d]);
-            }
-            float s = simd_sum(my_partial);
-            if (lid == 0) {
-                uint k_pos = p * PAGE + r;
-                scores_tg[r] = (k_pos < k_len) ? s * qk_scale : -INFINITY;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float my_score = (lid < PAGE) ? scores_tg[lid] : -INFINITY;
-        float page_max = simd_max(my_score);
-        float m_old = m_state[0];
-        float m_new = max(m_old, page_max);
-        float scale = exp(m_old - m_new);
-        float my_exp = (lid < PAGE) ? exp(my_score - m_new) : 0.0f;
-        float page_sum = simd_sum(my_exp);
-        if (lid < PAGE) scores[lid] = my_exp;
-        if (lid == 0) { l_state[0] = l_state[0] * scale + page_sum; m_state[0] = m_new; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint d = lid; d < D; d += THREADS) {
-            float acc = O_acc[d] * scale;
-            for (uint r = 0; r < PAGE; ++r) acc += scores[r] * float(V_tile[r * D + d]);
-            O_acc[d] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // Write partials (no final normalization — reduce will combine + normalize)
-    uint pidx = vs * N_SPLITS + split;
-    const bool empty = (p_begin >= p_end);
-    if (lid == 0) {
-        m_partials[pidx] = empty ? -INFINITY : m_state[0];
-        l_partials[pidx] = empty ? 0.0f : l_state[0];
-    }
-    device float* O_part = O_partials + pidx * D;
-    for (uint d = lid; d < D; d += THREADS) O_part[d] = O_acc[d];
-}
-
-// Same logic for D=512 PAGE=8 (full-attn layers).
-kernel void paged_attn_full_split_compute(
-    device const half* Q                    [[buffer(0)]],
-    device const half* K_cache              [[buffer(1)]],
-    device const half* V_cache              [[buffer(2)]],
-    device const uint* block_table          [[buffer(3)]],
-    device float* m_partials                [[buffer(4)]],
-    device float* l_partials                [[buffer(5)]],
-    device float* O_partials                [[buffer(6)]],
-    device const uint* num_pages_per_slot   [[buffer(7)]],
-    device const uint* k_len_per_slot       [[buffer(8)]],
-    constant float& qk_scale                [[buffer(9)]],
-    constant uint& max_pages                [[buffer(10)]],
-    constant uint& H_Q                      [[buffer(11)]],
-    constant uint& H_KV                     [[buffer(12)]],
-    constant uint& N_SPLITS                 [[buffer(13)]],
-    uint3 tg_pos                            [[threadgroup_position_in_grid]],
-    uint3 lid3                              [[thread_position_in_threadgroup]])
-{
-    constexpr uint D = 512;
-    constexpr uint PAGE = 8;
-    constexpr uint THREADS = 32;
-    const uint vs = tg_pos.x;
-    const uint split = tg_pos.y;
-    const uint slot = vs / H_Q;
-    const uint q_head = vs % H_Q;
-    const uint kv_head = (q_head * H_KV) / H_Q;
-    const uint lid = lid3.x;
-
-    threadgroup half Q_tile[D];
-    threadgroup half K_tile[PAGE * D];
-    threadgroup half V_tile[PAGE * D];
-    threadgroup float scores[PAGE];
-    threadgroup float m_state[1];
-    threadgroup float l_state[1];
-    threadgroup float O_acc[D];
-    threadgroup float scores_tg[PAGE];
-
-    device const half* Q_s = Q + (slot * H_Q + q_head) * D;
-    device const uint* bt_s = block_table + slot * max_pages;
-    for (uint i = lid; i < D; i += THREADS) { Q_tile[i] = Q_s[i]; O_acc[i] = 0.0f; }
-    if (lid == 0) { m_state[0] = -INFINITY; l_state[0] = 0.0f; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint total_pages = num_pages_per_slot[slot];
-    const uint pages_per_split = (total_pages + N_SPLITS - 1) / N_SPLITS;
-    const uint p_begin = split * pages_per_split;
-    const uint p_end   = min(p_begin + pages_per_split, total_pages);
-    const uint k_len   = k_len_per_slot[slot];
-
-    const uint kv_row_stride = H_KV * D;
-    for (uint p = p_begin; p < p_end; ++p) {
-        const uint phys = bt_s[p];
-        simdgroup_half8x8 tmp;
-        device const half* Kbase = K_cache + (phys * PAGE * H_KV + kv_head) * D;
-        device const half* Vbase = V_cache + (phys * PAGE * H_KV + kv_head) * D;
-        for (uint s = 0; s < 64; ++s) {
-            const uint br = 0;
-            const uint bc = s * 8;
-            simdgroup_load(tmp, Kbase + br * kv_row_stride + bc, kv_row_stride);
-            simdgroup_store(tmp, K_tile + br * D + bc, D);
-            simdgroup_load(tmp, Vbase + br * kv_row_stride + bc, kv_row_stride);
-            simdgroup_store(tmp, V_tile + br * D + bc, D);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint r = 0; r < PAGE; ++r) {
-            float my_partial = 0.0f;
-            for (uint di = 0; di < D / 32; ++di) {
-                uint d = lid + di * 32;
-                my_partial += float(Q_tile[d]) * float(K_tile[r * D + d]);
-            }
-            float s = simd_sum(my_partial);
-            if (lid == 0) {
-                uint k_pos = p * PAGE + r;
-                scores_tg[r] = (k_pos < k_len) ? s * qk_scale : -INFINITY;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float my_score = (lid < PAGE) ? scores_tg[lid] : -INFINITY;
-        float page_max = simd_max(my_score);
-        float m_old = m_state[0];
-        float m_new = max(m_old, page_max);
-        float scale = exp(m_old - m_new);
-        float my_exp = (lid < PAGE) ? exp(my_score - m_new) : 0.0f;
-        float page_sum = simd_sum(my_exp);
-        if (lid < PAGE) scores[lid] = my_exp;
-        if (lid == 0) { l_state[0] = l_state[0] * scale + page_sum; m_state[0] = m_new; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint d = lid; d < D; d += THREADS) {
-            float acc = O_acc[d] * scale;
-            for (uint r = 0; r < PAGE; ++r) acc += scores[r] * float(V_tile[r * D + d]);
-            O_acc[d] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    uint pidx = vs * N_SPLITS + split;
-    const bool empty = (p_begin >= p_end);
-    if (lid == 0) {
-        m_partials[pidx] = empty ? -INFINITY : m_state[0];
-        l_partials[pidx] = empty ? 0.0f : l_state[0];
-    }
-    device float* O_part = O_partials + pidx * D;
-    for (uint d = lid; d < D; d += THREADS) O_part[d] = O_acc[d];
-}
 
 // Reduce across N_SPLITS per (slot, q_head): Flash-associative merge.
 // Shared between sliding (D=256) and full (D=512) via runtime D param.
@@ -1406,221 +750,6 @@ kernel void paged_attn_split_reduce(
     }
 }
 
-// Real paged decode attention — OPTIMIZED: all 32 lanes cooperate on each score
-// via simd_sum reduction (instead of 16 lanes each doing scalar D-loop). Also
-// avoids tg-mem bank conflicts that the lane-per-row pattern triggers at D=256.
-//
-// Trade-off vs original: simd_sum per score × PAGE=16 scores = 16 simd_sums
-// per page. simd_sum is ~10 cycles. So 160 cycles of reduction overhead per
-// page, but the QK compute phase drops from 256-cycle scalar chain to
-// 8-cycle per-lane with parallel reduction.
-//
-// Real paged decode attention, D=256 PAGE=16 (sliding). Flash online softmax.
-// Grid: (B × H_Q) TGs. Each TG handles one (slot, q_head); kv_head derived
-// from q_head via integer divide for GQA. Per TG tg-mem:
-//   Q_tile[256] = 512 B, K_tile[16*256]=8KB, V_tile[16*256]=8KB, scores/m/l = small
-// Total ~17 KB per TG — fits under 32 KB limit.
-kernel void paged_attn_slide(
-    device const half* Q                    [[buffer(0)]],   // [B, H_Q, 256]
-    device const half* K_cache              [[buffer(1)]],   // [pages, 16, H_KV, 256]
-    device const half* V_cache              [[buffer(2)]],
-    device const uint* block_table          [[buffer(3)]],   // [B, max_pages]
-    device half* O                           [[buffer(4)]],   // [B, H_Q, 256]
-    device const uint* num_pages_per_slot   [[buffer(5)]],
-    device const uint* k_len_per_slot       [[buffer(6)]],
-    constant float& qk_scale                [[buffer(7)]],
-    constant uint& max_pages                [[buffer(8)]],
-    constant uint& H_Q                      [[buffer(9)]],
-    constant uint& H_KV                     [[buffer(10)]],
-    uint3 tg_pos                            [[threadgroup_position_in_grid]],
-    uint3 lid3                              [[thread_position_in_threadgroup]])
-{
-    constexpr uint D = 256;
-    constexpr uint PAGE = 16;
-    constexpr uint THREADS = 32;
-    const uint vs = tg_pos.x;
-    const uint slot = vs / H_Q;
-    const uint q_head = vs % H_Q;
-    const uint kv_head = (q_head * H_KV) / H_Q;
-    const uint lid = lid3.x;
-
-    threadgroup half Q_tile[D];
-    threadgroup half K_tile[PAGE * D];
-    threadgroup half V_tile[PAGE * D];
-    threadgroup float scores[PAGE];
-    threadgroup float m_state[1];
-    threadgroup float l_state[1];
-    threadgroup float O_acc[D];
-
-    device const half* Q_s = Q + (slot * H_Q + q_head) * D;
-    device half* O_s = O + (slot * H_Q + q_head) * D;
-    device const uint* bt_s = block_table + slot * max_pages;
-
-    for (uint i = lid; i < D; i += THREADS) { Q_tile[i] = Q_s[i]; O_acc[i] = 0.0f; }
-    if (lid == 0) { m_state[0] = -INFINITY; l_state[0] = 0.0f; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint num_pages = num_pages_per_slot[slot];
-    const uint k_len = k_len_per_slot[slot];
-
-    threadgroup float scores_tg[PAGE];
-
-    for (uint p = 0; p < num_pages; ++p) {
-        const uint phys = bt_s[p];
-        // simdgroup_load: 8×8 half blocks direct from DRAM into tg-mem,
-        // fewer instructions than 4096 scalar loads. K_tile is 16×256,
-        // V_tile same: 2×32 = 64 8×8 blocks each.
-        simdgroup_half8x8 tmp;
-        const uint kv_row_stride = H_KV * D;   // stride in halves between KV rows in cache
-        device const half* Kbase = K_cache + (phys * PAGE * H_KV + kv_head) * D;
-        device const half* Vbase = V_cache + (phys * PAGE * H_KV + kv_head) * D;
-        for (uint s = 0; s < 64; ++s) {
-            const uint br = (s / 32) * 8;    // 0 or 8
-            const uint bc = (s % 32) * 8;    // 0..248
-            simdgroup_load(tmp, Kbase + br * kv_row_stride + bc, kv_row_stride);
-            simdgroup_store(tmp, K_tile + br * D + bc, D);
-            simdgroup_load(tmp, Vbase + br * kv_row_stride + bc, kv_row_stride);
-            simdgroup_store(tmp, V_tile + br * D + bc, D);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // COOPERATIVE QK: all 32 lanes compute each score in parallel.
-        for (uint r = 0; r < PAGE; ++r) {
-            float my_partial = 0.0f;
-            for (uint di = 0; di < D / 32; ++di) {
-                uint d = lid + di * 32;
-                my_partial += float(Q_tile[d]) * float(K_tile[r * D + d]);
-            }
-            float s = simd_sum(my_partial);
-            if (lid == 0) {
-                uint k_pos = p * PAGE + r;
-                scores_tg[r] = (k_pos < k_len) ? s * qk_scale : -INFINITY;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float my_score = (lid < PAGE) ? scores_tg[lid] : -INFINITY;
-        float page_max = simd_max(my_score);
-        float m_old = m_state[0];
-        float m_new = max(m_old, page_max);
-        float scale = exp(m_old - m_new);
-        float my_exp = (lid < PAGE) ? exp(my_score - m_new) : 0.0f;
-        float page_sum = simd_sum(my_exp);
-        if (lid < PAGE) scores[lid] = my_exp;
-        if (lid == 0) { l_state[0] = l_state[0] * scale + page_sum; m_state[0] = m_new; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint d = lid; d < D; d += THREADS) {
-            float acc = O_acc[d] * scale;
-            for (uint r = 0; r < PAGE; ++r) acc += scores[r] * float(V_tile[r * D + d]);
-            O_acc[d] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    const float l_final = l_state[0];
-    for (uint d = lid; d < D; d += THREADS) O_s[d] = half(O_acc[d] / l_final);
-}
-
-// Real paged decode attention, D=512 PAGE=8 (full-attn). Same structure but
-// smaller PAGE to fit tg-mem budget at larger head_dim.
-kernel void paged_attn_full(
-    device const half* Q                    [[buffer(0)]],
-    device const half* K_cache              [[buffer(1)]],
-    device const half* V_cache              [[buffer(2)]],
-    device const uint* block_table          [[buffer(3)]],
-    device half* O                           [[buffer(4)]],
-    device const uint* num_pages_per_slot   [[buffer(5)]],
-    device const uint* k_len_per_slot       [[buffer(6)]],
-    constant float& qk_scale                [[buffer(7)]],
-    constant uint& max_pages                [[buffer(8)]],
-    constant uint& H_Q                      [[buffer(9)]],
-    constant uint& H_KV                     [[buffer(10)]],
-    uint3 tg_pos                            [[threadgroup_position_in_grid]],
-    uint3 lid3                              [[thread_position_in_threadgroup]])
-{
-    constexpr uint D = 512;
-    constexpr uint PAGE = 8;
-    constexpr uint THREADS = 32;
-    const uint vs = tg_pos.x;
-    const uint slot = vs / H_Q;
-    const uint q_head = vs % H_Q;
-    const uint kv_head = (q_head * H_KV) / H_Q;
-    const uint lid = lid3.x;
-
-    threadgroup half Q_tile[D];
-    threadgroup half K_tile[PAGE * D];
-    threadgroup half V_tile[PAGE * D];
-    threadgroup float scores[PAGE];
-    threadgroup float m_state[1];
-    threadgroup float l_state[1];
-    threadgroup float O_acc[D];
-
-    device const half* Q_s = Q + (slot * H_Q + q_head) * D;
-    device half* O_s = O + (slot * H_Q + q_head) * D;
-    device const uint* bt_s = block_table + slot * max_pages;
-
-    for (uint i = lid; i < D; i += THREADS) { Q_tile[i] = Q_s[i]; O_acc[i] = 0.0f; }
-    if (lid == 0) { m_state[0] = -INFINITY; l_state[0] = 0.0f; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint num_pages = num_pages_per_slot[slot];
-    const uint k_len = k_len_per_slot[slot];
-
-    threadgroup float scores_tg[PAGE];
-
-    for (uint p = 0; p < num_pages; ++p) {
-        const uint phys = bt_s[p];
-        // simdgroup_load for K/V tiles. PAGE=8 × D=512 = 1×64 blocks of 8×8.
-        simdgroup_half8x8 tmp;
-        const uint kv_row_stride = H_KV * D;
-        device const half* Kbase = K_cache + (phys * PAGE * H_KV + kv_head) * D;
-        device const half* Vbase = V_cache + (phys * PAGE * H_KV + kv_head) * D;
-        for (uint s = 0; s < 64; ++s) {
-            const uint br = 0;                // single 8-row band (PAGE=8)
-            const uint bc = s * 8;            // 0..504
-            simdgroup_load(tmp, Kbase + br * kv_row_stride + bc, kv_row_stride);
-            simdgroup_store(tmp, K_tile + br * D + bc, D);
-            simdgroup_load(tmp, Vbase + br * kv_row_stride + bc, kv_row_stride);
-            simdgroup_store(tmp, V_tile + br * D + bc, D);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Cooperative QK (all 32 lanes per score)
-        for (uint r = 0; r < PAGE; ++r) {
-            float my_partial = 0.0f;
-            for (uint di = 0; di < D / 32; ++di) {
-                uint d = lid + di * 32;
-                my_partial += float(Q_tile[d]) * float(K_tile[r * D + d]);
-            }
-            float s = simd_sum(my_partial);
-            if (lid == 0) {
-                uint k_pos = p * PAGE + r;
-                scores_tg[r] = (k_pos < k_len) ? s * qk_scale : -INFINITY;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float my_score = (lid < PAGE) ? scores_tg[lid] : -INFINITY;
-        float page_max = simd_max(my_score);
-        float m_old = m_state[0];
-        float m_new = max(m_old, page_max);
-        float scale = exp(m_old - m_new);
-        float my_exp = (lid < PAGE) ? exp(my_score - m_new) : 0.0f;
-        float page_sum = simd_sum(my_exp);
-        if (lid < PAGE) scores[lid] = my_exp;
-        if (lid == 0) { l_state[0] = l_state[0] * scale + page_sum; m_state[0] = m_new; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint d = lid; d < D; d += THREADS) {
-            float acc = O_acc[d] * scale;
-            for (uint r = 0; r < PAGE; ++r) acc += scores[r] * float(V_tile[r * D + d]);
-            O_acc[d] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    const float l_final = l_state[0];
-    for (uint d = lid; d < D; d += THREADS) O_s[d] = half(O_acc[d] / l_final);
-}
 
 // Attention BW-model placeholder. Real paged attention (paged_attention.swift)
 // does Flash online-softmax with simdgroup_load; measured at ~80-500 μs per
@@ -1714,22 +843,32 @@ kernel void softmax_topk(
 // Dispatch: 1 TG, 128 threads. Thread e owns expert e. active_exp stays
 // static (identity 0..E-1); empty experts early-return in MoE kernels via
 // group_start[e+1]==group_start[e].
+//
+// V2 takes aB (active batch count). Iterates only [0, aB*K) in passes 1
+// and 3 — silenced slots' garbage routings (computed by softmax_topk
+// over hidden states for non-active slots) are skipped, so MoE matmul
+// only consumes real-slot routings. For aB == B, behavior is identical
+// to V1. For aB < B, only the first aB slots' routings end up in
+// slot_token[]/batch_slots[] and group_start reflects their counts only.
+// active_exp remains the static identity map; MoE kernels dispatch the
+// full E_EXP grid and inactive experts (count==0) early-return as before.
 kernel void route_compact(
     device const uint* expert_ids   [[buffer(0)]],   // [B*K]
     device uint* group_start        [[buffer(1)]],   // [E+1]
     device uint* slot_token         [[buffer(2)]],   // [B*K]
     device uint* batch_slots        [[buffer(3)]],   // [B*K]
-    constant uint& B                [[buffer(4)]],
+    constant uint& aB               [[buffer(4)]],   // active batch count (was B)
     constant uint& K                [[buffer(5)]],
     uint2 lid                       [[thread_position_in_threadgroup]])
 {
     constexpr uint E = 128;
     threadgroup uint counts[E];
     uint e = lid.x;
-    uint BK = B * K;
+    uint BK = aB * K;
     if (e >= E) return;
 
-    // Pass 1: count matches for my expert.
+    // Pass 1: count matches for my expert across [0, aB*K) only —
+    // silenced slots [aB, B) are skipped.
     uint myCount = 0;
     for (uint i = 0; i < BK; ++i) {
         if (expert_ids[i] == e) ++myCount;
@@ -1748,9 +887,13 @@ kernel void route_compact(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Pass 3: scatter. Thread e walks (b,k) in row-major order and emits
-    // slots for its own expert. Same iteration order as pass 1 -> consistent
-    // local offset sequence, so batch_slots is well-defined.
+    // Pass 3: scatter. Thread e walks (b,k) in row-major order over
+    // [0, aB*K) and emits slots for its own expert. Same iteration order
+    // as pass 1 -> consistent local offset sequence, so batch_slots is
+    // well-defined for active slots. batch_slots[aB*K..B*K) is left
+    // stale; downstream consumers (encMoeCombineWriteInto) will read
+    // stale values for silenced slots but write to scratch outputs that
+    // the engine ignores anyway.
     uint base = group_start[e];
     uint localOff = 0;
     for (uint i = 0; i < BK; ++i) {
@@ -1956,7 +1099,7 @@ kernel void moe_gemv_q5_1_v4(
     uint2 tg                            [[threadgroup_position_in_grid]],
     uint2 lid                           [[thread_position_in_threadgroup]])
 {
-    constexpr uint MAX_SLOTS = 4;
+    constexpr uint MAX_SLOTS = 16;
     uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
     uint n = n_block * 32 + t;
     if (n >= D_out) return;
@@ -2165,6 +1308,147 @@ kernel void dense_gemv_q8_0_v6(
     }
 }
 
+// =============================================================================
+// Q8_0 GEMV — kernel zoo at compile-time fixed B_TILE ∈ {1, 2, 4, 8}.
+//
+// Architecture: each TG handles ALL B_TILE batches in registers via a per-
+// thread accumulator array `accs[B_TILE]`. Compared to V6 (1 batch per TG,
+// B TGs in grid), this reads weights ONCE per K-tile per TG and amortizes
+// across B_TILE batches at the register level — no L2 round-trip dependence.
+//
+// Compile-time B_TILE is critical: Apple's compiler can fully unroll the
+// inner B-loop and keep `accs[B_TILE]` in registers (we hit a hard wall on
+// runtime-bounded array indexing in V8/V9 — accs spilled to local mem,
+// 2-3× slower). With B_TILE constexpr, no spill.
+//
+// Scheduler picks the variant by rounding active-batch UP to the nearest
+// power of 2: activeB ∈ [1] → b1; [2] → b2; [3,4] → b4; [5..8] → b8.
+// Silenced slots in the tail (e.g., 5 active → b8 with 3 silenced) still
+// pay weight-bandwidth-amortized work; the per-stream cost is pessimal at
+// activeB just above a power-of-2 boundary, optimal exactly on it.
+//
+// Grid: (D_out/32) — one TG per 32-output slab. Threads: 4 SGs × 32 = 128.
+// Split-K: each SG covers a quarter of K. Per-batch reduction at end.
+// Caller dispatches with grid = (D_out/32, 1, 1) regardless of B_TILE.
+// Templated impl: caller (kernel) supplies the threadgroup partials array
+// because MSL forbids `threadgroup` declarations inside non-kernel functions.
+template<uint B_TILE>
+inline void dense_gemv_q8_0_btile_impl(
+    device const half* hidden,
+    device const uchar* W_sw,
+    device half* output,
+    constant uint& D_in,
+    constant uint& D_out,
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 34;
+
+    uint n_block = tg.x;
+    uint lid_sg = lid.x % 32;
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+
+    uint nbc = D_in / 32;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
+
+    uint kb_per_sg = nbc / N_SPLITS;
+    uint kb_begin = sg_id * kb_per_sg;
+    uint kb_end = kb_begin + kb_per_sg;
+
+    // B_TILE accumulators per thread, fully unrollable since B_TILE is constexpr.
+    float accs[B_TILE];
+    for (uint b = 0; b < B_TILE; ++b) accs[b] = 0.0f;
+
+    for (uint kb = kb_begin; kb < kb_end; ++kb) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        float d = float(*(device const half*)(blk));
+        device const char* qs = (device const char*)(blk + 2);
+        uint base_k = kb * 32;
+        for (uint p = 0; p < 32; ++p) {
+            float w_p = d * float(qs[p]);
+            // Compile-time unrolled inner loop: B_TILE FMAs into B_TILE register accs.
+            for (uint b = 0; b < B_TILE; ++b) {
+                accs[b] += float(hidden[b * D_in + base_k + p]) * w_p;
+            }
+        }
+    }
+
+    // Per-batch reduction across N_SPLITS SGs, write each output.
+    for (uint b = 0; b < B_TILE; ++b) {
+        partials[sg_id][lid_sg] = accs[b];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            output[b * D_out + n] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_q8_0_btile_b1")]]
+kernel void dense_gemv_q8_0_btile_b1(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q8_0_btile_impl<1>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q8_0_btile_b2")]]
+kernel void dense_gemv_q8_0_btile_b2(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q8_0_btile_impl<2>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q8_0_btile_b4")]]
+kernel void dense_gemv_q8_0_btile_b4(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q8_0_btile_impl<4>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q8_0_btile_b8")]]
+kernel void dense_gemv_q8_0_btile_b8(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q8_0_btile_impl<8>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
 // Q8_0 v6 + fused RMSNorm. Same pattern as v5_rmsnorm but with swizzled W.
 kernel void dense_gemv_q8_0_v6_rmsnorm(
     device const half* x                [[buffer(0)]],
@@ -2331,6 +1615,385 @@ kernel void dense_gemv_q8_0_v6_rmsnorm_qkv(
     if (sg_id == 0) {
         float total = partials[0][lid_sg] + partials[1][lid_sg] + partials[2][lid_sg] + partials[3][lid_sg];
         out[b * D_out + n] = half(total);
+    }
+}
+
+// =============================================================================
+// Q8_0 RMSNorm + QKV kernel zoo at compile-time fixed B_TILE ∈ {1, 2, 4}.
+//
+// Same spirit as V7 (one TG handles all B_TILE batches in registers, weight
+// read once per K-tile, V_count is runtime ≤ B_TILE) but B_TILE is now a
+// template parameter so the compiler:
+//   (a) sizes h_norms[B_TILE * MAX_D_IN] tg-mem to exactly what's needed
+//       — V7 hard-coded VEC_TILE=4 → 22.5 KB always, wasteful for activeB=1
+//   (b) unrolls the inner FMA loop across B_TILE accumulators
+//   (c) drops dead code paths for slot indices ≥ B_TILE
+//
+// tg-mem budget at MAX_D_IN=2816, half = 2 B:
+//   B_TILE=1 →  5.6 KB | B_TILE=2 → 11.2 KB | B_TILE=4 → 22.5 KB
+//   B_TILE=8 → 45 KB — over the 32 KB cap; needs a different staging
+//   strategy (e.g., k-tiled normalize on-the-fly). Future work.
+//
+// Scheduler maps activeB → kernel:
+//   activeB == 1 → btile_qkv_b1 (exact)
+//   activeB == 2 → btile_qkv_b2 (exact)
+//   activeB ∈ {3,4} → btile_qkv_b4 (1 predicated slot for activeB=3)
+//   activeB > 4 → fall back to V6 (no btile_qkv_b8 yet)
+template<uint B_TILE>
+inline void dense_gemv_q8_0_btile_qkv_impl(
+    device const half* x,
+    device const half* gamma,
+    device const uchar* Wq_sw,
+    device const uchar* Wk_sw,
+    device const uchar* Wv_sw,
+    device half* out_q,
+    device half* out_k,
+    device half* out_v,
+    constant uint& D_in,
+    constant uint& Q_nb,
+    constant uint& K_nb,
+    constant uint& V_nb,
+    constant uint& D_out_q,
+    constant uint& D_out_k,
+    constant uint& D_out_v,
+    constant float& eps,
+    constant uint& numVecs,
+    threadgroup half* h_norms,            // [B_TILE * MAX_D_IN]
+    threadgroup float (&ss_stage)[4],
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint MAX_D_IN = 2816;
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 34;
+    constexpr uint THREADS = 128;
+
+    uint slab = tg.x;
+    uint vec_block = tg.y;
+    uint v_base = vec_block * B_TILE;
+    if (v_base >= numVecs) return;
+    uint v_count = (numVecs - v_base < B_TILE) ? (numVecs - v_base) : B_TILE;
+
+    uint tid = lid.x;
+    uint lid_sg = tid % 32;
+
+    // Phase 1: stage RMS-normalized x for each of v_count batches into h_norms.
+    // Constexpr loop bound B_TILE; predicate body on (v < v_count).
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        uint b = v_base + v;
+        device const half* xb = x + b * D_in;
+        float local_ss = 0.0f;
+        for (uint i = tid; i < D_in; i += THREADS) {
+            float val = float(xb[i]);
+            local_ss += val * val;
+        }
+        float sg_ss = simd_sum(local_ss);
+        if (lid_sg == 0) ss_stage[sg_id] = sg_ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total_ss = ss_stage[0] + ss_stage[1] + ss_stage[2] + ss_stage[3];
+        float inv_rms = rsqrt(total_ss / float(D_in) + eps);
+        for (uint i = tid; i < D_in; i += THREADS) {
+            h_norms[v * MAX_D_IN + i] = half(float(xb[i]) * inv_rms * float(gamma[i]));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Phase 2: route slab to Q/K/V.
+    uint n_block;
+    uint D_out;
+    device const uchar* W_sw;
+    device half* out;
+    if (slab < Q_nb) {
+        n_block = slab; D_out = D_out_q; W_sw = Wq_sw; out = out_q;
+    } else if (slab < Q_nb + K_nb) {
+        n_block = slab - Q_nb; D_out = D_out_k; W_sw = Wk_sw; out = out_k;
+    } else {
+        n_block = slab - Q_nb - K_nb; D_out = D_out_v; W_sw = Wv_sw; out = out_v;
+    }
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+    uint nbc = D_in / 32;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
+    uint kb_per_sg = nbc / N_SPLITS;
+    uint kb_begin = sg_id * kb_per_sg;
+    uint kb_end = kb_begin + kb_per_sg;
+
+    // Phase 3: register-amortized matmul. B_TILE accs in registers.
+    float accs[B_TILE];
+    for (uint v = 0; v < B_TILE; ++v) accs[v] = 0.0f;
+    for (uint kb = kb_begin; kb < kb_end; ++kb) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        float d = float(*(device const half*)(blk));
+        device const char* qs = (device const char*)(blk + 2);
+        uint base_k = kb * 32;
+        for (uint p = 0; p < 32; ++p) {
+            float w_p = d * float(qs[p]);
+            for (uint v = 0; v < B_TILE; ++v) {
+                if (v < v_count) {
+                    accs[v] += float(h_norms[v * MAX_D_IN + base_k + p]) * w_p;
+                }
+            }
+        }
+    }
+
+    // Phase 4: per-batch reduction across N_SPLITS SGs and write outputs.
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        partials[sg_id][lid_sg] = accs[v];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            uint b = v_base + v;
+            out[b * D_out + n] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_q8_0_btile_qkv_b1")]]
+kernel void dense_gemv_q8_0_btile_qkv_b1(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]],
+    device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]],
+    device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]],
+    device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]],
+    constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]],
+    constant uint& V_nb         [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]],
+    constant uint& D_out_k      [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]],
+    constant float& eps         [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half h_norms[1 * 2816];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_q8_0_btile_qkv_impl<1>(x, gamma, Wq_sw, Wk_sw, Wv_sw,
+                                       out_q, out_k, out_v,
+                                       D_in, Q_nb, K_nb, V_nb,
+                                       D_out_q, D_out_k, D_out_v,
+                                       eps, numVecs,
+                                       h_norms, ss_stage, partials,
+                                       tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q8_0_btile_qkv_b2")]]
+kernel void dense_gemv_q8_0_btile_qkv_b2(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]],
+    device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]],
+    device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]],
+    device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]],
+    constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]],
+    constant uint& V_nb         [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]],
+    constant uint& D_out_k      [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]],
+    constant float& eps         [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half h_norms[2 * 2816];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_q8_0_btile_qkv_impl<2>(x, gamma, Wq_sw, Wk_sw, Wv_sw,
+                                       out_q, out_k, out_v,
+                                       D_in, Q_nb, K_nb, V_nb,
+                                       D_out_q, D_out_k, D_out_v,
+                                       eps, numVecs,
+                                       h_norms, ss_stage, partials,
+                                       tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q8_0_btile_qkv_b4")]]
+kernel void dense_gemv_q8_0_btile_qkv_b4(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]],
+    device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]],
+    device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]],
+    device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]],
+    constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]],
+    constant uint& V_nb         [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]],
+    constant uint& D_out_k      [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]],
+    constant float& eps         [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half h_norms[4 * 2816];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_q8_0_btile_qkv_impl<4>(x, gamma, Wq_sw, Wk_sw, Wv_sw,
+                                       out_q, out_k, out_v,
+                                       D_in, Q_nb, K_nb, V_nb,
+                                       D_out_q, D_out_k, D_out_v,
+                                       eps, numVecs,
+                                       h_norms, ss_stage, partials,
+                                       tg, lid, sg_id);
+}
+
+// V7 family: same swizzled Q8_0 layout as V6, but each threadgroup
+// amortizes weight reads across VEC_TILE input vectors via per-thread
+// register accumulators (the same pattern V4 uses across B for AR).
+// V6 dispatched (D_out/32, numVecs) TGs; V7 dispatches
+// (D_out/32, ceil(numVecs / VEC_TILE)) TGs with each handling VEC_TILE
+// vectors. Per K-tile: load weight ONCE, FMA into VEC_TILE accumulators.
+// At numVecs ≥ VEC_TILE this is a structural ~VEC_TILE× weight-bandwidth
+// reduction on prefill matmuls.
+//
+// VEC_TILE=4 chosen because tg-mem h_norms[VEC_TILE * MAX_D_IN] halves =
+// 4 × 2816 × 2 = 22.5 KB, comfortably under Apple GPU's 32 KB tg-mem cap.
+// VEC_TILE=8 would be 45 KB and exceed the budget.
+
+kernel void dense_gemv_q8_0_v7_rmsnorm_qkv(
+    device const half* x                [[buffer(0)]],
+    device const half* gamma            [[buffer(1)]],
+    device const uchar* Wq_sw           [[buffer(2)]],
+    device const uchar* Wk_sw           [[buffer(3)]],
+    device const uchar* Wv_sw           [[buffer(4)]],
+    device half* out_q                  [[buffer(5)]],
+    device half* out_k                  [[buffer(6)]],
+    device half* out_v                  [[buffer(7)]],
+    constant uint& D_in                 [[buffer(8)]],
+    constant uint& Q_nb                 [[buffer(9)]],
+    constant uint& K_nb                 [[buffer(10)]],
+    constant uint& V_nb                 [[buffer(11)]],
+    constant uint& D_out_q              [[buffer(12)]],
+    constant uint& D_out_k              [[buffer(13)]],
+    constant uint& D_out_v              [[buffer(14)]],
+    constant float& eps                 [[buffer(15)]],
+    constant uint& numVecs              [[buffer(16)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]],
+    uint sg_id                          [[simdgroup_index_in_threadgroup]])
+{
+    constexpr uint VEC_TILE = 4;
+    constexpr uint MAX_D_IN = 2816;
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 34;
+    constexpr uint THREADS = 128;
+    threadgroup half h_norms[VEC_TILE * MAX_D_IN];
+    threadgroup float ss_stage[N_SPLITS];
+
+    uint slab = tg.x;
+    uint vec_block = tg.y;
+    uint v_base = vec_block * VEC_TILE;
+    if (v_base >= numVecs) return;
+    uint v_count = (numVecs - v_base < VEC_TILE) ? (numVecs - v_base) : VEC_TILE;
+
+    uint tid = lid.x;
+    uint lid_sg = tid % 32;
+
+    // Phase 1: For each vector v ∈ [0..v_count), compute RMS-normalized
+    // h_norms[v * MAX_D_IN + i]. Each iteration uses ss_stage transiently;
+    // a barrier between iterations ensures stage doesn't get re-clobbered
+    // before all threads have read total_ss.
+    for (uint v = 0; v < v_count; ++v) {
+        uint b = v_base + v;
+        device const half* xb = x + b * D_in;
+        float local_ss = 0.0f;
+        for (uint i = tid; i < D_in; i += THREADS) {
+            float val = float(xb[i]);
+            local_ss += val * val;
+        }
+        float sg_ss = simd_sum(local_ss);
+        if (lid_sg == 0) ss_stage[sg_id] = sg_ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total_ss = ss_stage[0] + ss_stage[1] + ss_stage[2] + ss_stage[3];
+        float inv_rms = rsqrt(total_ss / float(D_in) + eps);
+        for (uint i = tid; i < D_in; i += THREADS) {
+            h_norms[v * MAX_D_IN + i] = half(float(xb[i]) * inv_rms * float(gamma[i]));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Phase 2: Route slab to Q/K/V projection.
+    uint n_block;
+    uint D_out;
+    device const uchar* W_sw;
+    device half* out;
+    if (slab < Q_nb) {
+        n_block = slab;
+        D_out = D_out_q; W_sw = Wq_sw; out = out_q;
+    } else if (slab < Q_nb + K_nb) {
+        n_block = slab - Q_nb;
+        D_out = D_out_k; W_sw = Wk_sw; out = out_k;
+    } else {
+        n_block = slab - Q_nb - K_nb;
+        D_out = D_out_v; W_sw = Wv_sw; out = out_v;
+    }
+
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+    uint nbc = D_in / 32;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
+    uint kb_per_sg = nbc / N_SPLITS;
+    uint kb_begin = sg_id * kb_per_sg;
+    uint kb_end = kb_begin + kb_per_sg;
+
+    // Phase 3: Amortized matmul. Each thread holds VEC_TILE accumulators
+    // in registers. Per K-tile: load weights once, FMA against all v_count
+    // vectors. The compile-time VEC_TILE bound guarantees the inner loop
+    // unrolls; v_count gates which iterations run actual work vs no-op.
+    float accs[VEC_TILE];
+    for (uint v = 0; v < VEC_TILE; ++v) accs[v] = 0.0f;
+
+    for (uint kb = kb_begin; kb < kb_end; ++kb) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        float d = float(*(device const half*)(blk));
+        device const char* qs = (device const char*)(blk + 2);
+        uint base_k = kb * 32;
+        for (uint p = 0; p < 32; ++p) {
+            float w_p = d * float(qs[p]);
+            for (uint v = 0; v < VEC_TILE; ++v) {
+                if (v < v_count) {
+                    accs[v] += float(h_norms[v * MAX_D_IN + base_k + p]) * w_p;
+                }
+            }
+        }
+    }
+
+    // Phase 4: Reduce partials across N_SPLITS subgroups, write VEC_TILE
+    // outputs. Reuse one partials buffer across vectors with a barrier
+    // between iterations.
+    threadgroup float partials[N_SPLITS][32];
+    for (uint v = 0; v < v_count; ++v) {
+        partials[sg_id][lid_sg] = accs[v];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            uint b = v_base + v;
+            out[b * D_out + n] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
@@ -2700,6 +2363,453 @@ kernel void moe_gemv_q5_1_v6(
             }
         }
         output[slot * D_out + n] = half(acc);
+    }
+}
+
+// MoE Q4_K GEMV v8 — V4-style register slot-amortization with chunked
+// MAX_SLOTS=16 (matches prefill numVecs=256 × top-8 / 128 experts ≈ 16
+// slots/expert avg). V6 walks slots one-by-one and re-reads the weight
+// slab from L2 each time; V8 reads the weight slab ONCE per slot-chunk
+// and FMAs into MAX_SLOTS accumulators in registers. At full prefill
+// numVecs the L2 amortization V6 relies on is already breaking down
+// (weight matrix is 285 MB, much bigger than L2), so register-level
+// amortization captures the bandwidth headroom.
+kernel void moe_gemv_q4k_v8(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    constexpr uint MAX_SLOTS = 4;     // matches V4's register footprint; chunked outer loop handles n_slots > 4
+    uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+    uint gb = group_start[expert]; uint ge = group_start[expert + 1];
+    if (ge == gb) return;
+
+    constexpr uint BLK = 144;
+    uint nbc = D_in / 256;
+    uint super_bytes = nbc * 32 * BLK;
+    uint expert_bytes = (D_out / 32) * super_bytes;
+    device const uchar* W_super = W_sw + expert * expert_bytes + n_block * super_bytes;
+
+    // Outer chunk-of-slots loop. Each chunk processes up to MAX_SLOTS
+    // slots with weight read once via the kb loop.
+    uint slot_base = gb;
+    while (slot_base < ge) {
+        uint chunk = (ge - slot_base < MAX_SLOTS) ? (ge - slot_base) : MAX_SLOTS;
+        device const half* hid_slots[MAX_SLOTS];
+        for (uint s = 0; s < chunk; ++s) {
+            hid_slots[s] = hidden + slot_token[slot_base + s] * D_in;
+        }
+        float accs[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) accs[s] = 0.0f;
+
+        for (uint kb = 0; kb < nbc; ++kb) {
+            device const uchar* blk = W_super + kb * 32 * BLK + t * BLK;
+            float d    = float(*(device const half*)(blk + 0));
+            float dmin = float(*(device const half*)(blk + 2));
+            device const uchar* scales = blk + 4;
+            device const uchar* qs     = blk + 16;
+            for (uint pair = 0; pair < 4; ++pair) {
+                uint sb_lo = pair * 2;
+                uint sb_hi = pair * 2 + 1;
+                uchar sc_lo, mn_lo, sc_hi, mn_hi;
+                unpack_q4k_scales(scales, sc_lo, mn_lo, sb_lo);
+                unpack_q4k_scales(scales, sc_hi, mn_hi, sb_hi);
+                float dl_lo = d * float(sc_lo), ml_lo = dmin * float(mn_lo);
+                float dl_hi = d * float(sc_hi), ml_hi = dmin * float(mn_hi);
+                uint base_lo = kb * 256 + sb_lo * 32;
+                uint base_hi = kb * 256 + sb_hi * 32;
+                for (uint p = 0; p < 32; ++p) {
+                    uchar byte = qs[pair * 32 + p];
+                    float w_lo = dl_lo * float(byte & 0xF)        - ml_lo;
+                    float w_hi = dl_hi * float((byte >> 4) & 0xF) - ml_hi;
+                    for (uint s = 0; s < chunk; ++s) {
+                        accs[s] += float(hid_slots[s][base_lo + p]) * w_lo
+                                 + float(hid_slots[s][base_hi + p]) * w_hi;
+                    }
+                }
+            }
+        }
+        for (uint s = 0; s < chunk; ++s) {
+            output[(slot_base + s) * D_out + n] = half(accs[s]);
+        }
+        slot_base += chunk;
+    }
+}
+
+// MoE Q5_1 GEMV v8 — same structure as q4k_v8 but for Q5_1 down. Down-proj
+// uses slot * D_in indexing (post-gate/up expanded layout) per the v6
+// note above.
+kernel void moe_gemv_q5_1_v8(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    constexpr uint MAX_SLOTS = 4;     // matches V4's register footprint; chunked outer loop handles n_slots > 4
+    uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+    uint gb = group_start[expert]; uint ge = group_start[expert + 1];
+    if (ge == gb) return;
+
+    constexpr uint BLK = 24;
+    uint nbc = D_in / 32;
+    uint super_bytes = nbc * 32 * BLK;
+    uint expert_bytes = (D_out / 32) * super_bytes;
+    device const uchar* W_super = W_sw + expert * expert_bytes + n_block * super_bytes;
+
+    uint slot_base = gb;
+    while (slot_base < ge) {
+        uint chunk = (ge - slot_base < MAX_SLOTS) ? (ge - slot_base) : MAX_SLOTS;
+        device const half* hid_slots[MAX_SLOTS];
+        for (uint s = 0; s < chunk; ++s) {
+            // Down-proj reads pre-expanded [TOTAL_SLOTS, D_in] layout: index
+            // by absolute slot, NOT slot_token (matches v6 commentary).
+            hid_slots[s] = hidden + (slot_base + s) * D_in;
+        }
+        float accs[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) accs[s] = 0.0f;
+
+        for (uint kb = 0; kb < nbc; ++kb) {
+            device const uchar* blk = W_super + kb * 32 * BLK + t * BLK;
+            float d = float(*(device const half*)(blk));
+            float m = float(*(device const half*)(blk + 2));
+            device const uchar* qh = blk + 4;
+            device const uchar* qs = blk + 8;
+            uint base_k = kb * 32;
+            for (uint p = 0; p < 16; ++p) {
+                uchar qsp = qs[p];
+                uint h_lo = (qh[p / 8]       >> (p       % 8)) & 1u;
+                uint h_hi = (qh[(p + 16) / 8] >> ((p + 16) % 8)) & 1u;
+                uint q_lo = (uint(qsp) & 0xFu)        | (h_lo << 4);
+                uint q_hi = ((uint(qsp) >> 4) & 0xFu) | (h_hi << 4);
+                float w_lo = d * float(q_lo) + m;
+                float w_hi = d * float(q_hi) + m;
+                for (uint s = 0; s < chunk; ++s) {
+                    accs[s] += float(hid_slots[s][base_k + p])      * w_lo
+                             + float(hid_slots[s][base_k + p + 16]) * w_hi;
+                }
+            }
+        }
+        for (uint s = 0; s < chunk; ++s) {
+            output[(slot_base + s) * D_out + n] = half(accs[s]);
+        }
+        slot_base += chunk;
+    }
+}
+
+// MoE Q4_K GEMV v9 — V8's chunked register slot-amortization, but inner
+// FMA loop uses constexpr MAX_SLOTS=8 bound + predicated `if (s < chunk)`
+// so Apple's compiler can unroll the s-loop and keep accs[]/hid_slots[]
+// in registers (the V7 QKV pattern). V8's `for s = 0..<chunk` was
+// runtime-bounded → array spilled to local mem and ran 2-3× slower than
+// V6. V9's biggest expected win is dequant amortization: V6 does N_slots
+// dequants per (kb, p); V9 does 1 per chunk, so 8× fewer Q4_K unpack ops
+// on each TG.
+kernel void moe_gemv_q4k_v9(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    constexpr uint MAX_SLOTS = 16;
+    uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+    uint gb = group_start[expert]; uint ge = group_start[expert + 1];
+    if (ge == gb) return;
+
+    constexpr uint BLK = 144;
+    uint nbc = D_in / 256;
+    uint super_bytes = nbc * 32 * BLK;
+    uint expert_bytes = (D_out / 32) * super_bytes;
+    device const uchar* W_super = W_sw + expert * expert_bytes + n_block * super_bytes;
+
+    uint slot_base = gb;
+    while (slot_base < ge) {
+        uint chunk = (ge - slot_base < MAX_SLOTS) ? (ge - slot_base) : MAX_SLOTS;
+        device const half* hid_slots[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            // Safe load: out-of-range lanes alias slot_base[0] but their
+            // FMAs are predicated off below.
+            uint idx = (s < chunk) ? (slot_base + s) : slot_base;
+            hid_slots[s] = hidden + slot_token[idx] * D_in;
+        }
+        float accs[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) accs[s] = 0.0f;
+
+        for (uint kb = 0; kb < nbc; ++kb) {
+            device const uchar* blk = W_super + kb * 32 * BLK + t * BLK;
+            float d    = float(*(device const half*)(blk + 0));
+            float dmin = float(*(device const half*)(blk + 2));
+            device const uchar* scales = blk + 4;
+            device const uchar* qs     = blk + 16;
+            for (uint pair = 0; pair < 4; ++pair) {
+                uint sb_lo = pair * 2;
+                uint sb_hi = pair * 2 + 1;
+                uchar sc_lo, mn_lo, sc_hi, mn_hi;
+                unpack_q4k_scales(scales, sc_lo, mn_lo, sb_lo);
+                unpack_q4k_scales(scales, sc_hi, mn_hi, sb_hi);
+                float dl_lo = d * float(sc_lo), ml_lo = dmin * float(mn_lo);
+                float dl_hi = d * float(sc_hi), ml_hi = dmin * float(mn_hi);
+                uint base_lo = kb * 256 + sb_lo * 32;
+                uint base_hi = kb * 256 + sb_hi * 32;
+                for (uint p = 0; p < 32; ++p) {
+                    uchar byte = qs[pair * 32 + p];
+                    float w_lo = dl_lo * float(byte & 0xF)        - ml_lo;
+                    float w_hi = dl_hi * float((byte >> 4) & 0xF) - ml_hi;
+                    // Constexpr-bounded predicated FMA (V7 pattern).
+                    for (uint s = 0; s < MAX_SLOTS; ++s) {
+                        if (s < chunk) {
+                            accs[s] += float(hid_slots[s][base_lo + p]) * w_lo
+                                     + float(hid_slots[s][base_hi + p]) * w_hi;
+                        }
+                    }
+                }
+            }
+        }
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            if (s < chunk) {
+                output[(slot_base + s) * D_out + n] = half(accs[s]);
+            }
+        }
+        slot_base += chunk;
+    }
+}
+
+// MoE Q4_K v10 — fused matmul + GELU(gate)·up. Each TG handles ONE
+// 32-column slab of the gate-side outputs (Dout = N_half = MOE_INT).
+// Inner K-loop reads BOTH the gate weight slab and the up weight slab in
+// lockstep, accumulating into two parallel register arrays. After the
+// K-loop, applies GELU(gate)·up in-register and writes [slots, N_half]
+// directly to the post-activation buffer (pre_gate_proj). This removes
+// the separate moe_gelu_mul_fused dispatch + the [slots, 2*N_half]
+// fused intermediate's DRAM round-trip.
+//
+// Caveat: profiler shows moe_gelu_mul_fused at 0.022 ms/call, so the
+// structural win is bounded at ~0.7 ms/pass total. The bigger expected
+// effect would be cross-slab L2 sharing of the hidden vector (same
+// hidden read drives gate+up in the same TG instead of two separate
+// TGs). Magnitude TBD empirically vs v9.
+//
+// Register footprint: 2 × MAX_SLOTS=8 floats + MAX_SLOTS device ptrs +
+// loop temps ≈ 24 32-bit slots/thread; under the ~32-48 cliff that V8
+// hit at MAX_SLOTS=16.
+//
+// Buffer layout: same swizzled per-expert layout as v6/v9. We reach
+// the up slab via offset (n_block + N_half/32) * super_bytes within
+// the same expert's region. D_out_fused = 2 * N_half is passed so the
+// kernel can compute the slab stride.
+kernel void moe_gemv_q4k_v10_fused_gelu(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],     // [slots, N_half]
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& N_half               [[buffer(7)]],     // = MOE_INT
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    constexpr uint MAX_SLOTS = 8;
+    uint n_block = tg.x;                               // [0, N_half/32)
+    uint ai = tg.y; uint expert = active_experts[ai];
+    uint t = lid.x;
+    uint n = n_block * 32 + t;                         // gate output column
+    if (n >= N_half) return;
+    uint gb = group_start[expert]; uint ge = group_start[expert + 1];
+    if (ge == gb) return;
+
+    constexpr uint BLK = 144;
+    uint nbc = D_in / 256;
+    uint super_bytes = nbc * 32 * BLK;
+    // Fused weight tensor has 2 * N_half output columns; expert region
+    // covers (2 * N_half / 32) super-blocks.
+    uint expert_bytes = (2 * N_half / 32) * super_bytes;
+    device const uchar* W_gate = W_sw + expert * expert_bytes + n_block * super_bytes;
+    device const uchar* W_up   = W_sw + expert * expert_bytes
+                                       + (n_block + N_half / 32) * super_bytes;
+
+    uint slot_base = gb;
+    while (slot_base < ge) {
+        uint chunk = (ge - slot_base < MAX_SLOTS) ? (ge - slot_base) : MAX_SLOTS;
+        device const half* hid_slots[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            uint idx = (s < chunk) ? (slot_base + s) : slot_base;
+            hid_slots[s] = hidden + slot_token[idx] * D_in;
+        }
+        float acc_g[MAX_SLOTS];
+        float acc_u[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) { acc_g[s] = 0.0f; acc_u[s] = 0.0f; }
+
+        for (uint kb = 0; kb < nbc; ++kb) {
+            // ---- gate slab ----
+            {
+                device const uchar* blk = W_gate + kb * 32 * BLK + t * BLK;
+                float d    = float(*(device const half*)(blk + 0));
+                float dmin = float(*(device const half*)(blk + 2));
+                device const uchar* scales = blk + 4;
+                device const uchar* qs     = blk + 16;
+                for (uint pair = 0; pair < 4; ++pair) {
+                    uint sb_lo = pair * 2;
+                    uint sb_hi = pair * 2 + 1;
+                    uchar sc_lo, mn_lo, sc_hi, mn_hi;
+                    unpack_q4k_scales(scales, sc_lo, mn_lo, sb_lo);
+                    unpack_q4k_scales(scales, sc_hi, mn_hi, sb_hi);
+                    float dl_lo = d * float(sc_lo), ml_lo = dmin * float(mn_lo);
+                    float dl_hi = d * float(sc_hi), ml_hi = dmin * float(mn_hi);
+                    uint base_lo = kb * 256 + sb_lo * 32;
+                    uint base_hi = kb * 256 + sb_hi * 32;
+                    for (uint p = 0; p < 32; ++p) {
+                        uchar byte = qs[pair * 32 + p];
+                        float w_lo = dl_lo * float(byte & 0xF)        - ml_lo;
+                        float w_hi = dl_hi * float((byte >> 4) & 0xF) - ml_hi;
+                        for (uint s = 0; s < MAX_SLOTS; ++s) {
+                            if (s < chunk) {
+                                acc_g[s] += float(hid_slots[s][base_lo + p]) * w_lo
+                                          + float(hid_slots[s][base_hi + p]) * w_hi;
+                            }
+                        }
+                    }
+                }
+            }
+            // ---- up slab (same hidden vectors, different weights) ----
+            {
+                device const uchar* blk = W_up + kb * 32 * BLK + t * BLK;
+                float d    = float(*(device const half*)(blk + 0));
+                float dmin = float(*(device const half*)(blk + 2));
+                device const uchar* scales = blk + 4;
+                device const uchar* qs     = blk + 16;
+                for (uint pair = 0; pair < 4; ++pair) {
+                    uint sb_lo = pair * 2;
+                    uint sb_hi = pair * 2 + 1;
+                    uchar sc_lo, mn_lo, sc_hi, mn_hi;
+                    unpack_q4k_scales(scales, sc_lo, mn_lo, sb_lo);
+                    unpack_q4k_scales(scales, sc_hi, mn_hi, sb_hi);
+                    float dl_lo = d * float(sc_lo), ml_lo = dmin * float(mn_lo);
+                    float dl_hi = d * float(sc_hi), ml_hi = dmin * float(mn_hi);
+                    uint base_lo = kb * 256 + sb_lo * 32;
+                    uint base_hi = kb * 256 + sb_hi * 32;
+                    for (uint p = 0; p < 32; ++p) {
+                        uchar byte = qs[pair * 32 + p];
+                        float w_lo = dl_lo * float(byte & 0xF)        - ml_lo;
+                        float w_hi = dl_hi * float((byte >> 4) & 0xF) - ml_hi;
+                        for (uint s = 0; s < MAX_SLOTS; ++s) {
+                            if (s < chunk) {
+                                acc_u[s] += float(hid_slots[s][base_lo + p]) * w_lo
+                                          + float(hid_slots[s][base_hi + p]) * w_hi;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // GELU(gate) · up — clamped tanh, matches moe_gelu_mul_fused.
+        const float c = 0.7978845608f;
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            if (s < chunk) {
+                float g = acc_g[s];
+                float inner = c * (g + 0.044715f * g * g * g);
+                inner = clamp(inner, -20.0f, 20.0f);
+                float gelu_g = 0.5f * g * (1.0f + tanh(inner));
+                output[(slot_base + s) * N_half + n] = half(gelu_g * acc_u[s]);
+            }
+        }
+        slot_base += chunk;
+    }
+}
+
+// MoE Q5_1 GEMV v9 — same constexpr-unroll pattern as q4k_v9 but for the
+// down projection (Q5_1, BLK=24, slot index uses absolute slot per the
+// down-proj layout note in v6).
+kernel void moe_gemv_q5_1_v9(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    constexpr uint MAX_SLOTS = 16;
+    uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+    uint gb = group_start[expert]; uint ge = group_start[expert + 1];
+    if (ge == gb) return;
+
+    constexpr uint BLK = 24;
+    uint nbc = D_in / 32;
+    uint super_bytes = nbc * 32 * BLK;
+    uint expert_bytes = (D_out / 32) * super_bytes;
+    device const uchar* W_super = W_sw + expert * expert_bytes + n_block * super_bytes;
+
+    uint slot_base = gb;
+    while (slot_base < ge) {
+        uint chunk = (ge - slot_base < MAX_SLOTS) ? (ge - slot_base) : MAX_SLOTS;
+        device const half* hid_slots[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            uint idx = (s < chunk) ? (slot_base + s) : slot_base;
+            hid_slots[s] = hidden + idx * D_in;     // absolute slot indexing for down-proj
+        }
+        float accs[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) accs[s] = 0.0f;
+
+        for (uint kb = 0; kb < nbc; ++kb) {
+            device const uchar* blk = W_super + kb * 32 * BLK + t * BLK;
+            float d = float(*(device const half*)(blk));
+            float m = float(*(device const half*)(blk + 2));
+            device const uchar* qh = blk + 4;
+            device const uchar* qs = blk + 8;
+            uint base_k = kb * 32;
+            for (uint p = 0; p < 16; ++p) {
+                uchar qsp = qs[p];
+                uint h_lo = (qh[p / 8]       >> (p       % 8)) & 1u;
+                uint h_hi = (qh[(p + 16) / 8] >> ((p + 16) % 8)) & 1u;
+                uint q_lo = (uint(qsp) & 0xFu)        | (h_lo << 4);
+                uint q_hi = ((uint(qsp) >> 4) & 0xFu) | (h_hi << 4);
+                float w_lo = d * float(q_lo) + m;
+                float w_hi = d * float(q_hi) + m;
+                for (uint s = 0; s < MAX_SLOTS; ++s) {
+                    if (s < chunk) {
+                        accs[s] += float(hid_slots[s][base_k + p])      * w_lo
+                                 + float(hid_slots[s][base_k + p + 16]) * w_hi;
+                    }
+                }
+            }
+        }
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            if (s < chunk) {
+                output[(slot_base + s) * D_out + n] = half(accs[s]);
+            }
+        }
+        slot_base += chunk;
     }
 }
 
@@ -3304,6 +3414,28 @@ kernel void rms_norm_fp32in(
     }
 }
 
+// Soft-prompt softs ingest: copy-and-cast a [n_rows, HIDDEN] fp32 region of
+// `src` (vision-tower padded output) into a [n_rows, HIDDEN] slice of `dst`
+// (LM pre_hidden, fp16). Replaces the CPU memcpy + fp32→fp16 loop that
+// used to follow `pendingCB.waitUntilCompleted()` in the soft-prefill prep.
+// Encoded into a pre-prefill CB on the LM queue, gated by
+// encodeWaitForEvent on the cross-queue vision event — GPU waits for the
+// vision pad-blit, then runs this copy, then the prefill CB consumes
+// pre_hidden in queue order. CPU never blocks. See notes/engine_debloat.md.
+kernel void vision_softs_copy_fp32_to_fp16(
+    device const float* src     [[buffer(0)]],
+    device half* dst            [[buffer(1)]],
+    constant uint& src_row_off  [[buffer(2)]],
+    constant uint& dst_row_off  [[buffer(3)]],
+    constant uint& n_rows       [[buffer(4)]],
+    constant uint& hidden       [[buffer(5)]],
+    uint gid                    [[thread_position_in_grid]])
+{
+    uint total = n_rows * hidden;
+    if (gid >= total) { return; }
+    dst[(dst_row_off * hidden) + gid] = half(src[(src_row_off * hidden) + gid]);
+}
+
 // dst is the fp32 residual stream; src is a fp16 post-norm sub-block output.
 // Equivalent to `x += post_norm(sub)` but without the fp16 round-trip on x.
 kernel void add_inplace_fp32dst_fp16src(
@@ -3444,11 +3576,23 @@ kernel void softcap(
 // and PARTIAL (intra-tile predicate required). EMPTY tiles are never in a
 // list, so they never dispatch.
 //
-// v0: slide layer (D=256, PAGE=16, Q_PER_TG=2, Q_BLOCK=1), causal_sliding
-// mask_mod only. Same MMA+softmax+AV structure as paged_attn_slide_gqa_compute
-// so correctness is a pure A/B test.
+// ONE kernel source. Specialized per-PSO via function constants:
+//   FC_D          — head dim (256 for slide layers, 512 for full)
+//   FC_PAGE       — KV-cache page size in tokens (16 for slide, 8 for full)
+//   FC_Q_PER_TG   — real Q rows per threadgroup (2 for slide, 8 for full)
+//   FC_USE_SLIDE  — 1 enables per-row sliding-window mask; 0 = causal only
+//
+// Metal function constants are resolved at PSO compile time; the compiler
+// constant-folds the `if (FC_USE_SLIDE)` branches and fixes array sizes
+// (threadgroup allocations, Q_tile/scores_tile) so each PSO lowers to
+// the same asm the old per-variant kernels did.
 // ========================================================================
-kernel void flex_attn_slide_v0(
+constant int  FC_D         [[function_constant(0)]];
+constant int  FC_PAGE      [[function_constant(1)]];
+constant int  FC_Q_PER_TG  [[function_constant(2)]];
+constant bool FC_USE_SLIDE [[function_constant(3)]];
+
+kernel void flex_attn_v0(
     device const half* Q                    [[buffer(0)]],
     device const half* K_cache              [[buffer(1)]],
     device const half* V_cache              [[buffer(2)]],
@@ -3465,19 +3609,31 @@ kernel void flex_attn_slide_v0(
     constant uint& max_pages                [[buffer(13)]],
     constant uint& H_Q                      [[buffer(14)]],
     constant uint& H_KV                     [[buffer(15)]],
-    constant uint& N_SPLITS                 [[buffer(16)]],    // internal — partitions CSR work (per_split = n_total/N_SPLITS)
-    constant uint& sliding_window           [[buffer(17)]],
+    constant uint& N_SPLITS                 [[buffer(16)]],
+    constant uint& sliding_window           [[buffer(17)]],    // value ignored when !FC_USE_SLIDE; always bound by wrapper
     constant uint& prefix_pages             [[buffer(18)]],    // skip logical pages < this (tail mode). 0 = process all.
-    constant uint& split_offset             [[buffer(19)]],    // write partials at total_splits_out stride, + split_offset + tg.y. 0 = default.
-    constant uint& total_splits_out         [[buffer(20)]],    // output layout stride. If 0, falls back to N_SPLITS (v0 back-compat).
+    constant uint& split_offset             [[buffer(19)]],    // write partials at total_splits_out stride, + split_offset + tg.y.
+    constant uint& total_splits_out         [[buffer(20)]],    // output layout stride. 0 → fallback to N_SPLITS.
     uint3 tg_pos                            [[threadgroup_position_in_grid]],
     uint3 lid3                              [[thread_position_in_threadgroup]])
 {
-    constexpr uint D = 256;
-    constexpr uint PAGE = 16;
     constexpr uint THREADS = 32;
-    constexpr uint Q_PER_TG = 2;
-    constexpr uint D8 = D / 8;
+    constexpr uint MMA = 8;                 // simdgroup_half8x8 is fixed 8×8
+
+    // MSL library compile happens before function constants resolve, so
+    // threadgroup/stack array sizes can't use FC_* directly. We size to
+    // the max over the two specialized PSOs (D=512, PAGE=16, Q_PER_TG=8)
+    // and only use the FC_*-sized prefix at runtime. The slide PSO leaves
+    // the tail of each array unused — a few KB of wasted threadgroup
+    // memory, well within the 32 KB/TG Apple GPU budget.
+    constexpr uint MAX_D        = 512;
+    constexpr uint MAX_PAGE     = 16;
+    constexpr uint MAX_Q_PER_TG = 8;
+
+    const     uint D        = uint(FC_D);
+    const     uint PAGE     = uint(FC_PAGE);
+    const     uint Q_PER_TG = uint(FC_Q_PER_TG);
+    const     uint D8       = D / 8;
 
     const uint vs = tg_pos.x;
     const uint split = tg_pos.y;
@@ -3486,20 +3642,25 @@ kernel void flex_attn_slide_v0(
     const uint q_head_base = kv_head * Q_PER_TG;
     const uint lid = lid3.x;
 
-    // v0: Q_BLOCK=1, q_blocks=1 → CSR index is just the slot.
+    // Q_BLOCK=1, q_blocks=1 → CSR index is just the slot.
     const uint csr_idx = slot;
 
-    threadgroup half  Q_tile[8 * D];
-    threadgroup half  scores_tile[8 * PAGE];
-    threadgroup float O_acc[Q_PER_TG * D];
-    threadgroup float m_state[Q_PER_TG];
-    threadgroup float l_state[Q_PER_TG];
-    threadgroup float scale_tile[Q_PER_TG];
+    // Q_tile always holds MMA rows of up-to-MAX_D columns. When Q_PER_TG <
+    // MMA the trailing rows are zero-padded so they contribute 0 to the
+    // 8×8 MMA output and are ignored by the softmax/AV loops (which
+    // iterate q < Q_PER_TG only).
+    threadgroup half  Q_tile[MMA * MAX_D];
+    threadgroup half  scores_tile[MMA * MAX_PAGE];
+    threadgroup float O_acc[MAX_Q_PER_TG * MAX_D];
+    threadgroup float m_state[MAX_Q_PER_TG];
+    threadgroup float l_state[MAX_Q_PER_TG];
+    threadgroup float scale_tile[MAX_Q_PER_TG];
 
     device const half* Qbase = Q + (slot * H_Q + q_head_base) * D;
     device const uint* bt_s = block_table + slot * max_pages;
 
-    for (uint i = lid; i < 8 * D; i += THREADS) {
+    // Load Q_PER_TG real rows; zero-pad up to MMA for the simdgroup MMA.
+    for (uint i = lid; i < MMA * D; i += THREADS) {
         uint r = i / D;
         Q_tile[i] = (r < Q_PER_TG) ? Qbase[r * D + (i % D)] : half(0);
     }
@@ -3509,12 +3670,11 @@ kernel void flex_attn_slide_v0(
 
     const uint k_len = k_len_per_slot[slot];
     const uint kv_row_stride = H_KV * D;
-    const uint window_lo = (sliding_window > 0 && k_len > sliding_window)
+    const uint window_lo = (FC_USE_SLIDE && sliding_window > 0 && k_len > sliding_window)
                            ? (k_len - sliding_window) : 0u;
 
-    // Each split gets a contiguous slice of the per-slot list. We split the
-    // FULL list first and PARTIAL list second, concatenated. This keeps
-    // roughly equal work per split when both lists are non-empty.
+    // Each split gets a contiguous slice of the per-slot list (FULL first,
+    // PARTIAL second, concatenated). Keeps work balanced across splits.
     uint full_lo  = full_kv_offsets[csr_idx];
     uint full_hi  = full_kv_offsets[csr_idx + 1];
     uint part_lo  = partial_kv_offsets[csr_idx];
@@ -3526,10 +3686,6 @@ kernel void flex_attn_slide_v0(
     uint ix_begin = split * per_split;
     uint ix_end   = min(ix_begin + per_split, n_total);
 
-    // Walk the split's assigned blocks. FULL blocks come first, then PARTIAL,
-    // so we dispatch based on where ix lands. When `prefix_pages > 0` we skip
-    // any logical page index < prefix_pages (those positions are handled by
-    // the shared-prefix broadcast kernel at split=0).
     for (uint ix = ix_begin; ix < ix_end; ++ix) {
         uint p;
         bool is_partial;
@@ -3540,14 +3696,14 @@ kernel void flex_attn_slide_v0(
             p = partial_kv_indices[part_lo + (ix - n_full)];
             is_partial = true;
         }
-        // Skip logical pages owned by the shared-prefix broadcast kernel.
+        // Tail mode: skip logical pages owned by the shared-prefix broadcast.
         if (p < prefix_pages) continue;
 
         const uint phys = bt_s[p];
         device const half* Kbase = K_cache + (phys * PAGE * H_KV + kv_head) * D;
         device const half* Vbase = V_cache + (phys * PAGE * H_KV + kv_head) * D;
 
-        // QK: PAGE=16 needs two 8-col K blocks.
+        // QK: PAGE/8 passes of 8 K-columns each (1 pass at PAGE=8, 2 at PAGE=16).
         for (uint pb = 0; pb < PAGE / 8; ++pb) {
             simdgroup_half8x8 mqk = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
             device const half* pk = Kbase + (pb * 8) * kv_row_stride;
@@ -3561,17 +3717,21 @@ kernel void flex_attn_slide_v0(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Per-row online softmax. FULL blocks skip the per-k predicate.
+        // Per-row online softmax. Only the partial-block path checks masks.
         if (lid < Q_PER_TG) {
             const uint q = lid;
             float row_max = -INFINITY;
-            float s_loc[PAGE];
+            float s_loc[MAX_PAGE];
             if (is_partial) {
                 for (uint k = 0; k < PAGE; ++k) {
                     float sv = float(scores_tile[q * PAGE + k]) * qk_scale;
                     uint k_pos = p * PAGE + k;
-                    // mask_mod(causalSliding): reject k_pos past causal or before window
-                    if (k_pos >= k_len || k_pos < window_lo) sv = -INFINITY;
+                    // causal: k_pos past k_len is always masked
+                    if (k_pos >= k_len) sv = -INFINITY;
+                    // sliding: reject below window_lo (elided when !FC_USE_SLIDE)
+                    if (FC_USE_SLIDE) {
+                        if (k_pos < window_lo) sv = -INFINITY;
+                    }
                     s_loc[k] = sv;
                     row_max = max(row_max, sv);
                 }
@@ -3597,9 +3757,9 @@ kernel void flex_attn_slide_v0(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // AV: scalar cooperative (same as paged_attn_slide_gqa_compute).
+        // AV: scalar cooperative.
         for (uint d = lid; d < D; d += THREADS) {
-            half V_reg[PAGE];
+            half V_reg[MAX_PAGE];
             for (uint k = 0; k < PAGE; ++k) {
                 V_reg[k] = Vbase[k * kv_row_stride + d];
             }
@@ -3614,10 +3774,9 @@ kernel void flex_attn_slide_v0(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Write partials per Q head. Output layout stride = total_splits_out
-    // (falls back to N_SPLITS for pre-broadcast callers that don't set it).
-    // With split_offset>0, this kernel writes to the tail slice of a shared
-    // partials buffer whose split=0 is owned by the shared-prefix kernel.
+    // Write partials per Q head. When split_offset>0, this writes the tail
+    // slice of a shared partials buffer whose split=0 belongs to the
+    // shared-prefix broadcast kernel.
     const uint out_stride = (total_splits_out > 0) ? total_splits_out : N_SPLITS;
     const bool empty_split = (ix_begin >= ix_end);
     for (uint q = 0; q < Q_PER_TG; ++q) {
@@ -3632,193 +3791,6 @@ kernel void flex_attn_slide_v0(
     }
 }
 
-// Cross-slot K/V broadcast kernel for AR decode over a SHARED PREFIX.
-//
-// Problem it solves: when B sessions share a KV prefix (same system prompt,
-// same multi-turn history, same cached tool-call result), every slot's AR
-// attention step independently re-reads the same K/V from DRAM. For a 1000-
-// token shared prefix at D=256, that's 1000 × 256 × 2 B × B reads per layer.
-// This kernel loads each shared page's K/V ONCE into threadgroup memory, then
-// runs Q@K for every slot's Q against that single staged K. Saves (B-1)/B of
-// the K/V bandwidth on the shared range (75% at B=4).
-//
-// Grid: (H_KV, 1, 1) — one TG per kv_head, fans out to all B slots in-TG.
-// Output: partials at (slot, q_head, split=0). Paired with a tail-only kernel
-// (the standard per-slot kernel called with a starting page offset) writing
-// split=1, then paged_attn_split_reduce with N_SPLITS=2 merges them into the
-// final per-slot attention output.
-//
-// Scope for v1: slide layers only (D=256, PAGE=16, Q_PER_TG=2). Full-attn has
-// the same pattern at D=512, PAGE=8 but different tg-mem math; left for a
-// follow-up. Causal + sliding-window applied per-slot in softmax using
-// per-slot k_len from `k_len_per_slot`. Each slot's SW horizon can differ,
-// so the mask is still per-slot even though K/V loads are shared.
-kernel void paged_attn_slide_ar_shared(
-    device const half* Q                    [[buffer(0)]],   // [B, H_Q, D]
-    device const half* K_cache              [[buffer(1)]],
-    device const half* V_cache              [[buffer(2)]],
-    device const uint* shared_pages         [[buffer(3)]],   // [prefix_pages] phys-page list
-    device float* m_partials                [[buffer(4)]],   // [B, H_Q, N_SPLITS]
-    device float* l_partials                [[buffer(5)]],
-    device float* O_partials                [[buffer(6)]],   // [B, H_Q, N_SPLITS, D]
-    device const uint* k_len_per_slot       [[buffer(7)]],
-    constant float& qk_scale                [[buffer(8)]],
-    constant uint& H_Q                      [[buffer(9)]],
-    constant uint& H_KV                     [[buffer(10)]],
-    constant uint& N_SPLITS                 [[buffer(11)]],
-    constant uint& prefix_pages             [[buffer(12)]],
-    constant uint& sliding_window           [[buffer(13)]],
-    constant uint& B_batch                  [[buffer(14)]],
-    uint3 tg_pos                            [[threadgroup_position_in_grid]],
-    uint3 lid3                              [[thread_position_in_threadgroup]])
-{
-    constexpr uint D = 256;
-    constexpr uint PAGE = 16;
-    constexpr uint THREADS = 128;       // 4 simdgroups
-    constexpr uint Q_PER_TG = 2;
-    constexpr uint MAX_B = 4;            // cap; B_batch runtime arg picks actual
-    constexpr uint D8 = D / 8;
-
-    const uint kv_head = tg_pos.x;
-    const uint q_head_base = kv_head * Q_PER_TG;
-    const uint lid = lid3.x;
-
-    // Threadgroup state. See kernel header for tg-mem budget.
-    threadgroup half  Q_tile[MAX_B * Q_PER_TG * D];       // 4*2*256*2 = 4KB
-    threadgroup half  K_stage[PAGE * D];                  // 16*256*2 = 8KB
-    threadgroup half  V_stage[PAGE * D];                  // 16*256*2 = 8KB
-    threadgroup half  scores_tile[MAX_B * Q_PER_TG * PAGE]; // 4*2*16*2 = 256B
-    threadgroup float O_acc[MAX_B * Q_PER_TG * D];        // 4*2*256*4 = 8KB
-    threadgroup float m_state[MAX_B * Q_PER_TG];
-    threadgroup float l_state[MAX_B * Q_PER_TG];
-    threadgroup float scale_tile[MAX_B * Q_PER_TG];
-
-    // Load all active slots' Q for this kv_head's Q_PER_TG grouping.
-    for (uint i = lid; i < B_batch * Q_PER_TG * D; i += THREADS) {
-        uint b = i / (Q_PER_TG * D);
-        uint r = (i / D) % Q_PER_TG;
-        uint d = i % D;
-        uint q_head = q_head_base + r;
-        Q_tile[i] = Q[(b * H_Q + q_head) * D + d];
-    }
-    // Clear O_acc for all active slots.
-    for (uint i = lid; i < B_batch * Q_PER_TG * D; i += THREADS) O_acc[i] = 0.0f;
-    if (lid < B_batch * Q_PER_TG) {
-        m_state[lid] = -INFINITY;
-        l_state[lid] = 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint kv_row_stride = H_KV * D;
-
-    // Iterate over SHARED pages. Each page's K/V is loaded once and reused
-    // across all active slots' Q@K + score@V computations.
-    for (uint p = 0; p < prefix_pages; ++p) {
-        const uint phys = shared_pages[p];
-        device const half* Kbase = K_cache + (phys * PAGE * H_KV + kv_head) * D;
-        device const half* Vbase = V_cache + (phys * PAGE * H_KV + kv_head) * D;
-
-        // Stage K into tg-mem. Layout: K_stage[k * D + d].
-        for (uint i = lid; i < PAGE * D; i += THREADS) {
-            uint k = i / D;
-            uint d = i % D;
-            K_stage[i] = Kbase[k * kv_row_stride + d];
-        }
-        // Stage V into tg-mem. Same layout.
-        for (uint i = lid; i < PAGE * D; i += THREADS) {
-            uint k = i / D;
-            uint d = i % D;
-            V_stage[i] = Vbase[k * kv_row_stride + d];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Q@K for every slot's Q, against the shared K. Each slot's Q_PER_TG
-        // rows share a K column (PAGE=16 → 2 passes of 8 K cols each).
-        for (uint b = 0; b < B_batch; ++b) {
-            for (uint pb = 0; pb < PAGE / 8; ++pb) {
-                simdgroup_half8x8 mqk = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
-                threadgroup const half* pk = K_stage + (pb * 8) * D;
-                for (uint dt = 0; dt < D8; ++dt) {
-                    simdgroup_half8x8 mq, mk;
-                    simdgroup_load(mq, Q_tile + b * Q_PER_TG * D + dt * 8, D);
-                    simdgroup_load(mk, pk + dt * 8, D, ulong2(0, 0), true);
-                    simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
-                }
-                simdgroup_store(mqk, scores_tile + (b * Q_PER_TG) * PAGE + pb * 8, PAGE);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Per-row online softmax with PER-SLOT mask (k_len and SW may differ
-        // across slots even when the prefix pages themselves are shared).
-        if (lid < B_batch * Q_PER_TG) {
-            uint b = lid / Q_PER_TG;
-            uint row_idx = lid;
-            uint k_len = k_len_per_slot[b];
-            uint window_lo = (sliding_window > 0 && k_len > sliding_window)
-                             ? (k_len - sliding_window) : 0u;
-
-            float row_max = -INFINITY;
-            float s_loc[PAGE];
-            for (uint k = 0; k < PAGE; ++k) {
-                float sv = float(scores_tile[row_idx * PAGE + k]) * qk_scale;
-                uint k_pos = p * PAGE + k;
-                if (k_pos >= k_len || k_pos < window_lo) sv = -INFINITY;
-                s_loc[k] = sv;
-                row_max = max(row_max, sv);
-            }
-            float m_old = m_state[row_idx];
-            float m_new = max(m_old, row_max);
-            float scale = exp(m_old - m_new);
-            float sum = 0.0f;
-            for (uint k = 0; k < PAGE; ++k) {
-                float e = exp(s_loc[k] - m_new);
-                scores_tile[row_idx * PAGE + k] = half(e);
-                sum += e;
-            }
-            m_state[row_idx] = m_new;
-            l_state[row_idx] = l_state[row_idx] * scale + sum;
-            scale_tile[row_idx] = scale;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // AV: each lane owns D/THREADS dims; for each (slot, q_head) row,
-        // multiply by rescale then accumulate scores @ V.
-        for (uint sqd = lid; sqd < B_batch * Q_PER_TG * D; sqd += THREADS) {
-            uint b = sqd / (Q_PER_TG * D);
-            uint q = (sqd / D) % Q_PER_TG;
-            uint d = sqd % D;
-            uint row_idx = b * Q_PER_TG + q;
-            float acc = O_acc[row_idx * D + d] * scale_tile[row_idx];
-            for (uint k = 0; k < PAGE; ++k) {
-                acc += float(scores_tile[row_idx * PAGE + k])
-                     * float(V_stage[k * D + d]);
-            }
-            O_acc[row_idx * D + d] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // Write partials at split=0 per (slot, q_head). Empty-prefix edge case:
-    // if prefix_pages==0 we never entered the loop; m_state is still -INF
-    // (correctly signalling "nothing seen") and O_acc is zero.
-    if (lid < B_batch * Q_PER_TG) {
-        uint b = lid / Q_PER_TG;
-        uint q = lid % Q_PER_TG;
-        uint q_head = q_head_base + q;
-        uint pidx = (b * H_Q + q_head) * N_SPLITS + 0;
-        m_partials[pidx] = m_state[lid];
-        l_partials[pidx] = l_state[lid];
-    }
-    for (uint sqd = lid; sqd < B_batch * Q_PER_TG * D; sqd += THREADS) {
-        uint b = sqd / (Q_PER_TG * D);
-        uint q = (sqd / D) % Q_PER_TG;
-        uint d = sqd % D;
-        uint q_head = q_head_base + q;
-        uint pidx = (b * H_Q + q_head) * N_SPLITS + 0;
-        O_partials[pidx * D + d] = O_acc[(b * Q_PER_TG + q) * D + d];
-    }
-}
 
 // Flex attention v1 — slide layer with Q_BLOCK=8 (prefill).
 // Each TG covers 8 consecutive Q positions × Q_PER_TG=2 Q-heads → 16 real Q rows.
@@ -4247,326 +4219,7 @@ kernel void flex_attn_full_prefill(
     }
 }
 
-// Full-attention cross-slot K/V broadcast kernel (shared-prefix AR).
-// Mirrors paged_attn_slide_ar_shared but for D=512, PAGE=8 full-attn
-// layers. tg-mem budget forces Q_PER_TG=1 (one q_head per TG); grid is
-// (H_Q, 1, 1) = 16 TGs per layer, each broadcasting its q_head across
-// all B active slots. Q_heads sharing a kv_head will all issue the same
-// K/V load pattern — on Apple Silicon these hit L2 after the first load,
-// so we still get most of the bandwidth benefit of true broadcast.
-//
-// tg-mem ≈ 28 KB at B=4: Q_tile 4 KB + K_stage 8 KB + V_stage 8 KB +
-// O_acc 8 KB + small m/l state.
-kernel void paged_attn_full_ar_shared(
-    device const half* Q                    [[buffer(0)]],   // [B, H_Q, D]
-    device const half* K_cache              [[buffer(1)]],
-    device const half* V_cache              [[buffer(2)]],
-    device const uint* shared_pages         [[buffer(3)]],   // [prefix_pages]
-    device float* m_partials                [[buffer(4)]],
-    device float* l_partials                [[buffer(5)]],
-    device float* O_partials                [[buffer(6)]],
-    device const uint* k_len_per_slot       [[buffer(7)]],
-    constant float& qk_scale                [[buffer(8)]],
-    constant uint& H_Q                      [[buffer(9)]],
-    constant uint& H_KV                     [[buffer(10)]],
-    constant uint& N_SPLITS                 [[buffer(11)]],
-    constant uint& prefix_pages             [[buffer(12)]],
-    constant uint& B_batch                  [[buffer(13)]],
-    uint3 tg_pos                            [[threadgroup_position_in_grid]],
-    uint3 lid3                              [[thread_position_in_threadgroup]])
-{
-    constexpr uint D = 512;
-    constexpr uint PAGE = 8;
-    constexpr uint THREADS = 128;
-    constexpr uint MAX_B = 4;
-    constexpr uint D8 = D / 8;
 
-    const uint q_head = tg_pos.x;
-    const uint kv_head = (q_head * H_KV) / H_Q;   // per GQA grouping
-    const uint lid = lid3.x;
-
-    threadgroup half  Q_tile[MAX_B * D];          // 4*512*2 = 4 KB
-    threadgroup half  K_stage[PAGE * D];          // 8*512*2 = 8 KB
-    threadgroup half  V_stage[PAGE * D];          // 8*512*2 = 8 KB
-    threadgroup half  scores_tile[MAX_B * PAGE];  // 4*8*2 = 64 B
-    threadgroup float O_acc[MAX_B * D];           // 4*512*4 = 8 KB
-    threadgroup float m_state[MAX_B];
-    threadgroup float l_state[MAX_B];
-    threadgroup float scale_tile[MAX_B];
-
-    // Load all active slots' Q[this q_head] into Q_tile
-    for (uint i = lid; i < B_batch * D; i += THREADS) {
-        uint b = i / D;
-        uint d = i % D;
-        Q_tile[i] = Q[(b * H_Q + q_head) * D + d];
-    }
-    for (uint i = lid; i < B_batch * D; i += THREADS) O_acc[i] = 0.0f;
-    if (lid < B_batch) {
-        m_state[lid] = -INFINITY;
-        l_state[lid] = 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint kv_row_stride = H_KV * D;
-
-    for (uint p = 0; p < prefix_pages; ++p) {
-        const uint phys = shared_pages[p];
-        device const half* Kbase = K_cache + (phys * PAGE * H_KV + kv_head) * D;
-        device const half* Vbase = V_cache + (phys * PAGE * H_KV + kv_head) * D;
-
-        // Stage K & V into tg-mem (shared by all slots' compute below).
-        for (uint i = lid; i < PAGE * D; i += THREADS) {
-            uint k = i / D; uint d = i % D;
-            K_stage[i] = Kbase[k * kv_row_stride + d];
-        }
-        for (uint i = lid; i < PAGE * D; i += THREADS) {
-            uint k = i / D; uint d = i % D;
-            V_stage[i] = Vbase[k * kv_row_stride + d];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Q@K for every slot. MAX_B=4 slots, each one 1×D × D×8 = 1×8 score row.
-        // Pad Q to 8 rows for 8×8 MMA (slots beyond B_batch get all-zero Q).
-        for (uint b = 0; b < B_batch; ++b) {
-            simdgroup_half8x8 mqk = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
-            for (uint dt = 0; dt < D8; ++dt) {
-                simdgroup_half8x8 mq, mk;
-                simdgroup_load(mq, Q_tile + b * D + dt * 8, D);
-                simdgroup_load(mk, K_stage + dt * 8, D, ulong2(0, 0), true);
-                simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
-            }
-            // Only row 0 of the 8x8 MMA matters (Q_PER_TG=1 → 1 real Q row);
-            // store full 8×8 to scores buffer and ignore rows 1..7.
-            threadgroup half row_buf[8 * PAGE];
-            simdgroup_store(mqk, row_buf, PAGE);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint k = lid; k < PAGE; k += THREADS) {
-                scores_tile[b * PAGE + k] = row_buf[k];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        // Per-slot softmax with per-slot k_len mask.
-        if (lid < B_batch) {
-            uint b = lid;
-            uint k_len = k_len_per_slot[b];
-            float row_max = -INFINITY;
-            float s_loc[PAGE];
-            for (uint k = 0; k < PAGE; ++k) {
-                float sv = float(scores_tile[b * PAGE + k]) * qk_scale;
-                uint k_pos = p * PAGE + k;
-                if (k_pos >= k_len) sv = -INFINITY;
-                s_loc[k] = sv;
-                row_max = max(row_max, sv);
-            }
-            float m_old = m_state[b];
-            float m_new = max(m_old, row_max);
-            float scale = exp(m_old - m_new);
-            float sum = 0.0f;
-            for (uint k = 0; k < PAGE; ++k) {
-                float e = exp(s_loc[k] - m_new);
-                scores_tile[b * PAGE + k] = half(e);
-                sum += e;
-            }
-            m_state[b] = m_new;
-            l_state[b] = l_state[b] * scale + sum;
-            scale_tile[b] = scale;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // AV: each lane owns D/THREADS dims per slot.
-        for (uint bd = lid; bd < B_batch * D; bd += THREADS) {
-            uint b = bd / D;
-            uint d = bd % D;
-            float acc = O_acc[b * D + d] * scale_tile[b];
-            for (uint k = 0; k < PAGE; ++k) {
-                acc += float(scores_tile[b * PAGE + k])
-                     * float(V_stage[k * D + d]);
-            }
-            O_acc[b * D + d] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // Write partials at split=0 for each active slot.
-    if (lid < B_batch) {
-        uint b = lid;
-        uint pidx = (b * H_Q + q_head) * N_SPLITS + 0;
-        m_partials[pidx] = m_state[b];
-        l_partials[pidx] = l_state[b];
-    }
-    for (uint bd = lid; bd < B_batch * D; bd += THREADS) {
-        uint b = bd / D;
-        uint d = bd % D;
-        uint pidx = (b * H_Q + q_head) * N_SPLITS + 0;
-        O_partials[pidx * D + d] = O_acc[b * D + d];
-    }
-}
-
-// Flex attention v0 for full-attention layers: D=512, PAGE=8, Q_PER_TG=8,
-// Q_BLOCK=1, mask_mod = causal (no sliding window — full layers are global).
-// Same list-driven structure as the slide variant.
-kernel void flex_attn_full_v0(
-    device const half* Q                    [[buffer(0)]],
-    device const half* K_cache              [[buffer(1)]],
-    device const half* V_cache              [[buffer(2)]],
-    device const uint* block_table          [[buffer(3)]],
-    device float* m_partials                [[buffer(4)]],
-    device float* l_partials                [[buffer(5)]],
-    device float* O_partials                [[buffer(6)]],
-    device const uint* full_kv_offsets      [[buffer(7)]],
-    device const uint* full_kv_indices      [[buffer(8)]],
-    device const uint* partial_kv_offsets   [[buffer(9)]],
-    device const uint* partial_kv_indices   [[buffer(10)]],
-    device const uint* k_len_per_slot       [[buffer(11)]],
-    constant float& qk_scale                [[buffer(12)]],
-    constant uint& max_pages                [[buffer(13)]],
-    constant uint& H_Q                      [[buffer(14)]],
-    constant uint& H_KV                     [[buffer(15)]],
-    constant uint& N_SPLITS                 [[buffer(16)]],
-    constant uint& prefix_pages             [[buffer(17)]],    // skip pages < this (tail mode)
-    constant uint& split_offset             [[buffer(18)]],    // write at split_offset+tg.y in output layout
-    constant uint& total_splits_out         [[buffer(19)]],    // output layout stride (0 → fallback to N_SPLITS)
-    uint3 tg_pos                            [[threadgroup_position_in_grid]],
-    uint3 lid3                              [[thread_position_in_threadgroup]])
-{
-    constexpr uint D = 512;
-    constexpr uint PAGE = 8;
-    constexpr uint THREADS = 32;
-    constexpr uint Q_PER_TG = 8;
-    constexpr uint D8 = D / 8;           // 64
-
-    const uint vs = tg_pos.x;
-    const uint split = tg_pos.y;
-    const uint slot = vs / H_KV;
-    const uint kv_head = vs % H_KV;
-    const uint q_head_base = kv_head * Q_PER_TG;
-    const uint lid = lid3.x;
-
-    const uint csr_idx = slot;
-
-    threadgroup half  Q_tile[Q_PER_TG * D];
-    threadgroup half  scores_tile[Q_PER_TG * PAGE];
-    threadgroup float O_acc[Q_PER_TG * D];
-    threadgroup float m_state[Q_PER_TG];
-    threadgroup float l_state[Q_PER_TG];
-    threadgroup float scale_tile[Q_PER_TG];
-
-    device const half* Qbase = Q + (slot * H_Q + q_head_base) * D;
-    device const uint* bt_s = block_table + slot * max_pages;
-
-    for (uint i = lid; i < Q_PER_TG * D; i += THREADS) Q_tile[i] = Qbase[i];
-    for (uint i = lid; i < Q_PER_TG * D; i += THREADS) O_acc[i] = 0.0f;
-    if (lid < Q_PER_TG) { m_state[lid] = -INFINITY; l_state[lid] = 0.0f; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint k_len = k_len_per_slot[slot];
-    const uint kv_row_stride = H_KV * D;
-
-    uint full_lo  = full_kv_offsets[csr_idx];
-    uint full_hi  = full_kv_offsets[csr_idx + 1];
-    uint part_lo  = partial_kv_offsets[csr_idx];
-    uint part_hi  = partial_kv_offsets[csr_idx + 1];
-    uint n_full   = full_hi - full_lo;
-    uint n_part   = part_hi - part_lo;
-    uint n_total  = n_full + n_part;
-    uint per_split = (n_total + N_SPLITS - 1) / N_SPLITS;
-    uint ix_begin = split * per_split;
-    uint ix_end   = min(ix_begin + per_split, n_total);
-
-    for (uint ix = ix_begin; ix < ix_end; ++ix) {
-        uint p;
-        bool is_partial;
-        if (ix < n_full) {
-            p = full_kv_indices[full_lo + ix];
-            is_partial = false;
-        } else {
-            p = partial_kv_indices[part_lo + (ix - n_full)];
-            is_partial = true;
-        }
-        // Tail mode: skip logical pages owned by the full-attn shared-prefix kernel.
-        if (p < prefix_pages) continue;
-
-        const uint phys = bt_s[p];
-        device const half* Kbase = K_cache + (phys * PAGE * H_KV + kv_head) * D;
-        device const half* Vbase = V_cache + (phys * PAGE * H_KV + kv_head) * D;
-
-        // QK: one 8x8 MMA per d-tile; 64 d-tiles at D=512. Q=8 real rows.
-        simdgroup_half8x8 mqk = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
-        for (uint dt = 0; dt < D8; ++dt) {
-            simdgroup_half8x8 mq, mk;
-            simdgroup_load(mq, Q_tile + dt * 8, D);
-            simdgroup_load(mk, Kbase + dt * 8, kv_row_stride, ulong2(0, 0), true);
-            simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
-        }
-        simdgroup_store(mqk, scores_tile, PAGE);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Per-row online softmax. FULL blocks skip the per-k predicate.
-        if (lid < Q_PER_TG) {
-            const uint q = lid;
-            float row_max = -INFINITY;
-            float s_loc[PAGE];
-            if (is_partial) {
-                for (uint k = 0; k < PAGE; ++k) {
-                    float sv = float(scores_tile[q * PAGE + k]) * qk_scale;
-                    uint k_pos = p * PAGE + k;
-                    if (k_pos >= k_len) sv = -INFINITY;
-                    s_loc[k] = sv;
-                    row_max = max(row_max, sv);
-                }
-            } else {
-                for (uint k = 0; k < PAGE; ++k) {
-                    float sv = float(scores_tile[q * PAGE + k]) * qk_scale;
-                    s_loc[k] = sv;
-                    row_max = max(row_max, sv);
-                }
-            }
-            float m_old = m_state[q];
-            float m_new = max(m_old, row_max);
-            float scale = exp(m_old - m_new);
-            float sum = 0.0f;
-            for (uint k = 0; k < PAGE; ++k) {
-                float e = exp(s_loc[k] - m_new);
-                scores_tile[q * PAGE + k] = half(e);
-                sum += e;
-            }
-            m_state[q] = m_new;
-            l_state[q] = l_state[q] * scale + sum;
-            scale_tile[q] = scale;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // AV: scalar cooperative.
-        for (uint d = lid; d < D; d += THREADS) {
-            half V_reg[PAGE];
-            for (uint k = 0; k < PAGE; ++k) {
-                V_reg[k] = Vbase[k * kv_row_stride + d];
-            }
-            for (uint q = 0; q < Q_PER_TG; ++q) {
-                float acc = O_acc[q * D + d] * scale_tile[q];
-                for (uint k = 0; k < PAGE; ++k) {
-                    acc += float(scores_tile[q * PAGE + k]) * float(V_reg[k]);
-                }
-                O_acc[q * D + d] = acc;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    const uint out_stride = (total_splits_out > 0) ? total_splits_out : N_SPLITS;
-    const bool empty_split = (ix_begin >= ix_end);
-    for (uint q = 0; q < Q_PER_TG; ++q) {
-        const uint q_head = q_head_base + q;
-        const uint pidx = (slot * H_Q + q_head) * out_stride + split_offset + split;
-        if (lid == 0) {
-            m_partials[pidx] = empty_split ? -INFINITY : m_state[q];
-            l_partials[pidx] = empty_split ? 0.0f : l_state[q];
-        }
-        device float* O_part = O_partials + pidx * D;
-        for (uint d = lid; d < D; d += THREADS) O_part[d] = O_acc[q * D + d];
-    }
-}
 
 // =======================================================================
 // fp32-path vision encoder kernels.
@@ -5619,6 +5272,187 @@ kernel void vision_scaled_std_normalize_fp32(
         float v = x[b * D + i] * global_scale;
         v -= float(bias[i]);
         out[b * D + i] = v * float(scale[i]);
+    }
+}
+
+// ============================================================================
+// GPU-side sampling kernel — Phase 1+1b of the dataflow pipeline spec.
+// See docs/dataflow_pipeline_spec.md §2.1.
+//
+// Direct port of CPU `sampleTokenFromLogits` (lm_engine.swift): same
+// inverse-CDF softmax-sampling algorithm, same temperature/min_p
+// semantics, same T<=0 argmax fast path, same additive per-slot
+// logit_bias. The ONLY substitution is the PRNG — Swift's stdlib RNG
+// cannot be called from Metal, so we use philox-4x32-10 keyed on
+// (seed, step, slot) for the per-slot uniform draw. Output distribution
+// is identical to the CPU path; specific draws differ because the PRNG
+// differs.
+//
+// Grid: (B, 1, 1). One TG per slot. 32 threads per TG (one simdgroup)
+// scan VOCAB cooperatively for the max/sum-exp reductions; the final
+// inverse-CDF walk runs on lid==0 only (~ms at VOCAB=262144, amortized
+// against a ~100ms step).
+//
+// logit_bias is a dense [B, VOCAB] fp32 buffer. Slots without a
+// client-set bias hold all-zeros, so the add is a no-op uniform across
+// threads. No data-conditional branch inside the kernel.
+//
+// When `sampling_active[slot] == 0` the kernel leaves input_tokens
+// untouched — caller's responsibility to ignore idle slots.
+// ============================================================================
+
+// philox-4x32-10 constants.
+#define PHILOX_M0 0xD2511F53u
+#define PHILOX_M1 0xCD9E8D57u
+#define PHILOX_W0 0x9E3779B9u
+#define PHILOX_W1 0xBB67AE85u
+
+static inline uint _mulhi_u32(uint x, uint y) {
+    return uint((ulong(x) * ulong(y)) >> 32);
+}
+
+// One uniform float in [0, 1) per (seed, step, slot). Same tuple →
+// same draw, different tuples → statistically-independent draws. 10
+// rounds matches the standard Random123 `philox4x32_10` (Salmon et al.
+// SC'11). We consume the high 24 bits of ctr.x to build a float —
+// avoids LSB bias that some PRNG outputs have.
+static inline float philox_uniform(uint seed, uint step_id, uint slot) {
+    uint4 ctr = uint4(step_id, 0u, slot, 0u);
+    uint2 key = uint2(seed, 0xA3C59A5Du);  // fixed key suffix
+    for (uint r = 0; r < 10; ++r) {
+        uint hi0 = _mulhi_u32(ctr.x, PHILOX_M0);
+        uint lo0 = ctr.x * PHILOX_M0;
+        uint hi1 = _mulhi_u32(ctr.z, PHILOX_M1);
+        uint lo1 = ctr.z * PHILOX_M1;
+        uint4 c;
+        c.x = hi1 ^ ctr.y ^ key.x;
+        c.y = lo1;
+        c.z = hi0 ^ ctr.w ^ key.y;
+        c.w = lo0;
+        ctr = c;
+        if (r < 9) {
+            key.x += PHILOX_W0;
+            key.y += PHILOX_W1;
+        }
+    }
+    return float(ctr.x >> 8) * (1.0f / 16777216.0f);   // 2^-24
+}
+
+kernel void sample_token(
+    device const half* logits                [[buffer(0)]],   // [B, VOCAB]
+    device const float* sampling_logit_bias  [[buffer(1)]],   // [B, VOCAB]
+    device const float* sampling_temperature [[buffer(2)]],   // [B]
+    device const float* sampling_min_p       [[buffer(3)]],   // [B]
+    device const uint* sampling_seed         [[buffer(4)]],   // [B]
+    device const uint* sampling_step         [[buffer(5)]],   // [B]
+    device const uint* sampling_active       [[buffer(6)]],   // [B] 0/1
+    device uint* input_tokens                [[buffer(7)]],   // [B] — WRITE
+    constant uint& VOCAB                     [[buffer(8)]],
+    uint3 tg_pos                             [[threadgroup_position_in_grid]],
+    uint3 lid3                               [[thread_position_in_threadgroup]])
+{
+    const uint slot = tg_pos.x;
+    const uint lid  = lid3.x;
+    constexpr uint THREADS = 32;
+
+    if (sampling_active[slot] == 0) return;
+
+    device const half* L = logits + slot * VOCAB;
+    device const float* BIAS = sampling_logit_bias + slot * VOCAB;
+    const float temperature = sampling_temperature[slot];
+
+    // T <= 0: argmax fast path over (logit + bias). Matches CPU
+    // `rawLogit(v)` which always applies bias regardless of temperature.
+    // Ties broken toward the lowest token id (strict `>` in CPU; same
+    // tie rule here).
+    if (temperature <= 0.0f) {
+        uint local_best_id = 0xFFFFFFFFu;
+        float local_best_val = -INFINITY;
+        for (uint v = lid; v < VOCAB; v += THREADS) {
+            float x = float(L[v]) + BIAS[v];
+            if (x > local_best_val || (x == local_best_val && v < local_best_id)) {
+                local_best_val = x;
+                local_best_id  = v;
+            }
+        }
+        threadgroup float vals[THREADS];
+        threadgroup uint  ids [THREADS];
+        vals[lid] = local_best_val;
+        ids [lid] = local_best_id;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = THREADS / 2; s > 0; s /= 2) {
+            if (lid < s) {
+                float oV = vals[lid + s];
+                uint  oI = ids [lid + s];
+                if (oV > vals[lid] || (oV == vals[lid] && oI < ids[lid])) {
+                    vals[lid] = oV;
+                    ids [lid] = oI;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lid == 0) input_tokens[slot] = ids[0];
+        return;
+    }
+
+    // T > 0: inverse-CDF softmax sampling. Three vocab passes, matching
+    // the CPU algorithm structure pass-for-pass. CPU's `rawLogit(v) * tInv`
+    // becomes `(logit[v] + bias[v]) * tInv` here — same expression.
+    const float tInv = 1.0f / temperature;
+    const float minP = sampling_min_p[slot];
+
+    // Pass 1: max of (logit + bias) * tInv.
+    float local_max = -INFINITY;
+    for (uint v = lid; v < VOCAB; v += THREADS) {
+        float x = (float(L[v]) + BIAS[v]) * tInv;
+        if (x > local_max) local_max = x;
+    }
+    threadgroup float mx[THREADS];
+    mx[lid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = THREADS / 2; s > 0; s /= 2) {
+        if (lid < s) mx[lid] = max(mx[lid], mx[lid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float m = mx[0];
+    const float cutoff = (minP > 0.0f) ? (m + log(minP)) : -INFINITY;
+
+    // Pass 2: sum_exp over eligible logits (x >= cutoff).
+    float local_sum = 0.0f;
+    for (uint v = lid; v < VOCAB; v += THREADS) {
+        float x = (float(L[v]) + BIAS[v]) * tInv;
+        if (x >= cutoff) local_sum += exp(x - m);
+    }
+    threadgroup float sm[THREADS];
+    sm[lid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = THREADS / 2; s > 0; s /= 2) {
+        if (lid < s) sm[lid] += sm[lid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float sumExp = sm[0];
+
+    // Draw one uniform r via philox. Only lid==0 runs; broadcast via
+    // threadgroup memory.
+    threadgroup float r_shared;
+    if (lid == 0) {
+        r_shared = philox_uniform(
+            sampling_seed[slot], sampling_step[slot], slot);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float target = r_shared * sumExp;
+
+    // Pass 3: inverse-CDF walk. Sequential on lid==0.
+    if (lid == 0) {
+        float cum = 0.0f;
+        uint chosen = VOCAB - 1;
+        for (uint v = 0; v < VOCAB; ++v) {
+            float x = (float(L[v]) + BIAS[v]) * tInv;
+            if (x < cutoff) continue;
+            cum += exp(x - m);
+            if (cum >= target) { chosen = v; break; }
+        }
+        input_tokens[slot] = chosen;
     }
 }
 """

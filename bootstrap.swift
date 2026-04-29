@@ -31,6 +31,21 @@ import Accelerate
 // (vision_tower.swift, future llm_*.swift) can initialize their top-level PSO
 // bindings in a defined order.
 
+// Vision→LM cross-queue ordering primitive. Vision pad-blit CBs encode
+// signal-event with a monotonic ticket; LM pre-prefill CBs encode
+// wait-event for that ticket. GPU waits, CPU never blocks. See
+// notes/engine_debloat.md.
+let gVisionEvent: MTLSharedEvent = device.makeSharedEvent()!
+let gVisionEventCounterLock = NSLock()
+private var _gVisionEventCounter: UInt64 = 0
+func nextVisionEventTicket() -> UInt64 {
+    gVisionEventCounterLock.lock(); defer { gVisionEventCounterLock.unlock() }
+    _gVisionEventCounter += 1
+    return _gVisionEventCounter
+}
+
+let visionSoftsCopyFp32PSO = pso("vision_softs_copy_fp32_to_fp16")
+
 let rmsPSO          = pso("rms_norm")
 let rmsNoScalePSO   = pso("rms_norm_noscale")
 let scaleByScalarPSO = pso("scale_by_scalar")
@@ -41,18 +56,20 @@ let addScaledCvecPrefillPSO = pso("add_scaled_cvector_prefill_fp16")
 let projectCvecPSO          = pso("project_cvector_fp16")
 let projectCvecSlotPSO      = pso("project_cvector_slot_fp16")
 let projectCvecPrefillPSO   = pso("project_cvector_prefill_fp16")
+let transportCvecSlotPSO    = pso("transport_cvector_slot_fp16")
+let transportCvecPrefillPSO = pso("transport_cvector_prefill_fp16")
+let orthogWritePSO          = pso("orthogonalize_write_fp16")
 let measureDotPSO    = pso("measure_dot_fp16")
 let geluMulPSO      = pso("gelu_mul_inplace")
 let moeCombineWritePSO = pso("moe_combine_write")
 let gemvV5PSO      = pso("dense_gemv_v5")
 let gemvV4PSO      = pso("dense_gemv_v4")
+let gemvV4PPSO     = pso("dense_gemv_v4_p")
 let gemvV4SoftcapPSO = pso("dense_gemv_v4_softcap")
 let gemvI8V4PSO    = pso("dense_gemv_i8w_v4")
 let ropePSO        = pso("rope_half")
 let kvwPSO         = pso("kv_write")
 let fakeAttnPSO    = pso("fake_attention")
-let pagedSlidePSO  = pso("paged_attn_slide")
-let pagedFullPSO   = pso("paged_attn_full")
 let topkPSO        = pso("softmax_topk")
 let routeCompactPSO = pso("route_compact")
 let moePSO         = pso("moe_gemv_v3")
@@ -62,29 +79,56 @@ let moeQ4KV4PSO    = pso("moe_gemv_q4k_v4")
 let moeQ51V4PSO    = pso("moe_gemv_q5_1_v4")
 let moeQ51V6PSO    = pso("moe_gemv_q5_1_v6")
 let moeQ4KV6PSO    = pso("moe_gemv_q4k_v6")
+let moeQ51V8PSO    = pso("moe_gemv_q5_1_v8")
+let moeQ4KV8PSO    = pso("moe_gemv_q4k_v8")
+let moeQ51V9PSO    = pso("moe_gemv_q5_1_v9")
+let moeQ4KV9PSO    = pso("moe_gemv_q4k_v9")
+let moeQ4KV10PSO   = pso("moe_gemv_q4k_v10_fused_gelu")
 let denseQ4KV4PSO  = pso("dense_gemv_q4k_v4")
 let moeQ40PSO      = pso("moe_gemv_q4_0_v3")
 let denseQ40V4PSO  = pso("dense_gemv_q4_0_v4")
 let denseQ80V5PSO  = pso("dense_gemv_q8_0_v5")
+// Q8_0 GEMV kernel zoo: compile-time fixed B_TILE specializations.
+// Scheduler picks by activeB rounded up to nearest power of 2.
+let denseQ80BtileB1PSO = pso("dense_gemv_q8_0_btile_b1")
+let denseQ80BtileB2PSO = pso("dense_gemv_q8_0_btile_b2")
+let denseQ80BtileB4PSO = pso("dense_gemv_q8_0_btile_b4")
+let denseQ80BtileB8PSO = pso("dense_gemv_q8_0_btile_b8")
+// Q8_0 RMSNorm+QKV templated zoo. B_TILE=8 omitted (tg-mem cap); for
+// activeB > 4 the dispatcher falls back to V6 grid-shrink at numVecs.
+let denseQ80BtileQkvB1PSO = pso("dense_gemv_q8_0_btile_qkv_b1")
+let denseQ80BtileQkvB2PSO = pso("dense_gemv_q8_0_btile_qkv_b2")
+let denseQ80BtileQkvB4PSO = pso("dense_gemv_q8_0_btile_qkv_b4")
 let denseQ80V5RmsPSO = pso("dense_gemv_q8_0_v5_rmsnorm")
 let denseQ80V6PSO    = pso("dense_gemv_q8_0_v6")
 let denseQ80V6RmsPSO = pso("dense_gemv_q8_0_v6_rmsnorm")
 let denseQ80V6RmsQkvPSO = pso("dense_gemv_q8_0_v6_rmsnorm_qkv")
+let denseQ80V7RmsQkvPSO = pso("dense_gemv_q8_0_v7_rmsnorm_qkv")
 let denseQ80V6RmsGateUpPSO = pso("dense_gemv_q8_0_v6_rmsnorm_gate_up")
 let denseQ80V4PSO  = pso("dense_gemv_q8_0_v4")
 let moeQ51PSO      = pso("moe_gemv_q5_1_v3")
 let moeGeluMulFusedPSO = pso("moe_gelu_mul_fused")
-let pagedSlideSplitPSO = pso("paged_attn_slide_split_compute")
-let pagedFullSplitPSO  = pso("paged_attn_full_split_compute")
 let pagedSplitReducePSO = pso("paged_attn_split_reduce")
-let pagedSlideSgmmPSO  = pso("paged_attn_slide_sgmm_compute")
-let pagedFullSgmmPSO   = pso("paged_attn_full_sgmm_compute")
-let pagedFullGqaPSO    = pso("paged_attn_full_gqa_compute")
-let pagedSlideGqaPSO   = pso("paged_attn_slide_gqa_compute")
-let flexAttnSlideV0PSO = pso("flex_attn_slide_v0")
-let pagedAttnSlideArSharedPSO = pso("paged_attn_slide_ar_shared")
-let pagedAttnFullArSharedPSO  = pso("paged_attn_full_ar_shared")
-let flexAttnFullV0PSO  = pso("flex_attn_full_v0")
+let sampleTokenPSO      = pso("sample_token")
+// Two specialized PSOs compiled from the one unified `flex_attn_v0` kernel
+// source. Function constants set head-dim / page / Q-per-TG / mask style;
+// the MSL compiler produces the same asm as the old per-variant kernels.
+let flexAttnSlideV0PSO: MTLComputePipelineState = psoFC("flex_attn_v0") { fcv in
+    var d: Int32 = 256, page: Int32 = 16, qPerTg: Int32 = 2
+    var useSlide: Bool = true
+    fcv.setConstantValue(&d,        type: .int,  index: 0)
+    fcv.setConstantValue(&page,     type: .int,  index: 1)
+    fcv.setConstantValue(&qPerTg,   type: .int,  index: 2)
+    fcv.setConstantValue(&useSlide, type: .bool, index: 3)
+}
+let flexAttnFullV0PSO: MTLComputePipelineState = psoFC("flex_attn_v0") { fcv in
+    var d: Int32 = 512, page: Int32 = 8, qPerTg: Int32 = 8
+    var useSlide: Bool = false
+    fcv.setConstantValue(&d,        type: .int,  index: 0)
+    fcv.setConstantValue(&page,     type: .int,  index: 1)
+    fcv.setConstantValue(&qPerTg,   type: .int,  index: 2)
+    fcv.setConstantValue(&useSlide, type: .bool, index: 3)
+}
 let flexAttnSlideV1Q8PSO = pso("flex_attn_slide_v1_q8")
 let flexAttnFullPrefillPSO = pso("flex_attn_full_prefill")
 let kvWriteMultiPSO      = pso("kv_write_multi")
@@ -129,8 +173,19 @@ let MAX_PAGES_PER_SLOT = 8192   // per-session max context (full-cache-bound at 
 // onto batches 0,1 — only undetected because our B=4 test replicates the same
 // tokens across slots, so writes were idempotent.)
 
+// Engine handle for the dylib's FFI entry points. Defined here (not in
+// ffi.swift) so the executable build — which excludes ffi.swift — still
+// resolves it. ffi.swift owns gEngine's lifecycle (assigns at gemma_init,
+// clears at teardown). In the executable build gEngine stays nil and the
+// writeAblation paths in buildStepCB no-op.
+//
+// There is no engine-state mutex in Swift. The bridge layer is responsible
+// for serializing FFI entry — see notes/decisions/2026-04-26-remove-
+// session-concurrency-primitives.md (Phase B).
+var gEngine: LmEngine?
+
 // --- Batch config ---
-let B = 4
+let B = 8
 // At B=4 top_k=8 = 32 slots; uniform routing gives ~32 active experts w/ g=1
 let TOTAL_SLOTS = B * TOPK
 let ACTIVE_EXPERTS = E_EXP   // worst case — we always launch all 128 TGs (early-return pattern)
@@ -274,7 +329,13 @@ let k_len_full      = device.makeBuffer(length: B * 4, options: .storageModeShar
 // inside the prefill CB — still a single CB for all 30 layers, just not
 // fully parallel on the 5/30 full-attn layers.
 // ========================================================================
-let MAX_Q_LEN = 8
+let MAX_Q_LEN = 32
+// Max number of 8-row Q-blocks that can fit in one prefill step. The
+// kernels (`flex_attn_full_prefill`, `flex_attn_slide_v1_q8`) tile along
+// the q_block axis at runtime; the v2 mask precompute below emits one
+// CSR entry per (slot, q_block) tuple, making MAX_Q_LEN ≥ 8 actually
+// usable. Buffer sizing below scales with this.
+let MAX_Q_BLOCKS = (MAX_Q_LEN + 7) / 8
 
 // Prefill scratch buffers sized for B * MAX_Q_LEN "virtual batches".
 let pre_hidden       = halfBuf(B * MAX_Q_LEN * HIDDEN, seed: 0x21)
@@ -330,12 +391,13 @@ let pre_m_partials = device.makeBuffer(length: PRE_NUM_VSLOTS * ATTN_N_SPLITS * 
 let pre_l_partials = device.makeBuffer(length: PRE_NUM_VSLOTS * ATTN_N_SPLITS * 4, options: .storageModeShared)!
 let pre_O_partials = device.makeBuffer(length: PRE_NUM_VSLOTS * ATTN_N_SPLITS * FULL_HD * 4, options: .storageModeShared)!
 
-// Prefill block-mask buffers. At Q_BLOCK=Q_LEN=MAX_Q_LEN=8, q_blocks=1 per slot,
-// so CSR offsets are [B+1]. At smaller q_len, still 1 block (padded to Q_BLOCK).
-let pre_slide_full_offsets = device.makeBuffer(length: (B + 1) * 4, options: .storageModeShared)!
-let pre_slide_full_indices = device.makeBuffer(length: B * MAX_PAGES_PER_SLOT * 4, options: .storageModeShared)!
-let pre_slide_part_offsets = device.makeBuffer(length: (B + 1) * 4, options: .storageModeShared)!
-let pre_slide_part_indices = device.makeBuffer(length: B * MAX_PAGES_PER_SLOT * 4, options: .storageModeShared)!
+// Prefill block-mask buffers (slide-attention layers).
+// CSR layout: one entry per (slot, q_block) → B * MAX_Q_BLOCKS + 1 offsets.
+// Indices/masks: worst-case every k_block × every q_block is partial.
+let pre_slide_full_offsets = device.makeBuffer(length: (B * MAX_Q_BLOCKS + 1) * 4, options: .storageModeShared)!
+let pre_slide_full_indices = device.makeBuffer(length: B * MAX_Q_BLOCKS * MAX_PAGES_PER_SLOT * 4, options: .storageModeShared)!
+let pre_slide_part_offsets = device.makeBuffer(length: (B * MAX_Q_BLOCKS + 1) * 4, options: .storageModeShared)!
+let pre_slide_part_indices = device.makeBuffer(length: B * MAX_Q_BLOCKS * MAX_PAGES_PER_SLOT * 4, options: .storageModeShared)!
 
 // Per-partial-block attention mask bitmap. Each partial block is a Q_BLOCK ×
 // PAGE mask; we store one uint32 per Q-row (low PAGE bits set = visible).
@@ -347,9 +409,11 @@ let pre_slide_part_indices = device.makeBuffer(length: B * MAX_PAGES_PER_SLOT * 
 // Sized for the worst case: every page is partial. Slide uses PAGE=16 (fits
 // in low 16 bits); full uses PAGE=8 (fits in low 8 bits). Q_BLOCK=8 rows.
 let FLEX_Q_BLOCK = 8   // compile-time; must match kernel's Q_BLOCK constant
-let pre_slide_part_masks = device.makeBuffer(length: B * MAX_PAGES_PER_SLOT * FLEX_Q_BLOCK * 4,
+// One uint32 mask per Q-row × per partial-block. Worst case: every k_block
+// is partial in every q_block of every slot.
+let pre_slide_part_masks = device.makeBuffer(length: B * MAX_Q_BLOCKS * MAX_PAGES_PER_SLOT * FLEX_Q_BLOCK * 4,
                                                options: .storageModeShared)!
-let flex_full_part_masks = device.makeBuffer(length: B * MAX_PAGES_PER_SLOT * FLEX_Q_BLOCK * 4,
+let flex_full_part_masks = device.makeBuffer(length: B * MAX_Q_BLOCKS * MAX_PAGES_PER_SLOT * FLEX_Q_BLOCK * 4,
                                                options: .storageModeShared)!
 
 let pre_k_len_slide = device.makeBuffer(length: B * 4, options: .storageModeShared)!
@@ -366,31 +430,48 @@ let flex_full_indices    = device.makeBuffer(length: B * MAX_PAGES_PER_SLOT * 4,
 let flex_partial_offsets = device.makeBuffer(length: (B + 1) * 4, options: .storageModeShared)!
 let flex_partial_indices = device.makeBuffer(length: B * MAX_PAGES_PER_SLOT * 4, options: .storageModeShared)!
 // Separate buffers for full-attention layer block masks (PAGE=8, no window).
-let flex_full_full_offsets = device.makeBuffer(length: (B + 1) * 4, options: .storageModeShared)!
-let flex_full_full_indices = device.makeBuffer(length: B * MAX_PAGES_PER_SLOT * 4, options: .storageModeShared)!
-let flex_full_partial_offsets = device.makeBuffer(length: (B + 1) * 4, options: .storageModeShared)!
-let flex_full_partial_indices = device.makeBuffer(length: B * MAX_PAGES_PER_SLOT * 4, options: .storageModeShared)!
-
-// Flex attention is the default as of Phase 1 (bit-for-bit match with legacy
-// validated on hellolong + 99-token prose). Set `LEGACY_ATTN=1` to force the
-// old paged_attn_{slide,full}_gqa_compute kernels instead (bisection escape).
-let USE_FLEX_ATTN = ProcessInfo.processInfo.environment["LEGACY_ATTN"] == nil
+// Same per-(slot, q_block) CSR layout as the slide buffers above.
+let flex_full_full_offsets = device.makeBuffer(length: (B * MAX_Q_BLOCKS + 1) * 4, options: .storageModeShared)!
+let flex_full_full_indices = device.makeBuffer(length: B * MAX_Q_BLOCKS * MAX_PAGES_PER_SLOT * 4, options: .storageModeShared)!
+let flex_full_partial_offsets = device.makeBuffer(length: (B * MAX_Q_BLOCKS + 1) * 4, options: .storageModeShared)!
+let flex_full_partial_indices = device.makeBuffer(length: B * MAX_Q_BLOCKS * MAX_PAGES_PER_SLOT * 4, options: .storageModeShared)!
 
 // Dynamic routing/control buffers (populated by the forward pass every step).
 let positions    = device.makeBuffer(length: B * 4, options: .storageModeShared)!
 let block_table  = device.makeBuffer(length: B * MAX_PAGES_PER_SLOT * 4, options: .storageModeShared)!
 
-// Populated per-step by the scheduler when active slots share a leading
-// prefix in their block_tables. `shared_phys_pages[p]` = the (single)
-// phys page ID that all active slots agree on for logical page p.
-// Read by paged_attn_{slide,full}_ar_shared during AR broadcast.
-let shared_phys_pages = device.makeBuffer(length: MAX_PAGES_PER_SLOT * 4,
-                                           options: .storageModeShared)!
 let active_exp   = device.makeBuffer(length: E_EXP * 4, options: .storageModeShared)!
 let group_start  = device.makeBuffer(length: (E_EXP + 1) * 4, options: .storageModeShared)!
 let slot_token   = device.makeBuffer(length: TOTAL_SLOTS * 4, options: .storageModeShared)!
 let batch_slots  = device.makeBuffer(length: B * TOPK * 4, options: .storageModeShared)!
 let input_tokens = device.makeBuffer(length: B * 4, options: .storageModeShared)!
+
+// Per-slot sampling-param buffers used by the GPU-side `sample_token`
+// kernel (see docs/dataflow_pipeline_spec.md §2). CPU writes per-step
+// from session state before committing the step CB; GPU reads during
+// dispatch; GPU writes the sampled token into `gpu_sampled_tokens`
+// which the post-wait CPU compares against the CPU sampler output
+// (Phase 2 validation) or uses directly (post-validation).
+let sampling_temperature = device.makeBuffer(length: B * 4, options: .storageModeShared)!
+let sampling_min_p       = device.makeBuffer(length: B * 4, options: .storageModeShared)!
+let sampling_seed        = device.makeBuffer(length: B * 4, options: .storageModeShared)!
+let sampling_step        = device.makeBuffer(length: B * 4, options: .storageModeShared)!
+let sampling_active      = device.makeBuffer(length: B * 4, options: .storageModeShared)!
+// Alias gpu_sampled_tokens → input_tokens. Sampler writes the next-step
+// input directly. This lets CB N+1 read input_tokens written by CB N's
+// sampler with no CPU bridge — Metal queue serialization handles the
+// dependency. Foundation for two-CB-in-flight pipelining: the CPU no
+// longer needs to wait for CB N's completion to populate input_tokens
+// for CB N+1's AR slots.
+let gpu_sampled_tokens = input_tokens
+
+// Dense per-slot logit-bias buffer. Sampler always reads it — slots
+// without a client-set bias hold all-zeros, so the add is a no-op.
+// 4 × 262144 × 4B = 4 MB total; per-step BW cost ≈ 80 μs at M5's
+// unified-memory bandwidth, negligible vs a ~100 ms step. Written
+// each step from session state by step(): memcpy when a session has
+// `logitBiasDense`, memset(0) when it doesn't.
+let sampling_logit_bias  = device.makeBuffer(length: B * VOCAB * 4, options: .storageModeShared)!
 
 // active_exp stays static at identity [0..E_EXP-1]: route_compact writes
 // group_start with prefix counts (empty groups == zero-width), and MoE
@@ -607,6 +688,25 @@ func encProjectCvecSlot(_ cb: MTLCommandBuffer, dst: MTLBuffer, slot: Int,
     enc.endEncoding()
 }
 
+// Heretic per-write ablation: y -= alpha * r_hat * dot(r_hat, y) over
+// every row of a [numVecs, N] fp16 buffer. Same (r_hat, alpha) for all
+// rows — model-level intervention, one dispatch per (layer, component)
+// covering all B batch slots.
+func encOrthogonalizeWrite(_ cb: MTLCommandBuffer, y: MTLBuffer,
+                            rHat: MTLBuffer, alpha: Float,
+                            N: Int, numVecs: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(orthogWritePSO)
+    enc.setBuffer(y,    offset: 0, index: 0)
+    enc.setBuffer(rHat, offset: 0, index: 1)
+    var Nv = UInt32(N); var a = alpha
+    enc.setBytes(&Nv, length: 4, index: 2)
+    enc.setBytes(&a,  length: 4, index: 3)
+    enc.dispatchThreadgroups(MTLSize(width: numVecs, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
 // Prefill variant. targets buffer holds [numVecs] fp32; a row with
 // target == Float.nan is skipped (kernel checks isnan). Matches the
 // add_scaled_cvector_prefill_fp16 idiom of "zero magnitude = no-op row"
@@ -622,6 +722,50 @@ func encProjectCvecPrefill(_ cb: MTLCommandBuffer, dst: MTLBuffer,
     enc.setBuffer(currentProjBuf, offset: 0, index: 3)
     var Nv = UInt32(N)
     enc.setBytes(&Nv, length: 4, index: 4)
+    enc.dispatchThreadgroups(MTLSize(width: numVecs, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// Transport slot variant: takes (scale, offset) scalars; projection is
+// coerced via the Brenier map a → scale*a + offset, which is per-PC
+// Gaussian OT when scale=σ_tgt/σ_src, offset=μ_tgt-scale*μ_src. Same
+// dispatch/threadgroup shape as encProjectCvecSlot; the only kernel
+// difference is the target formula (constant vs linear-in-projection).
+func encTransportCvecSlot(_ cb: MTLCommandBuffer, dst: MTLBuffer, slot: Int,
+                           cvec: MTLBuffer, currentProjBuf: MTLBuffer,
+                           currentProjSlotOffsetBytes: Int,
+                           scale: Float, offset: Float, N: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(transportCvecSlotPSO)
+    enc.setBuffer(dst, offset: slot * N * 2, index: 0)
+    enc.setBuffer(cvec, offset: 0, index: 1)
+    enc.setBuffer(currentProjBuf, offset: currentProjSlotOffsetBytes, index: 2)
+    var Nv = UInt32(N); var sc = scale; var off = offset
+    enc.setBytes(&Nv, length: 4, index: 3)
+    enc.setBytes(&sc, length: 4, index: 4)
+    enc.setBytes(&off, length: 4, index: 5)
+    enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// Transport prefill variant. scalesBuf[r] = NaN → row skipped. offsets
+// read per-row from offsetsBuf. Mirrors encProjectCvecPrefill otherwise.
+func encTransportCvecPrefill(_ cb: MTLCommandBuffer, dst: MTLBuffer,
+                              cvec: MTLBuffer,
+                              scalesBuf: MTLBuffer, offsetsBuf: MTLBuffer,
+                              currentProjBuf: MTLBuffer,
+                              N: Int, numVecs: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(transportCvecPrefillPSO)
+    enc.setBuffer(dst, offset: 0, index: 0)
+    enc.setBuffer(cvec, offset: 0, index: 1)
+    enc.setBuffer(scalesBuf, offset: 0, index: 2)
+    enc.setBuffer(offsetsBuf, offset: 0, index: 3)
+    enc.setBuffer(currentProjBuf, offset: 0, index: 4)
+    var Nv = UInt32(N)
+    enc.setBytes(&Nv, length: 4, index: 5)
     enc.dispatchThreadgroups(MTLSize(width: numVecs, height: 1, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
@@ -652,6 +796,28 @@ func encGemvV4(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ W: MTLBuffer, _ out:
     enc.setBytes(&du, length: 4, index: 4)
     enc.setBytes(&dou, length: 4, index: 5)
     enc.dispatchThreadgroups(MTLSize(width: Dout / 32, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// V4 with grid extended over vec-blocks. Same kernel as V4 but each TG
+// targets a 32-output × MAX_B=8-vec tile. For huge D_out (unembed) where
+// V5's per-vec L2 amortization breaks down, this pattern reads weight
+// once per slab and FMAs into MAX_B accumulators in registers.
+func encGemvV4P(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ W: MTLBuffer, _ out: MTLBuffer,
+                 Din: Int, Dout: Int, numVecs: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(gemvV4PPSO)
+    enc.setBuffer(xbuf, offset: 0, index: 0)
+    enc.setBuffer(W, offset: 0, index: 1)
+    enc.setBuffer(out, offset: 0, index: 2)
+    var du = UInt32(Din), dou = UInt32(Dout), nv = UInt32(numVecs)
+    enc.setBytes(&du, length: 4, index: 3)
+    enc.setBytes(&dou, length: 4, index: 4)
+    enc.setBytes(&nv, length: 4, index: 5)
+    let MAX_B = 8           // must match dense_gemv_v4_p's MAX_B
+    let yBlocks = (numVecs + MAX_B - 1) / MAX_B
+    enc.dispatchThreadgroups(MTLSize(width: Dout / 32, height: yBlocks, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
 }
@@ -717,6 +883,100 @@ func encGemvQ80V5Rmsnorm(_ cb: MTLCommandBuffer, x: MTLBuffer, gammaBuf: MTLBuff
     enc.endEncoding()
 }
 
+// Q8_0 GEMV kernel-zoo dispatcher: picks the B_TILE-specialized variant
+// for the given activeB. Each variant holds B_TILE accumulators in
+// registers (compile-time-fixed, fully unrolled inner FMA loop) and reads
+// the weight slab once per K-tile per TG. Grid is 1D (D_out/32 TGs total)
+// regardless of activeB — all the per-batch work is in registers.
+//
+// Scheduler rounds activeB UP to the nearest power of 2: 1→b1, 2→b2,
+// {3,4}→b4, {5..8}→b8. For non-power-of-2 actual counts, the unused
+// register slots accumulate against silenced-slot inputs; the caller is
+// expected to populate hidden[0..activeB) with real data and may leave
+// the tail rows uninitialized (output[activeB..B_TILE) is overwritten
+// with garbage and discarded by downstream consumers that index by
+// active slot only).
+func encGemvQ80Btile(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ WswBuf: MTLBuffer,
+                      _ out: MTLBuffer, Din: Int, Dout: Int, activeB: Int) {
+    precondition(activeB >= 1 && activeB <= 8, "activeB \(activeB) out of [1,8]")
+    let pso: MTLComputePipelineState
+    switch activeB {
+    case 1: pso = denseQ80BtileB1PSO
+    case 2: pso = denseQ80BtileB2PSO
+    case 3, 4: pso = denseQ80BtileB4PSO
+    default: pso = denseQ80BtileB8PSO   // 5..8
+    }
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(pso)
+    enc.setBuffer(xbuf, offset: 0, index: 0)
+    enc.setBuffer(WswBuf, offset: 0, index: 1)
+    enc.setBuffer(out, offset: 0, index: 2)
+    var du = UInt32(Din), dou = UInt32(Dout)
+    enc.setBytes(&du, length: 4, index: 3)
+    enc.setBytes(&dou, length: 4, index: 4)
+    enc.dispatchThreadgroups(MTLSize(width: Dout / 32, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// Q8_0 RMSNorm + QKV kernel-zoo dispatcher. activeB ≤ 4 picks the
+// templated b1/b2/b4 variant (one TG per slab, all batches in registers,
+// per-batch tg-mem h_norms). activeB > 4 falls back to V6 grid-shrink
+// (numVecs=activeB) — no btile_qkv_b8 yet because full-D h_norm staging
+// for 8 batches exceeds the 32 KB tg-mem budget.
+func encGemvQ80BtileQKV(_ cb: MTLCommandBuffer, x: MTLBuffer, gammaBuf: MTLBuffer,
+                         Wq: MTLBuffer, Wk: MTLBuffer, Wv: MTLBuffer,
+                         outQ: MTLBuffer, outK: MTLBuffer, outV: MTLBuffer,
+                         Din: Int, DoutQ: Int, DoutK: Int, DoutV: Int,
+                         activeB: Int) {
+    precondition(activeB >= 1 && activeB <= 8, "activeB \(activeB) out of [1,8]")
+    if activeB > 4 {
+        // No btile_qkv_b8 yet — fall back to V6 with numVecs=activeB.
+        encGemvQ80V6RmsnormQKV(cb, x: x, gammaBuf: gammaBuf,
+                                Wq: Wq, Wk: Wk, Wv: Wv,
+                                outQ: outQ, outK: outK, outV: outV,
+                                Din: Din, DoutQ: DoutQ, DoutK: DoutK, DoutV: DoutV,
+                                numVecs: activeB)
+        return
+    }
+    let pso: MTLComputePipelineState
+    let bTile: Int
+    switch activeB {
+    case 1: pso = denseQ80BtileQkvB1PSO; bTile = 1
+    case 2: pso = denseQ80BtileQkvB2PSO; bTile = 2
+    default: pso = denseQ80BtileQkvB4PSO; bTile = 4    // activeB ∈ {3,4}
+    }
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(pso)
+    enc.setBuffer(x, offset: 0, index: 0)
+    enc.setBuffer(gammaBuf, offset: 0, index: 1)
+    enc.setBuffer(Wq, offset: 0, index: 2)
+    enc.setBuffer(Wk, offset: 0, index: 3)
+    enc.setBuffer(Wv, offset: 0, index: 4)
+    enc.setBuffer(outQ, offset: 0, index: 5)
+    enc.setBuffer(outK, offset: 0, index: 6)
+    enc.setBuffer(outV, offset: 0, index: 7)
+    var du = UInt32(Din)
+    var qnb = UInt32(DoutQ / 32), knb = UInt32(DoutK / 32), vnb = UInt32(DoutV / 32)
+    var douq = UInt32(DoutQ), douk = UInt32(DoutK), douv = UInt32(DoutV)
+    var eps: Float = 1e-6
+    var nv = UInt32(activeB)
+    enc.setBytes(&du, length: 4, index: 8)
+    enc.setBytes(&qnb, length: 4, index: 9)
+    enc.setBytes(&knb, length: 4, index: 10)
+    enc.setBytes(&vnb, length: 4, index: 11)
+    enc.setBytes(&douq, length: 4, index: 12)
+    enc.setBytes(&douk, length: 4, index: 13)
+    enc.setBytes(&douv, length: 4, index: 14)
+    enc.setBytes(&eps, length: 4, index: 15)
+    enc.setBytes(&nv, length: 4, index: 16)
+    let totalSlabs = (DoutQ + DoutK + DoutV) / 32
+    let yBlocks = (activeB + bTile - 1) / bTile
+    enc.dispatchThreadgroups(MTLSize(width: totalSlabs, height: yBlocks, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
 // Q8_0 swizzled GEMV v6: consumes repacked weights for 32-way coalesced SG reads.
 func encGemvQ80V6(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ WswBuf: MTLBuffer,
                    _ out: MTLBuffer, Din: Int, Dout: Int, numVecs: Int = B) {
@@ -770,6 +1030,18 @@ func encGemvQ80V6RmsnormGateUp(_ cb: MTLCommandBuffer, x: MTLBuffer, gammaBuf: M
 }
 
 // Fused RMSNorm + Q8_0 v6 for Q/K/V in a single dispatch.
+//
+// V7 attempt (vector-amortized via per-thread accumulator array, like
+// V4-for-AR) was benchmarked 2026-04-26 and ran SLOWER than V6 at every
+// B in {4, 8, 16}: v7 collapses TG count (4× fewer at VEC_TILE=4) and
+// 4×'s tg-mem (22.5 KB), both of which hurt occupancy more than register-
+// level weight-amortization helps. Apple GPU's L2 cache was already
+// amortizing weight reads across adjacent (slab, vec) TGs, so the
+// "redundant DRAM reads" v7 targeted were going to L2 not DRAM, and
+// were ~free. v7 kernel + its dispatch helper retained in-tree for
+// reference (kernels.swift `dense_gemv_q8_0_v7_rmsnorm_qkv`); not used.
+// Real prefill-bandwidth wins live elsewhere — see notes/specs/
+// bandwidth_triage.md §5 follow-on items.
 func encGemvQ80V6RmsnormQKV(_ cb: MTLCommandBuffer, x: MTLBuffer, gammaBuf: MTLBuffer,
                              Wq: MTLBuffer, Wk: MTLBuffer, Wv: MTLBuffer,
                              outQ: MTLBuffer, outK: MTLBuffer, outV: MTLBuffer,
@@ -803,6 +1075,48 @@ func encGemvQ80V6RmsnormQKV(_ cb: MTLCommandBuffer, x: MTLBuffer, gammaBuf: MTLB
     enc.endEncoding()
 }
 
+// V7: vector-amortized variant of encGemvQ80V6RmsnormQKV. Same args,
+// different dispatch shape: (totalSlabs, ceil(numVecs/VEC_TILE)) with
+// each TG handling VEC_TILE=4 vectors. Per K-tile loads weights once,
+// FMAs into VEC_TILE accumulators in registers — structural 4×
+// weight-bandwidth reduction for prefill. See kernels.swift:1422.
+func encGemvQ80V7RmsnormQKV(_ cb: MTLCommandBuffer, x: MTLBuffer, gammaBuf: MTLBuffer,
+                             Wq: MTLBuffer, Wk: MTLBuffer, Wv: MTLBuffer,
+                             outQ: MTLBuffer, outK: MTLBuffer, outV: MTLBuffer,
+                             Din: Int, DoutQ: Int, DoutK: Int, DoutV: Int,
+                             numVecs: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(denseQ80V7RmsQkvPSO)
+    enc.setBuffer(x, offset: 0, index: 0)
+    enc.setBuffer(gammaBuf, offset: 0, index: 1)
+    enc.setBuffer(Wq, offset: 0, index: 2)
+    enc.setBuffer(Wk, offset: 0, index: 3)
+    enc.setBuffer(Wv, offset: 0, index: 4)
+    enc.setBuffer(outQ, offset: 0, index: 5)
+    enc.setBuffer(outK, offset: 0, index: 6)
+    enc.setBuffer(outV, offset: 0, index: 7)
+    var du = UInt32(Din)
+    var qnb = UInt32(DoutQ / 32), knb = UInt32(DoutK / 32), vnb = UInt32(DoutV / 32)
+    var douq = UInt32(DoutQ), douk = UInt32(DoutK), douv = UInt32(DoutV)
+    var eps: Float = 1e-6
+    var nv = UInt32(numVecs)
+    enc.setBytes(&du, length: 4, index: 8)
+    enc.setBytes(&qnb, length: 4, index: 9)
+    enc.setBytes(&knb, length: 4, index: 10)
+    enc.setBytes(&vnb, length: 4, index: 11)
+    enc.setBytes(&douq, length: 4, index: 12)
+    enc.setBytes(&douk, length: 4, index: 13)
+    enc.setBytes(&douv, length: 4, index: 14)
+    enc.setBytes(&eps, length: 4, index: 15)
+    enc.setBytes(&nv, length: 4, index: 16)
+    let VEC_TILE = 4
+    let totalSlabs = (DoutQ + DoutK + DoutV) / 32
+    let yBlocks = (numVecs + VEC_TILE - 1) / VEC_TILE
+    enc.dispatchThreadgroups(MTLSize(width: totalSlabs, height: yBlocks, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
 // Q8_0 multi-batch dense GEMV (v4 — for large D_out like unembed=262144).
 func encGemvQ80V4(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ Wq80: MTLBuffer, _ out: MTLBuffer, Din: Int, Dout: Int) {
     let enc = cb.makeComputeCommandEncoder()!
@@ -818,9 +1132,12 @@ func encGemvQ80V4(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ Wq80: MTLBuffer, 
 // Q5_1 MoE GEMV.
 func encMoeGemvQ51(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ Wq51: MTLBuffer, _ out: MTLBuffer,
                     Din: Int, Dout: Int, numActive: Int, useV4: Bool = false, useV6: Bool = false,
+                    useV8: Bool = false, useV9: Bool = false,
                     slotTokenBuf: MTLBuffer? = nil, groupStartBuf: MTLBuffer? = nil) {
     let enc = cb.makeComputeCommandEncoder()!
-    let pso = useV6 ? moeQ51V6PSO : (useV4 ? moeQ51V4PSO : moeQ51PSO)
+    let pso = useV9 ? moeQ51V9PSO
+            : (useV8 ? moeQ51V8PSO
+            : (useV6 ? moeQ51V6PSO : (useV4 ? moeQ51V4PSO : moeQ51PSO)))
     enc.setComputePipelineState(pso)
     enc.setBuffer(xbuf, offset: 0, index: 0); enc.setBuffer(slotTokenBuf ?? slot_token, offset: 0, index: 1)
     enc.setBuffer(Wq51, offset: 0, index: 2); enc.setBuffer(active_exp, offset: 0, index: 3)
@@ -868,14 +1185,38 @@ func encGemvQ40V4(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ Wq40: MTLBuffer, 
     enc.endEncoding()
 }
 
+// V10 fused matmul + GELU(gate)·up. Output is post-activation
+// [slots, N_half], so caller passes the post-activation buffer (e.g.
+// pre_gate_proj) directly and skips moe_gelu_mul_fused. Inputs identical
+// to encMoeGemvQ4K.
+func encMoeGemvQ4KFusedGelu(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ Wq4kFused: MTLBuffer,
+                              _ outPostAct: MTLBuffer,
+                              Din: Int, NHalf: Int, numActive: Int,
+                              slotTokenBuf: MTLBuffer? = nil,
+                              groupStartBuf: MTLBuffer? = nil) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(moeQ4KV10PSO)
+    enc.setBuffer(xbuf, offset: 0, index: 0); enc.setBuffer(slotTokenBuf ?? slot_token, offset: 0, index: 1)
+    enc.setBuffer(Wq4kFused, offset: 0, index: 2); enc.setBuffer(active_exp, offset: 0, index: 3)
+    enc.setBuffer(groupStartBuf ?? group_start, offset: 0, index: 4); enc.setBuffer(outPostAct, offset: 0, index: 5)
+    var du = UInt32(Din), nh = UInt32(NHalf)
+    enc.setBytes(&du, length: 4, index: 6); enc.setBytes(&nh, length: 4, index: 7)
+    enc.dispatchThreadgroups(MTLSize(width: NHalf / 32, height: numActive, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
 // GGUF-native Q4_K MoE GEMV (valid when D_in divisible by 256). Uses v4
 // (k-outer / slot-inner) pattern — amortizes Q4_K dequant across slots
 // sharing an expert. Falls back to v3 when useV4=false for benchmarking.
 func encMoeGemvQ4K(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ Wq4k: MTLBuffer, _ out: MTLBuffer,
                     Din: Int, Dout: Int, numActive: Int, useV4: Bool = false, useV6: Bool = false,
+                    useV8: Bool = false, useV9: Bool = false,
                     slotTokenBuf: MTLBuffer? = nil, groupStartBuf: MTLBuffer? = nil) {
     let enc = cb.makeComputeCommandEncoder()!
-    let pso = useV6 ? moeQ4KV6PSO : (useV4 ? moeQ4KV4PSO : moeQ4KPSO)
+    let pso = useV9 ? moeQ4KV9PSO
+            : (useV8 ? moeQ4KV8PSO
+            : (useV6 ? moeQ4KV6PSO : (useV4 ? moeQ4KV4PSO : moeQ4KPSO)))
     enc.setComputePipelineState(pso)
     enc.setBuffer(xbuf, offset: 0, index: 0); enc.setBuffer(slotTokenBuf ?? slot_token, offset: 0, index: 1)
     enc.setBuffer(Wq4k, offset: 0, index: 2); enc.setBuffer(active_exp, offset: 0, index: 3)
@@ -931,80 +1272,7 @@ func encKVWrite(_ cb: MTLCommandBuffer, K: MTLBuffer, V: MTLBuffer, Kc: MTLBuffe
     enc.endEncoding()
 }
 
-// Sliding split-KV with simdgroup_matrix QK/AV (llama.cpp-style). Same
-// reduce kernel as the scalar split variant — partials layout is identical.
-func encPagedAttnSlideSgmm(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
-                            Kc: MTLBuffer, Vc: MTLBuffer,
-                            numPagesBuf: MTLBuffer, kLenBuf: MTLBuffer,
-                            H_Q: Int, H_KV: Int, D: Int) {
-    let enc1 = cb.makeComputeCommandEncoder()!
-    enc1.setComputePipelineState(pagedSlideSgmmPSO)
-    enc1.setBuffer(Q, offset: 0, index: 0); enc1.setBuffer(Kc, offset: 0, index: 1)
-    enc1.setBuffer(Vc, offset: 0, index: 2); enc1.setBuffer(block_table, offset: 0, index: 3)
-    enc1.setBuffer(m_partials, offset: 0, index: 4)
-    enc1.setBuffer(l_partials, offset: 0, index: 5)
-    enc1.setBuffer(O_partials, offset: 0, index: 6)
-    enc1.setBuffer(numPagesBuf, offset: 0, index: 7); enc1.setBuffer(kLenBuf, offset: 0, index: 8)
-    var scale: Float = 1.0   // Gemma-4: attn.scaling == 1.0; q is already RMS-normed via q_norm
-    var mv = UInt32(MAX_PAGES_PER_SLOT), hq = UInt32(H_Q), hkv = UInt32(H_KV), ns = UInt32(ATTN_N_SPLITS)
-    enc1.setBytes(&scale, length: 4, index: 9); enc1.setBytes(&mv, length: 4, index: 10)
-    enc1.setBytes(&hq, length: 4, index: 11); enc1.setBytes(&hkv, length: 4, index: 12)
-    enc1.setBytes(&ns, length: 4, index: 13)
-    enc1.dispatchThreadgroups(MTLSize(width: B * H_Q, height: ATTN_N_SPLITS, depth: 1),
-                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc1.endEncoding()
 
-    let enc2 = cb.makeComputeCommandEncoder()!
-    enc2.setComputePipelineState(pagedSplitReducePSO)
-    enc2.setBuffer(m_partials, offset: 0, index: 0)
-    enc2.setBuffer(l_partials, offset: 0, index: 1)
-    enc2.setBuffer(O_partials, offset: 0, index: 2)
-    enc2.setBuffer(O, offset: 0, index: 3)
-    var Dv = UInt32(D)
-    enc2.setBytes(&Dv, length: 4, index: 4)
-    enc2.setBytes(&ns, length: 4, index: 5)
-    enc2.dispatchThreadgroups(MTLSize(width: B * H_Q, height: 1, depth: 1),
-                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc2.endEncoding()
-}
-
-// Sliding GQA split-KV: (B*H_KV, N_SPLITS) grid, Q_PER_TG=2. Halves KV DRAM.
-func encPagedAttnSlideGqa(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
-                           Kc: MTLBuffer, Vc: MTLBuffer,
-                           numPagesBuf: MTLBuffer, kLenBuf: MTLBuffer,
-                           H_Q: Int, H_KV: Int, D: Int) {
-    let enc1 = cb.makeComputeCommandEncoder()!
-    enc1.setComputePipelineState(pagedSlideGqaPSO)
-    enc1.setBuffer(Q, offset: 0, index: 0); enc1.setBuffer(Kc, offset: 0, index: 1)
-    enc1.setBuffer(Vc, offset: 0, index: 2); enc1.setBuffer(block_table, offset: 0, index: 3)
-    enc1.setBuffer(m_partials, offset: 0, index: 4)
-    enc1.setBuffer(l_partials, offset: 0, index: 5)
-    enc1.setBuffer(O_partials, offset: 0, index: 6)
-    enc1.setBuffer(numPagesBuf, offset: 0, index: 7); enc1.setBuffer(kLenBuf, offset: 0, index: 8)
-    var scale: Float = 1.0   // Gemma-4: attn.scaling == 1.0; q is already RMS-normed via q_norm
-    var mv = UInt32(MAX_PAGES_PER_SLOT), hq = UInt32(H_Q), hkv = UInt32(H_KV), ns = UInt32(ATTN_N_SPLITS)
-    var sw = UInt32(SLIDING_WINDOW)
-    enc1.setBytes(&scale, length: 4, index: 9); enc1.setBytes(&mv, length: 4, index: 10)
-    enc1.setBytes(&hq, length: 4, index: 11); enc1.setBytes(&hkv, length: 4, index: 12)
-    enc1.setBytes(&ns, length: 4, index: 13)
-    enc1.setBytes(&sw, length: 4, index: 14)
-    enc1.dispatchThreadgroups(MTLSize(width: B * H_KV, height: ATTN_N_SPLITS, depth: 1),
-                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc1.endEncoding()
-
-    let enc2 = cb.makeComputeCommandEncoder()!
-    enc2.setComputePipelineState(pagedSplitReducePSO)
-    enc2.setBuffer(m_partials, offset: 0, index: 0)
-    enc2.setBuffer(l_partials, offset: 0, index: 1)
-    enc2.setBuffer(O_partials, offset: 0, index: 2)
-    enc2.setBuffer(O, offset: 0, index: 3)
-    var Dv = UInt32(D)
-    enc2.setBytes(&Dv, length: 4, index: 4)
-    enc2.setBytes(&ns, length: 4, index: 5)
-    enc2.dispatchThreadgroups(MTLSize(width: B * H_Q, height: 1, depth: 1),
-                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc2.endEncoding()
-}
 
 // Host-side block-mask precompute for the flex attention kernel. v0 supports
 // Q_BLOCK=1 (decode) with causal_sliding mask_mod. Populates four buffers in
@@ -1096,14 +1364,12 @@ enum MaskMod {
 func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
                                  slideMask: MaskMod = .causalSliding(SLIDING_WINDOW),
                                  fullMask: MaskMod = .causal) {
-    // Per-slot q positions live in pre_q_positions[b * qLen + i]. We still
-    // take a positionStart arg for back-compat with single-slot callers;
-    // when multi-slot prefill is active (slots have different positionStarts)
-    // each slot's q_first/q_last is read from pre_q_positions instead, so
-    // the masks classify FULL/PARTIAL/EMPTY for each slot's own Q range.
+    // v2: emit one CSR entry per (slot, q_block_idx) so qLen > 8 actually
+    // works. Kernel-side csr_idx = slot * q_blocks_per_slot + q_block_idx
+    // is already in place (`flex_attn_full_prefill`, `flex_attn_slide_v1_q8`),
+    // it was just waiting for the host-side widened CSR.
     let qBlock = 8
     let qBlocks = (qLen + qBlock - 1) / qBlock
-    precondition(qBlocks == 1, "v1 prefill assumes single q_block per slot")
     let qPosP = pre_q_positions.contents().assumingMemoryBound(to: UInt32.self)
 
     // ---- Slide (PAGE_SLIDE=16) ----
@@ -1117,50 +1383,51 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
         fullOff[0] = 0; partOff[0] = 0
         for b in 0..<B {
             let k_len = Int(pre_k_len_slide.contents().assumingMemoryBound(to: UInt32.self)[b])
-            // Read per-slot q positions; fall back to positionStart-based when
-            // pre_q_positions[b*qLen] is 0 AND positionStart > 0 (single-slot
-            // path that didn't populate silenced slots' positions).
+            // Slot's first q position. Fallback to positionStart for the
+            // single-slot path that doesn't populate silenced slots.
             let slotPos = Int(qPosP[b * qLen])
-            let q_first = (slotPos != 0 || positionStart == 0) ? slotPos : positionStart
-            let q_last  = q_first + qLen - 1
+            let slotFirst = (slotPos != 0 || positionStart == 0) ? slotPos : positionStart
             let ctx = MaskModContext(kLen: k_len, slidingWindow: SLIDING_WINDOW)
             let kBlocks = (k_len + PAGE_SLIDE - 1) / PAGE_SLIDE
-            for K in 0..<kBlocks {
-                let lo = K * PAGE_SLIDE
-                let hi = lo + PAGE_SLIDE - 1
-                // Decide FULL/PARTIAL/EMPTY by sampling corners — safe for
-                // monotonic masks like causal + sliding. If the mask_mod is
-                // non-monotonic the classifier may over-classify as FULL;
-                // fall back to per-cell check when that matters.
-                let topLeft     = slideMask.keep(q: q_first, k: lo, ctx: ctx)
-                let topRight    = slideMask.keep(q: q_first, k: hi, ctx: ctx)
-                let botLeft     = slideMask.keep(q: q_last,  k: lo, ctx: ctx)
-                let botRight    = slideMask.keep(q: q_last,  k: hi, ctx: ctx)
-                if !(topLeft || topRight || botLeft || botRight) { continue }   // all-empty
-                let allKeep = topLeft && topRight && botLeft && botRight
-                if allKeep {
-                    fullIdx[fc] = UInt32(K); fc += 1
-                } else {
-                    partIdx[pc] = UInt32(K)
-                    // Emit bitmap for this partial block: one uint32 per Q row.
-                    for qrow in 0..<qBlock {
-                        let q_abs = q_first + qrow
-                        var row: UInt32 = 0
-                        if q_abs <= q_last {   // don't mask beyond real qLen
-                            for kcell in 0..<PAGE_SLIDE {
-                                let k_abs = lo + kcell
-                                if slideMask.keep(q: q_abs, k: k_abs, ctx: ctx) {
-                                    row |= UInt32(1) << kcell
+            for qb in 0..<qBlocks {
+                let q_first = slotFirst + qb * qBlock
+                // Last real q row in this block — capped at the slot's
+                // qLen so we don't classify mask cells for padding rows.
+                let blockLastIdx = min((qb + 1) * qBlock, qLen) - 1
+                let q_last  = slotFirst + blockLastIdx
+                let csrIdx = b * qBlocks + qb
+                for K in 0..<kBlocks {
+                    let lo = K * PAGE_SLIDE
+                    let hi = lo + PAGE_SLIDE - 1
+                    let topLeft     = slideMask.keep(q: q_first, k: lo, ctx: ctx)
+                    let topRight    = slideMask.keep(q: q_first, k: hi, ctx: ctx)
+                    let botLeft     = slideMask.keep(q: q_last,  k: lo, ctx: ctx)
+                    let botRight    = slideMask.keep(q: q_last,  k: hi, ctx: ctx)
+                    if !(topLeft || topRight || botLeft || botRight) { continue }
+                    let allKeep = topLeft && topRight && botLeft && botRight
+                    if allKeep {
+                        fullIdx[fc] = UInt32(K); fc += 1
+                    } else {
+                        partIdx[pc] = UInt32(K)
+                        for qrow in 0..<qBlock {
+                            let q_abs = q_first + qrow
+                            var row: UInt32 = 0
+                            if q_abs <= q_last {
+                                for kcell in 0..<PAGE_SLIDE {
+                                    let k_abs = lo + kcell
+                                    if slideMask.keep(q: q_abs, k: k_abs, ctx: ctx) {
+                                        row |= UInt32(1) << kcell
+                                    }
                                 }
                             }
+                            partMask[pc * FLEX_Q_BLOCK + qrow] = row
                         }
-                        partMask[pc * FLEX_Q_BLOCK + qrow] = row
+                        pc += 1
                     }
-                    pc += 1
                 }
+                fullOff[csrIdx + 1] = UInt32(fc)
+                partOff[csrIdx + 1] = UInt32(pc)
             }
-            fullOff[b + 1] = UInt32(fc)
-            partOff[b + 1] = UInt32(pc)
         }
     }
 
@@ -1176,271 +1443,52 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
         for b in 0..<B {
             let k_len = Int(pre_k_len_full.contents().assumingMemoryBound(to: UInt32.self)[b])
             let slotPos = Int(qPosP[b * qLen])
-            let q_first = (slotPos != 0 || positionStart == 0) ? slotPos : positionStart
-            let q_last  = q_first + qLen - 1
+            let slotFirst = (slotPos != 0 || positionStart == 0) ? slotPos : positionStart
             let ctx = MaskModContext(kLen: k_len, slidingWindow: 0)
             let kBlocks = (k_len + PAGE_FULL - 1) / PAGE_FULL
-            for K in 0..<kBlocks {
-                let lo = K * PAGE_FULL
-                let hi = lo + PAGE_FULL - 1
-                let topLeft  = fullMask.keep(q: q_first, k: lo, ctx: ctx)
-                let topRight = fullMask.keep(q: q_first, k: hi, ctx: ctx)
-                let botLeft  = fullMask.keep(q: q_last,  k: lo, ctx: ctx)
-                let botRight = fullMask.keep(q: q_last,  k: hi, ctx: ctx)
-                if !(topLeft || topRight || botLeft || botRight) { continue }
-                let allKeep = topLeft && topRight && botLeft && botRight
-                if allKeep {
-                    fullIdx[fc] = UInt32(K); fc += 1
-                } else {
-                    partIdx[pc] = UInt32(K)
-                    for qrow in 0..<qBlock {
-                        let q_abs = q_first + qrow
-                        var row: UInt32 = 0
-                        if q_abs <= q_last {
-                            for kcell in 0..<PAGE_FULL {
-                                let k_abs = lo + kcell
-                                if fullMask.keep(q: q_abs, k: k_abs, ctx: ctx) {
-                                    row |= UInt32(1) << kcell
+            for qb in 0..<qBlocks {
+                let q_first = slotFirst + qb * qBlock
+                let blockLastIdx = min((qb + 1) * qBlock, qLen) - 1
+                let q_last  = slotFirst + blockLastIdx
+                let csrIdx = b * qBlocks + qb
+                for K in 0..<kBlocks {
+                    let lo = K * PAGE_FULL
+                    let hi = lo + PAGE_FULL - 1
+                    let topLeft  = fullMask.keep(q: q_first, k: lo, ctx: ctx)
+                    let topRight = fullMask.keep(q: q_first, k: hi, ctx: ctx)
+                    let botLeft  = fullMask.keep(q: q_last,  k: lo, ctx: ctx)
+                    let botRight = fullMask.keep(q: q_last,  k: hi, ctx: ctx)
+                    if !(topLeft || topRight || botLeft || botRight) { continue }
+                    let allKeep = topLeft && topRight && botLeft && botRight
+                    if allKeep {
+                        fullIdx[fc] = UInt32(K); fc += 1
+                    } else {
+                        partIdx[pc] = UInt32(K)
+                        for qrow in 0..<qBlock {
+                            let q_abs = q_first + qrow
+                            var row: UInt32 = 0
+                            if q_abs <= q_last {
+                                for kcell in 0..<PAGE_FULL {
+                                    let k_abs = lo + kcell
+                                    if fullMask.keep(q: q_abs, k: k_abs, ctx: ctx) {
+                                        row |= UInt32(1) << kcell
+                                    }
                                 }
                             }
+                            partMask[pc * FLEX_Q_BLOCK + qrow] = row
                         }
-                        partMask[pc * FLEX_Q_BLOCK + qrow] = row
+                        pc += 1
                     }
-                    pc += 1
                 }
+                fullOff[csrIdx + 1] = UInt32(fc)
+                partOff[csrIdx + 1] = UInt32(pc)
             }
-            fullOff[b + 1] = UInt32(fc)
-            partOff[b + 1] = UInt32(pc)
         }
     }
 }
 
 // Prefill attention dispatchers (slide + full). Called from buildPrefillCB;
 // dispatch the flex v1 kernels with (B*H_KV or B*H_Q, q_blocks, N_SPLITS).
-// Dispatcher for the cross-slot broadcast AR shared-prefix attention.
-// Caller supplies:
-//   Q:                [B, H_Q, D] — AR-step Qs for every active slot
-//   K_cache, V_cache: [phys_pages, PAGE*H_KV, D]
-//   sharedPhysPages:  fp32 UInt32[prefix_pages] — one phys-page list used by ALL slots
-//   kLenBuf:          UInt32[B] — each slot's k_len (for per-slot SW mask)
-//   mPart/lPart/OPart: partials buffers sized [B, H_Q, N_SPLITS, …]; kernel
-//                      writes split=0 only. Caller runs a tail kernel into
-//                      split=1, then paged_attn_split_reduce to merge.
-// N_SPLITS must be 2 (one for shared, one for tail).
-func encPagedAttnSlideArShared(_ cb: MTLCommandBuffer,
-                                Q: MTLBuffer, Kc: MTLBuffer, Vc: MTLBuffer,
-                                sharedPhysPages: MTLBuffer,
-                                mPart: MTLBuffer, lPart: MTLBuffer, OPart: MTLBuffer,
-                                kLenBuf: MTLBuffer,
-                                H_Q: Int, H_KV: Int,
-                                prefixPages: Int, slidingWindow: Int, bBatch: Int) {
-    let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(pagedAttnSlideArSharedPSO)
-    enc.setBuffer(Q,  offset: 0, index: 0)
-    enc.setBuffer(Kc, offset: 0, index: 1)
-    enc.setBuffer(Vc, offset: 0, index: 2)
-    enc.setBuffer(sharedPhysPages, offset: 0, index: 3)
-    enc.setBuffer(mPart, offset: 0, index: 4)
-    enc.setBuffer(lPart, offset: 0, index: 5)
-    enc.setBuffer(OPart, offset: 0, index: 6)
-    enc.setBuffer(kLenBuf, offset: 0, index: 7)
-    var sc: Float = 1.0
-    var hq = UInt32(H_Q), hkv = UInt32(H_KV), ns = UInt32(2)
-    var pp = UInt32(prefixPages), sw = UInt32(slidingWindow), bb = UInt32(bBatch)
-    enc.setBytes(&sc, length: 4, index: 8)
-    enc.setBytes(&hq, length: 4, index: 9)
-    enc.setBytes(&hkv, length: 4, index: 10)
-    enc.setBytes(&ns, length: 4, index: 11)
-    enc.setBytes(&pp, length: 4, index: 12)
-    enc.setBytes(&sw, length: 4, index: 13)
-    enc.setBytes(&bb, length: 4, index: 14)
-    enc.dispatchThreadgroups(MTLSize(width: H_KV, height: 1, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
-    enc.endEncoding()
-}
-
-// Tail-only AR attention — runs flex_attn_slide_v0 with prefix_pages > 0 so
-// it skips logical pages already handled by the shared-prefix broadcast
-// kernel, and writes its partials at split_offset=1 into a 2-split layout.
-// The caller provides the same CSR (flex_full_*/flex_partial_*) as a
-// regular v0 call; filtering happens per-block inside the kernel.
-func encFlexAttnSlideV0Tail(_ cb: MTLCommandBuffer, Q: MTLBuffer,
-                             Kc: MTLBuffer, Vc: MTLBuffer,
-                             kLenBuf: MTLBuffer,
-                             mPart: MTLBuffer, lPart: MTLBuffer, OPart: MTLBuffer,
-                             H_Q: Int, H_KV: Int, D: Int,
-                             prefixPages: Int) {
-    let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(flexAttnSlideV0PSO)
-    enc.setBuffer(Q, offset: 0, index: 0); enc.setBuffer(Kc, offset: 0, index: 1)
-    enc.setBuffer(Vc, offset: 0, index: 2); enc.setBuffer(block_table, offset: 0, index: 3)
-    enc.setBuffer(mPart, offset: 0, index: 4)
-    enc.setBuffer(lPart, offset: 0, index: 5)
-    enc.setBuffer(OPart, offset: 0, index: 6)
-    enc.setBuffer(flex_full_offsets, offset: 0, index: 7)
-    enc.setBuffer(flex_full_indices, offset: 0, index: 8)
-    enc.setBuffer(flex_partial_offsets, offset: 0, index: 9)
-    enc.setBuffer(flex_partial_indices, offset: 0, index: 10)
-    enc.setBuffer(kLenBuf, offset: 0, index: 11)
-    var scale: Float = 1.0
-    var mv = UInt32(MAX_PAGES_PER_SLOT), hq = UInt32(H_Q), hkv = UInt32(H_KV)
-    // Internal N_SPLITS=1: the tail kernel doesn't sub-partition its CSR
-    // work across TGs in this variant. total_splits_out=2 reserves split=0
-    // for the shared-prefix broadcast kernel.
-    var ns: UInt32 = 1, sw = UInt32(SLIDING_WINDOW)
-    var pp = UInt32(prefixPages), so: UInt32 = 1, tso: UInt32 = 2
-    enc.setBytes(&scale, length: 4, index: 12); enc.setBytes(&mv, length: 4, index: 13)
-    enc.setBytes(&hq,  length: 4, index: 14); enc.setBytes(&hkv, length: 4, index: 15)
-    enc.setBytes(&ns,  length: 4, index: 16); enc.setBytes(&sw,  length: 4, index: 17)
-    enc.setBytes(&pp,  length: 4, index: 18); enc.setBytes(&so,  length: 4, index: 19)
-    enc.setBytes(&tso, length: 4, index: 20)
-    enc.dispatchThreadgroups(MTLSize(width: B * H_KV, height: 1, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc.endEncoding()
-}
-
-// Dispatcher for the full-attention shared-prefix broadcast kernel.
-// Grid (H_Q, 1, 1): one TG per q_head, fans out across B slots. Output
-// partials at (slot, q_head, split=0). Pair with full_v0_tail writing
-// split=1, then paged_attn_split_reduce with N_SPLITS=2.
-func encPagedAttnFullArShared(_ cb: MTLCommandBuffer,
-                               Q: MTLBuffer, Kc: MTLBuffer, Vc: MTLBuffer,
-                               sharedPhysPages: MTLBuffer,
-                               mPart: MTLBuffer, lPart: MTLBuffer, OPart: MTLBuffer,
-                               kLenBuf: MTLBuffer,
-                               H_Q: Int, H_KV: Int,
-                               prefixPages: Int, bBatch: Int) {
-    let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(pagedAttnFullArSharedPSO)
-    enc.setBuffer(Q,  offset: 0, index: 0)
-    enc.setBuffer(Kc, offset: 0, index: 1)
-    enc.setBuffer(Vc, offset: 0, index: 2)
-    enc.setBuffer(sharedPhysPages, offset: 0, index: 3)
-    enc.setBuffer(mPart, offset: 0, index: 4)
-    enc.setBuffer(lPart, offset: 0, index: 5)
-    enc.setBuffer(OPart, offset: 0, index: 6)
-    enc.setBuffer(kLenBuf, offset: 0, index: 7)
-    var sc: Float = 1.0
-    var hq = UInt32(H_Q), hkv = UInt32(H_KV), ns = UInt32(2)
-    var pp = UInt32(prefixPages), bb = UInt32(bBatch)
-    enc.setBytes(&sc, length: 4, index: 8)
-    enc.setBytes(&hq, length: 4, index: 9)
-    enc.setBytes(&hkv, length: 4, index: 10)
-    enc.setBytes(&ns, length: 4, index: 11)
-    enc.setBytes(&pp, length: 4, index: 12)
-    enc.setBytes(&bb, length: 4, index: 13)
-    enc.dispatchThreadgroups(MTLSize(width: H_Q, height: 1, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
-    enc.endEncoding()
-}
-
-// Tail-only full-attn AR — flex_attn_full_v0 with prefix_pages>0 + split_offset=1.
-func encFlexAttnFullV0Tail(_ cb: MTLCommandBuffer, Q: MTLBuffer,
-                            Kc: MTLBuffer, Vc: MTLBuffer,
-                            kLenBuf: MTLBuffer,
-                            mPart: MTLBuffer, lPart: MTLBuffer, OPart: MTLBuffer,
-                            H_Q: Int, H_KV: Int, D: Int,
-                            prefixPages: Int) {
-    let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(flexAttnFullV0PSO)
-    enc.setBuffer(Q, offset: 0, index: 0); enc.setBuffer(Kc, offset: 0, index: 1)
-    enc.setBuffer(Vc, offset: 0, index: 2); enc.setBuffer(block_table, offset: 0, index: 3)
-    enc.setBuffer(mPart, offset: 0, index: 4)
-    enc.setBuffer(lPart, offset: 0, index: 5)
-    enc.setBuffer(OPart, offset: 0, index: 6)
-    enc.setBuffer(flex_full_full_offsets, offset: 0, index: 7)
-    enc.setBuffer(flex_full_full_indices, offset: 0, index: 8)
-    enc.setBuffer(flex_full_partial_offsets, offset: 0, index: 9)
-    enc.setBuffer(flex_full_partial_indices, offset: 0, index: 10)
-    enc.setBuffer(kLenBuf, offset: 0, index: 11)
-    var scale: Float = 1.0
-    var mv = UInt32(MAX_PAGES_PER_SLOT), hq = UInt32(H_Q), hkv = UInt32(H_KV)
-    var ns: UInt32 = 1
-    var pp = UInt32(prefixPages), so: UInt32 = 1, tso: UInt32 = 2
-    enc.setBytes(&scale, length: 4, index: 12); enc.setBytes(&mv, length: 4, index: 13)
-    enc.setBytes(&hq, length: 4, index: 14); enc.setBytes(&hkv, length: 4, index: 15)
-    enc.setBytes(&ns, length: 4, index: 16)
-    enc.setBytes(&pp, length: 4, index: 17)
-    enc.setBytes(&so, length: 4, index: 18)
-    enc.setBytes(&tso, length: 4, index: 19)
-    enc.dispatchThreadgroups(MTLSize(width: B * H_KV, height: 1, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc.endEncoding()
-}
-
-// End-to-end shared+tail+reduce AR attention for the full layer.
-func encPagedAttnFullArSharedAndTail(_ cb: MTLCommandBuffer,
-                                      Q: MTLBuffer, O: MTLBuffer,
-                                      Kc: MTLBuffer, Vc: MTLBuffer,
-                                      sharedPhysPages: MTLBuffer,
-                                      mPart: MTLBuffer, lPart: MTLBuffer, OPart: MTLBuffer,
-                                      kLenBuf: MTLBuffer,
-                                      H_Q: Int, H_KV: Int, D: Int,
-                                      prefixPages: Int, bBatch: Int) {
-    encPagedAttnFullArShared(cb, Q: Q, Kc: Kc, Vc: Vc,
-                              sharedPhysPages: sharedPhysPages,
-                              mPart: mPart, lPart: lPart, OPart: OPart,
-                              kLenBuf: kLenBuf,
-                              H_Q: H_Q, H_KV: H_KV,
-                              prefixPages: prefixPages, bBatch: bBatch)
-    encFlexAttnFullV0Tail(cb, Q: Q, Kc: Kc, Vc: Vc,
-                           kLenBuf: kLenBuf,
-                           mPart: mPart, lPart: lPart, OPart: OPart,
-                           H_Q: H_Q, H_KV: H_KV, D: D,
-                           prefixPages: prefixPages)
-    let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(pagedSplitReducePSO)
-    enc.setBuffer(mPart, offset: 0, index: 0)
-    enc.setBuffer(lPart, offset: 0, index: 1)
-    enc.setBuffer(OPart, offset: 0, index: 2)
-    enc.setBuffer(O,     offset: 0, index: 3)
-    var Dv = UInt32(D), ns: UInt32 = 2
-    enc.setBytes(&Dv, length: 4, index: 4); enc.setBytes(&ns, length: 4, index: 5)
-    enc.dispatchThreadgroups(MTLSize(width: bBatch * H_Q, height: 1, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc.endEncoding()
-}
-
-// End-to-end shared+tail+reduce AR attention for the slide layer.
-// Caller provides the shared-phys-page list (one per logical page) which
-// applies to ALL active slots; each slot's block_table must agree on those
-// pages. The tail range is driven by each slot's own block_table + k_len.
-func encPagedAttnSlideArSharedAndTail(_ cb: MTLCommandBuffer,
-                                       Q: MTLBuffer, O: MTLBuffer,
-                                       Kc: MTLBuffer, Vc: MTLBuffer,
-                                       sharedPhysPages: MTLBuffer,
-                                       mPart: MTLBuffer, lPart: MTLBuffer, OPart: MTLBuffer,
-                                       kLenBuf: MTLBuffer,
-                                       H_Q: Int, H_KV: Int, D: Int,
-                                       prefixPages: Int, slidingWindow: Int, bBatch: Int) {
-    // 1. Shared kernel writes split=0.
-    encPagedAttnSlideArShared(cb, Q: Q, Kc: Kc, Vc: Vc,
-                               sharedPhysPages: sharedPhysPages,
-                               mPart: mPart, lPart: lPart, OPart: OPart,
-                               kLenBuf: kLenBuf,
-                               H_Q: H_Q, H_KV: H_KV,
-                               prefixPages: prefixPages,
-                               slidingWindow: slidingWindow, bBatch: bBatch)
-    // 2. Tail kernel writes split=1.
-    encFlexAttnSlideV0Tail(cb, Q: Q, Kc: Kc, Vc: Vc,
-                            kLenBuf: kLenBuf,
-                            mPart: mPart, lPart: lPart, OPart: OPart,
-                            H_Q: H_Q, H_KV: H_KV, D: D,
-                            prefixPages: prefixPages)
-    // 3. Reduce merges (split=0, split=1) → final O per (slot, q_head).
-    let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(pagedSplitReducePSO)
-    enc.setBuffer(mPart, offset: 0, index: 0)
-    enc.setBuffer(lPart, offset: 0, index: 1)
-    enc.setBuffer(OPart, offset: 0, index: 2)
-    enc.setBuffer(O, offset: 0, index: 3)
-    var Dv = UInt32(D), ns: UInt32 = 2
-    enc.setBytes(&Dv, length: 4, index: 4); enc.setBytes(&ns, length: 4, index: 5)
-    enc.dispatchThreadgroups(MTLSize(width: bBatch * H_Q, height: 1, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc.endEncoding()
-}
-
 func encFlexAttnSlidePrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
                               Kc: MTLBuffer, Vc: MTLBuffer,
                               kLenBuf: MTLBuffer, qPositions: MTLBuffer,
@@ -1594,88 +1642,173 @@ func precomputeFlexBlockMaskFull() {
     }
 }
 
-// Flex attention dispatcher for full-attn layers (D=512, Q_PER_TG=8, causal).
-func encFlexAttnFullV0(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
-                        Kc: MTLBuffer, Vc: MTLBuffer,
-                        kLenBuf: MTLBuffer,
-                        H_Q: Int, H_KV: Int, D: Int) {
+// Per-slot AR attention dispatcher. The `isFull` flag selects the
+// head-dim and mask variant of the PSO. Gemma-4's architecture is
+// compile-time-partitioned per layer into full-attention (D=512,
+// causal) and sliding-window (D=256, causal + window mask) layers,
+// so this is a per-layer config flag, not a runtime decision.
+func encAttn(_ cb: MTLCommandBuffer,
+             Q: MTLBuffer, O: MTLBuffer,
+             Kc: MTLBuffer, Vc: MTLBuffer,
+             kLenBuf: MTLBuffer,
+             H_Q: Int, H_KV: Int, D: Int,
+             isFull: Bool) {
+    encFlexAttnV0(cb, Q: Q, O: O, Kc: Kc, Vc: Vc,
+                   kLenBuf: kLenBuf, H_Q: H_Q, H_KV: H_KV, D: D,
+                   isFull: isFull)
+}
+
+// GPU-side sampling dispatcher — Phase 1 of the dataflow pipeline spec.
+// Encodes the `sample_token` MSL kernel as the last dispatch of a step
+// CB. Reads per-slot logits, writes sampled token ids into `inputTokens`
+// which the NEXT step's embed kernel reads.
+//
+// Direct port of CPU `sampleTokenFromLogits`: inverse-CDF softmax
+// sampling with temperature + min_p, argmax fast path at T <= 0. PRNG
+// is philox-4x32-10 keyed on (seed, step, slot) — statistically
+// equivalent to Swift's stdlib RNG, specific draws differ.
+//
+//   logits         [B, VOCAB] fp16 — typically the engine's `logits` buffer
+//   samplingTemp   [B] fp32
+//   samplingMinP   [B] fp32
+//   samplingSeed   [B] uint32 — per-slot RNG seed
+//   samplingStep   [B] uint32 — advances each AR step for fresh draws
+//   samplingActive [B] uint32 — 0=skip this slot (idle/closed)
+//   inputTokens    [B] uint32 — output buffer; kernel writes sampled ids
+//
+// Logit-bias is not yet supported by this kernel — sessions that set a
+// bias must use the CPU sampling fallback (Phase 1b adds GPU bias).
+// Soft-prompt softs ingest. One compute encoder, K dispatches: copies-and-
+// casts `qLen × HIDDEN` fp32 rows from each slot's `src` buffer (at
+// `srcByteOffset` bytes) into `dst` rows [dstSlot * qLen ..) (fp16).
+//
+// Why a single encoder instead of K separate encoders: with K separate
+// encoders we observed K≥2 garbage output (`<unused6226>` repetition).
+// Empirically the pre_hidden writes from later dispatches don't actually
+// land — likely a per-encoder argument-table reuse with the inline
+// setBytes constants. One encoder + K dispatchThreads, with full
+// rebinding per dispatch, sidesteps that and gives correct output at
+// any K.
+struct VisionSoftsIngestSlot {
+    let src: MTLBuffer
+    let srcByteOffset: Int
+    let dstSlot: Int
+}
+
+func encVisionSoftsCopyFp32Multi(_ cb: MTLCommandBuffer,
+                                   slots: [VisionSoftsIngestSlot],
+                                   dst: MTLBuffer,
+                                   qLen: Int) {
+    if slots.isEmpty { return }
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(visionSoftsCopyFp32PSO)
+    enc.setBuffer(dst, offset: 0, index: 1)
+    var nRows = UInt32(qLen)
+    var hidden = UInt32(HIDDEN)
+    enc.setBytes(&nRows, length: 4, index: 4)
+    enc.setBytes(&hidden, length: 4, index: 5)
+    let total = qLen * HIDDEN
+    let tg = 256
+    let grid = MTLSize(width: total, height: 1, depth: 1)
+    let tgSize = MTLSize(width: tg, height: 1, depth: 1)
+    for s in slots {
+        enc.setBuffer(s.src, offset: 0, index: 0)
+        var srcRowOff = UInt32(s.srcByteOffset / (HIDDEN * 4))
+        var dstRowOff = UInt32(s.dstSlot * qLen)
+        enc.setBytes(&srcRowOff, length: 4, index: 2)
+        enc.setBytes(&dstRowOff, length: 4, index: 3)
+        enc.dispatchThreads(grid, threadsPerThreadgroup: tgSize)
+    }
+    enc.endEncoding()
+}
+
+// Single-slot wrapper kept for the single-slot prefill path (which already
+// works correctly because there's only one dispatch per CB).
+func encVisionSoftsCopyFp32(_ cb: MTLCommandBuffer,
+                              src: MTLBuffer, srcByteOffset: Int,
+                              dst: MTLBuffer,
+                              dstSlot: Int, qLen: Int) {
+    encVisionSoftsCopyFp32Multi(cb, slots: [
+        VisionSoftsIngestSlot(src: src, srcByteOffset: srcByteOffset, dstSlot: dstSlot)
+    ], dst: dst, qLen: qLen)
+}
+
+func encSampleToken(_ cb: MTLCommandBuffer,
+                     logits: MTLBuffer,
+                     samplingLogitBias: MTLBuffer,
+                     samplingTemp: MTLBuffer,
+                     samplingMinP: MTLBuffer,
+                     samplingSeed: MTLBuffer,
+                     samplingStep: MTLBuffer,
+                     samplingActive: MTLBuffer,
+                     inputTokens: MTLBuffer,
+                     vocab: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(sampleTokenPSO)
+    enc.setBuffer(logits,            offset: 0, index: 0)
+    enc.setBuffer(samplingLogitBias, offset: 0, index: 1)
+    enc.setBuffer(samplingTemp,      offset: 0, index: 2)
+    enc.setBuffer(samplingMinP,      offset: 0, index: 3)
+    enc.setBuffer(samplingSeed,      offset: 0, index: 4)
+    enc.setBuffer(samplingStep,      offset: 0, index: 5)
+    enc.setBuffer(samplingActive,    offset: 0, index: 6)
+    enc.setBuffer(inputTokens,       offset: 0, index: 7)
+    var v = UInt32(vocab)
+    enc.setBytes(&v, length: 4, index: 8)
+    // One TG per slot, 32 threads (one simdgroup) per TG.
+    enc.dispatchThreadgroups(MTLSize(width: B, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// Unified flex-attention dispatcher — one Swift path, one MSL source.
+// Picks the specialized PSO (flexAttn{Slide,Full}V0PSO) and the matching
+// CSR buffer set (flex_full_* at PAGE=16 vs flex_full_full_* at PAGE=8)
+// by the per-layer `isFull` flag. Both PSOs are compiled from the same
+// `flex_attn_v0` kernel source; function constants select head-dim,
+// page size, Q-per-TG, and sliding-window enablement.
+//
+// This is called from encAttn when the scheduler determines a layer
+// should NOT take the shared-prefix broadcast path.
+func encFlexAttnV0(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
+                    Kc: MTLBuffer, Vc: MTLBuffer,
+                    kLenBuf: MTLBuffer,
+                    H_Q: Int, H_KV: Int, D: Int,
+                    isFull: Bool) {
+    let psoSel: MTLComputePipelineState = isFull ? flexAttnFullV0PSO : flexAttnSlideV0PSO
+    let fullOff = isFull ? flex_full_full_offsets   : flex_full_offsets
+    let fullIdx = isFull ? flex_full_full_indices   : flex_full_indices
+    let partOff = isFull ? flex_full_partial_offsets : flex_partial_offsets
+    let partIdx = isFull ? flex_full_partial_indices : flex_partial_indices
+
     let enc1 = cb.makeComputeCommandEncoder()!
-    enc1.setComputePipelineState(flexAttnFullV0PSO)
+    enc1.setComputePipelineState(psoSel)
     enc1.setBuffer(Q, offset: 0, index: 0); enc1.setBuffer(Kc, offset: 0, index: 1)
     enc1.setBuffer(Vc, offset: 0, index: 2); enc1.setBuffer(block_table, offset: 0, index: 3)
     enc1.setBuffer(m_partials, offset: 0, index: 4)
     enc1.setBuffer(l_partials, offset: 0, index: 5)
     enc1.setBuffer(O_partials, offset: 0, index: 6)
-    enc1.setBuffer(flex_full_full_offsets, offset: 0, index: 7)
-    enc1.setBuffer(flex_full_full_indices, offset: 0, index: 8)
-    enc1.setBuffer(flex_full_partial_offsets, offset: 0, index: 9)
-    enc1.setBuffer(flex_full_partial_indices, offset: 0, index: 10)
+    enc1.setBuffer(fullOff, offset: 0, index: 7)
+    enc1.setBuffer(fullIdx, offset: 0, index: 8)
+    enc1.setBuffer(partOff, offset: 0, index: 9)
+    enc1.setBuffer(partIdx, offset: 0, index: 10)
     enc1.setBuffer(kLenBuf, offset: 0, index: 11)
     var scale: Float = 1.0
     var mv = UInt32(MAX_PAGES_PER_SLOT), hq = UInt32(H_Q), hkv = UInt32(H_KV), ns = UInt32(ATTN_N_SPLITS)
-    enc1.setBytes(&scale, length: 4, index: 12); enc1.setBytes(&mv, length: 4, index: 13)
-    enc1.setBytes(&hq, length: 4, index: 14); enc1.setBytes(&hkv, length: 4, index: 15)
-    enc1.setBytes(&ns, length: 4, index: 16)
-    // New params (defaults match pre-broadcast behavior).
+    // sliding_window bound at index 17 in both PSOs — the full-attn PSO's
+    // FC_USE_SLIDE=false makes the kernel dead-strip all use of this value.
+    // Keeping the binding uniform is a Swift-side convenience.
+    var sw: UInt32 = isFull ? 0 : UInt32(SLIDING_WINDOW)
     var pp: UInt32 = 0, so: UInt32 = 0, tso: UInt32 = 0
-    enc1.setBytes(&pp,  length: 4, index: 17)
-    enc1.setBytes(&so,  length: 4, index: 18)
-    enc1.setBytes(&tso, length: 4, index: 19)
-    enc1.dispatchThreadgroups(MTLSize(width: B * H_KV, height: ATTN_N_SPLITS, depth: 1),
-                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc1.endEncoding()
-
-    let enc2 = cb.makeComputeCommandEncoder()!
-    enc2.setComputePipelineState(pagedSplitReducePSO)
-    enc2.setBuffer(m_partials, offset: 0, index: 0)
-    enc2.setBuffer(l_partials, offset: 0, index: 1)
-    enc2.setBuffer(O_partials, offset: 0, index: 2)
-    enc2.setBuffer(O, offset: 0, index: 3)
-    var Dv = UInt32(D)
-    enc2.setBytes(&Dv, length: 4, index: 4)
-    enc2.setBytes(&ns, length: 4, index: 5)
-    enc2.dispatchThreadgroups(MTLSize(width: B * H_Q, height: 1, depth: 1),
-                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc2.endEncoding()
-}
-
-// Flex attention dispatcher (v0: slide D=256, Q_BLOCK=1, causal_sliding).
-// Consumes the precomputed full/partial lists and shares the same split-reduce
-// kernel as the legacy encPagedAttnSlideGqa so pidx layout is unchanged.
-func encFlexAttnSlideV0(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
-                         Kc: MTLBuffer, Vc: MTLBuffer,
-                         kLenBuf: MTLBuffer,
-                         H_Q: Int, H_KV: Int, D: Int) {
-    let enc1 = cb.makeComputeCommandEncoder()!
-    enc1.setComputePipelineState(flexAttnSlideV0PSO)
-    enc1.setBuffer(Q, offset: 0, index: 0); enc1.setBuffer(Kc, offset: 0, index: 1)
-    enc1.setBuffer(Vc, offset: 0, index: 2); enc1.setBuffer(block_table, offset: 0, index: 3)
-    enc1.setBuffer(m_partials, offset: 0, index: 4)
-    enc1.setBuffer(l_partials, offset: 0, index: 5)
-    enc1.setBuffer(O_partials, offset: 0, index: 6)
-    enc1.setBuffer(flex_full_offsets, offset: 0, index: 7)
-    enc1.setBuffer(flex_full_indices, offset: 0, index: 8)
-    enc1.setBuffer(flex_partial_offsets, offset: 0, index: 9)
-    enc1.setBuffer(flex_partial_indices, offset: 0, index: 10)
-    enc1.setBuffer(kLenBuf, offset: 0, index: 11)
-    var scale: Float = 1.0   // Gemma-4 attn.scaling
-    var mv = UInt32(MAX_PAGES_PER_SLOT), hq = UInt32(H_Q), hkv = UInt32(H_KV), ns = UInt32(ATTN_N_SPLITS)
-    var sw = UInt32(SLIDING_WINDOW)
     enc1.setBytes(&scale, length: 4, index: 12); enc1.setBytes(&mv, length: 4, index: 13)
-    enc1.setBytes(&hq, length: 4, index: 14); enc1.setBytes(&hkv, length: 4, index: 15)
-    enc1.setBytes(&ns, length: 4, index: 16)
-    enc1.setBytes(&sw, length: 4, index: 17)
-    // New params — zeroed for the default path (no prefix skipping, pidx
-    // stride == N_SPLITS so output layout matches pre-broadcast v0 clients).
-    var pp: UInt32 = 0, so: UInt32 = 0, tso: UInt32 = 0
-    enc1.setBytes(&pp,  length: 4, index: 18)
-    enc1.setBytes(&so,  length: 4, index: 19)
+    enc1.setBytes(&hq, length: 4, index: 14);    enc1.setBytes(&hkv, length: 4, index: 15)
+    enc1.setBytes(&ns, length: 4, index: 16);    enc1.setBytes(&sw, length: 4, index: 17)
+    enc1.setBytes(&pp, length: 4, index: 18);    enc1.setBytes(&so, length: 4, index: 19)
     enc1.setBytes(&tso, length: 4, index: 20)
     enc1.dispatchThreadgroups(MTLSize(width: B * H_KV, height: ATTN_N_SPLITS, depth: 1),
                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc1.endEncoding()
 
-    // Shared reduce kernel: same as paged_attn_split_reduce.
     let enc2 = cb.makeComputeCommandEncoder()!
     enc2.setComputePipelineState(pagedSplitReducePSO)
     enc2.setBuffer(m_partials, offset: 0, index: 0)
@@ -1690,103 +1823,8 @@ func encFlexAttnSlideV0(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
     enc2.endEncoding()
 }
 
-// Full-attn GQA-grouped split-KV. Grid: (B*H_KV, N_SPLITS), one TG handles
-// all H_Q/H_KV=8 Q heads that share a kv_head — kills the 8× KV-read
-// redundancy and gives QK-sgmm real Q=8 rows. Shared reduce kernel unchanged.
-func encPagedAttnFullGqa(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
-                          Kc: MTLBuffer, Vc: MTLBuffer,
-                          numPagesBuf: MTLBuffer, kLenBuf: MTLBuffer,
-                          H_Q: Int, H_KV: Int, D: Int) {
-    let enc1 = cb.makeComputeCommandEncoder()!
-    enc1.setComputePipelineState(pagedFullGqaPSO)
-    enc1.setBuffer(Q, offset: 0, index: 0); enc1.setBuffer(Kc, offset: 0, index: 1)
-    enc1.setBuffer(Vc, offset: 0, index: 2); enc1.setBuffer(block_table, offset: 0, index: 3)
-    enc1.setBuffer(m_partials, offset: 0, index: 4)
-    enc1.setBuffer(l_partials, offset: 0, index: 5)
-    enc1.setBuffer(O_partials, offset: 0, index: 6)
-    enc1.setBuffer(numPagesBuf, offset: 0, index: 7); enc1.setBuffer(kLenBuf, offset: 0, index: 8)
-    var scale: Float = 1.0   // Gemma-4: attn.scaling == 1.0; q is already RMS-normed via q_norm
-    var mv = UInt32(MAX_PAGES_PER_SLOT), hq = UInt32(H_Q), hkv = UInt32(H_KV), ns = UInt32(ATTN_N_SPLITS)
-    enc1.setBytes(&scale, length: 4, index: 9); enc1.setBytes(&mv, length: 4, index: 10)
-    enc1.setBytes(&hq, length: 4, index: 11); enc1.setBytes(&hkv, length: 4, index: 12)
-    enc1.setBytes(&ns, length: 4, index: 13)
-    enc1.dispatchThreadgroups(MTLSize(width: B * H_KV, height: ATTN_N_SPLITS, depth: 1),
-                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc1.endEncoding()
 
-    let enc2 = cb.makeComputeCommandEncoder()!
-    enc2.setComputePipelineState(pagedSplitReducePSO)
-    enc2.setBuffer(m_partials, offset: 0, index: 0)
-    enc2.setBuffer(l_partials, offset: 0, index: 1)
-    enc2.setBuffer(O_partials, offset: 0, index: 2)
-    enc2.setBuffer(O, offset: 0, index: 3)
-    var Dv = UInt32(D)
-    enc2.setBytes(&Dv, length: 4, index: 4)
-    enc2.setBytes(&ns, length: 4, index: 5)
-    enc2.dispatchThreadgroups(MTLSize(width: B * H_Q, height: 1, depth: 1),
-                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc2.endEncoding()
-}
 
-// Split-KV attention: compute partials + reduce. 4× more parallelism than
-// single-TG variant — directly addresses the latency-bound bottleneck on M5.
-func encPagedAttnSplit(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
-                        Kc: MTLBuffer, Vc: MTLBuffer,
-                        numPagesBuf: MTLBuffer, kLenBuf: MTLBuffer,
-                        H_Q: Int, H_KV: Int, D: Int, isFull: Bool) {
-    // Compute: grid (B*H_Q, N_SPLITS)
-    let enc1 = cb.makeComputeCommandEncoder()!
-    enc1.setComputePipelineState(isFull ? pagedFullSplitPSO : pagedSlideSplitPSO)
-    enc1.setBuffer(Q, offset: 0, index: 0); enc1.setBuffer(Kc, offset: 0, index: 1)
-    enc1.setBuffer(Vc, offset: 0, index: 2); enc1.setBuffer(block_table, offset: 0, index: 3)
-    enc1.setBuffer(m_partials, offset: 0, index: 4)
-    enc1.setBuffer(l_partials, offset: 0, index: 5)
-    enc1.setBuffer(O_partials, offset: 0, index: 6)
-    enc1.setBuffer(numPagesBuf, offset: 0, index: 7); enc1.setBuffer(kLenBuf, offset: 0, index: 8)
-    var scale: Float = 1.0   // Gemma-4: attn.scaling == 1.0; q is already RMS-normed via q_norm
-    var mv = UInt32(MAX_PAGES_PER_SLOT), hq = UInt32(H_Q), hkv = UInt32(H_KV), ns = UInt32(ATTN_N_SPLITS)
-    enc1.setBytes(&scale, length: 4, index: 9); enc1.setBytes(&mv, length: 4, index: 10)
-    enc1.setBytes(&hq, length: 4, index: 11); enc1.setBytes(&hkv, length: 4, index: 12)
-    enc1.setBytes(&ns, length: 4, index: 13)
-    enc1.dispatchThreadgroups(MTLSize(width: B * H_Q, height: ATTN_N_SPLITS, depth: 1),
-                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc1.endEncoding()
-
-    // Reduce: grid (B*H_Q,)
-    let enc2 = cb.makeComputeCommandEncoder()!
-    enc2.setComputePipelineState(pagedSplitReducePSO)
-    enc2.setBuffer(m_partials, offset: 0, index: 0)
-    enc2.setBuffer(l_partials, offset: 0, index: 1)
-    enc2.setBuffer(O_partials, offset: 0, index: 2)
-    enc2.setBuffer(O, offset: 0, index: 3)
-    var Dv = UInt32(D)
-    enc2.setBytes(&Dv, length: 4, index: 4)
-    enc2.setBytes(&ns, length: 4, index: 5)
-    enc2.dispatchThreadgroups(MTLSize(width: B * H_Q, height: 1, depth: 1),
-                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc2.endEncoding()
-}
-
-func encPagedAttn(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer, Kc: MTLBuffer, Vc: MTLBuffer,
-                  numPagesBuf: MTLBuffer, kLenBuf: MTLBuffer,
-                  H_Q: Int, H_KV: Int, D: Int, isFull: Bool) {
-    let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(isFull ? pagedFullPSO : pagedSlidePSO)
-    enc.setBuffer(Q, offset: 0, index: 0); enc.setBuffer(Kc, offset: 0, index: 1)
-    enc.setBuffer(Vc, offset: 0, index: 2); enc.setBuffer(block_table, offset: 0, index: 3)
-    enc.setBuffer(O, offset: 0, index: 4); enc.setBuffer(numPagesBuf, offset: 0, index: 5)
-    enc.setBuffer(kLenBuf, offset: 0, index: 6)
-    var scale: Float = 1.0   // Gemma-4: attn.scaling == 1.0; q is already RMS-normed via q_norm
-    var mv = UInt32(MAX_PAGES_PER_SLOT), hq = UInt32(H_Q), hkv = UInt32(H_KV)
-    enc.setBytes(&scale, length: 4, index: 7)
-    enc.setBytes(&mv, length: 4, index: 8)
-    enc.setBytes(&hq, length: 4, index: 9)
-    enc.setBytes(&hkv, length: 4, index: 10)
-    // Grid: B × H_Q virtual slots (each TG handles one q-head for one slot)
-    enc.dispatchThreadgroups(MTLSize(width: B * H_Q, height: 1, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc.endEncoding()
-}
 
 func encSoftmaxTopk(_ cb: MTLCommandBuffer, expertScaleBuf: MTLBuffer) {
     encSoftmaxTopkInto(cb, logits: router_lg, expertIds: expert_ids, gateW: gate_w,
@@ -1815,9 +1853,13 @@ func encSoftmaxTopkInto(_ cb: MTLCommandBuffer, logits: MTLBuffer,
 // writes group_start[E+1], slot_token[numVecs*K], batch_slots[numVecs*K].
 // Single TG, 128 threads. Must run after softmax_topk and before any MoE GEMV.
 // The kernel takes B as a runtime arg, so pass B*qLen for prefill.
-func encRouteCompact(_ cb: MTLCommandBuffer) {
+// route_compact dispatch — `activeB` is passed to the kernel as the
+// active-batch count. Silenced slots [activeB, B) are skipped, so MoE
+// kernels see only real-slot routings in slot_token/group_start. Default
+// activeB=B preserves legacy behavior.
+func encRouteCompact(_ cb: MTLCommandBuffer, activeB: Int = B) {
     encRouteCompactInto(cb, expertIds: expert_ids, groupStart: group_start,
-                         slotToken: slot_token, batchSlots: batch_slots, numVecs: B)
+                         slotToken: slot_token, batchSlots: batch_slots, numVecs: activeB)
 }
 
 func encRouteCompactInto(_ cb: MTLCommandBuffer, expertIds: MTLBuffer,
@@ -2029,13 +2071,41 @@ let gResidualCaptureBuf: MTLBuffer = device.makeBuffer(
     length: HIDDEN * 2, options: .storageModeShared)!
 
 // All-layer capture: when enabled, every layer's post-FFN residual gets
-// blitted into gAllLayerCaptureBuf at its L-indexed slot. Used by the
-// screening endpoint to compute per-layer separation + coherence
-// metrics without needing one forward pass per layer-guess. Layout:
-// [NUM_LAYERS, HIDDEN] fp16, slot 0 = layer 0, etc.
+// blitted into gAllLayerCaptureBuf. Layout:
+//   [NUM_LAYERS, B, HIDDEN] fp16  — one strip per (layer, batch-slot) pair.
+// A single blit per layer copies B * HIDDEN halves at once (the `hidden`
+// buffer is already slot-major [B, HIDDEN]). Extracting one slot's
+// per-layer residuals is a non-contiguous gather over L strides, done
+// by gemma_get_all_slot_layer_residuals — cheap (30 * 5.6 KB memcpys).
+// Legacy gemma_get_all_layer_residuals returns slot 0's strip, same
+// semantics as the pre-batch layout.
 var gCaptureAllLayers: Bool = false
 let gAllLayerCaptureBuf: MTLBuffer = device.makeBuffer(
-    length: NUM_LAYERS * HIDDEN * 2, options: .storageModeShared)!
+    length: NUM_LAYERS * B * HIDDEN * 2, options: .storageModeShared)!
+
+// Per-layer Q/K/V capture for synthetic-KV fitting.
+// When gCaptureQKV is true, after each layer's q_norm+RoPE, k_norm+RoPE,
+// and v_norm_noscale, we blit the slot-0 q/k/v tensors into layer-
+// indexed slots in these buffers. Slot 0 only — we use these captures
+// from single-slot teacher-forcing during residual collection, not
+// from the B=4 batched AR path. Layout:
+//   Q: [NUM_LAYERS, MAX_Q_HEADS * MAX_HD] halves   (conservative sizing)
+//   K: [NUM_LAYERS, MAX_KV_HEADS * MAX_HD] halves
+//   V: [NUM_LAYERS, MAX_KV_HEADS * MAX_HD] halves
+// MAX_HD covers both SLIDE (256) and FULL (512) layer types.
+// Only the first (H_L * HD_L) halves of each per-layer slice are valid
+// for that particular layer's shape; the client splits based on
+// per-layer metadata.
+let MAX_Q_HEADS: Int = max(SLIDE_H, FULL_H)       // 16
+let MAX_KV_HEADS: Int = max(SLIDE_KV_H, FULL_KV_H) // 8
+let MAX_HD: Int = max(SLIDE_HD, FULL_HD)           // 512
+var gCaptureQKV: Bool = false
+let gQCaptureBuf: MTLBuffer = device.makeBuffer(
+    length: NUM_LAYERS * MAX_Q_HEADS * MAX_HD * 2, options: .storageModeShared)!
+let gKCaptureBuf: MTLBuffer = device.makeBuffer(
+    length: NUM_LAYERS * MAX_KV_HEADS * MAX_HD * 2, options: .storageModeShared)!
+let gVCaptureBuf: MTLBuffer = device.makeBuffer(
+    length: NUM_LAYERS * MAX_KV_HEADS * MAX_HD * 2, options: .storageModeShared)!
 
 // Per-tick staging: for each slot, the list of (cvec buffer, layer, mag)
 // triples to apply at their respective layers this step. Populated by
@@ -2054,9 +2124,13 @@ let gAllLayerCaptureBuf: MTLBuffer = device.makeBuffer(
 struct SlotControl {
     let buffer: MTLBuffer
     let layer: Int
-    let mag: Float
+    let mag: Float             // additive mag OR project target (mode-dependent)
     let mode: CvecMode
     let measureOutSlot: Int    // index into gProjectMeasureBuf
+    // Transport mode only: Brenier-map scale + offset. Applied as
+    // a' = scale * a + offset where a is the measured projection.
+    let transportScale: Float
+    let transportOffset: Float
 }
 var gSlotControls: [[SlotControl]] = Array(repeating: [], count: B)
 
@@ -2089,7 +2163,10 @@ struct PrefillControl {
     let mode: CvecMode
     let magsBuf: MTLBuffer          // additive-mode per-row scalars
     let targetsBuf: MTLBuffer       // project-mode per-row targets (NaN = skip)
-    let projectMeasuresBuf: MTLBuffer  // project-mode pre-write readback
+    let projectMeasuresBuf: MTLBuffer  // project- & transport-mode pre-write readback
+    // Transport-mode per-row buffers (NaN sentinel in scalesBuf skips row).
+    let transportScalesBuf: MTLBuffer
+    let transportOffsetsBuf: MTLBuffer
 }
 var gPrefillControls: [PrefillControl] = []
 
@@ -2185,22 +2262,22 @@ let LM_DUMP_L0_MOE_SLOTS: MTLBuffer? = {
     return device.makeBuffer(length: size, options: .storageModeShared)!
 }()
 
-// Threshold (in pages) below which broadcast attention isn't worth the
-// overhead — per-slot v0 stays faster at tiny shared regions. Env-
-// tunable: SHARED_PREFIX_THRESHOLD=<pages>. Default 4 (=64 tokens).
-let SHARED_PREFIX_THRESHOLD_PAGES =
-    Int(ProcessInfo.processInfo.environment["SHARED_PREFIX_THRESHOLD"] ?? "4") ?? 4
-
-func buildStepCB(_ w: LmWeights, sharedPrefixPages: Int = 0) -> MTLCommandBuffer {
+// AR step CB. `activeB` = the count of slots [0, activeB) carrying real
+// session data this tick — kernel-zoo dispatchers use it to pick the
+// compile-time-fixed B_TILE specialization that exactly matches the
+// active workload (no silenced-slot wasted weight reads). Slot
+// assignment policy ("lowest free first" in runAdmissionPass) keeps
+// real sessions packed at [0, activeB).
+//
+// Default activeB=B preserves legacy behaviour for callers that haven't
+// computed the actual count yet.
+func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
     let cb = queue.makeCommandBuffer()!
-    // Decide once per build whether the broadcast path applies. Above
-    // threshold, each layer's attention routes through the shared+tail
-    // kernel pair; below, we stay on the standard per-slot v0 path.
-    let useBroadcast = sharedPrefixPages >= SHARED_PREFIX_THRESHOLD_PAGES
+    let aB = max(1, min(B, activeB))
 
     // Embed lookup + Gemma-4 sqrt(hidden) scale on token embeddings.
     encEmbed(cb, embedTable: w.embedTable)
-    encScaleByScalar(cb, x: hidden, scalar: w.embedScaleBuf, N: HIDDEN, numVecs: B)
+    encScaleByScalar(cb, x: hidden, scalar: w.embedScaleBuf, N: HIDDEN, numVecs: aB)
     if let dump = LM_DUMP_STAGING {
         let blit = cb.makeBlitCommandEncoder()!
         blit.copy(from: hidden, sourceOffset: 0,
@@ -2233,57 +2310,39 @@ func buildStepCB(_ w: LmWeights, sharedPrefixPages: Int = 0) -> MTLCommandBuffer
                                 Din: HIDDEN,
                                 DoutQ: H * HD, DoutK: KV_H * HD, DoutV: KV_H * HD)
 
-        encRMSNormG(cb, x: q_out, gammaBuf: lw.attnQNorm, out: q_out, D: HD, numVecs: B * H)
+        encRMSNormG(cb, x: q_out, gammaBuf: lw.attnQNorm, out: q_out, D: HD, numVecs: aB * H)
         encRope(cb, q_out, H: H, D: HD, rotary: rotary, theta: theta)
-        encRMSNormG(cb, x: k_out, gammaBuf: lw.attnKNorm, out: k_out, D: HD, numVecs: B * KV_H)
+        encRMSNormG(cb, x: k_out, gammaBuf: lw.attnKNorm, out: k_out, D: HD, numVecs: aB * KV_H)
         encRope(cb, k_out, H: KV_H, D: HD, rotary: rotary, theta: theta)
-        encRMSNormNoScale(cb, x: v_out, out: v_out, D: HD, numVecs: B * KV_H)
+        encRMSNormNoScale(cb, x: v_out, out: v_out, D: HD, numVecs: aB * KV_H)
+
+        // Q/K/V capture: slot-0 per-layer snapshot after q_norm/RoPE,
+        // k_norm/RoPE, v_norm_noscale — i.e. exactly the tensors that
+        // would enter attention's dot products and be written to the
+        // KV cache. Used by the synthetic-KV fitting pipeline offline;
+        // no cost when gCaptureQKV is false.
+        if gCaptureQKV {
+            let blit = cb.makeBlitCommandEncoder()!
+            blit.copy(from: q_out, sourceOffset: 0,
+                      to: gQCaptureBuf, destinationOffset: L * MAX_Q_HEADS * MAX_HD * 2,
+                      size: H * HD * 2)
+            blit.copy(from: k_out, sourceOffset: 0,
+                      to: gKCaptureBuf, destinationOffset: L * MAX_KV_HEADS * MAX_HD * 2,
+                      size: KV_H * HD * 2)
+            blit.copy(from: v_out, sourceOffset: 0,
+                      to: gVCaptureBuf, destinationOffset: L * MAX_KV_HEADS * MAX_HD * 2,
+                      size: KV_H * HD * 2)
+            blit.endEncoding()
+        }
 
         let pg = isFull ? PAGE_FULL : PAGE_SLIDE
         encKVWrite(cb, K: k_out, V: v_out, Kc: Kc, Vc: Vc, H: KV_H, D: HD, page: pg)
 
         let npBuf = isFull ? num_pages_full : num_pages_slide
         let klBuf = isFull ? k_len_full : k_len_slide
-        if useBroadcast && isFull {
-            // Broadcast shared-prefix K/V across all B slots, then per-slot
-            // tail kernel writes split=1, split_reduce merges.
-            encPagedAttnFullArSharedAndTail(cb, Q: q_out, O: attn_out,
-                                             Kc: Kc, Vc: Vc,
-                                             sharedPhysPages: shared_phys_pages,
-                                             mPart: m_partials,
-                                             lPart: l_partials,
-                                             OPart: O_partials,
-                                             kLenBuf: klBuf,
-                                             H_Q: H, H_KV: KV_H, D: HD,
-                                             prefixPages: sharedPrefixPages,
-                                             bBatch: B)
-        } else if useBroadcast {
-            encPagedAttnSlideArSharedAndTail(cb, Q: q_out, O: attn_out,
-                                              Kc: Kc, Vc: Vc,
-                                              sharedPhysPages: shared_phys_pages,
-                                              mPart: m_partials,
-                                              lPart: l_partials,
-                                              OPart: O_partials,
-                                              kLenBuf: klBuf,
-                                              H_Q: H, H_KV: KV_H, D: HD,
-                                              prefixPages: sharedPrefixPages,
-                                              slidingWindow: SLIDING_WINDOW,
-                                              bBatch: B)
-        } else if isFull && USE_FLEX_ATTN {
-            encFlexAttnFullV0(cb, Q: q_out, O: attn_out, Kc: Kc, Vc: Vc,
-                              kLenBuf: klBuf, H_Q: H, H_KV: KV_H, D: HD)
-        } else if isFull {
-            encPagedAttnFullGqa(cb, Q: q_out, O: attn_out, Kc: Kc, Vc: Vc,
-                                numPagesBuf: npBuf, kLenBuf: klBuf,
-                                H_Q: H, H_KV: KV_H, D: HD)
-        } else if USE_FLEX_ATTN {
-            encFlexAttnSlideV0(cb, Q: q_out, O: attn_out, Kc: Kc, Vc: Vc,
-                               kLenBuf: klBuf, H_Q: H, H_KV: KV_H, D: HD)
-        } else {
-            encPagedAttnSlideGqa(cb, Q: q_out, O: attn_out, Kc: Kc, Vc: Vc,
-                                 numPagesBuf: npBuf, kLenBuf: klBuf,
-                                 H_Q: H, H_KV: KV_H, D: HD)
-        }
+        encAttn(cb, Q: q_out, O: attn_out, Kc: Kc, Vc: Vc,
+                kLenBuf: klBuf, H_Q: H, H_KV: KV_H, D: HD,
+                isFull: isFull)
         if LM_SKIP_ATTN {
             let blit = cb.makeBlitCommandEncoder()!
             blit.fill(buffer: attn_out, range: 0..<(B * max(SLIDE_H * SLIDE_HD, FULL_H * FULL_HD) * 2), value: 0)
@@ -2299,9 +2358,18 @@ func buildStepCB(_ w: LmWeights, sharedPrefixPages: Int = 0) -> MTLCommandBuffer
                       to: attnDump, destinationOffset: 0, size: H * HD * 2)
             blit.endEncoding()
         }
-        encGemvQ80V6(cb, attn_out, lw.attnOut, mlp_out, Din: H * HD, Dout: HIDDEN)
+        // o_proj — kernel zoo dispatcher picks btile_b{1,2,4,8} by activeB.
+        encGemvQ80Btile(cb, attn_out, lw.attnOut, mlp_out,
+                         Din: H * HD, Dout: HIDDEN, activeB: aB)
+        // Heretic-style attn-out ablation (niche, leave at B).
+        if let engine = gEngine {
+            for wa in engine.writeAblations where wa.layer == L && wa.component == .attnOut {
+                encOrthogonalizeWrite(cb, y: mlp_out, rHat: wa.rHatBuf,
+                                       alpha: wa.alpha, N: HIDDEN, numVecs: B)
+            }
+        }
         encRmsNormAdd(cb, x: mlp_out, gammaBuf: lw.postAttnNorm,
-                      residual: hidden, out: hidden, N: HIDDEN, numVecs: B)
+                      residual: hidden, out: hidden, N: HIDDEN, numVecs: aB)
         if L == 0, let dump = LM_DUMP_L0_STAGING {
             let blit = cb.makeBlitCommandEncoder()!
             blit.copy(from: hidden, sourceOffset: 0,
@@ -2314,9 +2382,11 @@ func buildStepCB(_ w: LmWeights, sharedPrefixPages: Int = 0) -> MTLCommandBuffer
                                    Wg: lw.ffnGate, Wu: lw.ffnUp,
                                    fusedOut: shrd_gate_up_fused,
                                    Din: HIDDEN, Dout: SHARED_INT)
-        encMoeGeluMulFused(cb, fused: shrd_gate_up_fused, out: shrd_gate, N_half: SHARED_INT, numSlots: B)
-        encGemvQ80V6(cb, shrd_gate, lw.ffnDown, mlp_out, Din: SHARED_INT, Dout: HIDDEN)
-        encRMSNormG(cb, x: mlp_out, gammaBuf: lw.postFfn1Norm, out: mlp_out, D: HIDDEN, numVecs: B)
+        encMoeGeluMulFused(cb, fused: shrd_gate_up_fused, out: shrd_gate, N_half: SHARED_INT, numSlots: aB)
+        // ffn_down — kernel zoo dispatcher (templated B_TILE).
+        encGemvQ80Btile(cb, shrd_gate, lw.ffnDown, mlp_out,
+                         Din: SHARED_INT, Dout: HIDDEN, activeB: aB)
+        encRMSNormG(cb, x: mlp_out, gammaBuf: lw.postFfn1Norm, out: mlp_out, D: HIDDEN, numVecs: aB)
         if L == 0, let dump = LM_DUMP_L0_STAGING {
             let blit = cb.makeBlitCommandEncoder()!
             blit.copy(from: mlp_out, sourceOffset: 0,
@@ -2351,10 +2421,10 @@ func buildStepCB(_ w: LmWeights, sharedPrefixPages: Int = 0) -> MTLCommandBuffer
                       to: routerDump, destinationOffset: TOPK * 4, size: TOPK * 4)
             blit.endEncoding()
         }
-        encRouteCompact(cb)
+        encRouteCompact(cb, activeB: aB)
 
         // MoE branch: pre_ffn_2(hidden) → fused Q4_K gate_up → gelu*mul → Q5_1 down → combine → post_ffn_2.
-        encRMSNormG(cb, x: hidden, gammaBuf: lw.preFfn2Norm, out: hidden_norm, D: HIDDEN, numVecs: B)
+        encRMSNormG(cb, x: hidden, gammaBuf: lw.preFfn2Norm, out: hidden_norm, D: HIDDEN, numVecs: aB)
         if L == 0, let dump = LM_DUMP_L0_STAGING {
             // Slot 3: pre_feedforward_layernorm_2(hidden) = input to experts.
             let blit = cb.makeBlitCommandEncoder()!
@@ -2362,10 +2432,18 @@ func buildStepCB(_ w: LmWeights, sharedPrefixPages: Int = 0) -> MTLCommandBuffer
                       to: dump, destinationOffset: 3 * HIDDEN * 2, size: HIDDEN * 2)
             blit.endEncoding()
         }
+        // numActive=E_EXP is the SAFE setting: route_compact populates
+        // active_experts[] sorted by EXPERT ID, not by slot, so slot 0's
+        // 8 TOPK experts may sit at any indices in [0, num_unique). To
+        // trim correctly we need either: (a) route_compact awareness of
+        // activeB to put slot-0's experts up front, or (b) a separate
+        // per-active-slot active list. Naive numActive=TOPK*aB produces
+        // garbage output (verified 2026-04-29). Future work.
         encMoeGemvQ4K(cb, hidden_norm, lw.moeGateUp, gate_up_fused,
                       Din: HIDDEN, Dout: MOE_FUSED_DOUT, numActive: E_EXP, useV6: true)
         encMoeGeluMulFused(cb, fused: gate_up_fused, out: gate_proj, N_half: MOE_INT, numSlots: TOTAL_SLOTS)
-        encMoeGemvQ51(cb, gate_proj, lw.moeDown, moe_down_out, Din: MOE_INT, Dout: HIDDEN, numActive: E_EXP, useV6: true)
+        encMoeGemvQ51(cb, gate_proj, lw.moeDown, moe_down_out,
+                      Din: MOE_INT, Dout: HIDDEN, numActive: E_EXP, useV6: true)
         if L == 0, let slotsDump = LM_DUMP_L0_MOE_SLOTS {
             let blit = cb.makeBlitCommandEncoder()!
             var off = 0
@@ -2393,7 +2471,7 @@ func buildStepCB(_ w: LmWeights, sharedPrefixPages: Int = 0) -> MTLCommandBuffer
                       to: dump, destinationOffset: 4 * HIDDEN * 2, size: HIDDEN * 2)
             blit.endEncoding()
         }
-        encRMSNormG(cb, x: moe_sum, gammaBuf: lw.postFfn2Norm, out: moe_sum, D: HIDDEN, numVecs: B)
+        encRMSNormG(cb, x: moe_sum, gammaBuf: lw.postFfn2Norm, out: moe_sum, D: HIDDEN, numVecs: aB)
         if L == 0, let dump = LM_DUMP_L0_STAGING {
             let blit = cb.makeBlitCommandEncoder()!
             blit.copy(from: moe_sum, sourceOffset: 0,
@@ -2412,11 +2490,18 @@ func buildStepCB(_ w: LmWeights, sharedPrefixPages: Int = 0) -> MTLCommandBuffer
         }
 
         // Combine + final post_ffn_norm + residual add + layer_output_scale (fused).
-        encBufferCopy(cb, src: mlp_out, dst: ffn_combined, bytes: B * HIDDEN * 2)
-        encAddInplace(cb, dst: ffn_combined, src: moe_sum, N: HIDDEN, numVecs: B)
+        encBufferCopy(cb, src: mlp_out, dst: ffn_combined, bytes: aB * HIDDEN * 2)
+        encAddInplace(cb, dst: ffn_combined, src: moe_sum, N: HIDDEN, numVecs: aB)
+        // Heretic-style ffn-out ablation (niche, leave at B).
+        if let engine = gEngine {
+            for wa in engine.writeAblations where wa.layer == L && wa.component == .ffnOut {
+                encOrthogonalizeWrite(cb, y: ffn_combined, rHat: wa.rHatBuf,
+                                       alpha: wa.alpha, N: HIDDEN, numVecs: B)
+            }
+        }
         encRmsNormAddScale(cb, x: ffn_combined, gammaBuf: lw.postFfnNorm,
                            residual: hidden, scalar: lw.layerOutputScale,
-                           out: hidden, N: HIDDEN, numVecs: B)
+                           out: hidden, N: HIDDEN, numVecs: aB)
         // Control-vector injection at the post-FFN residual site.
         //
         // Phase A: LM_CVEC_* env vars apply ONE cvec at ONE layer to ALL
@@ -2453,6 +2538,18 @@ func buildStepCB(_ w: LmWeights, sharedPrefixPages: Int = 0) -> MTLCommandBuffer
                                         currentProjBuf: gProjectMeasureBuf,
                                         currentProjSlotOffsetBytes: sc.measureOutSlot * 4,
                                         target: sc.mag, N: HIDDEN)
+                case .transport:
+                    // Gaussian OT: same reduction + write shape as
+                    // project, but target is a linear function of the
+                    // measured projection (scale*a + offset) rather
+                    // than a constant. Preserves within-class variation.
+                    encTransportCvecSlot(cb, dst: hidden, slot: slot,
+                                          cvec: sc.buffer,
+                                          currentProjBuf: gProjectMeasureBuf,
+                                          currentProjSlotOffsetBytes: sc.measureOutSlot * 4,
+                                          scale: sc.transportScale,
+                                          offset: sc.transportOffset,
+                                          N: HIDDEN)
                 }
             }
         }
@@ -2482,12 +2579,18 @@ func buildStepCB(_ w: LmWeights, sharedPrefixPages: Int = 0) -> MTLCommandBuffer
                 print("[capture] blit fired in buildStepCB @ layer \(L)")
             }
         }
-        // All-layer capture: one blit per layer into its L-indexed slot.
+        // All-layer capture: one blit per layer, copies the FULL B-slot
+        // strip of `hidden` (layout [B, HIDDEN] fp16) into the layer's
+        // B-wide strip in gAllLayerCaptureBuf at offset L*B*HIDDEN*2.
+        // Per-slot extraction happens on readback via
+        // gemma_get_all_slot_layer_residuals; legacy callers using
+        // gemma_get_all_layer_residuals still see slot 0's strip.
         if gCaptureAllLayers {
             let blit = cb.makeBlitCommandEncoder()!
             blit.copy(from: hidden, sourceOffset: 0,
-                      to: gAllLayerCaptureBuf, destinationOffset: L * HIDDEN * 2,
-                      size: HIDDEN * 2)
+                      to: gAllLayerCaptureBuf,
+                      destinationOffset: L * B * HIDDEN * 2,
+                      size: B * HIDDEN * 2)
             blit.endEncoding()
         }
         if let dump = LM_DUMP_STAGING {
@@ -2502,6 +2605,22 @@ func buildStepCB(_ w: LmWeights, sharedPrefixPages: Int = 0) -> MTLCommandBuffer
     encRMSNormG(cb, x: hidden, gammaBuf: w.outputNorm, out: hidden_norm, D: HIDDEN, numVecs: B)
     encGemvV4Softcap(cb, hidden_norm, w.unembedW, logits,
                      Din: HIDDEN, Dout: VOCAB, cap: 30.0)
+
+    // Phase 2 of the dataflow-pipeline spec: GPU-side sampling. Reads
+    // logits + per-slot sampling params (populated by step() before
+    // commit), writes chosen token ids into `gpu_sampled_tokens`.
+    // Post-wait, step() reads gpu_sampled_tokens and compares vs the
+    // CPU sampler (validation phase) or uses it directly.
+    encSampleToken(cb,
+                    logits: logits,
+                    samplingLogitBias: sampling_logit_bias,
+                    samplingTemp: sampling_temperature,
+                    samplingMinP: sampling_min_p,
+                    samplingSeed: sampling_seed,
+                    samplingStep: sampling_step,
+                    samplingActive: sampling_active,
+                    inputTokens: gpu_sampled_tokens,
+                    vocab: VOCAB)
     return cb
 }
 
@@ -2530,7 +2649,8 @@ func buildStepCB(_ w: LmWeights, sharedPrefixPages: Int = 0) -> MTLCommandBuffer
 //                     skipped tile.
 func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
                             qLen: Int, skipEmbed: Bool = false,
-                            skipUnembed: Bool = false) {
+                            skipUnembed: Bool = false,
+                            fullPrefillLogits: Bool = false) {
     precondition(qLen <= MAX_Q_LEN, "qLen \(qLen) exceeds MAX_Q_LEN=\(MAX_Q_LEN)")
     let N = B * qLen               // total token rows
     let NS = B * qLen * TOPK       // total MoE slots
@@ -2577,6 +2697,31 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
         encRopeMulti(cb, k_out, q_positions: pre_q_positions, H: KV_H, D: HD,
                      rotary: rotary, theta: theta, qLen: qLen)
         encRMSNormNoScale(cb, x: v_out, out: v_out, D: HD, numVecs: N * KV_H)
+
+        // Q/K/V capture during prefill. Mirror of the AR site: blits
+        // slot-0 LAST-position q/k/v into the capture buffers at
+        // layer-indexed offsets. q/k/v are laid out as [B*qLen, H*HD]
+        // halves, so slot 0 position qLen-1 starts at offset
+        // (qLen - 1) * H * HD halves.
+        if gCaptureQKV {
+            let blit = cb.makeBlitCommandEncoder()!
+            blit.copy(from: q_out,
+                      sourceOffset: (qLen - 1) * H * HD * 2,
+                      to: gQCaptureBuf,
+                      destinationOffset: L * MAX_Q_HEADS * MAX_HD * 2,
+                      size: H * HD * 2)
+            blit.copy(from: k_out,
+                      sourceOffset: (qLen - 1) * KV_H * HD * 2,
+                      to: gKCaptureBuf,
+                      destinationOffset: L * MAX_KV_HEADS * MAX_HD * 2,
+                      size: KV_H * HD * 2)
+            blit.copy(from: v_out,
+                      sourceOffset: (qLen - 1) * KV_H * HD * 2,
+                      to: gVCaptureBuf,
+                      destinationOffset: L * MAX_KV_HEADS * MAX_HD * 2,
+                      size: KV_H * HD * 2)
+            blit.endEncoding()
+        }
 
         // Multi-position KV write: qLen entries per batch.
         let pg = isFull ? PAGE_FULL : PAGE_SLIDE
@@ -2665,6 +2810,12 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
                                        targetsBuf: pc.targetsBuf,
                                        currentProjBuf: pc.projectMeasuresBuf,
                                        N: HIDDEN, numVecs: N)
+            case .transport:
+                encTransportCvecPrefill(cb, dst: pre_hidden, cvec: pc.buffer,
+                                         scalesBuf: pc.transportScalesBuf,
+                                         offsetsBuf: pc.transportOffsetsBuf,
+                                         currentProjBuf: pc.projectMeasuresBuf,
+                                         N: HIDDEN, numVecs: N)
             }
         }
         // Residual capture for the pairwise prose constructor — mirror
@@ -2681,36 +2832,97 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
             blit.endEncoding()
         }
         // All-layer capture during prefill: one blit per layer, last-
-        // position slot only. Used by the screening endpoint so a
-        // single forward pass per example yields every layer's
-        // signature without needing to re-run.
+        // position slot only (prefill is single-slot in this path).
+        // Writes into layer L's slot-0 strip of the B-wide capture
+        // buffer, leaving the other slots whatever they had from the
+        // prior AR tick (batched callers should drain+capture via
+        // buildStepCB's blit, not the prefill path).
         if gCaptureAllLayers {
             let blit = cb.makeBlitCommandEncoder()!
             blit.copy(from: pre_hidden,
                       sourceOffset: (qLen - 1) * HIDDEN * 2,
-                      to: gAllLayerCaptureBuf, destinationOffset: L * HIDDEN * 2,
+                      to: gAllLayerCaptureBuf,
+                      destinationOffset: L * B * HIDDEN * 2,
                       size: HIDDEN * 2)
             blit.endEncoding()
         }
     }
 
-    // Final output norm + unembed + softcap. v4 softcap's accumulator is
-    // MAX_B=8 wide — prefill's N = B*qLen can exceed that, so split into a
-    // numVecs-generic GEMV followed by an in-place softcap pass.
+    // Final output norm + unembed + softcap.
+    //
+    // Default fast path (fullPrefillLogits=false): only the B last-q rows
+    // feed sampling, so we gather those rows from pre_hidden, RMSNorm at
+    // numVecs=B, and run V4Softcap (fused matmul+softcap) into the
+    // AR-shaped logits[B, VOCAB] directly. Collapses unembed work 32× at
+    // qLen=32 (~150 ms → ~5 ms).
+    //
+    // Slow path (fullPrefillLogits=true): legacy full [B*qLen, VOCAB]
+    // unembed; required by runLmPrefillValidate which reads pre_logits
+    // for per-position KL math.
     if !skipUnembed {
-        encRMSNormG(cb, x: pre_hidden, gammaBuf: w.outputNorm, out: pre_hidden_norm,
-                    D: HIDDEN, numVecs: N)
-        encGemvV5(cb, pre_hidden_norm, w.unembedW, pre_logits,
-                  Din: HIDDEN, Dout: VOCAB, numVecs: N)
-        encSoftcapInto(cb, buf: pre_logits, N: VOCAB, numVecs: N, cap: 30.0)
+        if fullPrefillLogits {
+            encRMSNormG(cb, x: pre_hidden, gammaBuf: w.outputNorm, out: pre_hidden_norm,
+                        D: HIDDEN, numVecs: N)
+            encGemvV5(cb, pre_hidden_norm, w.unembedW, pre_logits,
+                      Din: HIDDEN, Dout: VOCAB, numVecs: N)
+            encSoftcapInto(cb, buf: pre_logits, N: VOCAB, numVecs: N, cap: 30.0)
+            let blit = cb.makeBlitCommandEncoder()!
+            for slot in 0..<B {
+                let srcOff = (slot * qLen + (qLen - 1)) * VOCAB * 2
+                let dstOff = slot * VOCAB * 2
+                blit.copy(from: pre_logits, sourceOffset: srcOff,
+                          to: logits, destinationOffset: dstOff,
+                          size: VOCAB * 2)
+            }
+            blit.endEncoding()
+        } else {
+            let gatherBlit = cb.makeBlitCommandEncoder()!
+            for slot in 0..<B {
+                let srcOff = (slot * qLen + (qLen - 1)) * HIDDEN * 2
+                let dstOff = slot * HIDDEN * 2
+                gatherBlit.copy(from: pre_hidden, sourceOffset: srcOff,
+                                 to: hidden, destinationOffset: dstOff,
+                                 size: HIDDEN * 2)
+            }
+            gatherBlit.endEncoding()
+            encRMSNormG(cb, x: hidden, gammaBuf: w.outputNorm, out: hidden_norm,
+                        D: HIDDEN, numVecs: B)
+            encGemvV4Softcap(cb, hidden_norm, w.unembedW, logits,
+                              Din: HIDDEN, Dout: VOCAB, cap: 30.0)
+        }
+
+        // GPU-side sampling at the end of prefill — same kernel, same
+        // buffers, same contract as the AR step. Sampling params are
+        // populated by the caller (stepPrefillForSession /
+        // stepMultiSlotPrefill / stepMultiSlotSoftPrefill) before commit.
+        encSampleToken(cb,
+                        logits: logits,
+                        samplingLogitBias: sampling_logit_bias,
+                        samplingTemp: sampling_temperature,
+                        samplingMinP: sampling_min_p,
+                        samplingSeed: sampling_seed,
+                        samplingStep: sampling_step,
+                        samplingActive: sampling_active,
+                        inputTokens: gpu_sampled_tokens,
+                        vocab: VOCAB)
     }
 }
 
 // Back-compat wrapper for callers (LmSession, runLmPrefillValidate) that
 // want a single-tile CB handed to them ready to commit.
-func buildPrefillCB(_ w: LmWeights, qLen: Int, skipEmbed: Bool = false) -> MTLCommandBuffer {
+//
+// skipUnembed: defaults to false to preserve existing callers (validation
+// harness needs pre_logits populated; LmSession's last prefill tick needs
+// gpu_sampled_tokens). Multi-tile callers should pass skipUnembed=true on
+// non-final ticks — the unembed at Dout=262144 is ~150 ms per CB and is
+// pure waste when the logits won't be sampled.
+func buildPrefillCB(_ w: LmWeights, qLen: Int, skipEmbed: Bool = false,
+                     skipUnembed: Bool = false,
+                     fullPrefillLogits: Bool = false) -> MTLCommandBuffer {
     let cb = queue.makeCommandBuffer()!
-    encodePrefillTileInto(cb, w, qLen: qLen, skipEmbed: skipEmbed, skipUnembed: false)
+    encodePrefillTileInto(cb, w, qLen: qLen, skipEmbed: skipEmbed,
+                            skipUnembed: skipUnembed,
+                            fullPrefillLogits: fullPrefillLogits)
     return cb
 }
 
@@ -3093,206 +3305,6 @@ final class PrefixCache {
     var totalCachedPages: Int { byHash.values.reduce(0) { $0 + $1.pages.count } }
 }
 
-// ====================================================================
-// Real-weight pipeline. Loads + repacks all per-layer weights from a
-// Gemma-4-A4B Q4_K_M GGUF into swizzled-v6 buffers, plus dequants the
-// tied token_embd into fp16 for embed + unembed. Validates the full
-// weight-loading pipeline end-to-end — every shape, every dtype,
-// every repack — ahead of running a real forward pass.
-// ====================================================================
-// Paged-attention shared-prefix nondivergence test. Sets up B=4 slots whose
-// block_tables all point at the SAME phys pages (i.e., shared prefix),
-// populates the KV cache with deterministic values, and verifies:
-//   A) Identical-Q run: all 4 slot outputs are bitwise identical
-//      (kernel must be slot-order-invariant).
-//   B) Distinct-Q run: each slot's output is a function only of its own Q
-//      and the shared pages — not of any other slot's Q. We prove this by
-//      re-running with other slots' Qs zeroed and checking slot 0's output
-//      is unchanged.
-// If either check fails, the shared-prefix decode is not equivalent to
-// serial decode from the same prefix state.
-func runPagedAttnSharedPrefixTest() {
-    // Deterministic fill of a half buffer (seeded, matches halfBuf).
-    func fillHalf(_ buf: MTLBuffer, seed: UInt64) {
-        let p = buf.contents().assumingMemoryBound(to: Float16.self)
-        let n = buf.length / 2
-        var s = seed
-        for i in 0..<n {
-            s = s &* 6364136223846793005 &+ 1442695040888963407
-            let u = Float((s >> 32) & 0xFFFFFFFF) / Float(UInt32.max)
-            p[i] = Float16(u - 0.5) * Float16(0.1)
-        }
-    }
-    func halfAt(_ buf: MTLBuffer, _ offset: Int) -> Float16 {
-        buf.contents().load(fromByteOffset: offset * 2, as: Float16.self)
-    }
-
-    // Helper: set up shared block_tables (all slots point to same phys 0..N-1).
-    func setSharedBlockTable(numPages: Int, kLen: Int, numPagesBuf: MTLBuffer, kLenBuf: MTLBuffer) {
-        let bt = block_table.contents().assumingMemoryBound(to: UInt32.self)
-        for slot in 0..<B {
-            for p in 0..<numPages {
-                bt[slot * MAX_PAGES_PER_SLOT + p] = UInt32(p)
-            }
-        }
-        let np = numPagesBuf.contents().assumingMemoryBound(to: UInt32.self)
-        let kl = kLenBuf.contents().assumingMemoryBound(to: UInt32.self)
-        for slot in 0..<B {
-            np[slot] = UInt32(numPages)
-            kl[slot] = UInt32(kLen)
-        }
-    }
-
-    // Measure max abs diff between two half tensors of given element count.
-    func maxDiff(_ a: MTLBuffer, _ b: MTLBuffer, count: Int) -> Float {
-        let ap = a.contents().assumingMemoryBound(to: Float16.self)
-        let bp = b.contents().assumingMemoryBound(to: Float16.self)
-        var m: Float = 0
-        for i in 0..<count {
-            m = max(m, abs(Float(ap[i]) - Float(bp[i])))
-        }
-        return m
-    }
-
-    func sliceBuffer(_ buf: MTLBuffer, start: Int, count: Int) -> [Float] {
-        let p = buf.contents().assumingMemoryBound(to: Float16.self)
-        return (0..<count).map { Float(p[start + $0]) }
-    }
-
-    func runOne(isFull: Bool) {
-        let H = isFull ? FULL_H : SLIDE_H
-        let KV_H = isFull ? FULL_KV_H : SLIDE_KV_H
-        let HD = isFull ? FULL_HD : SLIDE_HD
-        let PAGE = isFull ? PAGE_FULL : PAGE_SLIDE
-        // Local K/V caches sized just for this test (TOTAL_PAGES global pool).
-        let Kc = emptyHalf(TOTAL_PAGES * PAGE * KV_H * HD)
-        let Vc = emptyHalf(TOTAL_PAGES * PAGE * KV_H * HD)
-        let npBuf = isFull ? num_pages_full : num_pages_slide
-        let klBuf = isFull ? k_len_full : k_len_slide
-        let qBuf = isFull ? q_full_out : q_slide_out
-
-        let NUM_PAGES = 8
-        let K_LEN = NUM_PAGES * PAGE
-        let slotQElems = H * HD          // halves per slot in Q
-        let slotOutElems = H * HD        // halves per slot in attn_out
-
-        // Populate KV cache pages 0..NUM_PAGES-1 deterministically. Other pages
-        // are left random so we can detect if any slot reaches past its shared
-        // block_table range.
-        fillHalf(Kc, seed: 0xD00D0000 + (isFull ? 1 : 0))
-        fillHalf(Vc, seed: 0xD00D1000 + (isFull ? 1 : 0))
-        setSharedBlockTable(numPages: NUM_PAGES, kLen: K_LEN, numPagesBuf: npBuf, kLenBuf: klBuf)
-
-        let label = isFull ? "full-attn GQA" : "sliding GQA"
-        print("  --- \(label): H_Q=\(H) H_KV=\(KV_H) HD=\(HD) PAGE=\(PAGE) K_len=\(K_LEN) ---")
-
-        // ======= Mode A: all 4 slots share same Q =======
-        // Fill slot 0's Q, then copy to slots 1-3. Run attention. All outputs equal.
-        fillHalf(qBuf, seed: 0xBEEF_0000)
-        let qp = qBuf.contents().assumingMemoryBound(to: Float16.self)
-        for slot in 1..<B {
-            for i in 0..<slotQElems {
-                qp[slot * slotQElems + i] = qp[i]
-            }
-        }
-        let outSameBuf = emptyHalf(B * slotOutElems)
-        let cbA = queue.makeCommandBuffer()!
-        if isFull {
-            encPagedAttnFullGqa(cbA, Q: qBuf, O: outSameBuf, Kc: Kc, Vc: Vc,
-                                 numPagesBuf: npBuf, kLenBuf: klBuf,
-                                 H_Q: H, H_KV: KV_H, D: HD)
-        } else {
-            encPagedAttnSlideGqa(cbA, Q: qBuf, O: outSameBuf, Kc: Kc, Vc: Vc,
-                                  numPagesBuf: npBuf, kLenBuf: klBuf,
-                                  H_Q: H, H_KV: KV_H, D: HD)
-        }
-        cbA.commit(); cbA.waitUntilCompleted()
-
-        var maxCrossSlot: Float = 0
-        let outp = outSameBuf.contents().assumingMemoryBound(to: Float16.self)
-        for slot in 1..<B {
-            for i in 0..<slotOutElems {
-                let d = abs(Float(outp[i]) - Float(outp[slot * slotOutElems + i]))
-                if d > maxCrossSlot { maxCrossSlot = d }
-            }
-        }
-        print(String(format: "    Mode A (identical Q × 4 slots): max cross-slot diff = %.3e", maxCrossSlot))
-        let aPass = maxCrossSlot == 0
-        print("    Mode A: \(aPass ? "✓ BITWISE IDENTICAL across slots" : "✗ SLOTS DIVERGE")")
-
-        // ======= Mode B: 4 distinct Qs, verify slot-independence =======
-        // Run 1: 4 different Qs (different seeds per slot)
-        for slot in 0..<B {
-            let slotPtr = UnsafeMutableRawPointer(mutating: qp.advanced(by: slot * slotQElems))
-            let slotBuf = device.makeBuffer(bytesNoCopy: slotPtr, length: slotQElems * 2,
-                                             options: .storageModeShared, deallocator: nil)!
-            fillHalf(slotBuf, seed: 0xCAFE_0000 &+ UInt64(slot))
-        }
-        let outRun1 = emptyHalf(B * slotOutElems)
-        let cbB1 = queue.makeCommandBuffer()!
-        if isFull {
-            encPagedAttnFullGqa(cbB1, Q: qBuf, O: outRun1, Kc: Kc, Vc: Vc,
-                                 numPagesBuf: npBuf, kLenBuf: klBuf,
-                                 H_Q: H, H_KV: KV_H, D: HD)
-        } else {
-            encPagedAttnSlideGqa(cbB1, Q: qBuf, O: outRun1, Kc: Kc, Vc: Vc,
-                                  numPagesBuf: npBuf, kLenBuf: klBuf,
-                                  H_Q: H, H_KV: KV_H, D: HD)
-        }
-        cbB1.commit(); cbB1.waitUntilCompleted()
-
-        // Run 2: keep slot 0's Q, zero out slots 1-3
-        for slot in 1..<B {
-            for i in 0..<slotQElems { qp[slot * slotQElems + i] = 0 }
-        }
-        let outRun2 = emptyHalf(B * slotOutElems)
-        let cbB2 = queue.makeCommandBuffer()!
-        if isFull {
-            encPagedAttnFullGqa(cbB2, Q: qBuf, O: outRun2, Kc: Kc, Vc: Vc,
-                                 numPagesBuf: npBuf, kLenBuf: klBuf,
-                                 H_Q: H, H_KV: KV_H, D: HD)
-        } else {
-            encPagedAttnSlideGqa(cbB2, Q: qBuf, O: outRun2, Kc: Kc, Vc: Vc,
-                                  numPagesBuf: npBuf, kLenBuf: klBuf,
-                                  H_Q: H, H_KV: KV_H, D: HD)
-        }
-        cbB2.commit(); cbB2.waitUntilCompleted()
-
-        // Slot 0 of run 1 (4 distinct Qs) vs slot 0 of run 2 (only slot 0's Q).
-        // Should match — slot 0's output doesn't depend on other slots' Qs.
-        var maxSlot0Diff: Float = 0
-        let r1 = outRun1.contents().assumingMemoryBound(to: Float16.self)
-        let r2 = outRun2.contents().assumingMemoryBound(to: Float16.self)
-        for i in 0..<slotOutElems {
-            maxSlot0Diff = max(maxSlot0Diff, abs(Float(r1[i]) - Float(r2[i])))
-        }
-        print(String(format: "    Mode B (distinct Qs, serial-equiv check): slot-0 diff run1 vs run2 = %.3e", maxSlot0Diff))
-        let bPass = maxSlot0Diff == 0
-        print("    Mode B: \(bPass ? "✓ slot 0 is isolated from other slots' Qs" : "✗ CROSS-SLOT CONTAMINATION")")
-
-        // Print a few sample output values so regressions are grep-able.
-        let sample = sliceBuffer(outRun1, start: 0, count: 8)
-        print(String(format: "    slot 0 output[0..7] = [%@]",
-                     sample.map { String(format: "%.4f", $0) }.joined(separator: ", ")))
-    }
-
-    runOne(isFull: false)
-    runOne(isFull: true)
-
-    // Smoke test the PrefixCache as well.
-    print("  --- PrefixCache smoke test ---")
-    let pc = PrefixCache(maxPhys: 1024)
-    let prompt = Array<UInt32>(stride(from: UInt32(0), to: UInt32(64), by: 1))  // 64 tokens
-    let pages1 = pc.getOrAllocate(tokens: prompt, pageSize: 8)
-    let pages2 = pc.getOrAllocate(tokens: prompt, pageSize: 8)
-    precondition(pages1 == pages2, "identical prefix must dedupe")
-    let differentPrompt = Array<UInt32>(stride(from: UInt32(1000), to: UInt32(1064), by: 1))
-    let pages3 = pc.getOrAllocate(tokens: differentPrompt, pageSize: 8)
-    precondition(Set(pages1).isDisjoint(with: Set(pages3)), "different prefixes must not share pages")
-    print("    cache: \(pc.entryCount) entries, \(pc.totalCachedPages) pages allocated")
-    print("    identical-prompt hit: pages match (\(pages1.count) pages)")
-    print("    disjoint-prompt miss: new pages allocated (\(pages3.count) pages)")
-}
 
 struct LayerW {
     let attnQ, attnK, attnOut: MTLBuffer              // Q8_0 v6 swizzled
@@ -3611,10 +3623,8 @@ func initLmState(bos: UInt32) {
             btP[b * MAX_PAGES_PER_SLOT + p] = UInt32(b * MAX_PAGES_PER_SLOT + p) % UInt32(TOTAL_PAGES)
         }
     }
-    if USE_FLEX_ATTN {
-        precomputeFlexBlockMaskSlide(slidingWindow: SLIDING_WINDOW)
-        precomputeFlexBlockMaskFull()
-    }
+    precomputeFlexBlockMaskSlide(slidingWindow: SLIDING_WINDOW)
+    precomputeFlexBlockMaskFull()
 }
 
 // Advance AR state by one token: next input_tokens = nextTokens,
@@ -3639,10 +3649,8 @@ func advanceLmState(nextTokens: [UInt32]) {
         npsP[b] = UInt32((newKLS + PAGE_SLIDE - 1) / PAGE_SLIDE)
         npfP[b] = UInt32((newKLF + PAGE_FULL - 1) / PAGE_FULL)
     }
-    if USE_FLEX_ATTN {
-        precomputeFlexBlockMaskSlide(slidingWindow: SLIDING_WINDOW)
-        precomputeFlexBlockMaskFull()
-    }
+    precomputeFlexBlockMaskSlide(slidingWindow: SLIDING_WINDOW)
+    precomputeFlexBlockMaskFull()
 }
 
 // Diagnostic: count finite / NaN / Inf / min / max in an fp16 buffer region.
@@ -3701,19 +3709,8 @@ func buildPartialStepCB(_ w: LmWeights, stopAfterLayer: Int) -> MTLCommandBuffer
         encKVWrite(cb, K: k_out, V: v_out, Kc: Kc, Vc: Vc, H: KV_H, D: HD, page: pg)
         let npBuf = isFull ? num_pages_full : num_pages_slide
         let klBuf = isFull ? k_len_full : k_len_slide
-        if isFull && USE_FLEX_ATTN {
-            encFlexAttnFullV0(cb, Q: q_out, O: attn_out, Kc: Kc, Vc: Vc,
-                              kLenBuf: klBuf, H_Q: H, H_KV: KV_H, D: HD)
-        } else if isFull {
-            encPagedAttnFullGqa(cb, Q: q_out, O: attn_out, Kc: Kc, Vc: Vc,
-                                numPagesBuf: npBuf, kLenBuf: klBuf, H_Q: H, H_KV: KV_H, D: HD)
-        } else if USE_FLEX_ATTN {
-            encFlexAttnSlideV0(cb, Q: q_out, O: attn_out, Kc: Kc, Vc: Vc,
-                               kLenBuf: klBuf, H_Q: H, H_KV: KV_H, D: HD)
-        } else {
-            encPagedAttnSlideGqa(cb, Q: q_out, O: attn_out, Kc: Kc, Vc: Vc,
-                                 numPagesBuf: npBuf, kLenBuf: klBuf, H_Q: H, H_KV: KV_H, D: HD)
-        }
+        encAttn(cb, Q: q_out, O: attn_out, Kc: Kc, Vc: Vc,
+                kLenBuf: klBuf, H_Q: H, H_KV: KV_H, D: HD, isFull: isFull)
         encGemvQ80V6(cb, attn_out, lw.attnOut, mlp_out, Din: H * HD, Dout: HIDDEN)
         encRmsNormAdd(cb, x: mlp_out, gammaBuf: lw.postAttnNorm,
                       residual: hidden, out: hidden, N: HIDDEN, numVecs: B)
@@ -3995,9 +3992,6 @@ if let stPath = ProcessInfo.processInfo.environment["VISION_LOAD"] {
 if let png = ProcessInfo.processInfo.environment["VISION_PREPROCESS"] {
     runVisionPreprocessSmokeTest(png: png)
 }
-if ProcessInfo.processInfo.environment["PAGED_ATTN_TEST"] != nil {
-    runPagedAttnHarness()
-}
 let isDumpRun = ProcessInfo.processInfo.environment["LM_DUMP_LAYERS"] != nil
     || ProcessInfo.processInfo.environment["LM_DUMP_L0_INTERNALS"] != nil
 if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
@@ -4007,46 +4001,22 @@ if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
    ProcessInfo.processInfo.environment["LM_MULTISESSION"] == nil,
    ProcessInfo.processInfo.environment["LM_TEST_CVEC_CACHE"] == nil,
    ProcessInfo.processInfo.environment["LM_TEST_CACHE_DIVERGENCE"] == nil,
+   ProcessInfo.processInfo.environment["LM_PROFILE_PREFILL"] == nil,
+   ProcessInfo.processInfo.environment["LM_PROFILE_AR"] == nil,
    !isDumpRun {
     // GGUF_PATH alone → LM forward benchmark. If LM_KL_REF, LM_PREFILL_VALIDATE,
     // LM_GENERATE, LM_MULTISESSION, LM_TEST_CVEC_CACHE or any dump flag is also
     // set, let those harnesses drive (all reuse loadLmWeights).
     runGgufPathHarness(ggufPath: ggufPath)
 }
-if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
-   let prompt = ProcessInfo.processInfo.environment["LM_GENERATE"] {
-    let maxN = Int(ProcessInfo.processInfo.environment["LM_GENERATE_MAX"] ?? "64") ?? 64
-    let eos = (ProcessInfo.processInfo.environment["LM_GENERATE_EOS"]).flatMap { UInt32($0) }
-    runLmGenerate(ggufPath: ggufPath, prompt: prompt, maxNewTokens: maxN, eos: eos)
-}
-if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
-   let prompts = ProcessInfo.processInfo.environment["LM_MULTISESSION"] {
-    let maxN = Int(ProcessInfo.processInfo.environment["LM_MULTISESSION_MAX"] ?? "32") ?? 32
-    runLmMultisession(ggufPath: ggufPath, promptsStr: prompts, maxNewPerSession: maxN)
-}
-if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
-   ProcessInfo.processInfo.environment["LM_MULTITURN_DEMO"] != nil {
-    let turnsStr = ProcessInfo.processInfo.environment["LM_MULTITURN_TURNS"]
-    let maxN = Int(ProcessInfo.processInfo.environment["LM_MULTITURN_MAX_PER_TURN"] ?? "24") ?? 24
-    runLmMultiturnDemo(ggufPath: ggufPath, turnsStr: turnsStr, maxPerTurn: maxN)
-}
-if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
-   ProcessInfo.processInfo.environment["LM_COMPOSITE_DEMO"] != nil {
-    let n = Int(ProcessInfo.processInfo.environment["LM_COMPOSITE_N"] ?? "4") ?? 4
-    let maxN = Int(ProcessInfo.processInfo.environment["LM_COMPOSITE_MAX_PER_TURN"] ?? "24") ?? 24
-    runLmCompositeDemo(ggufPath: ggufPath, nUsers: n, maxPerTurn: maxN)
-}
-if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
-   let stPath = ProcessInfo.processInfo.environment["VISION_ST"],
-   let imagePath = ProcessInfo.processInfo.environment["LM_MULTIMODAL"] {
-    let prefix = ProcessInfo.processInfo.environment["LM_MULTIMODAL_PREFIX"]
-        ?? "<|turn>user\n"
-    let suffix = ProcessInfo.processInfo.environment["LM_MULTIMODAL_SUFFIX"]
-        ?? "\nDescribe this image in one short sentence.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
-    let maxN = Int(ProcessInfo.processInfo.environment["LM_MULTIMODAL_MAX"] ?? "48") ?? 48
-    runLmMultimodal(ggufPath: ggufPath, stPath: stPath, imagePath: imagePath,
-                     prefix: prefix, suffix: suffix, maxNew: maxN)
-}
+// LM_GENERATE was a reach-inside demo that took a raw prompt string
+// and ran generation directly. Equivalent behavior is available through
+// /v1/completions (or /v1/chat/completions) via the HTTP API.
+// LM_MULTISESSION / LM_MULTITURN_DEMO / LM_COMPOSITE_DEMO / LM_MULTIMODAL
+// demos were inline-chat-template harnesses that bypassed the FFI/HTTP API
+// and hand-crafted `<|turn>user\n...` strings. Removed — equivalent
+// behavior is available through /v1/chat/completions with the same
+// messages payloads, using the model's real jinja template.
 if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
    let refDir = ProcessInfo.processInfo.environment["LM_KL_REF"],
    !isDumpRun {
@@ -4059,6 +4029,14 @@ if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
         ?? "/Users/mdot/metal-microbench/test_data/reference"
     runLmPrefillValidate(ggufPath: ggufPath, refDir: refDir, tag: tag)
 }
+if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
+   ProcessInfo.processInfo.environment["LM_PROFILE_PREFILL"] != nil {
+    runLmPrefillProfile(ggufPath: ggufPath)
+}
+if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
+   ProcessInfo.processInfo.environment["LM_PROFILE_AR"] != nil {
+    runLmARProfile(ggufPath: ggufPath)
+}
 if let outDir = ProcessInfo.processInfo.environment["FLEX_ATTN_TEST"] {
     runFlexAttnSlideV1Test(outDir: outDir)
     runFlexAttnFullPrefillTest(outDir: outDir)
@@ -4066,32 +4044,13 @@ if let outDir = ProcessInfo.processInfo.environment["FLEX_ATTN_TEST"] {
 if ProcessInfo.processInfo.environment["ATTN_BENCH"] != nil {
     runAttnBench()
 }
-if ProcessInfo.processInfo.environment["SHARED_PREFIX_SMOKE"] != nil {
-    runSharedPrefixSmoke()
-}
-if ProcessInfo.processInfo.environment["SHARED_PREFIX_PARITY"] != nil {
-    runSharedPrefixParity()
-}
-if ProcessInfo.processInfo.environment["SHARED_PREFIX_PARITY_FULL"] != nil {
-    runSharedPrefixParityFull()
-}
 if ProcessInfo.processInfo.environment["KV_VIZ"] != nil {
     runKvVisualizer()
 }
-if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
-   ProcessInfo.processInfo.environment["LM_SHARED_PREFIX_DEMO"] != nil {
-    let maxN = Int(ProcessInfo.processInfo.environment["LM_SHARED_PREFIX_MAX"] ?? "16") ?? 16
-    runLmSharedPrefixDemo(ggufPath: ggufPath, maxNewPerSession: maxN)
-}
-if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
-   ProcessInfo.processInfo.environment["LM_BRANCH_DEMO"] != nil {
-    let maxN = Int(ProcessInfo.processInfo.environment["LM_BRANCH_MAX"] ?? "16") ?? 16
-    runLmBranchDemo(ggufPath: ggufPath, maxNewPerBranch: maxN)
-}
-if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
-   ProcessInfo.processInfo.environment["LM_PAUSE_DEMO"] != nil {
-    runLmPauseResumeDemo(ggufPath: ggufPath)
-}
+// LM_SHARED_PREFIX_DEMO / LM_BRANCH_DEMO / LM_PAUSE_DEMO were inline-
+// template harnesses replicating what /v1/chat/completions does. Removed.
+// The scheduler features these demos exercised (prefix caching, branch,
+// pause/resume) are exercised through the HTTP API by normal clients.
 if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
    let outDir = ProcessInfo.processInfo.environment["LM_DUMP_EXPERT_W"] {
     let id = Int(ProcessInfo.processInfo.environment["LM_DUMP_EXPERT_ID"] ?? "52") ?? 52
@@ -4125,6 +4084,10 @@ if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
 if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
    ProcessInfo.processInfo.environment["LM_TEST_CACHE_DIVERGENCE"] != nil {
     runPrefillCacheDivergenceDump(ggufPath: ggufPath)
+}
+if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
+   ProcessInfo.processInfo.environment["LM_TEST_PREFIX_CACHE"] != nil {
+    runPrefixCacheSmoke(ggufPath: ggufPath)
 }
 } // end runEnvDrivenDemos
 

@@ -6,7 +6,7 @@
 // Contract: each runXxxHarness() is callable independently, prints its own
 // header and body, and never aborts (internal catches convert errors to
 // printed diagnostics). Depends on common.swift (device/queue/GGUF/safetensors),
-// kernels.swift, and vision_tower.swift (for runVisionTowerForward etc.).
+// kernels.swift, and vision_tower.swift (for runVisionTowerBatchForward etc.).
 
 import Metal
 import Foundation
@@ -108,7 +108,7 @@ func runVisionEndToEndForward(framePath: String, stPath: String) {
         let st = try SafetensorsFile(stPath)
         let weights = try loadVisionWeights(st, device: device)
 
-        var batch = try gemma4ImagePreprocess(path: framePath, device: device)
+        var batch = try gemma4ImagePreprocessFromPath(path: framePath, device: device)
         // VISION_FORCE_PATCHES=<fp16-bin> — override our preprocessor with an
         // externally-supplied patch buffer (e.g. ref's torchvision bicubic output)
         // to isolate model divergence from preprocessor divergence.
@@ -127,8 +127,9 @@ func runVisionEndToEndForward(framePath: String, stPath: String) {
                      (framePath as NSString).lastPathComponent, batch.gridH, batch.gridW, batch.numRealPatches))
 
         let t0 = Date()
-        let (softTokens, nPooled) = runVisionTowerForward(
-            batch: batch, weights: weights, device: device, queue: queue)
+        let results = runVisionTowerBatchForward(
+            batches: [batch], weights: weights, device: device, queue: queue)
+        let (softTokens, nPooled) = results[0]
         let fwdMs = Date().timeIntervalSince(t0) * 1000
         print(String(format: "  forward: %d pooled tokens in %.1f ms (%.2f tok/ms)",
                      nPooled, fwdMs, Double(nPooled) / fwdMs))
@@ -217,24 +218,25 @@ func runVisionConcurrentQueues(batchDir: String, stPath: String, nQueues: Int) {
         precondition(pngs.count >= 1, "need ≥1 PNG in VISION_BATCH_DIR")
         var batches: [PatchBatch] = []
         for p in pngs {
-            batches.append(try gemma4ImagePreprocess(path: "\(batchDir)/\(p)", device: device))
+            batches.append(try gemma4ImagePreprocessFromPath(path: "\(batchDir)/\(p)", device: device))
         }
 
-        // Baseline: single queue, serial
+        // Baseline: single queue, serial (batched-B=1 per image, looped).
         let tSerial0 = Date()
         for b in batches {
-            _ = runVisionTowerForward(batch: b, weights: weights, device: device, queue: queue)
+            _ = runVisionTowerBatchForward(batches: [b], weights: weights, device: device, queue: queue)
         }
         let tSerial = Date().timeIntervalSince(tSerial0) * 1000
         print(String(format: "  serial on 1 queue:  %.1f ms (%d images)", tSerial, batches.count))
 
-        // Concurrent: N queues, submit all async, wait on all
+        // Concurrent: N queues, submit all async, wait on all.
         let queues = (0..<batches.count).map { _ in device.makeCommandQueue()! }
         let tPar0 = Date()
         var cbs: [MTLCommandBuffer] = []
         for (i, b) in batches.enumerated() {
-            let (_, _, cb) = runVisionTowerForwardAsync(batch: b, weights: weights,
-                                                         device: device, queue: queues[i])
+            let (_, cb) = runVisionTowerBatchForwardAsync(batches: [b], weights: weights,
+                                                           device: device, queue: queues[i])
+            cb.commit()
             cbs.append(cb)
         }
         for cb in cbs { cb.waitUntilCompleted() }
@@ -247,9 +249,10 @@ func runVisionConcurrentQueues(batchDir: String, stPath: String, nQueues: Int) {
 }
 
 // VISION_BATCH_DIR=<dir> — run the batched forward over the first 4
-// PNGs in the directory, compare per-image soft-tokens to the serial
-// runVisionTowerForward path. Validates numerical equivalence + measures
-// wall-clock speedup (batch vs sum of serial).
+// PNGs in the directory, compare per-image soft-tokens against a looped
+// B=1 reference path. Validates numerical equivalence (batched B>1 kernel
+// dispatches vs looped B=1 of the same kernels) and measures wall-clock
+// speedup (one B=N CB vs N sequential B=1 CBs).
 func runVisionBatchForward(batchDir: String, stPath: String) {
     print("\n=== Vision batched forward (B=4) ===")
     do {
@@ -262,22 +265,23 @@ func runVisionBatchForward(batchDir: String, stPath: String) {
 
         var batches: [PatchBatch] = []
         for p in pngs {
-            let b = try gemma4ImagePreprocess(path: "\(batchDir)/\(p)", device: device)
+            let b = try gemma4ImagePreprocessFromPath(path: "\(batchDir)/\(p)", device: device)
             batches.append(b)
             print(String(format: "  %@ → %d×%d grid, %d patches",
                          p, b.gridH, b.gridW, b.numRealPatches))
         }
         let B = batches.count
 
-        // Serial baseline — run each image through runVisionTowerForward.
+        // Reference: each image through batched-B=1 sequentially.
         let tSerial0 = Date()
         var serialOut: [(MTLBuffer, Int)] = []
         for b in batches {
-            serialOut.append(runVisionTowerForward(batch: b, weights: weights,
-                                                    device: device, queue: queue))
+            let r = runVisionTowerBatchForward(batches: [b], weights: weights,
+                                                 device: device, queue: queue)
+            serialOut.append(r[0])
         }
         let tSerial = Date().timeIntervalSince(tSerial0) * 1000
-        print(String(format: "  serial (B×1): %.1f ms (sum across %d images)", tSerial, B))
+        print(String(format: "  B=1 × %d sequential: %.1f ms", B, tSerial))
 
         // Batched forward.
         let tBatch0 = Date()
@@ -333,10 +337,11 @@ func runVisionAspectSweep(aspectDir: String, stPath: String) {
                 print("  skip \(png): missing \(stem)_ref.npy")
                 continue
             }
-            let batch = try gemma4ImagePreprocess(path: pngPath, device: device)
+            let batch = try gemma4ImagePreprocessFromPath(path: pngPath, device: device)
             let t0 = Date()
-            let (softTokens, nPooled) = runVisionTowerForward(
-                batch: batch, weights: weights, device: device, queue: queue)
+            let r = runVisionTowerBatchForward(
+                batches: [batch], weights: weights, device: device, queue: queue)
+            let (softTokens, nPooled) = r[0]
             let fwdMs = Date().timeIntervalSince(t0) * 1000
 
             // Load ref (shape is [N_soft, 2816] fp16; a single frame).
@@ -422,10 +427,11 @@ func runVisionMultiFrameSweep(sweepDir: String, stPath: String, refPath: String,
         var tFwdList = [Double]()
         for i in 0..<nFrames {
             let fp = "\(sweepDir)/\(frameNames[i])"
-            let batch = try gemma4ImagePreprocess(path: fp, device: device)
+            let batch = try gemma4ImagePreprocessFromPath(path: fp, device: device)
             let t0 = Date()
-            let (softTokens, nPooled) = runVisionTowerForward(
-                batch: batch, weights: weights, device: device, queue: queue)
+            let r = runVisionTowerBatchForward(
+                batches: [batch], weights: weights, device: device, queue: queue)
+            let (softTokens, nPooled) = r[0]
             let fwdMs = Date().timeIntervalSince(t0) * 1000
             tFwdList.append(fwdMs)
             let total = nPooled * weights.textHidden
@@ -514,7 +520,7 @@ func runVisionWeightLoadSmokeTest(stPath: String) {
 func runVisionPreprocessSmokeTest(png: String) {
     print("\n=== Vision preprocessor smoke test ===")
     do {
-        let batch = try gemma4ImagePreprocess(path: png, device: device)
+        let batch = try gemma4ImagePreprocessFromPath(path: png, device: device)
         print("  resized: \(batch.resizedH) × \(batch.resizedW)")
         print("  grid: \(batch.gridH) × \(batch.gridW) = \(batch.numRealPatches) real patches")
         print("  after pool÷3: \((batch.gridH/3)) × \((batch.gridW/3)) = \((batch.gridH/3) * (batch.gridW/3)) soft tokens")
@@ -543,12 +549,6 @@ func runVisionPreprocessSmokeTest(png: String) {
     } catch {
         print("  preprocess failed: \(error)")
     }
-}
-
-// Env-var driver: PAGED_ATTN_TEST
-func runPagedAttnHarness() {
-    print("\n=== Paged-attention shared-prefix nondivergence test ===")
-    runPagedAttnSharedPrefixTest()
 }
 
 // Env-var driver: GGUF_PATH — load weights and run the LM forward benchmark
@@ -1752,293 +1752,6 @@ func runLmLayerDump(ggufPath: String, refDir: String, tag: String, outDir: Strin
     }
 }
 
-// Smoke test for the cross-slot shared-prefix broadcast kernel.
-// Synthesizes per-layer scratch (small: a single layer's worth of KV at
-// H_KV=8, D=256, PAGE=16), populates B slots' Qs + 2 shared pages of K/V,
-// dispatches paged_attn_slide_ar_shared, then reads back the (m, l, O)
-// partials at split=0. Verifies:
-//   - m_partials[slot, h, 0] is finite
-//   - l_partials[slot, h, 0] > 0
-//   - O_partials[slot, h, 0, :] has non-trivial magnitude
-// Doesn't yet cross-check against flex_attn_slide_v0 (full correctness
-// parity pending next session's tail-kernel variant + split_reduce merge).
-//
-// Env: SHARED_PREFIX_SMOKE=1 (no args).
-func runSharedPrefixSmoke() {
-    print("\n=== Shared-prefix broadcast smoke test ===")
-    let H_Q = 16, H_KV = 8, D = 256, PAGE = 16
-    let B_batch = 4
-    let N_SPLITS = 2
-    let prefixPages = 2
-
-    // Q: [B, H_Q, D] fp16
-    let Qbuf = halfBuf(B_batch * H_Q * D, seed: 0x11)
-    // K/V cache: [phys_pages, PAGE*H_KV, D] — we only need the first
-    // prefix_pages phys pages populated.
-    let Kcache = halfBuf(prefixPages * PAGE * H_KV * D, seed: 0x22)
-    let Vcache = halfBuf(prefixPages * PAGE * H_KV * D, seed: 0x33)
-
-    let sharedPages = device.makeBuffer(length: prefixPages * 4, options: .storageModeShared)!
-    let spp = sharedPages.contents().assumingMemoryBound(to: UInt32.self)
-    for i in 0..<prefixPages { spp[i] = UInt32(i) }
-
-    let kLens = device.makeBuffer(length: B_batch * 4, options: .storageModeShared)!
-    let klp = kLens.contents().assumingMemoryBound(to: UInt32.self)
-    for b in 0..<B_batch { klp[b] = UInt32(prefixPages * PAGE) }
-
-    // Partials: split=0 only; [B, H_Q, N_SPLITS, D] for O; [B, H_Q, N_SPLITS] for m/l.
-    let mPart = device.makeBuffer(length: B_batch * H_Q * N_SPLITS * 4, options: .storageModeShared)!
-    let lPart = device.makeBuffer(length: B_batch * H_Q * N_SPLITS * 4, options: .storageModeShared)!
-    let OPart = device.makeBuffer(length: B_batch * H_Q * N_SPLITS * D * 4, options: .storageModeShared)!
-
-    let cb = queue.makeCommandBuffer()!
-    encPagedAttnSlideArShared(cb, Q: Qbuf, Kc: Kcache, Vc: Vcache,
-                               sharedPhysPages: sharedPages,
-                               mPart: mPart, lPart: lPart, OPart: OPart,
-                               kLenBuf: kLens,
-                               H_Q: H_Q, H_KV: H_KV,
-                               prefixPages: prefixPages,
-                               slidingWindow: 0, bBatch: B_batch)
-    let t0 = Date()
-    cb.commit(); cb.waitUntilCompleted()
-    let dtMs = Date().timeIntervalSince(t0) * 1000
-    if let err = cb.error { print("  GPU: \(err)"); return }
-
-    let mP = mPart.contents().assumingMemoryBound(to: Float.self)
-    let lP = lPart.contents().assumingMemoryBound(to: Float.self)
-    let oP = OPart.contents().assumingMemoryBound(to: Float.self)
-    var okM = true, okL = true, okO = true
-    for b in 0..<B_batch {
-        for h in 0..<H_Q {
-            let pidx = (b * H_Q + h) * N_SPLITS + 0
-            if !mP[pidx].isFinite { okM = false }
-            if lP[pidx] <= 0 { okL = false }
-            var oMag: Float = 0
-            for d in 0..<D { oMag += abs(oP[pidx * D + d]) }
-            if oMag < 1e-6 { okO = false }
-        }
-    }
-    print(String(format: "  wall: %.2f ms  (B=%d, H_KV=%d, prefix_pages=%d)",
-                 dtMs, B_batch, H_KV, prefixPages))
-    print("  m_partials finite: \(okM ? "✓" : "✗")")
-    print("  l_partials > 0   : \(okL ? "✓" : "✗")")
-    print("  O_partials nonzero: \(okO ? "✓" : "✗")")
-    if okM && okL && okO {
-        print("  ✓ broadcast kernel dispatches correctly; correctness-vs-v0 parity pending")
-    }
-}
-
-// Parity test: run the split-kernel (shared + tail + reduce) path against
-// vanilla flex_attn_slide_v0 on identical synthetic inputs and compare
-// the final attention outputs. Should be near-bit-exact (FP non-
-// associativity in softmax ordering may produce differences in the last
-// few bits of mantissa; we allow <1e-3 relative deviation).
-//
-// Setup: all B slots' block_tables point at THE SAME phys pages for the
-// first prefix_pages logical pages, and at DISTINCT phys pages beyond.
-// k_len = prefix_pages * PAGE (pure-shared case: tail contributes nothing
-// and broadcast output alone must match v0). This isolates the shared path.
-//
-// Env: SHARED_PREFIX_PARITY=1
-func runSharedPrefixParity() {
-    print("\n=== Shared-prefix broadcast vs v0 parity ===")
-    let H_Q = 16, H_KV = 8, D = 256, PAGE = 16
-    let B_batch = 4
-    let prefixPages = 2
-
-    // K/V cache sized for prefix_pages phys pages.
-    let Kcache = halfBuf(prefixPages * PAGE * H_KV * D, seed: 0xA1)
-    let Vcache = halfBuf(prefixPages * PAGE * H_KV * D, seed: 0xB2)
-    // Q: [B, H_Q, D]
-    let Qbuf = halfBuf(B_batch * H_Q * D, seed: 0xC3)
-
-    // Block tables for v0 path: every slot b maps logical page p → phys p
-    // (same phys across slots for p < prefix_pages; we only have prefix_pages
-    // pages total, so all slots share identically).
-    let bt = device.makeBuffer(length: B_batch * MAX_PAGES_PER_SLOT * 4, options: .storageModeShared)!
-    let btP = bt.contents().assumingMemoryBound(to: UInt32.self)
-    for b in 0..<B_batch {
-        for p in 0..<MAX_PAGES_PER_SLOT {
-            btP[b * MAX_PAGES_PER_SLOT + p] = UInt32(p % prefixPages)
-        }
-    }
-    // Also write into the global `block_table` since v0 binds it by name.
-    let btGlobal = block_table.contents().bindMemory(to: UInt32.self,
-                    capacity: B_batch * MAX_PAGES_PER_SLOT)
-    for i in 0..<(B_batch * MAX_PAGES_PER_SLOT) { btGlobal[i] = btP[i] }
-
-    // k_len, num_pages — mirror slide path.
-    let kLenBuf = device.makeBuffer(length: B_batch * 4, options: .storageModeShared)!
-    let klP = kLenBuf.contents().assumingMemoryBound(to: UInt32.self)
-    for b in 0..<B_batch { klP[b] = UInt32(prefixPages * PAGE) }
-    let klGlobal = k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B_batch)
-    for b in 0..<B_batch { klGlobal[b] = UInt32(prefixPages * PAGE) }
-    let npGlobal = num_pages_slide.contents().bindMemory(to: UInt32.self, capacity: B_batch)
-    for b in 0..<B_batch { npGlobal[b] = UInt32(prefixPages) }
-
-    // Recompute CSR for v0 (causal + SW against this k_len).
-    precomputeFlexBlockMaskSlide(slidingWindow: SLIDING_WINDOW)
-
-    // Output buffers.
-    let O_v0    = emptyHalf(B_batch * H_Q * D)
-    let O_split = emptyHalf(B_batch * H_Q * D)
-
-    // ---- Path A: v0 alone (uses global m/l/O_partials sized for AR). ----
-    let cbA = queue.makeCommandBuffer()!
-    encFlexAttnSlideV0(cbA, Q: Qbuf, O: O_v0, Kc: Kcache, Vc: Vcache,
-                        kLenBuf: k_len_slide, H_Q: H_Q, H_KV: H_KV, D: D)
-    cbA.commit(); cbA.waitUntilCompleted()
-    if let e = cbA.error { print("  v0: \(e)"); return }
-
-    // ---- Path B: shared + tail + reduce (N_SPLITS=2). ----
-    // Fresh partials sized for 2 splits.
-    let mP = device.makeBuffer(length: B_batch * H_Q * 2 * 4, options: .storageModeShared)!
-    let lP = device.makeBuffer(length: B_batch * H_Q * 2 * 4, options: .storageModeShared)!
-    let OP = device.makeBuffer(length: B_batch * H_Q * 2 * D * 4, options: .storageModeShared)!
-    // Initialize to -INF / 0 so any path that writes nothing leaves the
-    // reducer with the correct empty-split semantics.
-    let mPp = mP.contents().assumingMemoryBound(to: Float.self)
-    let lPp = lP.contents().assumingMemoryBound(to: Float.self)
-    let OPp = OP.contents().assumingMemoryBound(to: Float.self)
-    for i in 0..<(B_batch * H_Q * 2) { mPp[i] = -.infinity; lPp[i] = 0 }
-    for i in 0..<(B_batch * H_Q * 2 * D) { OPp[i] = 0 }
-
-    let sharedPages = device.makeBuffer(length: prefixPages * 4, options: .storageModeShared)!
-    let spp = sharedPages.contents().assumingMemoryBound(to: UInt32.self)
-    for i in 0..<prefixPages { spp[i] = UInt32(i) }
-
-    let cbB = queue.makeCommandBuffer()!
-    encPagedAttnSlideArSharedAndTail(cbB, Q: Qbuf, O: O_split,
-                                      Kc: Kcache, Vc: Vcache,
-                                      sharedPhysPages: sharedPages,
-                                      mPart: mP, lPart: lP, OPart: OP,
-                                      kLenBuf: k_len_slide,
-                                      H_Q: H_Q, H_KV: H_KV, D: D,
-                                      prefixPages: prefixPages,
-                                      slidingWindow: SLIDING_WINDOW,
-                                      bBatch: B_batch)
-    cbB.commit(); cbB.waitUntilCompleted()
-    if let e = cbB.error { print("  split path: \(e)"); return }
-
-    // ---- Compare ----
-    let A = O_v0.contents().assumingMemoryBound(to: Float16.self)
-    let Bp = O_split.contents().assumingMemoryBound(to: Float16.self)
-    var maxAbsDiff: Float = 0
-    var sumAbsDiff: Double = 0
-    var l2A: Double = 0, l2B: Double = 0
-    let N = B_batch * H_Q * D
-    for i in 0..<N {
-        let a = Float(A[i]); let b = Float(Bp[i])
-        let d = abs(a - b)
-        if d > maxAbsDiff { maxAbsDiff = d }
-        sumAbsDiff += Double(d)
-        l2A += Double(a * a); l2B += Double(b * b)
-    }
-    let cos = (A.withMemoryRebound(to: Float16.self, capacity: N) { aPtr -> Double in
-        var dot: Double = 0
-        for i in 0..<N { dot += Double(Float(aPtr[i])) * Double(Float(Bp[i])) }
-        return dot
-    }) / (l2A.squareRoot() * l2B.squareRoot() + 1e-12)
-    print(String(format: "  max|diff|: %.6f   mean|diff|: %.6f",
-                 maxAbsDiff, Float(sumAbsDiff / Double(N))))
-    print(String(format: "  ‖v0‖₂=%.3f   ‖split‖₂=%.3f   cos-sim=%.9f",
-                 l2A.squareRoot(), l2B.squareRoot(), cos))
-    if maxAbsDiff < 1e-2 && cos > 0.999999 {
-        print("  ✓ split path matches v0 within FP tolerance")
-    } else {
-        print("  ✗ split path diverges from v0")
-    }
-}
-
-// Same shape as runSharedPrefixParity but for full-attn layers: D=512,
-// PAGE=8, H_KV=2, Q_PER_TG=1 (one q_head per TG in the broadcast kernel).
-// Env: SHARED_PREFIX_PARITY_FULL=1
-func runSharedPrefixParityFull() {
-    print("\n=== Shared-prefix broadcast vs v0 parity (FULL attn) ===")
-    let H_Q = 16, H_KV = 2, D = 512, PAGE = 8
-    let B_batch = 4
-    let prefixPages = 3
-
-    let Kcache = halfBuf(prefixPages * PAGE * H_KV * D, seed: 0xD4)
-    let Vcache = halfBuf(prefixPages * PAGE * H_KV * D, seed: 0xE5)
-    let Qbuf = halfBuf(B_batch * H_Q * D, seed: 0xF6)
-
-    // All slots map logical page p → phys p (same phys across slots).
-    let btGlobal = block_table.contents().bindMemory(to: UInt32.self,
-                    capacity: B_batch * MAX_PAGES_PER_SLOT)
-    for b in 0..<B_batch {
-        for p in 0..<MAX_PAGES_PER_SLOT {
-            btGlobal[b * MAX_PAGES_PER_SLOT + p] = UInt32(p % prefixPages)
-        }
-    }
-    let klGlobal = k_len_full.contents().bindMemory(to: UInt32.self, capacity: B_batch)
-    for b in 0..<B_batch { klGlobal[b] = UInt32(prefixPages * PAGE) }
-    let npGlobal = num_pages_full.contents().bindMemory(to: UInt32.self, capacity: B_batch)
-    for b in 0..<B_batch { npGlobal[b] = UInt32(prefixPages) }
-    precomputeFlexBlockMaskFull()
-
-    let O_v0    = emptyHalf(B_batch * H_Q * D)
-    let O_split = emptyHalf(B_batch * H_Q * D)
-
-    // Path A: v0 full alone.
-    let cbA = queue.makeCommandBuffer()!
-    encFlexAttnFullV0(cbA, Q: Qbuf, O: O_v0, Kc: Kcache, Vc: Vcache,
-                       kLenBuf: k_len_full, H_Q: H_Q, H_KV: H_KV, D: D)
-    cbA.commit(); cbA.waitUntilCompleted()
-    if let e = cbA.error { print("  v0: \(e)"); return }
-
-    // Path B: shared + tail + reduce with N_SPLITS=2.
-    let mP = device.makeBuffer(length: B_batch * H_Q * 2 * 4, options: .storageModeShared)!
-    let lP = device.makeBuffer(length: B_batch * H_Q * 2 * 4, options: .storageModeShared)!
-    let OP = device.makeBuffer(length: B_batch * H_Q * 2 * D * 4, options: .storageModeShared)!
-    let mPp = mP.contents().assumingMemoryBound(to: Float.self)
-    let lPp = lP.contents().assumingMemoryBound(to: Float.self)
-    let OPp = OP.contents().assumingMemoryBound(to: Float.self)
-    for i in 0..<(B_batch * H_Q * 2) { mPp[i] = -.infinity; lPp[i] = 0 }
-    for i in 0..<(B_batch * H_Q * 2 * D) { OPp[i] = 0 }
-
-    let sharedPages = device.makeBuffer(length: prefixPages * 4, options: .storageModeShared)!
-    let spp = sharedPages.contents().assumingMemoryBound(to: UInt32.self)
-    for i in 0..<prefixPages { spp[i] = UInt32(i) }
-
-    let cbB = queue.makeCommandBuffer()!
-    encPagedAttnFullArSharedAndTail(cbB, Q: Qbuf, O: O_split,
-                                     Kc: Kcache, Vc: Vcache,
-                                     sharedPhysPages: sharedPages,
-                                     mPart: mP, lPart: lP, OPart: OP,
-                                     kLenBuf: k_len_full,
-                                     H_Q: H_Q, H_KV: H_KV, D: D,
-                                     prefixPages: prefixPages,
-                                     bBatch: B_batch)
-    cbB.commit(); cbB.waitUntilCompleted()
-    if let e = cbB.error { print("  split path: \(e)"); return }
-
-    let A = O_v0.contents().assumingMemoryBound(to: Float16.self)
-    let Bp = O_split.contents().assumingMemoryBound(to: Float16.self)
-    var maxAbsDiff: Float = 0
-    var sumAbsDiff: Double = 0
-    var l2A: Double = 0, l2B: Double = 0, dot: Double = 0
-    let N = B_batch * H_Q * D
-    for i in 0..<N {
-        let a = Float(A[i]); let b = Float(Bp[i])
-        let d = abs(a - b)
-        if d > maxAbsDiff { maxAbsDiff = d }
-        sumAbsDiff += Double(d)
-        l2A += Double(a * a); l2B += Double(b * b)
-        dot += Double(a) * Double(b)
-    }
-    let cos = dot / (l2A.squareRoot() * l2B.squareRoot() + 1e-12)
-    print(String(format: "  max|diff|: %.6f   mean|diff|: %.6f",
-                 maxAbsDiff, Float(sumAbsDiff / Double(N))))
-    print(String(format: "  ‖v0‖₂=%.3f   ‖split‖₂=%.3f   cos-sim=%.9f",
-                 l2A.squareRoot(), l2B.squareRoot(), cos))
-    if maxAbsDiff < 1e-2 && cos > 0.999999 {
-        print("  ✓ full split path matches v0 within FP tolerance")
-    } else {
-        print("  ✗ full split path diverges from v0")
-    }
-}
-
 // ====================================================================
 // Prefill validation harness — drives `buildPrefillCB` against the same
 // lm_<tag>_tokens / lm_<tag>_logits oracle as runLmKLHarness, but in a
@@ -2118,7 +1831,7 @@ func runLmPrefillValidate(ggufPath: String, refDir: String, tag: String) {
     // we're doing the initial prefill.
     precomputeFlexPrefillMasks(qLen: qLen, positionStart: 0)
 
-    let cb = buildPrefillCB(w, qLen: qLen)
+    let cb = buildPrefillCB(w, qLen: qLen, fullPrefillLogits: true)
     let t0 = Date()
     cb.commit(); cb.waitUntilCompleted()
     let dtMs = Date().timeIntervalSince(t0) * 1000
