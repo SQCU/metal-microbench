@@ -1348,7 +1348,12 @@ func encMoeGemvQ4(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ Wq4: MTLBuffer, _
     enc.endEncoding()
 }
 
-func encRope(_ cb: MTLCommandBuffer, _ x: MTLBuffer, H: Int, D: Int, rotary: Int, theta: Float) {
+// activeB-aware grid-shrink: dispatch only [0, activeB) slot rows.
+// The kernel itself reads `b = tg.x` and operates on whichever slot
+// it gets — silenced slots [activeB, B) simply aren't dispatched.
+// Default activeB=B preserves legacy AR-batch-full behavior.
+func encRope(_ cb: MTLCommandBuffer, _ x: MTLBuffer, H: Int, D: Int, rotary: Int, theta: Float,
+              activeB: Int = B) {
     let enc = cb.makeComputeCommandEncoder()!
     enc.setComputePipelineState(ropePSO)
     enc.setBuffer(x, offset: 0, index: 0)
@@ -1358,13 +1363,13 @@ func encRope(_ cb: MTLCommandBuffer, _ x: MTLBuffer, H: Int, D: Int, rotary: Int
     enc.setBytes(&dv, length: 4, index: 3)
     enc.setBytes(&rv, length: 4, index: 4)
     enc.setBytes(&tv, length: 4, index: 5)
-    enc.dispatchThreadgroups(MTLSize(width: B, height: H, depth: 1),
+    enc.dispatchThreadgroups(MTLSize(width: activeB, height: H, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
 }
 
 func encKVWrite(_ cb: MTLCommandBuffer, K: MTLBuffer, V: MTLBuffer, Kc: MTLBuffer, Vc: MTLBuffer,
-                H: Int, D: Int, page: Int) {
+                H: Int, D: Int, page: Int, activeB: Int = B) {
     let enc = cb.makeComputeCommandEncoder()!
     enc.setComputePipelineState(kvwPSO)
     enc.setBuffer(K, offset: 0, index: 0); enc.setBuffer(V, offset: 0, index: 1)
@@ -1758,10 +1763,11 @@ func encAttn(_ cb: MTLCommandBuffer,
              Kc: MTLBuffer, Vc: MTLBuffer,
              kLenBuf: MTLBuffer,
              H_Q: Int, H_KV: Int, D: Int,
-             isFull: Bool) {
+             isFull: Bool,
+             activeB: Int = B) {
     encFlexAttnV0(cb, Q: Q, O: O, Kc: Kc, Vc: Vc,
                    kLenBuf: kLenBuf, H_Q: H_Q, H_KV: H_KV, D: D,
-                   isFull: isFull)
+                   isFull: isFull, activeB: activeB)
 }
 
 // GPU-side sampling dispatcher — Phase 1 of the dataflow pipeline spec.
@@ -1880,7 +1886,8 @@ func encFlexAttnV0(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
                     Kc: MTLBuffer, Vc: MTLBuffer,
                     kLenBuf: MTLBuffer,
                     H_Q: Int, H_KV: Int, D: Int,
-                    isFull: Bool) {
+                    isFull: Bool,
+                    activeB: Int = B) {
     let psoSel: MTLComputePipelineState = isFull ? flexAttnFullV0PSO : flexAttnSlideV0PSO
     let fullOff = isFull ? flex_full_full_offsets   : flex_full_offsets
     let fullIdx = isFull ? flex_full_full_indices   : flex_full_indices
@@ -1911,7 +1918,7 @@ func encFlexAttnV0(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
     enc1.setBytes(&ns, length: 4, index: 16);    enc1.setBytes(&sw, length: 4, index: 17)
     enc1.setBytes(&pp, length: 4, index: 18);    enc1.setBytes(&so, length: 4, index: 19)
     enc1.setBytes(&tso, length: 4, index: 20)
-    enc1.dispatchThreadgroups(MTLSize(width: B * H_KV, height: ATTN_N_SPLITS, depth: 1),
+    enc1.dispatchThreadgroups(MTLSize(width: activeB * H_KV, height: ATTN_N_SPLITS, depth: 1),
                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc1.endEncoding()
 
@@ -1924,7 +1931,7 @@ func encFlexAttnV0(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
     var Dv = UInt32(D)
     enc2.setBytes(&Dv, length: 4, index: 4)
     enc2.setBytes(&ns, length: 4, index: 5)
-    enc2.dispatchThreadgroups(MTLSize(width: B * H_Q, height: 1, depth: 1),
+    enc2.dispatchThreadgroups(MTLSize(width: activeB * H_Q, height: 1, depth: 1),
                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc2.endEncoding()
 }
@@ -1932,9 +1939,14 @@ func encFlexAttnV0(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
 
 
 
-func encSoftmaxTopk(_ cb: MTLCommandBuffer, expertScaleBuf: MTLBuffer) {
+// activeB-aware softmax+topk: only [0, activeB) slot rows get routing.
+// Silenced slots' router_lg is garbage (driven by garbage hidden) — this
+// fix prevents downstream route_compact from seeing those bogus topk
+// picks. Together with slot-aware route_compact this fully isolates the
+// MoE pipeline from silenced-slot pollution.
+func encSoftmaxTopk(_ cb: MTLCommandBuffer, expertScaleBuf: MTLBuffer, activeB: Int = B) {
     encSoftmaxTopkInto(cb, logits: router_lg, expertIds: expert_ids, gateW: gate_w,
-                        expertScaleBuf: expertScaleBuf, numVecs: B)
+                        expertScaleBuf: expertScaleBuf, numVecs: activeB)
 }
 
 // Row-generic softmax+topk+renorm+per-expert-scale. Processes numVecs token
@@ -2007,10 +2019,13 @@ func encMoeCombine(_ cb: MTLCommandBuffer) {
 }
 
 // MoE combine writing to a dedicated output buffer (used in the new Gemma-4
-// flow where we need the MoE output separate for post_ffw_norm_2).
-func encMoeCombineWrite(_ cb: MTLCommandBuffer, to outBuf: MTLBuffer) {
+// flow where we need the MoE output separate for post_ffw_norm_2). The
+// `activeB` cap restricts the per-batch combine to slots [0, activeB);
+// silenced slots get no combine writes (their MoE route was zero anyway
+// after slot-aware route_compact).
+func encMoeCombineWrite(_ cb: MTLCommandBuffer, to outBuf: MTLBuffer, activeB: Int = B) {
     encMoeCombineWriteInto(cb, moeOut: moe_down_out, batchSlots: batch_slots, gateW: gate_w,
-                            outBuf: outBuf, numVecs: B)
+                            outBuf: outBuf, numVecs: activeB)
 }
 
 // Row-generic MoE combine (in-place add to hidden). For prefill pass
@@ -2420,9 +2435,9 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
                                 activeB: aB)
 
         encRMSNormG(cb, x: q_out, gammaBuf: lw.attnQNorm, out: q_out, D: HD, numVecs: aB * H)
-        encRope(cb, q_out, H: H, D: HD, rotary: rotary, theta: theta)
+        encRope(cb, q_out, H: H, D: HD, rotary: rotary, theta: theta, activeB: aB)
         encRMSNormG(cb, x: k_out, gammaBuf: lw.attnKNorm, out: k_out, D: HD, numVecs: aB * KV_H)
-        encRope(cb, k_out, H: KV_H, D: HD, rotary: rotary, theta: theta)
+        encRope(cb, k_out, H: KV_H, D: HD, rotary: rotary, theta: theta, activeB: aB)
         encRMSNormNoScale(cb, x: v_out, out: v_out, D: HD, numVecs: aB * KV_H)
 
         // Q/K/V capture: slot-0 per-layer snapshot after q_norm/RoPE,
@@ -2445,13 +2460,13 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
         }
 
         let pg = isFull ? PAGE_FULL : PAGE_SLIDE
-        encKVWrite(cb, K: k_out, V: v_out, Kc: Kc, Vc: Vc, H: KV_H, D: HD, page: pg)
+        encKVWrite(cb, K: k_out, V: v_out, Kc: Kc, Vc: Vc, H: KV_H, D: HD, page: pg, activeB: aB)
 
         let npBuf = isFull ? num_pages_full : num_pages_slide
         let klBuf = isFull ? k_len_full : k_len_slide
         encAttn(cb, Q: q_out, O: attn_out, Kc: Kc, Vc: Vc,
                 kLenBuf: klBuf, H_Q: H, H_KV: KV_H, D: HD,
-                isFull: isFull)
+                isFull: isFull, activeB: aB)
         if LM_SKIP_ATTN {
             let blit = cb.makeBlitCommandEncoder()!
             blit.fill(buffer: attn_out, range: 0..<(B * max(SLIDE_H * SLIDE_HD, FULL_H * FULL_HD) * 2), value: 0)
@@ -2506,7 +2521,8 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
 
         // Router: pre-norm with per-dim scale and 1/sqrt(D) divisor, project to
         // logits, softmax+topk+renorm*per_expert_scale, then compact for MoE.
-        encRouterPreNorm(cb, x: hidden, per_dim_scale: lw.routerScale, out: hidden_norm)
+        encRouterPreNorm(cb, x: hidden, per_dim_scale: lw.routerScale, out: hidden_norm,
+                          numVecs: aB)
         if L == 0, let routerDump = LM_DUMP_L0_ROUTER {
             // hidden_norm (slot 0) f16[HIDDEN] — capture BEFORE the router proj.
             let blit = cb.makeBlitCommandEncoder()!
@@ -2514,7 +2530,7 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
                       to: routerDump, destinationOffset: TOPK * 4 + TOPK * 4 + E_EXP * 2, size: HIDDEN * 2)
             blit.endEncoding()
         }
-        encGemvV5(cb, hidden_norm, lw.routerW, router_lg, Din: HIDDEN, Dout: E_EXP)
+        encGemvV5(cb, hidden_norm, lw.routerW, router_lg, Din: HIDDEN, Dout: E_EXP, numVecs: aB)
         if L == 0, let routerDump = LM_DUMP_L0_ROUTER {
             // router_lg (slot 0) f16[E_EXP] — captured AFTER proj, BEFORE softmax.
             let blit = cb.makeBlitCommandEncoder()!
@@ -2522,7 +2538,7 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
                       to: routerDump, destinationOffset: TOPK * 4 + TOPK * 4, size: E_EXP * 2)
             blit.endEncoding()
         }
-        encSoftmaxTopk(cb, expertScaleBuf: lw.expertScale)
+        encSoftmaxTopk(cb, expertScaleBuf: lw.expertScale, activeB: aB)
         if L == 0, let routerDump = LM_DUMP_L0_ROUTER {
             let blit = cb.makeBlitCommandEncoder()!
             blit.copy(from: expert_ids, sourceOffset: 0,
@@ -2573,7 +2589,7 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
             blit.copy(from: group_start, sourceOffset: 0, to: slotsDump, destinationOffset: off, size: (E_EXP + 1) * 4)
             blit.endEncoding()
         }
-        encMoeCombineWrite(cb, to: moe_sum)
+        encMoeCombineWrite(cb, to: moe_sum, activeB: aB)
         if L == 0, let dump = LM_DUMP_L0_STAGING {
             // Slot 4: moe_sum BEFORE post_feedforward_layernorm_2 (raw scatter-sum experts output).
             let blit = cb.makeBlitCommandEncoder()!
