@@ -107,6 +107,11 @@ let denseQ80BtileQkvOtfB1PSO = pso("dense_gemv_q8_0_btile_qkv_otf_b1")
 let denseQ80BtileQkvOtfB2PSO = pso("dense_gemv_q8_0_btile_qkv_otf_b2")
 let denseQ80BtileQkvOtfB4PSO = pso("dense_gemv_q8_0_btile_qkv_otf_b4")
 let denseQ80BtileQkvOtfB8PSO = pso("dense_gemv_q8_0_btile_qkv_otf_b8")
+// Q8_0 RMSNorm + gate_up templated zoo (otf — same pattern as QKV otf).
+let denseQ80BtileGateUpOtfB1PSO = pso("dense_gemv_q8_0_btile_gate_up_otf_b1")
+let denseQ80BtileGateUpOtfB2PSO = pso("dense_gemv_q8_0_btile_gate_up_otf_b2")
+let denseQ80BtileGateUpOtfB4PSO = pso("dense_gemv_q8_0_btile_gate_up_otf_b4")
+let denseQ80BtileGateUpOtfB8PSO = pso("dense_gemv_q8_0_btile_gate_up_otf_b8")
 let denseQ80V5RmsPSO = pso("dense_gemv_q8_0_v5_rmsnorm")
 let denseQ80V6PSO    = pso("dense_gemv_q8_0_v6")
 let denseQ80V6RmsPSO = pso("dense_gemv_q8_0_v6_rmsnorm")
@@ -1038,6 +1043,42 @@ func encGemvQ80BtileQKVOtf(_ cb: MTLCommandBuffer, x: MTLBuffer, gammaBuf: MTLBu
     let totalSlabs = (DoutQ + DoutK + DoutV) / 32
     let yBlocks = (activeB + bTile - 1) / bTile
     enc.dispatchThreadgroups(MTLSize(width: totalSlabs, height: yBlocks, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// Q8_0 RMSNorm + gate_up kernel-zoo dispatcher (OTF). Same policy as
+// QKV otf: otf_b1 wins at activeB=1, V6 grid-shrink wins at higher
+// widths because V6's TG-grid parallelism (2*D_out/32 × B TGs) beats
+// otf's all-batches-in-one-TG layout when there are enough batches to
+// amortize SM scheduling.
+func encGemvQ80BtileGateUpOtf(_ cb: MTLCommandBuffer, x: MTLBuffer, gammaBuf: MTLBuffer,
+                                Wg: MTLBuffer, Wu: MTLBuffer, fusedOut: MTLBuffer,
+                                Din: Int, Dout: Int, activeB: Int) {
+    precondition(activeB >= 1 && activeB <= 8, "activeB \(activeB) out of [1,8]")
+    if activeB > 1 {
+        encGemvQ80V6RmsnormGateUp(cb, x: x, gammaBuf: gammaBuf,
+                                    Wg: Wg, Wu: Wu, fusedOut: fusedOut,
+                                    Din: Din, Dout: Dout, numVecs: activeB)
+        return
+    }
+    let pso = denseQ80BtileGateUpOtfB1PSO
+    let bTile = 1
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(pso)
+    enc.setBuffer(x, offset: 0, index: 0)
+    enc.setBuffer(gammaBuf, offset: 0, index: 1)
+    enc.setBuffer(Wg, offset: 0, index: 2)
+    enc.setBuffer(Wu, offset: 0, index: 3)
+    enc.setBuffer(fusedOut, offset: 0, index: 4)
+    var du = UInt32(Din), dou = UInt32(Dout); var eps: Float = 1e-6
+    var nv = UInt32(activeB)
+    enc.setBytes(&du, length: 4, index: 5)
+    enc.setBytes(&dou, length: 4, index: 6)
+    enc.setBytes(&eps, length: 4, index: 7)
+    enc.setBytes(&nv, length: 4, index: 8)
+    let yBlocks = (activeB + bTile - 1) / bTile
+    enc.dispatchThreadgroups(MTLSize(width: 2 * (Dout / 32), height: yBlocks, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
     enc.endEncoding()
 }
@@ -2446,10 +2487,11 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
         }
 
         // Shared MLP branch: fused (rmsnorm + gate + up) → gelu*mul → down → post_ffn_1.
-        encGemvQ80V6RmsnormGateUp(cb, x: hidden, gammaBuf: lw.ffnNorm,
+        // Kernel-zoo dispatcher: otf_b1 for activeB=1, V6 grid-shrink for activeB>1.
+        encGemvQ80BtileGateUpOtf(cb, x: hidden, gammaBuf: lw.ffnNorm,
                                    Wg: lw.ffnGate, Wu: lw.ffnUp,
                                    fusedOut: shrd_gate_up_fused,
-                                   Din: HIDDEN, Dout: SHARED_INT)
+                                   Din: HIDDEN, Dout: SHARED_INT, activeB: aB)
         encMoeGeluMulFused(cb, fused: shrd_gate_up_fused, out: shrd_gate, N_half: SHARED_INT, numSlots: aB)
         // ffn_down — kernel zoo dispatcher (templated B_TILE).
         encGemvQ80Btile(cb, shrd_gate, lw.ffnDown, mlp_out,
