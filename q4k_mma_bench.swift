@@ -93,6 +93,218 @@ func buildQ4kBlob(N: Int, K: Int) -> [UInt8] {
     return out
 }
 
+// ── Q5_K helpers ────────────────────────────────────────────────────
+// Block: 176 bytes / 256 elts. Layout:
+//   half d (offset 0..2), half dmin (2..4), uchar scales[12] (4..16),
+//   uchar qh[32] (16..48), uchar qs[128] (48..176).
+let BLK_Q5K_BYTES = 176
+let BLK_Q5K = 256
+
+// Generate a random Q5_K block (random d/dmin/scales/qh/qs). Returns 176 bytes.
+func randomQ5kBlock(_ rng: inout SystemRandomNumberGenerator) -> [UInt8] {
+    var blk = [UInt8](repeating: 0, count: BLK_Q5K_BYTES)
+    let d    = Float16(Float.random(in: 0.005...0.05, using: &rng))
+    let dmin = Float16(Float.random(in: 0.001...0.02, using: &rng))
+    blk.withUnsafeMutableBytes { buf in
+        buf.bindMemory(to: Float16.self)[0] = d
+        buf.bindMemory(to: Float16.self)[1] = dmin
+    }
+    for i in 4..<BLK_Q5K_BYTES { blk[i] = UInt8.random(in: 0...255, using: &rng) }
+    return blk
+}
+
+// Mirror of MSL dequantize_q5_K_llama: returns 16 weights for il_orig ∈ 0..15.
+// CPU correctness reference; not perf-critical.
+func dequantQ5kSubtile(_ blk: UnsafePointer<UInt8>, _ il_orig: Int) -> [Float] {
+    let raw = UnsafeRawPointer(blk)
+    let dHalf    = Float(raw.load(fromByteOffset: 0, as: Float16.self))
+    let dminHalf = Float(raw.load(fromByteOffset: 2, as: Float16.self))
+    let scales   = blk + 4
+    var qPtr     = blk + 48     // qs[128] starts at offset 48
+    var qhPtr    = blk + 16     // qh[32] starts at offset 16
+
+    let is_ = (il_orig/4) * 2
+    qPtr  = qPtr  + 32 * (il_orig/4) + 16 * (il_orig & 1)
+    qhPtr = qhPtr + 16 * (il_orig & 1)
+    let ul: UInt8 = UInt8(1 << (il_orig / 2))
+    let il = il_orig & 3
+
+    let (sc, mn) = unpackQ4kScales(scales, is_ + (il / 2))
+    let d  = il < 2 ? dHalf : dHalf / 16.0
+    let m  = dminHalf
+    let dl = d * Float(sc)
+    let ml = m * Float(mn)
+
+    let mask: UInt8 = il < 2 ? 0x0F : 0xF0
+    let qh_val: Float = il < 2 ? 16.0 : 256.0
+
+    var out = [Float](repeating: 0, count: 16)
+    for i in 0..<16 {
+        let lower = Float(qPtr[i] & mask)
+        let high  = (qhPtr[i] & ul) != 0 ? qh_val : 0.0
+        out[i] = dl * (lower + high) - ml
+    }
+    return out
+}
+
+// 256 dequantized weights in K-axis order (K_in_block = il_orig*16 + i).
+func dequantQ5kBlock(_ blk: UnsafePointer<UInt8>) -> [Float] {
+    var out = [Float](repeating: 0, count: 256)
+    for il_orig in 0..<16 {
+        let v = dequantQ5kSubtile(blk, il_orig)
+        for i in 0..<16 { out[il_orig * 16 + i] = v[i] }
+    }
+    return out
+}
+
+func buildQ5kBlob(N: Int, K: Int) -> [UInt8] {
+    precondition(K % BLK_Q5K == 0, "K must be multiple of 256 for Q5_K")
+    let blocksPerRow = K / BLK_Q5K
+    var rng = SystemRandomNumberGenerator()
+    var out = [UInt8](repeating: 0, count: N * blocksPerRow * BLK_Q5K_BYTES)
+    for n in 0..<N {
+        for kb in 0..<blocksPerRow {
+            let off = (n * blocksPerRow + kb) * BLK_Q5K_BYTES
+            let blk = randomQ5kBlock(&rng)
+            for i in 0..<BLK_Q5K_BYTES { out[off + i] = blk[i] }
+        }
+    }
+    return out
+}
+
+func cpuRefQ5K(X: [Float16], W: [UInt8], B: Int, K: Int, N: Int) -> [Float] {
+    let blocksPerRow = K / BLK_Q5K
+    var Y = [Float](repeating: 0, count: B * N)
+    W.withUnsafeBufferPointer { wPtr in
+        for b in 0..<B {
+            for n in 0..<N {
+                var acc: Float = 0
+                for kb in 0..<blocksPerRow {
+                    let blkOff = (n * blocksPerRow + kb) * BLK_Q5K_BYTES
+                    let dq = dequantQ5kBlock(wPtr.baseAddress!.advanced(by: blkOff))
+                    let kBase = kb * BLK_Q5K
+                    for elem in 0..<BLK_Q5K {
+                        acc += Float(X[b * K + kBase + elem]) * dq[elem]
+                    }
+                }
+                Y[b * N + n] = acc
+            }
+        }
+    }
+    return Y
+}
+
+// ── Q6_K helpers ────────────────────────────────────────────────────
+// Block: 210 bytes / 256 elts. Layout:
+//   uchar ql[128] (offset 0..128), uchar qh[64] (128..192),
+//   int8 scales[16] (192..208), half d (208..210).
+let BLK_Q6K_BYTES = 210
+let BLK_Q6K = 256
+
+func randomQ6kBlock(_ rng: inout SystemRandomNumberGenerator) -> [UInt8] {
+    var blk = [UInt8](repeating: 0, count: BLK_Q6K_BYTES)
+    // Random ql, qh
+    for i in 0..<192 { blk[i] = UInt8.random(in: 0...255, using: &rng) }
+    // Random scales (int8); use small magnitude for stable values
+    for i in 192..<208 { blk[i] = UInt8(bitPattern: Int8.random(in: -8...8, using: &rng)) }
+    // d (half) at offset 208
+    let d = Float16(Float.random(in: 0.005...0.05, using: &rng))
+    blk.withUnsafeMutableBytes { buf in
+        let p = buf.baseAddress!.advanced(by: 208)
+        p.bindMemory(to: Float16.self, capacity: 1).pointee = d
+    }
+    return blk
+}
+
+// Mirror of MSL dequantize_q6_K_llama: returns 16 weights for il_orig ∈ 0..15.
+func dequantQ6kSubtile(_ blk: UnsafePointer<UInt8>, _ il_orig: Int) -> [Float] {
+    let raw = UnsafeRawPointer(blk)
+    let dAll = Float(raw.load(fromByteOffset: 208, as: Float16.self))
+
+    // ql at byte 0 (uint16 array of 64 entries), qh at byte 128 (32 uint16s).
+    @inline(__always) func ql_u16(_ idx: Int) -> UInt16 {
+        return raw.load(fromByteOffset: idx * 2, as: UInt16.self)
+    }
+    @inline(__always) func qh_u16(_ idx: Int) -> UInt16 {
+        return raw.load(fromByteOffset: 128 + idx * 2, as: UInt16.self)
+    }
+
+    let qlBase = 32*(il_orig/8) + 16*((il_orig/2) & 1) + 8*(il_orig & 1)
+    let qhBase = 16*(il_orig/8) + 8*(il_orig & 1)
+    let scIdx = (il_orig % 2) + 2 * (il_orig / 2)
+    let sc = Float(Int8(bitPattern: blk[192 + scIdx]))
+    let il = (il_orig / 2) & 3
+
+    let kmask1: UInt32 = il > 1 ? (il > 2 ? 0xC0C0C0C0 : 0x30303030) : (il > 0 ? 0x0C0C0C0C : 0x03030303)
+    let kmask2: UInt32 = il > 1 ? 0xF0F0F0F0 : 0x0F0F0F0F
+    let ml  = dAll * sc * 32.0
+    let dl0 = dAll * sc
+    let dl1 = dl0 / 256.0
+    let dl2 = dl0 / (256.0 * 256.0)
+    let dl3 = dl0 / (256.0 * 256.0 * 256.0)
+    let shr_h: UInt32 = il > 2 ? 2 : 0
+    let shl_h: UInt32 = il > 1 ? 0 : (il > 0 ? 2 : 4)
+    let shr_l: UInt32 = il > 1 ? 4 : 0
+
+    var out = [Float](repeating: 0, count: 16)
+    for i in 0..<4 {
+        let low  = (UInt32(ql_u16(qlBase + 2*i)) | (UInt32(ql_u16(qlBase + 2*i + 1)) << 16)) & kmask2
+        let high = (UInt32(qh_u16(qhBase + 2*i)) | (UInt32(qh_u16(qhBase + 2*i + 1)) << 16)) & kmask1
+        let q = ((high << shl_h) >> shr_h) | (low >> shr_l)
+        out[i*4 + 0] = dl0 * Float(q & 0xFF)         - ml
+        out[i*4 + 1] = dl1 * Float(q & 0xFF00)       - ml
+        out[i*4 + 2] = dl2 * Float(q & 0xFF0000)     - ml
+        out[i*4 + 3] = dl3 * Float(q & 0xFF000000)   - ml
+    }
+    return out
+}
+
+func dequantQ6kBlock(_ blk: UnsafePointer<UInt8>) -> [Float] {
+    var out = [Float](repeating: 0, count: 256)
+    for il_orig in 0..<16 {
+        let v = dequantQ6kSubtile(blk, il_orig)
+        for i in 0..<16 { out[il_orig * 16 + i] = v[i] }
+    }
+    return out
+}
+
+func buildQ6kBlob(N: Int, K: Int) -> [UInt8] {
+    precondition(K % BLK_Q6K == 0, "K must be multiple of 256 for Q6_K")
+    let blocksPerRow = K / BLK_Q6K
+    var rng = SystemRandomNumberGenerator()
+    var out = [UInt8](repeating: 0, count: N * blocksPerRow * BLK_Q6K_BYTES)
+    for n in 0..<N {
+        for kb in 0..<blocksPerRow {
+            let off = (n * blocksPerRow + kb) * BLK_Q6K_BYTES
+            let blk = randomQ6kBlock(&rng)
+            for i in 0..<BLK_Q6K_BYTES { out[off + i] = blk[i] }
+        }
+    }
+    return out
+}
+
+func cpuRefQ6K(X: [Float16], W: [UInt8], B: Int, K: Int, N: Int) -> [Float] {
+    let blocksPerRow = K / BLK_Q6K
+    var Y = [Float](repeating: 0, count: B * N)
+    W.withUnsafeBufferPointer { wPtr in
+        for b in 0..<B {
+            for n in 0..<N {
+                var acc: Float = 0
+                for kb in 0..<blocksPerRow {
+                    let blkOff = (n * blocksPerRow + kb) * BLK_Q6K_BYTES
+                    let dq = dequantQ6kBlock(wPtr.baseAddress!.advanced(by: blkOff))
+                    let kBase = kb * BLK_Q6K
+                    for elem in 0..<BLK_Q6K {
+                        acc += Float(X[b * K + kBase + elem]) * dq[elem]
+                    }
+                }
+                Y[b * N + n] = acc
+            }
+        }
+    }
+    return Y
+}
+
 // ── Q8_0 helpers ────────────────────────────────────────────────────
 let BLK_Q8_BYTES = 34
 let BLK_Q8 = 32
@@ -152,9 +364,37 @@ func cpuRefQ8(X: [Float16], W: [UInt8], B: Int, K: Int, N: Int) -> [Float] {
     return Y
 }
 
-// v6 swizzle: standard [n, kb, byte] → swizzled [n_super, kb, col, byte].
-// Mirror of repackQ80ToSwizzled in bootstrap.swift, in-Swift on a flat blob.
-// Requires N % 32 == 0 (super-row size).
+// v6 swizzle (generic): standard [n, kb, byte] → swizzled [n_super, kb, col, byte].
+// Same layout as repackQ80ToSwizzled in bootstrap.swift, format-agnostic.
+// Requires N % 32 == 0 and K divisible by blkElems.
+func swizzleBlob(_ src: [UInt8], N: Int, K: Int, blkBytes: Int, blkElems: Int) -> [UInt8] {
+    precondition(N % 32 == 0, "N must be multiple of 32 for v6 swizzle")
+    precondition(K % blkElems == 0, "K must be multiple of blkElems")
+    let nbc = K / blkElems
+    let nSuper = N / 32
+    let colBytes = nbc * blkBytes
+    var dst = [UInt8](repeating: 0, count: src.count)
+    src.withUnsafeBufferPointer { sp in
+        dst.withUnsafeMutableBufferPointer { dp in
+            for ns in 0..<nSuper {
+                let srcColBase = ns * 32 * colBytes
+                let dstSuperBase = ns * nbc * 32 * blkBytes
+                for kb in 0..<nbc {
+                    for col in 0..<32 {
+                        let srcOff = srcColBase + col * colBytes + kb * blkBytes
+                        let dstOff = dstSuperBase + kb * 32 * blkBytes + col * blkBytes
+                        memcpy(dp.baseAddress!.advanced(by: dstOff),
+                               sp.baseAddress!.advanced(by: srcOff),
+                               blkBytes)
+                    }
+                }
+            }
+        }
+    }
+    return dst
+}
+
+// Q8_0-specific shim (Q8_0 was the only swizzled variant before Q5_K/Q6_K landed).
 func swizzleQ8Blob(_ src: [UInt8], N: Int, K: Int) -> [UInt8] {
     precondition(N % 32 == 0, "N must be multiple of 32 for v6 swizzle")
     precondition(K % BLK_Q8 == 0, "K must be multiple of 32 for Q8_0")
@@ -498,6 +738,83 @@ static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q
                  : uchar2{uchar((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)), uchar((q[j+4+k] >> 4) | ((q[j-0+k] & 0xc0) >> 2))};
 }
 
+// ── Q5_K block struct + dequant (port of llama.cpp ggml-metal:699) ──
+// 176 bytes per 256 weights:
+//   half d, half dmin, uchar scales[12], uchar qh[32], uchar qs[128]
+struct block_q5K_metal {
+    half  d;
+    half  dmin;
+    uchar scales[12];
+    uchar qh[32];
+    uchar qs[128];
+};
+
+static inline void dequantize_q5_K_llama(device const block_q5K_metal * xb, short il, thread half4x4 & reg) {
+    device const uchar * q  = xb->qs;
+    device const uchar * qh = xb->qh;
+
+    short is = (il/4) * 2;
+    q  = q  + 32 * (il/4) + 16 * (il&1);
+    qh = qh + 16 * (il&1);
+    uchar ul = 1 << (il/2);
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const float d   = il < 2 ? float(xb->d) : float(xb->d) / 16.0f;
+    const float min_= float(xb->dmin);
+    const float dl  = d * sc[0];
+    const float ml  = min_ * sc[1];
+    const ushort mask  = il < 2 ? 0x0F : 0xF0;
+    const float qh_val = il < 2 ? 16.0f : 256.0f;
+    for (int i = 0; i < 16; ++i) {
+        const float v = (q[i] & mask) + (qh[i] & ul ? qh_val : 0.0f);
+        reg[i/4][i%4] = half(dl * v - ml);
+    }
+}
+
+// ── Q6_K block struct + dequant (port of llama.cpp ggml-metal:722) ──
+// 210 bytes per 256 weights:
+//   uchar ql[128], uchar qh[64], int8 scales[16], half d
+struct block_q6K_metal {
+    uchar  ql[128];
+    uchar  qh[64];
+    int8_t scales[16];
+    half   d;
+};
+
+static inline void dequantize_q6_K_llama(device const block_q6K_metal * xb, short il, thread half4x4 & reg) {
+    const half d_all = xb->d;
+    device const uint16_t * ql = (device const uint16_t *)xb->ql;
+    device const uint16_t * qh = (device const uint16_t *)xb->qh;
+    device const int8_t   * scales = xb->scales;
+
+    ql = ql + 32*(il/8) + 16*((il/2)&1) + 8*(il&1);
+    qh = qh + 16*(il/8) + 8*(il&1);
+    float sc = scales[(il%2) + 2 * ((il/2))];
+    il = (il/2) & 3;
+
+    const uint32_t kmask1 = il>1 ? (il>2 ? 0xC0C0C0C0u : 0x30303030u)
+                                 : (il>0 ? 0x0C0C0C0Cu : 0x03030303u);
+    const uint32_t kmask2 = il>1 ? 0xF0F0F0F0u : 0x0F0F0F0Fu;
+    const float ml  = float(d_all) * sc * 32.0f;
+    const float dl0 = float(d_all) * sc;
+    const float dl1 = dl0 / 256.0f;
+    const float dl2 = dl0 / (256.0f * 256.0f);
+    const float dl3 = dl0 / (256.0f * 256.0f * 256.0f);
+    const uchar shr_h = il>2 ? 2 : 0;
+    const uchar shl_h = il>1 ? 0 : (il>0 ? 2 : 4);
+    const uchar shr_l = il>1 ? 4 : 0;
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t  low = (uint32_t(ql[2*i]) | (uint32_t(ql[2*i+1]) << 16)) & kmask2;
+        const uint32_t high = (uint32_t(qh[2*i]) | (uint32_t(qh[2*i+1]) << 16)) & kmask1;
+        const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+        reg[i][0] = half(dl0 * float(q & 0xFFu)         - ml);
+        reg[i][1] = half(dl1 * float(q & 0xFF00u)       - ml);
+        reg[i][2] = half(dl2 * float(q & 0xFF0000u)     - ml);
+        reg[i][3] = half(dl3 * float(q & 0xFF000000u)   - ml);
+    }
+}
+
+// ── Q4_K dequant (existing) ─────────────────────────────────────────
 static inline void dequantize_q4_K_llama(device const block_q4K_metal * xb, short il, thread half4x4 & reg) {
     device const uchar * q = xb->qs;
 
@@ -1011,6 +1328,286 @@ kernel void kernel_mul_mm_q8_0_swiz(
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
         // swizzle: +1 kb step = +32 block stride (32 cols per kb in super-row)
+        x  = (il < 2) ? x + 32 : x;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float * temp_str = ((threadgroup float *) shmem)
+                                   + 32*(sgitg & 1)
+                                   + (16 * (sgitg >> 1)) * NR0;
+
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        for (int j = tiitg; j < nr1; j += NR1) {
+            device half * D = Y + r0 + (r1 + j) * ne0 + im * ne1 * ne0;
+            threadgroup float * C = ((threadgroup float *) shmem) + (j * NR0);
+            int i = 0;
+            for (; i < nr0; i++) {
+                D[i] = (half) C[i];
+            }
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// kernel_mul_mm_q5_K_swiz — dense Q5_K swizzled simdgroup matmul.
+// Same structure as kernel_mul_mm_q8_0_swiz; differences:
+//   block_q5K_metal (176 B / 256 elts), nl=16, nbc=D_in/256.
+// ────────────────────────────────────────────────────────────────────
+
+kernel void kernel_mul_mm_q5_K_swiz(
+    device const half*   X               [[buffer(0)]],
+    device const uchar*  W_q5k           [[buffer(1)]],
+    device half*         Y               [[buffer(2)]],
+    constant uint& B_count               [[buffer(3)]],
+    constant uint& D_in                  [[buffer(4)]],
+    constant uint& D_out                 [[buffer(5)]],
+    threadgroup char*    shmem           [[threadgroup(0)]],
+    uint3 tgpig                          [[threadgroup_position_in_grid]],
+    ushort tiitg                         [[thread_index_in_threadgroup]],
+    ushort sgitg                         [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+    constexpr short nl = 16;          // QK_NL for K-quants
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y * NR0;
+    const int r1 = tgpig.x * NR1;
+
+    const int ne00 = (int)D_in;
+    const int ne0  = (int)D_out;
+    const int ne1  = (int)B_count;
+    const ulong nb10 = sizeof(half);
+    const ulong nb11 = (ulong)D_in * sizeof(half);
+
+    const short nr0 = (ne0 - r0 < NR0) ? short(ne0 - r0) : NR0;
+    const short nr1 = (ne1 - r1 < NR1) ? short(ne1 - r1) : NR1;
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : (nr0 - 1);
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : (nr1 - 1);
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+
+    const short offset1 = il0/nl;
+
+    // Swizzled W base. nbc = D_in / 256 for Q5_K.
+    const int   nbc    = ne00 / 256;
+    const short row_g  = (short)(r0 + lr0);
+    const short ns     = row_g >> 5;
+    const short col    = row_g & 31;
+    device const block_q5K_metal * x = (device const block_q5K_metal *)W_q5k
+        + (int)ns * nbc * 32
+        + (int)offset1 * 32
+        + col;
+
+    const short iy = 8 * (tiitg % NL1);
+    device const half * y = (device const half *) ((device const char *)X
+        + nb11*(r1 + lr1) + nb10*iy);
+
+    simdgroup_half8x8     ma[4];
+    simdgroup_half8x8     mb[2];
+    simdgroup_float8x8    mc[8];
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (int loop_k = 0; loop_k < ne00; loop_k += NK) {
+        {
+            half4x4 temp_a;
+            dequantize_q5_K_llama(x, il, temp_a);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = (tiitg/NL0)%8;
+                const short ly = i%8;
+                const short ib = 8*sx + sy;
+                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+            }
+        }
+
+        {
+            const short sx = (tiitg % NL1);
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4*sx + sy;
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = *((device half2x4 *) y);
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + 32 : x;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float * temp_str = ((threadgroup float *) shmem)
+                                   + 32*(sgitg & 1)
+                                   + (16 * (sgitg >> 1)) * NR0;
+
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        for (int j = tiitg; j < nr1; j += NR1) {
+            device half * D = Y + r0 + (r1 + j) * ne0 + im * ne1 * ne0;
+            threadgroup float * C = ((threadgroup float *) shmem) + (j * NR0);
+            int i = 0;
+            for (; i < nr0; i++) {
+                D[i] = (half) C[i];
+            }
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// kernel_mul_mm_q6_K_swiz — dense Q6_K swizzled simdgroup matmul.
+// Same as Q5_K version with block_q6K_metal (210 B / 256 elts) + Q6_K dequant.
+// ────────────────────────────────────────────────────────────────────
+
+kernel void kernel_mul_mm_q6_K_swiz(
+    device const half*   X               [[buffer(0)]],
+    device const uchar*  W_q6k           [[buffer(1)]],
+    device half*         Y               [[buffer(2)]],
+    constant uint& B_count               [[buffer(3)]],
+    constant uint& D_in                  [[buffer(4)]],
+    constant uint& D_out                 [[buffer(5)]],
+    threadgroup char*    shmem           [[threadgroup(0)]],
+    uint3 tgpig                          [[threadgroup_position_in_grid]],
+    ushort tiitg                         [[thread_index_in_threadgroup]],
+    ushort sgitg                         [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+    constexpr short nl = 16;
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y * NR0;
+    const int r1 = tgpig.x * NR1;
+
+    const int ne00 = (int)D_in;
+    const int ne0  = (int)D_out;
+    const int ne1  = (int)B_count;
+    const ulong nb10 = sizeof(half);
+    const ulong nb11 = (ulong)D_in * sizeof(half);
+
+    const short nr0 = (ne0 - r0 < NR0) ? short(ne0 - r0) : NR0;
+    const short nr1 = (ne1 - r1 < NR1) ? short(ne1 - r1) : NR1;
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : (nr0 - 1);
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : (nr1 - 1);
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+
+    const short offset1 = il0/nl;
+
+    const int   nbc    = ne00 / 256;
+    const short row_g  = (short)(r0 + lr0);
+    const short ns     = row_g >> 5;
+    const short col    = row_g & 31;
+    device const block_q6K_metal * x = (device const block_q6K_metal *)W_q6k
+        + (int)ns * nbc * 32
+        + (int)offset1 * 32
+        + col;
+
+    const short iy = 8 * (tiitg % NL1);
+    device const half * y = (device const half *) ((device const char *)X
+        + nb11*(r1 + lr1) + nb10*iy);
+
+    simdgroup_half8x8     ma[4];
+    simdgroup_half8x8     mb[2];
+    simdgroup_float8x8    mc[8];
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (int loop_k = 0; loop_k < ne00; loop_k += NK) {
+        {
+            half4x4 temp_a;
+            dequantize_q6_K_llama(x, il, temp_a);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = (tiitg/NL0)%8;
+                const short ly = i%8;
+                const short ib = 8*sx + sy;
+                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+            }
+        }
+
+        {
+            const short sx = (tiitg % NL1);
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4*sx + sy;
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = *((device half2x4 *) y);
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
         x  = (il < 2) ? x + 32 : x;
         y += NK;
 
@@ -1685,13 +2282,318 @@ kernel void kernel_mul_mm_id_q5_1_swiz(
         }
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// kernel_mul_mm_id_q5_K_swiz — MoE-routed Q5_K matmul, per-expert v6
+// swizzled. Same body as id_q4K_swiz with Q5_K dequant + block.
+// ────────────────────────────────────────────────────────────────────
+
+kernel void kernel_mul_mm_id_q5_K_swiz(
+    device const half*     X            [[buffer(0)]],
+    device const uchar*    W_q5k        [[buffer(1)]],
+    device half*           Y            [[buffer(2)]],
+    device const uint*     tpe          [[buffer(3)]],
+    device const int*      ids          [[buffer(4)]],
+    constant uint& B_count              [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    constant uint& E_count              [[buffer(8)]],
+    constant uint& TOPK                 [[buffer(9)]],
+    constant uint& IDS_STRIDE           [[buffer(10)]],
+    threadgroup char*  shmem            [[threadgroup(0)]],
+    uint3 tgpig                         [[threadgroup_position_in_grid]],
+    ushort tiitg                        [[thread_index_in_threadgroup]],
+    ushort tiisg                        [[thread_index_in_simdgroup]],
+    ushort sgitg                        [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+    constexpr short nl = 16;
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y * NR0;
+    const int r1 = tgpig.x * NR1;
+
+    const int neh1 = (int)tpe[im];
+    if (r1 >= neh1) return;
+
+    const int ne00 = (int)D_in;
+    const int ne0  = (int)D_out;
+    const int nbc  = ne00 / 256;
+    const int blocks_per_expert = ne0 * nbc;
+
+    const ulong nb11 = 0ul;
+    const ulong nb12 = (ulong)D_in * sizeof(half);
+
+    const short nr0 = (ne0 - r0 < NR0) ? short(ne0 - r0) : NR0;
+    const short nr1 = (neh1 - r1 < NR1) ? short(neh1 - r1) : NR1;
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : (nr0 - 1);
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : (nr1 - 1);
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+
+    const int id  = ids[im * (int)IDS_STRIDE + r1 + lr1];
+    const int i12 = id / (int)TOPK;
+    const int i11 = id % (int)TOPK;
+
+    const short offset1 = il0 / nl;
+
+    const short row_g = (short)(r0 + lr0);
+    const short ns    = row_g >> 5;
+    const short col   = row_g & 31;
+    device const block_q5K_metal * x = ((device const block_q5K_metal *)W_q5k)
+        + im * blocks_per_expert
+        + (int)ns * nbc * 32
+        + (int)offset1 * 32
+        + col;
+
+    const short iy = 8 * (tiitg % NL1);
+    device const half * y = (device const half *) ((device const char *)X
+        + nb12 * i12 + nb11 * i11 + sizeof(half) * iy);
+
+    simdgroup_half8x8     ma[4];
+    simdgroup_half8x8     mb[2];
+    simdgroup_float8x8    mc[8];
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (int loop_k = 0; loop_k < ne00; loop_k += NK) {
+        {
+            half4x4 temp_a;
+            dequantize_q5_K_llama(x, il, temp_a);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = (tiitg/NL0)%8;
+                const short ly = i%8;
+                const short ib = 8*sx + sy;
+                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+            }
+        }
+
+        {
+            const short sx = (tiitg % NL1);
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4*sx + sy;
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = *((device half2x4 *) y);
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + 32 : x;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float * temp_str = ((threadgroup float *) shmem)
+                                   + 32*(sgitg & 1)
+                                   + (16 * (sgitg >> 1)) * NR0;
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short j = sgitg; j < nr1; j += 4) {
+        const int id_j = ids[im * (int)IDS_STRIDE + r1 + j];
+        const int ide = id_j % (int)TOPK;
+        const int idt = id_j / (int)TOPK;
+        device half * D = Y + r0 + ide * ne0 + idt * (int)TOPK * ne0;
+        threadgroup float * C = ((threadgroup float *) shmem) + j * NR0;
+        for (int i = tiisg; i < nr0; i += 32) {
+            D[i] = (half) C[i];
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// kernel_mul_mm_id_q6_K_swiz — MoE-routed Q6_K matmul.
+// ────────────────────────────────────────────────────────────────────
+
+kernel void kernel_mul_mm_id_q6_K_swiz(
+    device const half*     X            [[buffer(0)]],
+    device const uchar*    W_q6k        [[buffer(1)]],
+    device half*           Y            [[buffer(2)]],
+    device const uint*     tpe          [[buffer(3)]],
+    device const int*      ids          [[buffer(4)]],
+    constant uint& B_count              [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    constant uint& E_count              [[buffer(8)]],
+    constant uint& TOPK                 [[buffer(9)]],
+    constant uint& IDS_STRIDE           [[buffer(10)]],
+    threadgroup char*  shmem            [[threadgroup(0)]],
+    uint3 tgpig                         [[threadgroup_position_in_grid]],
+    ushort tiitg                        [[thread_index_in_threadgroup]],
+    ushort tiisg                        [[thread_index_in_simdgroup]],
+    ushort sgitg                        [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+    constexpr short nl = 16;
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y * NR0;
+    const int r1 = tgpig.x * NR1;
+
+    const int neh1 = (int)tpe[im];
+    if (r1 >= neh1) return;
+
+    const int ne00 = (int)D_in;
+    const int ne0  = (int)D_out;
+    const int nbc  = ne00 / 256;
+    const int blocks_per_expert = ne0 * nbc;
+
+    const ulong nb11 = 0ul;
+    const ulong nb12 = (ulong)D_in * sizeof(half);
+
+    const short nr0 = (ne0 - r0 < NR0) ? short(ne0 - r0) : NR0;
+    const short nr1 = (neh1 - r1 < NR1) ? short(neh1 - r1) : NR1;
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : (nr0 - 1);
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : (nr1 - 1);
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+
+    const int id  = ids[im * (int)IDS_STRIDE + r1 + lr1];
+    const int i12 = id / (int)TOPK;
+    const int i11 = id % (int)TOPK;
+
+    const short offset1 = il0 / nl;
+
+    const short row_g = (short)(r0 + lr0);
+    const short ns    = row_g >> 5;
+    const short col   = row_g & 31;
+    device const block_q6K_metal * x = ((device const block_q6K_metal *)W_q6k)
+        + im * blocks_per_expert
+        + (int)ns * nbc * 32
+        + (int)offset1 * 32
+        + col;
+
+    const short iy = 8 * (tiitg % NL1);
+    device const half * y = (device const half *) ((device const char *)X
+        + nb12 * i12 + nb11 * i11 + sizeof(half) * iy);
+
+    simdgroup_half8x8     ma[4];
+    simdgroup_half8x8     mb[2];
+    simdgroup_float8x8    mc[8];
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (int loop_k = 0; loop_k < ne00; loop_k += NK) {
+        {
+            half4x4 temp_a;
+            dequantize_q6_K_llama(x, il, temp_a);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = (tiitg/NL0)%8;
+                const short ly = i%8;
+                const short ib = 8*sx + sy;
+                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+            }
+        }
+
+        {
+            const short sx = (tiitg % NL1);
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4*sx + sy;
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = *((device half2x4 *) y);
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + 32 : x;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float * temp_str = ((threadgroup float *) shmem)
+                                   + 32*(sgitg & 1)
+                                   + (16 * (sgitg >> 1)) * NR0;
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short j = sgitg; j < nr1; j += 4) {
+        const int id_j = ids[im * (int)IDS_STRIDE + r1 + j];
+        const int ide = id_j % (int)TOPK;
+        const int idt = id_j / (int)TOPK;
+        device half * D = Y + r0 + ide * ne0 + idt * (int)TOPK * ne0;
+        threadgroup float * C = ((threadgroup float *) shmem) + j * NR0;
+        for (int i = tiisg; i < nr0; i += 32) {
+            D[i] = (half) C[i];
+        }
+    }
+}
 """
 
 // ────────────────────────────────────────────────────────────────────
 // Bench driver.
 // ────────────────────────────────────────────────────────────────────
 
-enum WeightFormat { case q4k, q8_0, q8_0_swiz }
+enum WeightFormat { case q4k, q8_0, q8_0_swiz, q5k, q6k }
 
 struct KernelVariant {
     let name: String
@@ -1711,18 +2613,34 @@ func runShape(_ device: MTLDevice, _ queue: MTLCommandQueue,
     let tileQ = variant.tileQ
     let tileO = variant.tileO
     let threads = variant.threads
-    let isQ8 = (variant.format == .q8_0 || variant.format == .q8_0_swiz)
-    let isSwiz = (variant.format == .q8_0_swiz)
-    if isQ8 { precondition(K % BLK_Q8 == 0) } else { precondition(K % BLK_K == 0) }
-    if isSwiz { precondition(N % 32 == 0, "swizzled Q8_0 requires N % 32 == 0") }
+    let fmt = variant.format
+    // Per-format K-axis precondition + swizzle requirement (Q5_K/Q6_K
+    // kernels in this bench are swizzled-only; Q8_0 has both variants).
+    let needsSwiz: Bool
+    switch fmt {
+    case .q4k:        precondition(K % BLK_K == 0); needsSwiz = false
+    case .q8_0:       precondition(K % BLK_Q8 == 0); needsSwiz = false
+    case .q8_0_swiz:  precondition(K % BLK_Q8 == 0); needsSwiz = true
+    case .q5k:        precondition(K % BLK_Q5K == 0); needsSwiz = true
+    case .q6k:        precondition(K % BLK_Q6K == 0); needsSwiz = true
+    }
+    if needsSwiz { precondition(N % 32 == 0, "swizzled layout requires N % 32 == 0") }
 
     var rng = SystemRandomNumberGenerator()
     var X = [Float16](repeating: 0, count: B * K)
     for i in 0..<X.count { X[i] = Float16(Float.random(in: -1...1, using: &rng) * 0.1) }
-    // Always build standard layout (the CPU reference reads it this way).
-    // If the variant wants swizzled, derive a swizzled copy for the GPU buffer.
-    let W: [UInt8] = isQ8 ? buildQ8Blob(N: N, K: K) : buildQ4kBlob(N: N, K: K)
-    let Wgpu: [UInt8] = isSwiz ? swizzleQ8Blob(W, N: N, K: K) : W
+    // Build the W blob (standard layout — used by CPU reference) and a swizzled
+    // copy (when the kernel needs swizzled weights).
+    let W: [UInt8]
+    let blkBytes: Int
+    let blkElems: Int
+    switch fmt {
+    case .q4k:                W = buildQ4kBlob(N: N, K: K); blkBytes = BLK_BYTES;     blkElems = BLK_K
+    case .q8_0, .q8_0_swiz:   W = buildQ8Blob(N: N, K: K);  blkBytes = BLK_Q8_BYTES;  blkElems = BLK_Q8
+    case .q5k:                W = buildQ5kBlob(N: N, K: K); blkBytes = BLK_Q5K_BYTES; blkElems = BLK_Q5K
+    case .q6k:                W = buildQ6kBlob(N: N, K: K); blkBytes = BLK_Q6K_BYTES; blkElems = BLK_Q6K
+    }
+    let Wgpu: [UInt8] = needsSwiz ? swizzleBlob(W, N: N, K: K, blkBytes: blkBytes, blkElems: blkElems) : W
 
     let xBuf = device.makeBuffer(bytes: X, length: X.count * 2, options: .storageModeShared)!
     let wBuf = device.makeBuffer(bytes: Wgpu, length: Wgpu.count, options: .storageModeShared)!
@@ -1759,8 +2677,13 @@ func runShape(_ device: MTLDevice, _ queue: MTLCommandQueue,
     var rmseRel: Float = 0
     if B * K * N <= 1_000_000 {
         dispatch()
-        let yRef = isQ8 ? cpuRefQ8(X: X, W: W, B: B, K: K, N: N)
-                        : cpuRef(X: X, W: W, B: B, K: K, N: N)
+        let yRef: [Float]
+        switch fmt {
+        case .q4k:                yRef = cpuRef(X: X, W: W, B: B, K: K, N: N)
+        case .q8_0, .q8_0_swiz:   yRef = cpuRefQ8(X: X, W: W, B: B, K: K, N: N)
+        case .q5k:                yRef = cpuRefQ5K(X: X, W: W, B: B, K: K, N: N)
+        case .q6k:                yRef = cpuRefQ6K(X: X, W: W, B: B, K: K, N: N)
+        }
         let yPtr = yBuf.contents().bindMemory(to: Float16.self, capacity: B * N)
         var sumSq: Double = 0
         for i in 0..<B * N {
@@ -1906,13 +2829,20 @@ catch { FileHandle.standardError.write("compile error: \(error)\n".data(using:.u
 // Same with the minimum-change NR1=8 in commit ea03163.)
 let q8spl = try device.makeComputePipelineState(function:
     library.makeFunction(name: "kernel_mul_mm_q8_0_swiz")!)
+let q5kspl = try device.makeComputePipelineState(function:
+    library.makeFunction(name: "kernel_mul_mm_q5_K_swiz")!)
+let q6kspl = try device.makeComputePipelineState(function:
+    library.makeFunction(name: "kernel_mul_mm_q6_K_swiz")!)
 let variants: [KernelVariant] = [
-    KernelVariant(
-        name: "swiz_nr1_32",
-        pipeline: q8spl,
-        tileQ: 32, tileO: 64, threads: 128,
-        threadgroupMemoryBytes: 4096 + 2048 + 4096,
-        format: .q8_0_swiz),
+    KernelVariant(name: "q8_0_swiz",  pipeline: q8spl,
+                  tileQ: 32, tileO: 64, threads: 128,
+                  threadgroupMemoryBytes: 4096 + 2048 + 4096, format: .q8_0_swiz),
+    KernelVariant(name: "q5_K_swiz",  pipeline: q5kspl,
+                  tileQ: 32, tileO: 64, threads: 128,
+                  threadgroupMemoryBytes: 4096 + 2048 + 4096, format: .q5k),
+    KernelVariant(name: "q6_K_swiz",  pipeline: q6kspl,
+                  tileQ: 32, tileO: 64, threads: 128,
+                  threadgroupMemoryBytes: 4096 + 2048 + 4096, format: .q6k),
 ]
 FileHandle.standardError.write("ALIVE: variants=\(variants.count)\n".data(using:.utf8)!)
 
@@ -1921,6 +2851,10 @@ let moeQ4Kspl = try device.makeComputePipelineState(function:
     library.makeFunction(name: "kernel_mul_mm_id_q4K_swiz")!)
 let moeQ51spl = try device.makeComputePipelineState(function:
     library.makeFunction(name: "kernel_mul_mm_id_q5_1_swiz")!)
+let moeQ5Kspl = try device.makeComputePipelineState(function:
+    library.makeFunction(name: "kernel_mul_mm_id_q5_K_swiz")!)
+let moeQ6Kspl = try device.makeComputePipelineState(function:
+    library.makeFunction(name: "kernel_mul_mm_id_q6_K_swiz")!)
 
 // Default to small shapes for debugging; pass --full for production matched-B=32 sweep;
 // pass --batch-sweep for the FFN-gate shape across multiple Q-batch sizes (the operating
