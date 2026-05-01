@@ -53,6 +53,7 @@ def main() -> None:
     # Resolve paths and export as env vars (bridge.py reads these).
     gguf = os.environ.get("GEMMA_GGUF") or _resolve(model_cfg.get("gguf_path", ""))
     st = os.environ.get("GEMMA_SAFETENSORS") or _resolve(model_cfg.get("safetensors_path", ""))
+    chat_tpl = os.environ.get("GEMMA_CHAT_TEMPLATE") or _resolve(model_cfg.get("chat_template_path", ""))
     display = os.environ.get("GEMMA_MODEL_NAME") or model_cfg.get("display_name", "gemma-metal")
     if not gguf or not pathlib.Path(gguf).exists():
         raise SystemExit(
@@ -66,6 +67,11 @@ def main() -> None:
             print(f"[warn] safetensors_path {st!r} doesn't exist — multimodal disabled", file=sys.stderr)
         else:
             os.environ["GEMMA_SAFETENSORS"] = st
+    if chat_tpl:
+        if not pathlib.Path(chat_tpl).exists():
+            print(f"[warn] chat_template_path {chat_tpl!r} doesn't exist — falling back to auto-discovery", file=sys.stderr)
+        else:
+            os.environ["GEMMA_CHAT_TEMPLATE"] = chat_tpl
     os.environ["GEMMA_MODEL_NAME"] = display
 
     host = os.environ.get("GEMMA_HOST") or server_cfg.get("host", "0.0.0.0")
@@ -77,9 +83,10 @@ def main() -> None:
     # where uvicorn expects to find the module.
     os.chdir(REPO_ROOT / "server")
     import uvicorn
-    print(f"[serve] gguf        = {gguf}")
-    print(f"[serve] safetensors = {st or '(none — text-only)'}")
-    print(f"[serve] listening   = http://{host}:{port}  ·  model name={display}")
+    print(f"[serve] gguf          = {gguf}")
+    print(f"[serve] safetensors   = {st or '(none — text-only)'}")
+    print(f"[serve] chat_template = {chat_tpl or '(auto-discover from safetensors/gguf dir)'}")
+    print(f"[serve] listening     = http://{host}:{port}  ·  model name={display}")
     uvicorn.run("bridge:app", host=host, port=port, log_level=log_level)
 
 

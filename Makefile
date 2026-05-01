@@ -43,3 +43,10 @@ gguf_loader: gguf_loader.swift gguf_tool.swift
 
 clean:
 	rm -f mem_mountain tile_gemm paged_attention moe_matmul dense_gemv forward_ops forward_graph gguf_loader
+
+# Run the bridge with the canonical config (server/config.toml). Rebuilds
+# libgemma_metal.dylib first so kernel changes pick up cleanly. No env
+# vars / inline shell incantations — change paths or port in config.toml.
+.PHONY: serve
+serve: libgemma_metal.dylib
+	./server/.venv/bin/python ./server/serve.py

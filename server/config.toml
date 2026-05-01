@@ -1,32 +1,46 @@
 # gemma-metal bridge config
 #
-# Paths are resolved relative to the REPO ROOT (one level up from this
-# file). Absolute paths work too.
+# Paths can be absolute, or relative to the REPO ROOT (one level up from
+# this file). Override any field via matching GEMMA_* env vars:
+#   GEMMA_GGUF, GEMMA_SAFETENSORS, GEMMA_CHAT_TEMPLATE,
+#   GEMMA_HOST, GEMMA_PORT, GEMMA_LOG_LEVEL  — env wins over config-file.
 #
-# Override any field via matching GEMMA_* env vars if you need to:
-#   GEMMA_GGUF, GEMMA_SAFETENSORS, GEMMA_HOST, GEMMA_PORT, GEMMA_LOG_LEVEL
-# env vars win over config-file values.
+# Canonical launch (no env vars, no inline shell-script incantations):
+#
+#     ./server/serve.py
+#
+# Or via make:
+#
+#     make serve
 
 [model]
-# LM weights: Q4_K_M GGUF is what the engine's GEMVs are tuned for.
-gguf_path = "models/gemma-4/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
+# LM weights: Q4_K_M GGUF is what the engine's matmul kernels are tuned for.
+gguf_path = "/Users/mdot/models/gemma-4-a4b/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
 
 # Vision-tower weights: first shard of the bf16 safetensors checkpoint.
-# Omit or leave blank to run text-only (image content items will 400).
-safetensors_path = "models/gemma-4-bf16/model-00001-of-00002.safetensors"
+# chat_template.jinja is auto-discovered relative to this dir; if it's
+# elsewhere, set chat_template_path explicitly below.
+safetensors_path = "/Users/mdot/models/gemma-4-a4b-bf16/model-00001-of-00002.safetensors"
+
+# Optional explicit chat template (overrides auto-discovery). Useful when
+# safetensors_path points at a location that doesn't carry the .jinja
+# alongside it. Comment out to use auto-discovery.
+# chat_template_path = "/Users/mdot/models/gemma-4-a4b-bf16/chat_template.jinja"
 
 # Display name returned by /v1/models and shown in client status bars.
 display_name = "gemma-4-a4b-q4km"
 
 [server]
+# Port 8001 matches the SVG / quant-search harness expectation
+# (QUANT_BRIDGE_URL in tools/quant_search/scripts/05_generate_svg_refs.sh).
 host = "0.0.0.0"
-port = 8000
+port = 8001
 log_level = "warning"
 
 [fetch]
 # `scripts/fetch-weights.py` uses these to pull from HuggingFace.
 # Defaults point at unsloth's Gemma-4 26B A4B MoE Q4_K_M quant (what
-# the engine's GEMVs are tuned for) and unsloth's non-gated bf16 mirror
+# the engine's kernels are tuned for) and unsloth's non-gated bf16 mirror
 # of google/gemma-4-26B-A4B-it (saves the HF-login dance for the happy
 # path; the google repo is gated and requires license acceptance).
 gguf_repo = "unsloth/gemma-4-26B-A4B-it-GGUF"
