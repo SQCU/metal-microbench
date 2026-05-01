@@ -31,7 +31,7 @@ Per-token cost grows monotonically with prompt size — that's the attention
 quadratic (5 of 30 layers are full-attention with no sliding window; per-token
 attention cost scales linearly with prompt length, total scales O(N²)).
 
-## Lever A — NR1 specialization for low-batch prefill (FALSIFIED)
+## Lever A — NR1 specialization for low-batch prefill (FALSIFIED, twice)
 
 **Hypothesis**: at single-stream prefill chunk (numVecs=256), the canonical
 matmul kernel (NR1=32) leaves only 8 X-TGs per output-col tile, while the
@@ -39,21 +39,40 @@ saturated case (numVecs=1024) has 32 X-TGs per tile. More X-TGs at the same
 gridY co-read W from L2 → higher TFLOPS. A kernel with NR1=8 would have 4× more
 X-TGs at numVecs=256, recovering the L2-reuse density.
 
-**Result**: falsified by `q4k_mma_bench` measurement (commit `ea03163` — the
-same commit that fixed a separate dispatch-grid axis bug in the bench). NR1=32
-canonical scales 2.44 → 13.72 TFLOPS as numVecs grows 32 → 1024. NR1=8 as a
-minimum-change kernel (just `NR1=32` → `NR1=8` in the same body) plateaus at
-~3.5 TFLOPS regardless of numVecs because half the `mc` tiles compute against
-duplicate-clamped sb data and get discarded by the cooperative output store.
-The L2-reuse mechanism is real in principle but the implementation has 50%
-wasted simdgroup-matmul FMA work, which more than offsets the L2 win.
+**Falsification round 1** (commit `ea03163`): minimum-change NR1=8 kernel
+(just `NR1=32` → `NR1=8` in the same body, keeping the canonical 2×2 col×row
+simdgroup partition). Plateaus at ~3.5 TFLOPS regardless of numVecs because
+half the `mc` tiles compute against duplicate-clamped sb data and get
+discarded by the cooperative output store. The L2-reuse mechanism is real in
+principle but the implementation has 50% wasted simdgroup-matmul FMA work.
 
-A "real" NR1=8 kernel would need to redesign the simdgroup row-partition so
-all 4 simdgroups produce useful `mc` tiles at NR1=8. A custom version was
-attempted in the same investigation; failed correctness (RMSE 1.09 on tiny
-shape) and was abandoned. Restarting that work isn't cheap — the row-partition
-redesign means a different thread-mapping + sa/sb layout + output-store
-pattern. **Not justified by current data.**
+**Falsification round 2** (this iteration): proper row-partition NR1=8
+kernel where all 4 simdgroups produce useful `mc` output (each handles a
+16-row stripe of NR0=64, ma[2] × mb[1] = 2 mc useful per simdgroup, 8 mc
+useful per TG total). Numerically correct (RMSE 0.0004, fp16 floor) and 2.7×
+faster than the minimum-change variant — peaks at 9.65 TFLOPS at numVecs=1024
+versus 3.5 plateau. **But still loses to NR1=32 at every operating point**:
+
+| numVecs | NR1=32 | NR1=8 row-part | Δ |
+|---|---|---|---|
+| 32 | 2.78 | 2.34 | -16% |
+| 64 | 4.59 | 3.74 | -19% |
+| 128 | 4.82 | 4.63 | -4% |
+| 256 | 8.62 | 6.99 | -19% |
+| 512 | 11.13 | 9.52 | -14% |
+| 1024 | 13.69 | 9.65 | -29% |
+
+The L2-reuse hypothesis was right that "more X-TGs per gridY = more L2 sharing
+= higher TFLOPS" — that's why the row-partition variant beat the minimum-change
+variant by 2.7×. But NR1=32 also benefits from L2 reuse via grid scaling once
+numVecs ≥ 256 (gridX = numVecs/32 grows naturally), AND has 4× more useful
+compute per TG. The row-partition design's 1/4 mc-per-TG density costs more
+than the L2-reuse density gains.
+
+**Conclusion**: NR1=32 is genuinely the best tile for this kernel design across
+the entire numVecs range we care about. There is no kernel-zoo dispatch rule
+based on NR1 that beats the canonical case. Not just "loser at one operating
+point" — falsified across all of them.
 
 ## Lever B — MAX_Q_LEN bump (FALSIFIED)
 
@@ -76,29 +95,26 @@ bump alone, plus 4× memory cost on `pre_logits`. Reverted.
 
 ## What this leaves
 
-The single-stream prefill operating point is bound by a **mix** of attention
-quadratic and matmul under-fill, not by any single lever the substrate exposes.
-Closing it without algorithmic changes (forbidden — see
-`feedback_no_destructive_algorithmic_changes.md`) requires a more invasive
-redesign:
+Both clean substrate-level NR1 levers are exhausted, and the row-partition
+design that "should have worked" turned out to lose too — definitively closing
+the matmul-kernel-zoo angle. The single-stream prefill operating point is
+bound by a **mix** of attention quadratic and matmul under-fill, not any
+single lever the simdgroup-matmul kernel design exposes.
+
+Remaining substrate-only options for single-user prefill speed (none cheap):
 
 - **Attention kernel zoo at high qLen**: a flex-attention variant tuned for
   qLen=1024+ at B=1, addressing the per-token cost growth. Likely needs
   different block-Q sizing, different threadgroup-memory budget. Real kernel
   work, not a knob.
-- **Properly-row-partitioned NR1=8 simdgroup matmul** (the design that the
-  minimum-change variant approximated and lost on). A row-partition that keeps
-  all 4 simdgroups productive at NR1=8 would deliver the L2-reuse win without
-  the wasted-mc penalty. The simdgroup_matrix register layout makes this
-  non-trivial; the first-cut attempt failed correctness.
-- **CB consolidation**: lever C from the prior version of this doc
-  (norm-fused matmul kernels). 1.1-1.2× modest gain at most. Defer.
+- **CB consolidation** via norm-fused matmul kernels. 1.1-1.2× modest gain at
+  most. Defer.
 
 The bigger architectural truth is: **the engine is correctly designed for
 multi-stream**. Single-user is a corner case. The bridge already aggregates
 multi-user prefill via `stepMultiSlotPrefill`; if production single-user TTFT
-is a real concern, the right answer is more concurrent users, not making the
-single-stream path beat the architectural grain.
+is a real concern, the right answer is more concurrent users (the architectural
+intent), not contorting the single-stream path against the architectural grain.
 
 ## Out of scope
 

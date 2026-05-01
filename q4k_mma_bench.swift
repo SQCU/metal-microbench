@@ -1057,155 +1057,6 @@ kernel void kernel_mul_mm_q8_0_swiz(
     }
 }
 
-// ────────────────────────────────────────────────────────────────────
-// NR1=8 specialization for dense Q8_0 v6-swizzled (low-numVecs).
-//
-// First-cut: same kernel body as kernel_mul_mm_q8_0_swiz with NR1
-// reduced from 32 → 8. The clamping mechanisms in the original handle
-// the partial slot dimension correctly (mc tiles for invalid slot rows
-// compute garbage, but the cooperative output store skips them via
-// `j < nr1`). Per-simdgroup work drops to 1/4 of the NR1=32 case, but
-// gridX grows 4× — which is the L2-reuse density gain we want at
-// numVecs ∈ [32..256].
-//
-// Target operating point: numVecs in [32..256] where NR1=32 leaves
-// gridX < 32 X-TGs per gridY, undersaturating L2 reuse.
-// ────────────────────────────────────────────────────────────────────
-
-kernel void kernel_mul_mm_q8_0_swiz_nr1_8(
-    device const half*   X               [[buffer(0)]],
-    device const uchar*  W_q8            [[buffer(1)]],
-    device half*         Y               [[buffer(2)]],
-    constant uint& B_count               [[buffer(3)]],
-    constant uint& D_in                  [[buffer(4)]],
-    constant uint& D_out                 [[buffer(5)]],
-    threadgroup char*    shmem           [[threadgroup(0)]],
-    uint3 tgpig                          [[threadgroup_position_in_grid]],
-    ushort tiitg                         [[thread_index_in_threadgroup]],
-    ushort sgitg                         [[simdgroup_index_in_threadgroup]])
-{
-    threadgroup half * sa = (threadgroup half *)(shmem);
-    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
-
-    constexpr int NR0 = 64;
-    constexpr int NR1 = 8;            // ← only change vs the canonical
-    constexpr int NK  = 32;
-    constexpr int NL0 = NK/16;
-    constexpr int NL1 = NK/8;
-    constexpr short nl = 2;
-
-    const int im = tgpig.z;
-    const int r0 = tgpig.y * NR0;
-    const int r1 = tgpig.x * NR1;
-
-    const int ne00 = (int)D_in;
-    const int ne0  = (int)D_out;
-    const int ne1  = (int)B_count;
-    const ulong nb10 = sizeof(half);
-    const ulong nb11 = (ulong)D_in * sizeof(half);
-
-    const short nr0 = (ne0 - r0 < NR0) ? short(ne0 - r0) : NR0;
-    const short nr1 = (ne1 - r1 < NR1) ? short(ne1 - r1) : NR1;
-    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : (nr0 - 1);
-    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : (nr1 - 1);
-
-    const short il0 = (tiitg % NL0);
-    short il = il0;
-
-    const short offset1 = il0/nl;
-
-    const int   nbc    = ne00 / 32;
-    const short row_g  = (short)(r0 + lr0);
-    const short ns     = row_g >> 5;
-    const short col    = row_g & 31;
-    device const block_q8_0_metal * x = (device const block_q8_0_metal *)W_q8
-        + (int)ns * nbc * 32
-        + (int)offset1 * 32
-        + col;
-
-    const short iy = 8 * (tiitg % NL1);
-    device const half * y = (device const half *) ((device const char *)X
-        + nb11*(r1 + lr1) + nb10*iy);
-
-    simdgroup_half8x8     ma[4];
-    simdgroup_half8x8     mb[2];
-    simdgroup_float8x8    mc[8];
-
-    for (short i = 0; i < 8; i++) {
-        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    }
-
-    for (int loop_k = 0; loop_k < ne00; loop_k += NK) {
-        {
-            half4x4 temp_a;
-            dequantize_q8_0_llama(x, il, temp_a);
-
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            for (short i = 0; i < 16; i++) {
-                const short sx = 2*il0 + i/8;
-                const short sy = (tiitg/NL0)/8;
-                const short lx = (tiitg/NL0)%8;
-                const short ly = i%8;
-                const short ib = 8*sx + sy;
-                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
-            }
-        }
-
-        {
-            const short sx = (tiitg % NL1);
-            const short sy = (tiitg / NL1) / 8;
-            const short ly = (tiitg / NL1) % 8;
-            const short ib = 4*sx + sy;
-            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = *((device half2x4 *) y);
-        }
-
-        il = (il + 2 < nl) ? il + 2 : il % 2;
-        x  = (il < 2) ? x + 32 : x;
-        y += NK;
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
-        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
-
-        for (short ik = 0; ik < NK/8; ik++) {
-            simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
-            simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
-            simdgroup_barrier(mem_flags::mem_none);
-            for (short i = 0; i < 8; i++) {
-                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
-            }
-            lsma += 8*64;
-            lsmb += 4*64;
-        }
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    threadgroup float * temp_str = ((threadgroup float *) shmem)
-                                   + 32*(sgitg & 1)
-                                   + (16 * (sgitg >> 1)) * NR0;
-
-    for (short i = 0; i < 8; i++) {
-        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (sgitg == 0) {
-        for (int j = tiitg; j < nr1; j += NR1) {
-            device half * D = Y + r0 + (r1 + j) * ne0 + im * ne1 * ne0;
-            threadgroup float * C = ((threadgroup float *) shmem) + (j * NR0);
-            int i = 0;
-            for (; i < nr0; i++) {
-                D[i] = (half) C[i];
-            }
-        }
-    }
-}
 
 // ────────────────────────────────────────────────────────────────────
 // kernel_mul_mm_id — verbatim port of llama.cpp's MoE-routed matmul
@@ -2049,23 +1900,17 @@ let library: MTLLibrary
 do { library = try device.makeLibrary(source: mslSource, options: opts) }
 catch { FileHandle.standardError.write("compile error: \(error)\n".data(using:.utf8)!); exit(1) }
 
-// Production canonical (v6-swizzled Q8_0 simdgroup matmul, NR1=32) plus
-// the NR1=8 specialization candidate for low-numVecs operating points.
+// Production canonical: v6-swizzled Q8_0 simdgroup matmul, NR1=32.
+// (The NR1=8 row-partition variant was tested and loses across the
+// numVecs range we care about; commit f25d3a0 captures the falsification.
+// Same with the minimum-change NR1=8 in commit ea03163.)
 let q8spl = try device.makeComputePipelineState(function:
     library.makeFunction(name: "kernel_mul_mm_q8_0_swiz")!)
-let q8spl_nr1_8 = try device.makeComputePipelineState(function:
-    library.makeFunction(name: "kernel_mul_mm_q8_0_swiz_nr1_8")!)
 let variants: [KernelVariant] = [
     KernelVariant(
         name: "swiz_nr1_32",
         pipeline: q8spl,
         tileQ: 32, tileO: 64, threads: 128,
-        threadgroupMemoryBytes: 4096 + 2048 + 4096,
-        format: .q8_0_swiz),
-    KernelVariant(
-        name: "swiz_nr1_8",
-        pipeline: q8spl_nr1_8,
-        tileQ: 8, tileO: 64, threads: 128,
         threadgroupMemoryBytes: 4096 + 2048 + 4096,
         format: .q8_0_swiz),
 ]
