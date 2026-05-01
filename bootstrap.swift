@@ -84,6 +84,26 @@ let moeQ4KV8PSO    = pso("moe_gemv_q4k_v8")
 let moeQ51V9PSO    = pso("moe_gemv_q5_1_v9")
 let moeQ4KV9PSO    = pso("moe_gemv_q4k_v9")
 let moeQ4KV10PSO   = pso("moe_gemv_q4k_v10_fused_gelu")
+// MoE Q4_K v11 — templated MAX_SLOTS={1,2,4,8} with scale-hoist + per-pair
+// pre-dequant register scratch. Dispatcher picks the right specialization
+// from activeB (= the actual chunk size at the typical-routing case).
+let moeQ4KV11B1PSO = pso("moe_gemv_q4k_v11_b1")
+let moeQ4KV11B2PSO = pso("moe_gemv_q4k_v11_b2")
+let moeQ4KV11B4PSO = pso("moe_gemv_q4k_v11_b4")
+let moeQ4KV11B8PSO = pso("moe_gemv_q4k_v11_b8")
+// MoE Q5_1 v11 — port of Q4K V11's structure to Q5_1's simpler 32-elem
+// blocks (single d/m pair, no paired sub-blocks). Down-projection kernel.
+let moeQ51V11B1PSO = pso("moe_gemv_q5_1_v11_b1")
+let moeQ51V11B2PSO = pso("moe_gemv_q5_1_v11_b2")
+let moeQ51V11B4PSO = pso("moe_gemv_q5_1_v11_b4")
+let moeQ51V11B8PSO = pso("moe_gemv_q5_1_v11_b8")
+// MoE Q4_K v12 — V11 + per-pair private register nibble lookup table.
+// Compute-bound dequant rewrite attempt (Item-A precomputed-table
+// sub-option from the original kernel-zoo plan).
+let moeQ4KV12B1PSO = pso("moe_gemv_q4k_v12_b1")
+let moeQ4KV12B2PSO = pso("moe_gemv_q4k_v12_b2")
+let moeQ4KV12B4PSO = pso("moe_gemv_q4k_v12_b4")
+let moeQ4KV12B8PSO = pso("moe_gemv_q4k_v12_b8")
 let denseQ4KV4PSO  = pso("dense_gemv_q4k_v4")
 let moeQ40PSO      = pso("moe_gemv_q4_0_v3")
 let denseQ40V4PSO  = pso("dense_gemv_q4_0_v4")
@@ -107,6 +127,13 @@ let denseQ80BtileQkvOtfB1PSO = pso("dense_gemv_q8_0_btile_qkv_otf_b1")
 let denseQ80BtileQkvOtfB2PSO = pso("dense_gemv_q8_0_btile_qkv_otf_b2")
 let denseQ80BtileQkvOtfB4PSO = pso("dense_gemv_q8_0_btile_qkv_otf_b4")
 let denseQ80BtileQkvOtfB8PSO = pso("dense_gemv_q8_0_btile_qkv_otf_b8")
+// QKV K-tile staging family (Item C). Targets activeB ∈ {2,3,4} where
+// neither OTF (per-FMA gamma reads accumulate) nor V6 grid-shrink (small
+// batches waste B-grid parallelism) wins cleanly.
+let denseQ80BtileQkvTiledB1PSO = pso("dense_gemv_q8_0_btile_qkv_tiled_b1")
+let denseQ80BtileQkvTiledB2PSO = pso("dense_gemv_q8_0_btile_qkv_tiled_b2")
+let denseQ80BtileQkvTiledB4PSO = pso("dense_gemv_q8_0_btile_qkv_tiled_b4")
+let denseQ80BtileQkvTiledB8PSO = pso("dense_gemv_q8_0_btile_qkv_tiled_b8")
 // Q8_0 RMSNorm + gate_up templated zoo (otf — same pattern as QKV otf).
 let denseQ80BtileGateUpOtfB1PSO = pso("dense_gemv_q8_0_btile_gate_up_otf_b1")
 let denseQ80BtileGateUpOtfB2PSO = pso("dense_gemv_q8_0_btile_gate_up_otf_b2")
@@ -118,6 +145,14 @@ let denseQ80V6RmsPSO = pso("dense_gemv_q8_0_v6_rmsnorm")
 let denseQ80V6RmsQkvPSO = pso("dense_gemv_q8_0_v6_rmsnorm_qkv")
 let denseQ80V7RmsQkvPSO = pso("dense_gemv_q8_0_v7_rmsnorm_qkv")
 let denseQ80V6RmsGateUpPSO = pso("dense_gemv_q8_0_v6_rmsnorm_gate_up")
+// Verbatim simdgroup-matmul port for prefill (replaces GEMV at high Q-batch).
+// Reads v6-swizzled Q8_0 weights — same layout as the AR decode kernels.
+let prefillMmQ80SwizPSO    = pso("prefill_mm_q8_0_swiz")
+// MoE simdgroup-matmul ports — slot-flat conventions matching route_compact
+// + moe_combine_write. Per-expert v6-swizzled weights, broadcast X for
+// gate+up (Q4_K), per-slot X for down (Q5_1).
+let prefillMmIdQ4KSwizPSO  = pso("prefill_mm_id_q4K_swiz")
+let prefillMmIdQ51SwizPSO  = pso("prefill_mm_id_q5_1_swiz")
 let denseQ80V4PSO  = pso("dense_gemv_q8_0_v4")
 let moeQ51PSO      = pso("moe_gemv_q5_1_v3")
 let moeGeluMulFusedPSO = pso("moe_gelu_mul_fused")
@@ -342,7 +377,14 @@ let k_len_full      = device.makeBuffer(length: B * 4, options: .storageModeShar
 // inside the prefill CB — still a single CB for all 30 layers, just not
 // fully parallel on the 5/30 full-attn layers.
 // ========================================================================
-let MAX_Q_LEN = 32
+// Bumped 32 → 256 alongside the verbatim cooperative-matmul kernel
+// (kernel_mul_mm_q4K_llama in q4k_mma_bench.swift). At MAX_Q_LEN=32 the
+// matmul kernel was Q-batch-starved at ~2 TFLOPS; at MAX_Q_LEN=256 it
+// runs at ~9 TFLOPS per call, a ~5× per-CB throughput gain on prefill.
+// Scratch buffers below grow 8× — biggest single allocation is
+// pre_logits (B × MAX_Q_LEN × VOCAB fp16 = 1 GB at B=8 / VOCAB=262144);
+// trivial on M5 Max's 128 GB unified memory.
+let MAX_Q_LEN = 256
 // Max number of 8-row Q-blocks that can fit in one prefill step. The
 // kernels (`flex_attn_full_prefill`, `flex_attn_slide_v1_q8`) tile along
 // the q_block axis at runtime; the v2 mask precompute below emits one
@@ -374,10 +416,16 @@ let pre_q_positions  = device.makeBuffer(length: B * MAX_Q_LEN * 4, options: .st
 // widen every single pre_* residual buffer — the residual buffers stay
 // at MAX_Q_LEN capacity and get overwritten tile-by-tile.
 //
-// MAX_PREFILL_TILES sets the cap on tiles-per-single-CB. A 280-soft-token
-// image rounds up to 35 tiles, so 64 is a comfortable headroom.
-let MAX_PREFILL_TILES = 64
-let MAX_PREFILL_TOKENS = MAX_PREFILL_TILES * MAX_Q_LEN   // 512
+// MAX_PREFILL_TILES sets the cap on tiles-per-single-CB. With MAX_Q_LEN
+// bumped from 8 → 256, a 280-soft-token image now fits in 2 tiles, so
+// the prior 64-tile headroom is way overprovisioned. Drop to 16 — that
+// caps prefill at 16 × 256 = 4096 tokens per single CB. Larger prompts
+// chunk into multiple CBs (per-CB submission overhead is ~100µs vs
+// per-CB compute of tens of ms, so the chunking cost is negligible).
+// Wide-staging buffer pre_hidden_wide is B × MAX_PREFILL_TOKENS ×
+// HIDDEN fp16 = 8 × 4096 × 2304 × 2 = 150 MB at this setting.
+let MAX_PREFILL_TILES = 16
+let MAX_PREFILL_TOKENS = MAX_PREFILL_TILES * MAX_Q_LEN   // = 4096
 let pre_input_tokens_wide = device.makeBuffer(length: B * MAX_PREFILL_TOKENS * 4, options: .storageModeShared)!
 let pre_q_positions_wide  = device.makeBuffer(length: B * MAX_PREFILL_TOKENS * 4, options: .storageModeShared)!
 // Soft-token staging: fp16 rows ready to copy into pre_hidden slot-s' range.
@@ -999,17 +1047,35 @@ func encGemvQ80BtileQKV(_ cb: MTLCommandBuffer, x: MTLBuffer, gammaBuf: MTLBuffe
 // over the otf "all-batches-in-one-TG" design at higher widths because
 // per-TG work scales with B_TILE while V6 spreads across 8 SMs cleanly.
 // Policy:
-//   activeB == 1 → otf_b1 (22% faster than V6 at numVecs=1)
-//   activeB >= 2 → V6 (with numVecs=activeB grid-shrink)
-// The b2/b4/b8 otf PSOs stay registered for future use if the structural
-// trade-off shifts (e.g., on bigger SMs or with weight-residency tricks).
+//   activeB == 1 → otf_b1 (best single-stream)
+//   activeB >= 2 → V6 grid-shrink (won the Item-C falsification A/B)
+// Item C (K-tile staging at B_TILE=2/4) was falsified empirically:
+// tiled_b2 lost N=2 by -18%, tiled_b4 lost N=4 by -5%. The tg-mem
+// barriers + cooperative load overhead outweigh the gamma/inv_rms hoist
+// benefit at these batch sizes; V6's per-batch-TG design with cheap
+// launch overhead and L1/L2-amortized weight reads wins at {2,3,4}.
+// The OTF b2/b4/b8 and tiled b1/2/4/8 PSOs stay registered as diagnostic
+// kernels for future revisits if the substrate changes.
 func encGemvQ80BtileQKVOtf(_ cb: MTLCommandBuffer, x: MTLBuffer, gammaBuf: MTLBuffer,
                             Wq: MTLBuffer, Wk: MTLBuffer, Wv: MTLBuffer,
                             outQ: MTLBuffer, outK: MTLBuffer, outV: MTLBuffer,
                             Din: Int, DoutQ: Int, DoutK: Int, DoutV: Int,
                             activeB: Int) {
     precondition(activeB >= 1 && activeB <= 8, "activeB \(activeB) out of [1,8]")
-    if activeB > 1 {
+    // Three-tier dispatch:
+    //   activeB == 1            → OTF B_TILE=1 (best at single-stream)
+    //   activeB ∈ {2, 3, 4}     → tiled B_TILE=2/4 (Item C — K-tile staging
+    //                             closes the gap where OTF's per-FMA gamma
+    //                             reads accumulate but V6 grid-shrink wastes
+    //                             B-parallelism on small batches)
+    //   activeB ∈ {5, 6, 7, 8}  → V6 grid-shrink (large enough B that the
+    //                             B-grid amortizes scheduling overhead)
+    let pso: MTLComputePipelineState
+    let bTile: Int
+    if activeB == 1 {
+        pso = denseQ80BtileQkvOtfB1PSO
+        bTile = 1
+    } else {
         encGemvQ80V6RmsnormQKV(cb, x: x, gammaBuf: gammaBuf,
                                 Wq: Wq, Wk: Wk, Wv: Wv,
                                 outQ: outQ, outK: outK, outV: outV,
@@ -1017,8 +1083,7 @@ func encGemvQ80BtileQKVOtf(_ cb: MTLCommandBuffer, x: MTLBuffer, gammaBuf: MTLBu
                                 numVecs: activeB)
         return
     }
-    let pso = denseQ80BtileQkvOtfB1PSO
-    let bTile = 1
+    let _ = (pso, bTile)
     let enc = cb.makeComputeCommandEncoder()!
     enc.setComputePipelineState(pso)
     enc.setBuffer(x, offset: 0, index: 0)
@@ -1096,6 +1161,111 @@ func encGemvQ80V6(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ WswBuf: MTLBuffer
     enc.setBytes(&du, length: 4, index: 3); enc.setBytes(&dou, length: 4, index: 4)
     enc.dispatchThreadgroups(MTLSize(width: Dout / 32, height: numVecs, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// Prefill simdgroup-matmul dispatcher for Q8_0 v6-swizzled weights.
+// Tile: NR0=64 output cols, NR1=32 batch rows, 128 threads, 4 simdgroups,
+// 4096 + 2048 + 4096 = 10240 B threadgroup memory (sa + sb + reduction).
+//
+// Y is written as a contiguous [numVecs, Dout] tensor — caller is responsible
+// for picking the right output buffer (and offset, via MTLBuffer.makeBuffer
+// or setBuffer with explicit offset) when fanning gate/up into a shared
+// scratch region. Both Dout and numVecs must be multiples of 32 (the kernel
+// clamps inside-tile but expects grid-aligned outer dims for production
+// shapes). For Gemma-4 these are always satisfied.
+func encMatMulQ80SwizPrefill(_ cb: MTLCommandBuffer,
+                              x: MTLBuffer, W: MTLBuffer, Y: MTLBuffer, yOffset: Int = 0,
+                              Din: Int, Dout: Int, numVecs: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(prefillMmQ80SwizPSO)
+    enc.setBuffer(x, offset: 0, index: 0)
+    enc.setBuffer(W, offset: 0, index: 1)
+    enc.setBuffer(Y, offset: yOffset, index: 2)
+    var bC = UInt32(numVecs), kC = UInt32(Din), nC = UInt32(Dout)
+    enc.setBytes(&bC, length: 4, index: 3)
+    enc.setBytes(&kC, length: 4, index: 4)
+    enc.setBytes(&nC, length: 4, index: 5)
+    enc.setThreadgroupMemoryLength(4096 + 2048 + 4096, index: 0)
+    let gx = (numVecs + 31) / 32
+    let gy = (Dout + 63) / 64
+    enc.dispatchThreadgroups(MTLSize(width: gx, height: gy, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// MoE Q4_K gate+up prefill dispatcher (simdgroup matmul, v6 swizzled
+// per-expert, slot-flat output). Broadcasts X via slot_token: each slot
+// reads from X[slot_token[s] * D_in].
+//
+// Grid: gridX upper-bounded by ceil(N_slots / NR1=32) — the kernel
+// early-exits cheaply when r1 >= neh1 for this expert. gridZ = E (all
+// experts; sentinel ID=128 from route_compact tail also early-exits).
+func encMmIdQ4KSwizPrefill(_ cb: MTLCommandBuffer,
+                            x: MTLBuffer, W: MTLBuffer, Y: MTLBuffer,
+                            slotTokenBuf: MTLBuffer, activeExpBuf: MTLBuffer,
+                            groupStartBuf: MTLBuffer,
+                            Din: Int, Dout: Int, numSlots: Int, E: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(prefillMmIdQ4KSwizPSO)
+    enc.setBuffer(x, offset: 0, index: 0)
+    enc.setBuffer(slotTokenBuf, offset: 0, index: 1)
+    enc.setBuffer(W, offset: 0, index: 2)
+    enc.setBuffer(activeExpBuf, offset: 0, index: 3)
+    enc.setBuffer(groupStartBuf, offset: 0, index: 4)
+    enc.setBuffer(Y, offset: 0, index: 5)
+    var kC = UInt32(Din), nC = UInt32(Dout)
+    enc.setBytes(&kC, length: 4, index: 6)
+    enc.setBytes(&nC, length: 4, index: 7)
+    enc.setThreadgroupMemoryLength(4096 + 2048 + 4096, index: 0)
+    let gx = (numSlots + 31) / 32                  // worst-case slot block count
+    let gy = (Dout + 63) / 64
+    enc.dispatchThreadgroups(MTLSize(width: max(gx, 1), height: gy, depth: E),
+                              threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// MoE Q5_1 down prefill dispatcher (simdgroup matmul, v6 swizzled
+// per-expert, slot-flat output). Per-slot X read (no slot_token lookup,
+// since down's input is already slot-flat after gelu_mul).
+func encMmIdQ51SwizPrefill(_ cb: MTLCommandBuffer,
+                            x: MTLBuffer, W: MTLBuffer, Y: MTLBuffer,
+                            activeExpBuf: MTLBuffer, groupStartBuf: MTLBuffer,
+                            Din: Int, Dout: Int, numSlots: Int, E: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(prefillMmIdQ51SwizPSO)
+    enc.setBuffer(x, offset: 0, index: 0)
+    enc.setBuffer(W, offset: 0, index: 1)
+    enc.setBuffer(activeExpBuf, offset: 0, index: 2)
+    enc.setBuffer(groupStartBuf, offset: 0, index: 3)
+    enc.setBuffer(Y, offset: 0, index: 4)
+    var kC = UInt32(Din), nC = UInt32(Dout)
+    enc.setBytes(&kC, length: 4, index: 5)
+    enc.setBytes(&nC, length: 4, index: 6)
+    enc.setThreadgroupMemoryLength(4096 + 2048 + 4096, index: 0)
+    let gx = (numSlots + 31) / 32
+    let gy = (Dout + 63) / 64
+    enc.dispatchThreadgroups(MTLSize(width: max(gx, 1), height: gy, depth: E),
+                              threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// gelu_mul_inplace dispatcher — reads two separate gate/up half-buffers,
+// applies gelu(gate) * up, writes back into gate. Used by the prefill
+// matmul rewire which produces gate and up as separate tensors (instead
+// of the AR-path's interleaved fused buffer).
+func encGeluMulInplace(_ cb: MTLCommandBuffer,
+                        gate: MTLBuffer, gateOffset: Int = 0,
+                        up: MTLBuffer, upOffset: Int = 0,
+                        N_half: Int, numSlots: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(geluMulPSO)
+    enc.setBuffer(gate, offset: gateOffset, index: 0)
+    enc.setBuffer(up,   offset: upOffset,   index: 1)
+    var Nv = UInt32(N_half)
+    enc.setBytes(&Nv, length: 4, index: 2)
+    enc.dispatchThreadgroups(MTLSize(width: numSlots, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
 }
 
@@ -1258,6 +1428,59 @@ func encMoeGemvQ51(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ Wq51: MTLBuffer,
     enc.endEncoding()
 }
 
+// MoE Q4_K v12 dispatcher — picks MAX_SLOTS specialization from activeB.
+// Same mapping as V11. Intended for A/B against V11.
+func encMoeGemvQ4KV12(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ Wq4k: MTLBuffer, _ out: MTLBuffer,
+                       Din: Int, Dout: Int, numActive: Int, activeB: Int,
+                       slotTokenBuf: MTLBuffer? = nil, groupStartBuf: MTLBuffer? = nil) {
+    let pso: MTLComputePipelineState
+    switch max(1, activeB) {
+    case 1:           pso = moeQ4KV12B1PSO
+    case 2:           pso = moeQ4KV12B2PSO
+    case 3, 4:        pso = moeQ4KV12B4PSO
+    default:          pso = moeQ4KV12B8PSO
+    }
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(pso)
+    enc.setBuffer(xbuf, offset: 0, index: 0); enc.setBuffer(slotTokenBuf ?? slot_token, offset: 0, index: 1)
+    enc.setBuffer(Wq4k, offset: 0, index: 2); enc.setBuffer(active_exp, offset: 0, index: 3)
+    enc.setBuffer(groupStartBuf ?? group_start, offset: 0, index: 4); enc.setBuffer(out, offset: 0, index: 5)
+    var du = UInt32(Din), dou = UInt32(Dout)
+    enc.setBytes(&du, length: 4, index: 6); enc.setBytes(&dou, length: 4, index: 7)
+    enc.dispatchThreadgroups(MTLSize(width: Dout / 32, height: numActive, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// MoE Q5_1 v11 dispatcher — picks MAX_SLOTS specialization from activeB,
+// same mapping as encMoeGemvQ4KV11. Used for the down projection.
+//
+// slotTokenBuf parameter is accepted for ABI parity with the V6 dispatcher
+// but not actually consumed by V11's kernel (Q5_1 is per-slot indexed for
+// the down projection — see moe_gemv_q5_1_v11_impl). groupStartBuf IS used
+// (same expert→slot-range mapping as Q4K).
+func encMoeGemvQ51V11(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ Wq51: MTLBuffer, _ out: MTLBuffer,
+                       Din: Int, Dout: Int, numActive: Int, activeB: Int,
+                       slotTokenBuf: MTLBuffer? = nil, groupStartBuf: MTLBuffer? = nil) {
+    let pso: MTLComputePipelineState
+    switch max(1, activeB) {
+    case 1:           pso = moeQ51V11B1PSO
+    case 2:           pso = moeQ51V11B2PSO
+    case 3, 4:        pso = moeQ51V11B4PSO
+    default:          pso = moeQ51V11B8PSO
+    }
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(pso)
+    enc.setBuffer(xbuf, offset: 0, index: 0); enc.setBuffer(slotTokenBuf ?? slot_token, offset: 0, index: 1)
+    enc.setBuffer(Wq51, offset: 0, index: 2); enc.setBuffer(active_exp, offset: 0, index: 3)
+    enc.setBuffer(groupStartBuf ?? group_start, offset: 0, index: 4); enc.setBuffer(out, offset: 0, index: 5)
+    var du = UInt32(Din), dou = UInt32(Dout)
+    enc.setBytes(&du, length: 4, index: 6); enc.setBytes(&dou, length: 4, index: 7)
+    enc.dispatchThreadgroups(MTLSize(width: Dout / 32, height: numActive, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
 // GELU(gate) * up over the fused [slots, 2*N_half] tensor.
 func encMoeGeluMulFused(_ cb: MTLCommandBuffer, fused: MTLBuffer, out: MTLBuffer, N_half: Int, numSlots: Int) {
     let enc = cb.makeComputeCommandEncoder()!
@@ -1326,6 +1549,47 @@ func encMoeGemvQ4K(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ Wq4k: MTLBuffer,
     let pso = useV9 ? moeQ4KV9PSO
             : (useV8 ? moeQ4KV8PSO
             : (useV6 ? moeQ4KV6PSO : (useV4 ? moeQ4KV4PSO : moeQ4KPSO)))
+    enc.setComputePipelineState(pso)
+    enc.setBuffer(xbuf, offset: 0, index: 0); enc.setBuffer(slotTokenBuf ?? slot_token, offset: 0, index: 1)
+    enc.setBuffer(Wq4k, offset: 0, index: 2); enc.setBuffer(active_exp, offset: 0, index: 3)
+    enc.setBuffer(groupStartBuf ?? group_start, offset: 0, index: 4); enc.setBuffer(out, offset: 0, index: 5)
+    var du = UInt32(Din), dou = UInt32(Dout)
+    enc.setBytes(&du, length: 4, index: 6); enc.setBytes(&dou, length: 4, index: 7)
+    enc.dispatchThreadgroups(MTLSize(width: Dout / 32, height: numActive, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// MoE Q4_K v11 dispatcher — picks the MAX_SLOTS specialization from
+// the typical chunk size at the given activeB. Mapping logic:
+//
+//   activeB=1 → MAX_SLOTS=1  (with TOPK=8, every active expert holds 1 slot
+//                             at single-stream; the SLOTS=1 instantiation
+//                             collapses the chunked-slot loop and drops
+//                             the predicated-FMA register array entirely)
+//   activeB=2 → MAX_SLOTS=2  (worst case 2 colliding tokens → 2 slots)
+//   activeB=3-4 → MAX_SLOTS=4
+//   activeB=5-8 → MAX_SLOTS=8
+//
+// MAX_SLOTS=N means the kernel processes up to N slots per chunk; if a
+// particular expert has fewer than N slots, the unused lanes are masked
+// out by `if (s < chunk)` predicates — no work executes for them.
+// MAX_SLOTS larger than the actual chunk only costs unused register
+// allocation (an MAX_SLOTS=8 kernel with chunk=1 burns 7 unused
+// accumulators), but no spurious memory traffic.
+//
+// Falls back to V6 when activeB is 0 or unknown.
+func encMoeGemvQ4KV11(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ Wq4k: MTLBuffer, _ out: MTLBuffer,
+                       Din: Int, Dout: Int, numActive: Int, activeB: Int,
+                       slotTokenBuf: MTLBuffer? = nil, groupStartBuf: MTLBuffer? = nil) {
+    let pso: MTLComputePipelineState
+    switch max(1, activeB) {
+    case 1:           pso = moeQ4KV11B1PSO
+    case 2:           pso = moeQ4KV11B2PSO
+    case 3, 4:        pso = moeQ4KV11B4PSO
+    default:          pso = moeQ4KV11B8PSO
+    }
+    let enc = cb.makeComputeCommandEncoder()!
     enc.setComputePipelineState(pso)
     enc.setBuffer(xbuf, offset: 0, index: 0); enc.setBuffer(slotTokenBuf ?? slot_token, offset: 0, index: 1)
     enc.setBuffer(Wq4k, offset: 0, index: 2); enc.setBuffer(active_exp, offset: 0, index: 3)
@@ -2577,12 +2841,12 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
         // bail; the saving is the (E_EXP - TOPK*aB) wasted launches we
         // never fire in the first place.
         let aMoeNumActive = min(TOPK * aB, E_EXP)
-        encMoeGemvQ4K(cb, hidden_norm, lw.moeGateUp, gate_up_fused,
-                      Din: HIDDEN, Dout: MOE_FUSED_DOUT, numActive: aMoeNumActive, useV6: true)
+        encMoeGemvQ4KV11(cb, hidden_norm, lw.moeGateUp, gate_up_fused,
+                          Din: HIDDEN, Dout: MOE_FUSED_DOUT, numActive: aMoeNumActive, activeB: aB)
         encMoeGeluMulFused(cb, fused: gate_up_fused, out: gate_proj,
                             N_half: MOE_INT, numSlots: TOPK * aB)
-        encMoeGemvQ51(cb, gate_proj, lw.moeDown, moe_down_out,
-                      Din: MOE_INT, Dout: HIDDEN, numActive: aMoeNumActive, useV6: true)
+        encMoeGemvQ51V11(cb, gate_proj, lw.moeDown, moe_down_out,
+                          Din: MOE_INT, Dout: HIDDEN, numActive: aMoeNumActive, activeB: aB)
         if L == 0, let slotsDump = LM_DUMP_L0_MOE_SLOTS {
             let blit = cb.makeBlitCommandEncoder()!
             var off = 0
@@ -2823,14 +3087,19 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
         let Kc = w.K_caches[L]
         let Vc = w.V_caches[L]
 
-        // Fused RMSNorm + Q/K/V projection over all N tokens.
+        // RMSNorm + Q/K/V projection over all N tokens. Unfused (norm into
+        // pre_hidden_norm, then 3 separate matmuls) so the projections can
+        // use the simdgroup-matmul kernel — at MAX_Q_LEN=256 this beats
+        // the fused-RMSNorm GEMV path by ~5×.
         let Wv = lw.attnV ?? lw.attnK
-        encGemvQ80V6RmsnormQKV(cb, x: pre_hidden, gammaBuf: lw.attnNorm,
-                                Wq: lw.attnQ, Wk: lw.attnK, Wv: Wv,
-                                outQ: q_out, outK: k_out, outV: v_out,
-                                Din: HIDDEN,
-                                DoutQ: H * HD, DoutK: KV_H * HD, DoutV: KV_H * HD,
-                                numVecs: N)
+        encRMSNormG(cb, x: pre_hidden, gammaBuf: lw.attnNorm, out: pre_hidden_norm,
+                     D: HIDDEN, numVecs: N)
+        encMatMulQ80SwizPrefill(cb, x: pre_hidden_norm, W: lw.attnQ, Y: q_out,
+                                 Din: HIDDEN, Dout: H * HD, numVecs: N)
+        encMatMulQ80SwizPrefill(cb, x: pre_hidden_norm, W: lw.attnK, Y: k_out,
+                                 Din: HIDDEN, Dout: KV_H * HD, numVecs: N)
+        encMatMulQ80SwizPrefill(cb, x: pre_hidden_norm, W: Wv, Y: v_out,
+                                 Din: HIDDEN, Dout: KV_H * HD, numVecs: N)
 
         // Per-head norms (numVecs = N * head-count).
         encRMSNormG(cb, x: q_out, gammaBuf: lw.attnQNorm, out: q_out, D: HD, numVecs: N * H)
@@ -2884,21 +3153,26 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
                                      H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
         }
 
-        // o_proj (Q8_0) → pre_mlp_out; fused post-attn norm + residual add on pre_hidden.
-        encGemvQ80V6(cb, pre_attn_out, lw.attnOut, pre_mlp_out,
-                     Din: H * HD, Dout: HIDDEN, numVecs: N)
+        // o_proj (Q8_0 simdgroup matmul) → pre_mlp_out; fused post-attn norm + residual add.
+        encMatMulQ80SwizPrefill(cb, x: pre_attn_out, W: lw.attnOut, Y: pre_mlp_out,
+                                 Din: H * HD, Dout: HIDDEN, numVecs: N)
         encRmsNormAdd(cb, x: pre_mlp_out, gammaBuf: lw.postAttnNorm,
                       residual: pre_hidden, out: pre_hidden, N: HIDDEN, numVecs: N)
 
-        // Shared MLP (fused RMSNorm + gate_up → gelu*up → down → post_ffn_1_norm).
-        encGemvQ80V6RmsnormGateUp(cb, x: pre_hidden, gammaBuf: lw.ffnNorm,
-                                   Wg: lw.ffnGate, Wu: lw.ffnUp,
-                                   fusedOut: pre_shrd_gate_up_fused,
-                                   Din: HIDDEN, Dout: SHARED_INT, numVecs: N)
-        encMoeGeluMulFused(cb, fused: pre_shrd_gate_up_fused, out: pre_shrd_gate,
-                            N_half: SHARED_INT, numSlots: N)
-        encGemvQ80V6(cb, pre_shrd_gate, lw.ffnDown, pre_mlp_out,
-                     Din: SHARED_INT, Dout: HIDDEN, numVecs: N)
+        // Shared MLP. RMSNorm into pre_hidden_norm, then two separate
+        // simdgroup matmuls (gate → pre_shrd_gate, up → pre_shrd_gate_up_fused
+        // first half), gelu_mul_inplace combines them in-place into
+        // pre_shrd_gate, ffn_down matmul produces pre_mlp_out, post-norm.
+        encRMSNormG(cb, x: pre_hidden, gammaBuf: lw.ffnNorm, out: pre_hidden_norm,
+                     D: HIDDEN, numVecs: N)
+        encMatMulQ80SwizPrefill(cb, x: pre_hidden_norm, W: lw.ffnGate, Y: pre_shrd_gate,
+                                 Din: HIDDEN, Dout: SHARED_INT, numVecs: N)
+        encMatMulQ80SwizPrefill(cb, x: pre_hidden_norm, W: lw.ffnUp, Y: pre_shrd_gate_up_fused,
+                                 Din: HIDDEN, Dout: SHARED_INT, numVecs: N)
+        encGeluMulInplace(cb, gate: pre_shrd_gate, up: pre_shrd_gate_up_fused,
+                           N_half: SHARED_INT, numSlots: N)
+        encMatMulQ80SwizPrefill(cb, x: pre_shrd_gate, W: lw.ffnDown, Y: pre_mlp_out,
+                                 Din: SHARED_INT, Dout: HIDDEN, numVecs: N)
         encRMSNormG(cb, x: pre_mlp_out, gammaBuf: lw.postFfn1Norm, out: pre_mlp_out,
                     D: HIDDEN, numVecs: N)
 
@@ -2915,17 +3189,22 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
                              activeExperts: active_exp,
                              numVecs: N)
 
-        // MoE: pre_ffn_2(pre_hidden) → Q4_K gate_up → gelu*up → Q5_1 down → combine → post_ffn_2.
+        // MoE: pre_ffn_2(pre_hidden) → Q4_K gate_up (simdgroup matmul) →
+        // gelu*up → Q5_1 down (simdgroup matmul) → combine → post_ffn_2.
+        // Both matmuls write slot-flat outputs matching moe_combine_write's
+        // expected layout. Q4_K reads X via slot_token (broadcast per token),
+        // Q5_1 reads X per-slot (gelu output is already slot-flat).
         encRMSNormG(cb, x: pre_hidden, gammaBuf: lw.preFfn2Norm, out: pre_hidden_norm,
                     D: HIDDEN, numVecs: N)
-        encMoeGemvQ4K(cb, pre_hidden_norm, lw.moeGateUp, pre_gate_up_fused,
-                      Din: HIDDEN, Dout: MOE_FUSED_DOUT, numActive: E_EXP, useV6: true,
-                      slotTokenBuf: pre_slot_token, groupStartBuf: pre_group_start)
+        encMmIdQ4KSwizPrefill(cb, x: pre_hidden_norm, W: lw.moeGateUp, Y: pre_gate_up_fused,
+                               slotTokenBuf: pre_slot_token, activeExpBuf: active_exp,
+                               groupStartBuf: pre_group_start,
+                               Din: HIDDEN, Dout: MOE_FUSED_DOUT, numSlots: NS, E: E_EXP)
         encMoeGeluMulFused(cb, fused: pre_gate_up_fused, out: pre_gate_proj,
                             N_half: MOE_INT, numSlots: NS)
-        encMoeGemvQ51(cb, pre_gate_proj, lw.moeDown, pre_moe_down_out,
-                      Din: MOE_INT, Dout: HIDDEN, numActive: E_EXP, useV6: true,
-                      slotTokenBuf: pre_slot_token, groupStartBuf: pre_group_start)
+        encMmIdQ51SwizPrefill(cb, x: pre_gate_proj, W: lw.moeDown, Y: pre_moe_down_out,
+                               activeExpBuf: active_exp, groupStartBuf: pre_group_start,
+                               Din: MOE_INT, Dout: HIDDEN, numSlots: NS, E: E_EXP)
         encMoeCombineWriteInto(cb, moeOut: pre_moe_down_out, batchSlots: pre_batch_slots,
                                 gateW: pre_gate_w, outBuf: pre_moe_sum, numVecs: N)
         encRMSNormG(cb, x: pre_moe_sum, gammaBuf: lw.postFfn2Norm, out: pre_moe_sum,

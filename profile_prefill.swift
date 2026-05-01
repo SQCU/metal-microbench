@@ -106,14 +106,17 @@ func runLmPrefillProfile(ggufPath: String) {
             let Kc = w.K_caches[L]
             let Vc = w.V_caches[L]
 
+            // QKV: RMSNorm + 3 simdgroup matmuls (Q, K, V) on v6-swizzled Q8_0.
             stages.append(runStage("qkv", layer: L) { cb in
                 let Wv = lw.attnV ?? lw.attnK
-                encGemvQ80V6RmsnormQKV(cb, x: pre_hidden, gammaBuf: lw.attnNorm,
-                                        Wq: lw.attnQ, Wk: lw.attnK, Wv: Wv,
-                                        outQ: q_out, outK: k_out, outV: v_out,
-                                        Din: HIDDEN,
-                                        DoutQ: H * HD, DoutK: KV_H * HD, DoutV: KV_H * HD,
-                                        numVecs: N)
+                encRMSNormG(cb, x: pre_hidden, gammaBuf: lw.attnNorm, out: pre_hidden_norm,
+                             D: HIDDEN, numVecs: N)
+                encMatMulQ80SwizPrefill(cb, x: pre_hidden_norm, W: lw.attnQ, Y: q_out,
+                                         Din: HIDDEN, Dout: H * HD, numVecs: N)
+                encMatMulQ80SwizPrefill(cb, x: pre_hidden_norm, W: lw.attnK, Y: k_out,
+                                         Din: HIDDEN, Dout: KV_H * HD, numVecs: N)
+                encMatMulQ80SwizPrefill(cb, x: pre_hidden_norm, W: Wv, Y: v_out,
+                                         Din: HIDDEN, Dout: KV_H * HD, numVecs: N)
             })
 
             stages.append(runStage("qkn_rope", layer: L) { cb in
@@ -143,22 +146,26 @@ func runLmPrefillProfile(ggufPath: String) {
                 }
             })
 
+            // o_proj (simdgroup matmul, v6-swizzled Q8_0) + post-attn RMSNormAdd.
             stages.append(runStage("oproj_norm", layer: L) { cb in
-                encGemvQ80V6(cb, pre_attn_out, lw.attnOut, pre_mlp_out,
-                             Din: H * HD, Dout: HIDDEN, numVecs: N)
+                encMatMulQ80SwizPrefill(cb, x: pre_attn_out, W: lw.attnOut, Y: pre_mlp_out,
+                                         Din: H * HD, Dout: HIDDEN, numVecs: N)
                 encRmsNormAdd(cb, x: pre_mlp_out, gammaBuf: lw.postAttnNorm,
                               residual: pre_hidden, out: pre_hidden, N: HIDDEN, numVecs: N)
             })
 
+            // Shared FFN: RMSNorm + 2 matmuls (gate, up) + gelu_mul_inplace + ffn_down + post-norm.
             stages.append(runStage("shrd_ffn", layer: L) { cb in
-                encGemvQ80V6RmsnormGateUp(cb, x: pre_hidden, gammaBuf: lw.ffnNorm,
-                                           Wg: lw.ffnGate, Wu: lw.ffnUp,
-                                           fusedOut: pre_shrd_gate_up_fused,
-                                           Din: HIDDEN, Dout: SHARED_INT, numVecs: N)
-                encMoeGeluMulFused(cb, fused: pre_shrd_gate_up_fused, out: pre_shrd_gate,
-                                    N_half: SHARED_INT, numSlots: N)
-                encGemvQ80V6(cb, pre_shrd_gate, lw.ffnDown, pre_mlp_out,
-                             Din: SHARED_INT, Dout: HIDDEN, numVecs: N)
+                encRMSNormG(cb, x: pre_hidden, gammaBuf: lw.ffnNorm, out: pre_hidden_norm,
+                             D: HIDDEN, numVecs: N)
+                encMatMulQ80SwizPrefill(cb, x: pre_hidden_norm, W: lw.ffnGate, Y: pre_shrd_gate,
+                                         Din: HIDDEN, Dout: SHARED_INT, numVecs: N)
+                encMatMulQ80SwizPrefill(cb, x: pre_hidden_norm, W: lw.ffnUp, Y: pre_shrd_gate_up_fused,
+                                         Din: HIDDEN, Dout: SHARED_INT, numVecs: N)
+                encGeluMulInplace(cb, gate: pre_shrd_gate, up: pre_shrd_gate_up_fused,
+                                   N_half: SHARED_INT, numSlots: N)
+                encMatMulQ80SwizPrefill(cb, x: pre_shrd_gate, W: lw.ffnDown, Y: pre_mlp_out,
+                                         Din: SHARED_INT, Dout: HIDDEN, numVecs: N)
                 encRMSNormG(cb, x: pre_mlp_out, gammaBuf: lw.postFfn1Norm, out: pre_mlp_out,
                             D: HIDDEN, numVecs: N)
             })
@@ -176,53 +183,24 @@ func runLmPrefillProfile(ggufPath: String) {
                                      numVecs: N)
             })
 
-            // Split the moe stage into 4 sub-stages so we can see per-kernel
-            // timings (gate_up Q4_K vs gelu vs down Q5_1 vs combine+norms).
-            stages.append(runStage("moe_q4k_v6", layer: L) { cb in
+            // MoE: pre-FFN2 RMSNorm + Q4_K gate_up matmul (slot-flat, broadcast X).
+            stages.append(runStage("moe_q4k", layer: L) { cb in
                 encRMSNormG(cb, x: pre_hidden, gammaBuf: lw.preFfn2Norm, out: pre_hidden_norm,
                             D: HIDDEN, numVecs: N)
-                encMoeGemvQ4K(cb, pre_hidden_norm, lw.moeGateUp, pre_gate_up_fused,
-                              Din: HIDDEN, Dout: MOE_FUSED_DOUT, numActive: E_EXP, useV6: true,
-                              slotTokenBuf: pre_slot_token, groupStartBuf: pre_group_start)
-            })
-            stages.append(runStage("moe_q4k_v8", layer: L) { cb in
-                // V8 dispatch shadow run — same input, throwaway output (overwrites
-                // pre_gate_up_fused). Gives a parallel A/B timing.
-                encMoeGemvQ4K(cb, pre_hidden_norm, lw.moeGateUp, pre_gate_up_fused,
-                              Din: HIDDEN, Dout: MOE_FUSED_DOUT, numActive: E_EXP, useV8: true,
-                              slotTokenBuf: pre_slot_token, groupStartBuf: pre_group_start)
-            })
-            stages.append(runStage("moe_q4k_v9", layer: L) { cb in
-                encMoeGemvQ4K(cb, pre_hidden_norm, lw.moeGateUp, pre_gate_up_fused,
-                              Din: HIDDEN, Dout: MOE_FUSED_DOUT, numActive: E_EXP, useV9: true,
-                              slotTokenBuf: pre_slot_token, groupStartBuf: pre_group_start)
-            })
-            stages.append(runStage("moe_q4k_v10_fused", layer: L) { cb in
-                // Writes [slots, MOE_INT] post-activation directly to
-                // pre_gate_proj. AB compares this single stage vs the
-                // v6/v9 matmul stage + the moe_gelu stage combined.
-                encMoeGemvQ4KFusedGelu(cb, pre_hidden_norm, lw.moeGateUp, pre_gate_proj,
-                                        Din: HIDDEN, NHalf: MOE_INT, numActive: E_EXP,
-                                        slotTokenBuf: pre_slot_token, groupStartBuf: pre_group_start)
+                encMmIdQ4KSwizPrefill(cb, x: pre_hidden_norm, W: lw.moeGateUp, Y: pre_gate_up_fused,
+                                       slotTokenBuf: pre_slot_token, activeExpBuf: active_exp,
+                                       groupStartBuf: pre_group_start,
+                                       Din: HIDDEN, Dout: MOE_FUSED_DOUT, numSlots: NS, E: E_EXP)
             })
             stages.append(runStage("moe_gelu", layer: L) { cb in
                 encMoeGeluMulFused(cb, fused: pre_gate_up_fused, out: pre_gate_proj,
                                     N_half: MOE_INT, numSlots: NS)
             })
-            stages.append(runStage("moe_q51_v6", layer: L) { cb in
-                encMoeGemvQ51(cb, pre_gate_proj, lw.moeDown, pre_moe_down_out,
-                              Din: MOE_INT, Dout: HIDDEN, numActive: E_EXP, useV6: true,
-                              slotTokenBuf: pre_slot_token, groupStartBuf: pre_group_start)
-            })
-            stages.append(runStage("moe_q51_v8", layer: L) { cb in
-                encMoeGemvQ51(cb, pre_gate_proj, lw.moeDown, pre_moe_down_out,
-                              Din: MOE_INT, Dout: HIDDEN, numActive: E_EXP, useV8: true,
-                              slotTokenBuf: pre_slot_token, groupStartBuf: pre_group_start)
-            })
-            stages.append(runStage("moe_q51_v9", layer: L) { cb in
-                encMoeGemvQ51(cb, pre_gate_proj, lw.moeDown, pre_moe_down_out,
-                              Din: MOE_INT, Dout: HIDDEN, numActive: E_EXP, useV9: true,
-                              slotTokenBuf: pre_slot_token, groupStartBuf: pre_group_start)
+            // MoE Q5_1 down matmul (slot-flat, per-slot X).
+            stages.append(runStage("moe_q51", layer: L) { cb in
+                encMmIdQ51SwizPrefill(cb, x: pre_gate_proj, W: lw.moeDown, Y: pre_moe_down_out,
+                                       activeExpBuf: active_exp, groupStartBuf: pre_group_start,
+                                       Din: MOE_INT, Dout: HIDDEN, numSlots: NS, E: E_EXP)
             })
             stages.append(runStage("moe_tail", layer: L) { cb in
                 encMoeCombineWriteInto(cb, moeOut: pre_moe_down_out, batchSlots: pre_batch_slots,
@@ -240,18 +218,6 @@ func runLmPrefillProfile(ggufPath: String) {
             })
         }
 
-        stages.append(runStage("unembed_v5", layer: -1) { cb in
-            encRMSNormG(cb, x: pre_hidden, gammaBuf: w.outputNorm, out: pre_hidden_norm,
-                        D: HIDDEN, numVecs: N)
-            encGemvV5(cb, pre_hidden_norm, w.unembedW, pre_logits,
-                      Din: HIDDEN, Dout: VOCAB, numVecs: N)
-            encSoftcapInto(cb, buf: pre_logits, N: VOCAB, numVecs: N, cap: 30.0)
-        })
-        stages.append(runStage("unembed_v4p", layer: -1) { cb in
-            encGemvV4P(cb, pre_hidden_norm, w.unembedW, pre_logits,
-                       Din: HIDDEN, Dout: VOCAB, numVecs: N)
-            encSoftcapInto(cb, buf: pre_logits, N: VOCAB, numVecs: N, cap: 30.0)
-        })
         stages.append(runStage("unembed_fast", layer: -1) { cb in
             // gather B last-rows + RMSNorm + V4Softcap → logits[B, VOCAB]
             // matches encodePrefillTileInto's fast-path unembed branch
@@ -317,14 +283,12 @@ func runLmPrefillProfile(ggufPath: String) {
     }
 
     let stageOrder = ["embed",
-                       "qkv", "qkn_rope", "kv_attn", "oproj_norm",
-                       "shrd_ffn", "router",
-                       "moe_q4k_v6", "moe_q4k_v8", "moe_q4k_v9", "moe_q4k_v10_fused",
-                       "moe_gelu",
-                       "moe_q51_v6", "moe_q51_v8", "moe_q51_v9",
-                       "moe_tail",
+                       "qkv", "qkn_rope", "kv_attn",
+                       "oproj_norm", "shrd_ffn",
+                       "router",
+                       "moe_q4k", "moe_gelu", "moe_q51", "moe_tail",
                        "resid",
-                       "unembed_v5", "unembed_v4p", "unembed_fast"]
+                       "unembed_fast"]
     print("")
     print("=== aggregate per-stage GPU time (across \(reps) reps, summed across layers/passes) ===")
     print("  \(pad("stage", 14))\(pad("count", 8))\(pad("total_gpu_ms", 14))\(pad("avg_per_call_ms", 18))\(pad("per_pass_ms", 14))")
