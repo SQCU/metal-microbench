@@ -377,13 +377,22 @@ let k_len_full      = device.makeBuffer(length: B * 4, options: .storageModeShar
 // inside the prefill CB — still a single CB for all 30 layers, just not
 // fully parallel on the 5/30 full-attn layers.
 // ========================================================================
-// Bumped 32 → 256 alongside the verbatim cooperative-matmul kernel
-// (kernel_mul_mm_q4K_llama in q4k_mma_bench.swift). At MAX_Q_LEN=32 the
-// matmul kernel was Q-batch-starved at ~2 TFLOPS; at MAX_Q_LEN=256 it
-// runs at ~9 TFLOPS per call, a ~5× per-CB throughput gain on prefill.
-// Scratch buffers below grow 8× — biggest single allocation is
-// pre_logits (B × MAX_Q_LEN × VOCAB fp16 = 1 GB at B=8 / VOCAB=262144);
-// trivial on M5 Max's 128 GB unified memory.
+// Settled at 256 (2026-05-01) after empirical bridge measurement showed
+// 256 is at-or-near the end-to-end pareto optimum for single-stream
+// prefill. Earlier history: 32 → 256 alongside the simdgroup-matmul
+// rewire (commit bcfa0fd) when the matmul kernel was Q-batch-starved
+// at MAX_Q_LEN=32.
+//
+// Tried 256 → 1024 to feed the matmul kernel at its saturated regime
+// (bench: 8.0 TFLOPS at numVecs=256 vs 13.7 TFLOPS at numVecs=1024).
+// Net: SLOWER end-to-end. The per-token attention cost grows with
+// chunk_qLen (kv_attn went 5.5 → 10.8 µs/tok between MAX_Q_LEN=256
+// and 1024 in profile_prefill), and that loss eats the matmul gain.
+// Cold bridge measurement at ~3000-token prompt: 141 tok/s @ MQL=256
+// vs 85 tok/s @ MQL=1024.
+//
+// Scratch budget: pre_logits (B × MAX_Q_LEN × VOCAB fp16) is the
+// binding constraint; at B=8 / VOCAB=262144 / MAX_Q_LEN=256 → 1 GB.
 let MAX_Q_LEN = 256
 // Max number of 8-row Q-blocks that can fit in one prefill step. The
 // kernels (`flex_attn_full_prefill`, `flex_attn_slide_v1_q8`) tile along

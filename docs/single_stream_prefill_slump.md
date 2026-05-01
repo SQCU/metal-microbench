@@ -1,149 +1,104 @@
-# Single-stream prefill slump: diagnosis + substrate-only fix menu
+# Single-stream prefill slump: diagnosis + falsified levers
 
 ## TL;DR
 
 After the simdgroup-matmul prefill rewire (commit `bcfa0fd`, 2026-04-30), the
 multi-stream operating point hits ~1.4 sec for 2048 tokens (B=8 streams ×
-qLen=256), ≈1422 tok/s aggregate. The single-stream operating point (one
-user, one prompt) hits ≈96–236 tok/s depending on prompt length. That single-stream
-slump is structural to running an 8-slot-batched engine at 1 active slot, and
-is what this spec is about. Multi-user batching already aggregates correctly
-(`lm_engine.swift::stepMultiSlotPrefill`); this is purely the case where exactly
-one user is in flight.
+qLen=256), ≈1422 tok/s aggregate. The single-stream operating point (one user,
+one prompt) hits ~85–195 tok/s depending on prompt length. That single-stream
+gap is structural to running an 8-slot-batched engine at 1 active slot. Two
+substrate-level levers were investigated as ways to close it; **neither
+delivered**. This doc captures the falsifications so they aren't repeated.
 
-## Measured baseline (commit `bcfa0fd`, M5 Max, Gemma-4-A4B Q4_K_M, MAX_Q_LEN=256)
+Multi-user batching already aggregates correctly via
+`lm_engine.swift::stepMultiSlotPrefill` — when 2+ sessions are priming, the
+scheduler packs them into a B≥2 prefill CB. The rest of this doc is purely
+about the case where exactly one user is in flight.
 
-| prompt_tokens | wall (s) | per-token (ms) | rate (tok/s) |
-|---|---|---|---|
-| 71 | 0.48 | 6.8 | 236 |
-| 521 | 3.18 | 6.1 | 173 |
-| 1521 | 10.06 | 6.6 | 154 |
-| 3021 | 21.56 | 7.1 | 141 |
-| 6021 | 62.70 | 10.4 | 96 |
+## Measured baseline (2026-05-01, M5 Max, Gemma-4-A4B Q4_K_M, MAX_Q_LEN=256)
 
-Per-chunk (≈256 tokens each at MAX_Q_LEN=256):
+Cold-prefill rates (random nonces in each prompt to defeat the prefix cache):
 
-| chunks | per-chunk wall (s) |
-|---|---|
-| 3 | 1.06 |
-| 6 | 1.68 |
-| 12 | 1.80 |
-| 24 | 2.61 |
+| prompt_tokens | wall (s) | rate (tok/s) |
+|---|---|---|
+| 330 | 2.19 | 195 |
+| 579 | 3.83 | 174 |
+| 1082 | 8.24 | 140 |
+| 2082 | 19.28 | 111 |
+| 4131 | 48.90 | 85 |
 
-Two distinct effects compose:
+Per-token cost grows monotonically with prompt size — that's the attention
+quadratic (5 of 30 layers are full-attention with no sliding window; per-token
+attention cost scales linearly with prompt length, total scales O(N²)).
 
-- **Constant single-stream baseline**: ~1.06 s for one 256-token chunk at 1 active stream.
-  Multi-stream profile says the same chunk under B=8 saturated takes 1.44 s for
-  2048-token-equivalent batch. Per-token cost: 4.1 ms (single-stream) vs 0.7 ms
-  (multi-stream, fully packed). **6× under-utilization at single-stream**.
-- **Attention quadratic at long context**: per-chunk wall grows 2.5× from chunk 1
-  (~1.06 s) to chunk 24 (~2.61 s). Five of thirty layers are full-attention (no
-  sliding window), so each new chunk's queries attend to the full accumulated
-  KV history. **This is intrinsic to dense full-attention layers and is not in
-  scope for this spec — algorithmic attention changes are forbidden.**
+## Lever A — NR1 specialization for low-batch prefill (FALSIFIED)
 
-## Where the 6× single-stream gap comes from
+**Hypothesis**: at single-stream prefill chunk (numVecs=256), the canonical
+matmul kernel (NR1=32) leaves only 8 X-TGs per output-col tile, while the
+saturated case (numVecs=1024) has 32 X-TGs per tile. More X-TGs at the same
+gridY co-read W from L2 → higher TFLOPS. A kernel with NR1=8 would have 4× more
+X-TGs at numVecs=256, recovering the L2-reuse density.
 
-Three substrate-level contributors, multiplicative:
+**Result**: falsified by `q4k_mma_bench` measurement (commit `ea03163` — the
+same commit that fixed a separate dispatch-grid axis bug in the bench). NR1=32
+canonical scales 2.44 → 13.72 TFLOPS as numVecs grows 32 → 1024. NR1=8 as a
+minimum-change kernel (just `NR1=32` → `NR1=8` in the same body) plateaus at
+~3.5 TFLOPS regardless of numVecs because half the `mc` tiles compute against
+duplicate-clamped sb data and get discarded by the cooperative output store.
+The L2-reuse mechanism is real in principle but the implementation has 50%
+wasted simdgroup-matmul FMA work, which more than offsets the L2 win.
 
-1. **Matmul tile under-fill**. The dense Q8_0 simdgroup matmul kernel
-   (`prefill_mm_q8_0_swiz`) uses NR1=32 for the slot dimension. At single-stream
-   chunk (qLen=256, B=1), each matmul gets `ceil(256/32) = 8` X-axis TGs. At
-   B=8 saturated (256 × 8 = 2048 effective batch), the same matmul gets 64
-   X-axis TGs. Bench measurement at FFN gate/up shape: `swiz_q8_0` runs at 7.59
-   TFLOPS at B=256, 13.69 TFLOPS at B=1024 — about **1.8× directly attributable
-   to tile-fill density**.
+A "real" NR1=8 kernel would need to redesign the simdgroup row-partition so
+all 4 simdgroups produce useful `mc` tiles at NR1=8. A custom version was
+attempted in the same investigation; failed correctness (RMSE 1.09 on tiny
+shape) and was abandoned. Restarting that work isn't cheap — the row-partition
+redesign means a different thread-mapping + sa/sb layout + output-store
+pattern. **Not justified by current data.**
 
-2. **MoE expert grid under-fill**. `prefill_mm_id_q4K_swiz` and
-   `prefill_mm_id_q5_1_swiz` dispatch with `gridZ = E = 128` regardless of how
-   many slot-fills exist. At B=8 streams, total routed slots ≈
-   `B × MAX_Q_LEN × TOPK = 16384`, giving each expert ~128 slots → fills the
-   NR1=32 slot tile cleanly. At B=1 stream, ~2048 routed slots, each expert
-   ~16 slots → half-empty tiles. **Estimated 1.5–2× MoE-call lost** to partial
-   tiles at single-stream (consistent with the bench's `mm_id_q4K_swiz` numbers
-   at B=8 vs B=256).
+## Lever B — MAX_Q_LEN bump (FALSIFIED)
 
-3. **Per-CB / per-encoder overhead**. ~30 layers × ~10–15 encoders = ~300–450
-   encoder boundaries per prefill CB. Each encoder pays a fixed
-   `~50–100 µs` setup cost on Apple silicon. That's ~15–45 ms per CB of pure
-   overhead. At B=8 saturated this is amortized over 2048 tokens (≈10 µs/tok);
-   at B=1 it's amortized over 256 tokens (≈80 µs/tok). **Amounts to a ~70 µs/tok
-   single-stream tax** — small but real, contributing maybe 1.1–1.2× to the gap.
+**Hypothesis**: the canonical kernel scales cleanly to ~13.7 TFLOPS at
+numVecs=1024. Bumping MAX_Q_LEN from 256 → 1024 lets single-stream chunks
+reach the saturated regime. Engine knob only, no kernel work.
 
-Multiplicatively: 1.8 × 1.7 × 1.15 ≈ **3.5×**, leaving ~1.7× unaccounted-for —
-likely a mix of activeB-non-aware kernels (some ancillary ops still dispatch
-B-wide grids) and the matmul kernel's intra-TG simdgroup count being tuned for
-the B=8 case.
+**Result**: falsified by bridge end-to-end measurement (2026-05-01). Cold
+single-stream prefill rates were within 3% noise of the MAX_Q_LEN=256 baseline
+across prompts from 330 to 4131 tokens. The matmul does run faster per-call
+(profile-confirmed), but the per-token attention cost grows with chunk size:
+`kv_attn` went from 5.5 µs/tok at MAX_Q_LEN=256 to 10.8 µs/tok at MAX_Q_LEN=1024
+in the multi-stream profile. Attention's per-token cost growing 2× cancels the
+matmul's 25% per-token speedup.
 
-## Substrate-only fix menu (to be evaluated; this spec scopes the work, not the
- selection)
+The mathematical reason: chunked prefill processes the same total attention
+ops (O(N²/2)) regardless of MAX_Q_LEN partitioning, but the per-chunk attention
+KERNEL is less efficient at larger qLen. Net: no end-to-end gain from MAX_Q_LEN
+bump alone, plus 4× memory cost on `pre_logits`. Reverted.
 
-### Lever A — NR1 specialization for low-batch prefill (kernel zoo)
+## What this leaves
 
-Add a low-batch variant of each simdgroup matmul kernel with smaller NR1 (slot
-tile). Same matmul body; smaller slot tile fills more cleanly at B=1×qLen=256.
-Mirrors the existing AR-decode B_TILE zoo
-(`dense_gemv_q8_0_btile_b{1,2,4,8}` and friends). Three new kernels:
+The single-stream prefill operating point is bound by a **mix** of attention
+quadratic and matmul under-fill, not by any single lever the substrate exposes.
+Closing it without algorithmic changes (forbidden — see
+`feedback_no_destructive_algorithmic_changes.md`) requires a more invasive
+redesign:
 
-- `prefill_mm_q8_0_swiz_nr1_8` (NR1=8, suitable for activeB=1×MAX_Q_LEN=256)
-- `prefill_mm_id_q4K_swiz_nr1_8`
-- `prefill_mm_id_q5_1_swiz_nr1_8`
+- **Attention kernel zoo at high qLen**: a flex-attention variant tuned for
+  qLen=1024+ at B=1, addressing the per-token cost growth. Likely needs
+  different block-Q sizing, different threadgroup-memory budget. Real kernel
+  work, not a knob.
+- **Properly-row-partitioned NR1=8 simdgroup matmul** (the design that the
+  minimum-change variant approximated and lost on). A row-partition that keeps
+  all 4 simdgroups productive at NR1=8 would deliver the L2-reuse win without
+  the wasted-mc penalty. The simdgroup_matrix register layout makes this
+  non-trivial; the first-cut attempt failed correctness.
+- **CB consolidation**: lever C from the prior version of this doc
+  (norm-fused matmul kernels). 1.1-1.2× modest gain at most. Defer.
 
-Dispatcher picks NR1 from `activeB`:
-- `activeB ≥ 8`: use NR1=32 (current)
-- `activeB ∈ {2..7}`: use NR1=16 (could specialize further)
-- `activeB == 1`: use NR1=8
-
-Estimated win: 1.5–2× on the lever-A axis, recovers most of the tile-fill slump.
-
-Risk: more MSL surface area, more kernel-zoo dispatcher complexity. Mitigation:
-the fix-set-of-three is small (production target is fixed Gemma-4 shapes) and
-follows the well-trodden B_TILE pattern.
-
-### Lever B — MAX_Q_LEN tuning above 256
-
-The matmul kernel scales cleanly at larger Q-batch. Bench at FFN gate/up:
-- B=256: 7.59 TFLOPS
-- B=512: 12.00 TFLOPS
-- B=1024: 12.71 TFLOPS
-
-Bumping MAX_Q_LEN from 256 to 512 should give ~1.6× per-chunk efficiency at
-single-stream (since each chunk now has B=1×512 effective). At MAX_Q_LEN=1024,
-~1.7× over MAX_Q_LEN=256. Past 1024 we hit the matmul kernel's roofline.
-
-Cost: scratch buffers (`pre_*` in `bootstrap.swift`) grow proportionally.
-Biggest is `pre_logits` at B × MAX_Q_LEN × VOCAB × 2 bytes:
-- MAX_Q_LEN=256: 8 × 256 × 262144 × 2 = 1 GB
-- MAX_Q_LEN=512: 2 GB
-- MAX_Q_LEN=1024: 4 GB
-
-Unified memory is 128 GB so all three fit comfortably. The fast-unembed-gather
-path (`unembed_fast` in `profile_prefill.swift`) only writes the last position
-per slot, sidestepping the full `pre_logits` buffer most of the time, but the
-allocation still has to fit.
-
-Estimated win: 1.5–1.7× across the per-chunk baseline at single-stream.
-
-Risk: low. Engine-side change only, no kernel modifications. KL parity is
-mechanical.
-
-### Lever C — CB consolidation (fewer encoder boundaries)
-
-Each `enc.endEncoding()` + new encoder is a fixed ~50–100 µs cost. Some prefill
-stages currently use multiple encoders that could be merged:
-
-- QKV is now 1 RMSNorm + 3 matmul = 4 encoders. Could fuse QKV into one matmul
-  call writing into a [Q | K | V] concat output buffer.
-- Shared FFN gate+up is currently 1 RMSNorm + 2 matmul + gelu_mul + matmul +
-  RMSNorm = 6 encoders. Some of these can fuse if the kernel-zoo grows variants
-  with norm-pre-fused matmul (similar to the existing
-  `dense_gemv_q8_0_v6_rmsnorm` pattern, but on the simdgroup matmul).
-
-Estimated win: 1.1–1.2× across all single-stream prefill (the encoder overhead
-is real but small; this is gravy).
-
-Risk: each fused kernel is more code surface and harder to A/B-test in isolation.
-Defer until A and B are landed and we know the residual gap.
+The bigger architectural truth is: **the engine is correctly designed for
+multi-stream**. Single-user is a corner case. The bridge already aggregates
+multi-user prefill via `stepMultiSlotPrefill`; if production single-user TTFT
+is a real concern, the right answer is more concurrent users, not making the
+single-stream path beat the architectural grain.
 
 ## Out of scope
 
@@ -157,15 +112,9 @@ Defer until A and B are landed and we know the residual gap.
 
 ## Decision deferred
 
-Not selecting between A/B/C now — wait until the multi-stream path is exercised
-in production traffic and the actual single-user TTFT pain is concrete from
-real users. When that happens:
-
-1. Pick A first (biggest single-lever win, well-trodden code pattern).
-2. If A leaves residual gap, add B (cheap, just engine-side knob).
-3. If A+B leaves residual gap, evaluate C.
-
-Expected post-A+B single-stream rate at 256-token chunk: ~400–500 tok/s
-(2.5–3× over current 173 tok/s baseline at 521-token prompt). Expected
-6021-token prefill: ~25–35 sec (down from current 62.7 sec). Attention
-quadratic remains the asymptotic limit at very long context.
+Two clean levers are exhausted, neither paid back. A third (the redesigned
+NR1=8 kernel) is real kernel work that should be motivated by concrete pain
+before being attempted. Hold the line at MAX_Q_LEN=256 + canonical NR1=32
+matmul as the single-stream operating point. If a later workload proves single-
+user prefill TTFT is binding, revisit the attention-kernel and row-partition
+options above with a fresh round of profiling.
