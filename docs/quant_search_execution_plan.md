@@ -32,32 +32,66 @@
 
 For each V1 grid format, what kernels exist on the M5 production engine and what's missing as of 2026-05-01 (post-prefill-rewire commits `bcfa0fd`/`c76eb68`):
 
-| Format | Prefill dense matmul | Prefill MoE mul_mm_id | AR dense GEMV | AR MoE GEMV |
+| Format | Prefill dense matmul (bench) | Prefill MoE mul_mm_id (bench) | AR dense GEMV | AR MoE GEMV |
 |---|---|---|---|---|
-| **Q4_0**  | ✗ (kernel needed) | ✗ (kernel needed) | ✓ `dense_gemv_q4_0_v4` | ✓ `moe_gemv_q4_0_v3` |
-| **Q4_K**  | ✗ (kernel needed) | ✓ `prefill_mm_id_q4K_swiz` | ✓ `dense_gemv_q4k_v4` | ✓ `moe_gemv_q4k_v11_b{1,2,4,8}` |
-| **Q5_1**  | ✗ (kernel needed) | ✓ `prefill_mm_id_q5_1_swiz` | partial (no dense path used in prod) | ✓ `moe_gemv_q5_1_v11_b{1,2,4,8}` |
-| **Q5_K**  | ✗ (kernel needed) | ✗ (kernel needed) | ✗ (kernel needed) | ✗ (kernel needed) |
-| **Q6_K**  | ✗ (kernel needed) | ✗ (kernel needed) | ✗ (kernel needed) | ✗ (kernel needed) |
-| **Q8_0**  | ✓ `prefill_mm_q8_0_swiz` | ✗ (kernel needed) | ✓ `dense_gemv_q8_0_btile_b{1,2,4,8}` | n/a (Gemma-4 doesn't use Q8_0 MoE) |
+| **Q4_0**  | ✓ `kernel_mul_mm_q4_0_swiz` | ✓ `kernel_mul_mm_id_q4_0_swiz` | ✓ `dense_gemv_q4_0_v4` | ✓ `moe_gemv_q4_0_v3` |
+| **Q4_K**  | ✓ `kernel_mul_mm_q4_K_swiz` | ✓ `kernel_mul_mm_id_q4K_swiz` | ✓ `dense_gemv_q4k_v4` | ✓ `moe_gemv_q4k_v11_b{1,2,4,8}` |
+| **Q5_1**  | ✓ `kernel_mul_mm_q5_1_swiz` | ✓ `kernel_mul_mm_id_q5_1_swiz` | partial | ✓ `moe_gemv_q5_1_v11_b{1,2,4,8}` |
+| **Q5_K**  | ✓ `kernel_mul_mm_q5_K_swiz` | ✓ `kernel_mul_mm_id_q5_K_swiz` | ✗ (AR port pending) | ✗ (AR port pending) |
+| **Q6_K**  | ✓ `kernel_mul_mm_q6_K_swiz` | ✓ `kernel_mul_mm_id_q6_K_swiz` | ✗ (AR port pending) | ✗ (AR port pending) |
+| **Q8_0**  | ✓ `kernel_mul_mm_q8_0_swiz` (prod) | ✓ `kernel_mul_mm_id_q8_0_swiz` | ✓ `dense_gemv_q8_0_btile_b{1,2,4,8}` | n/a (Gemma-4 doesn't use Q8_0 MoE) |
 
-Of the 9 V1 grid configs, only **Q8_0-uniform partially runs** on M5 today (its MoE path is missing — Gemma-4's Q4_K_M reference doesn't use Q8_0 MoE so production never needed it). The other 8 configs need kernel work before M5 calibration can happen.
+**Bench-level coverage is now complete** — every V1 grid format has both a
+dense and a MoE simdgroup-matmul kernel in `q4k_mma_bench.swift`, all
+validated against CPU references at fp16 floor (RMSE 0.0004 on tiny shapes).
+Throughput ranking at saturated batch is in the **Substrate priors** section
+above.
 
-This is the gap closure the rest of this update tracks. Each missing kernel is mechanical: copy the existing simdgroup-matmul template, swap the per-format dequant function and block struct. ~1-2 hours each, validated against a CPU reference at fp16 floor (RMSE ≤ 0.001).
+Two layers of follow-up work remain to make uniform-Q5_K and uniform-Q6_K
+configs runnable end-to-end on the M5 production engine:
+
+1. **AR-decode GEMV ports for Q5_K, Q6_K.** The bench validates the prefill
+   path (simdgroup matmul). The AR-decode path uses the GEMV-shaped kernel
+   zoo (`dense_gemv_q*_v4` / `moe_gemv_q*_v11_b{1,2,4,8}`); Q5_K and Q6_K
+   need ports of those patterns. ~half-day each.
+
+2. **Production wire-up in `bootstrap.swift`.** `LayerW` currently hardcodes
+   per-tensor-class formats (Q8_0 dense, Q4_K MoE gate_up, Q5_1 MoE down).
+   For uniform-Q5_K to actually run, `LayerW` needs to be parameterized by
+   per-tensor-class quant, the GGUF loader needs to handle Q5_K/Q6_K, and
+   the prefill+AR dispatchers need to pick the right kernel per tensor. ~1
+   day of plumbing.
+
+After both, V1 calibration on M5 (Phase 4.1) can run all 9 configs.
 
 ## Substrate priors for the cost model
 
-This session (commits `ea03163`, `c76eb68`) produced concrete kernel-level TFLOPS measurements for the formats currently in production, at saturated batch on M5:
+Kernel-level TFLOPS measurements at saturated batch (numVecs=1024, FFN gate
+shape K=2304 N=11008) on M5, dense swizzled simdgroup matmul, all 6 V1 grid
+formats now have validated kernels (commit forthcoming):
 
-| Format | Peak TFLOPS @ saturated batch | Per-element dequant complexity | Block geometry |
-|---|---|---|---|
-| Q8_0 dense (swizzled simdgroup matmul) | ~13.7 | one int8 multiply, no bit-packing | 32 elts / 34 B |
-| Q4_K MoE (swizzled mul_mm_id) | ~5.0  | bit-unpacking (4-bit) + paired 6-bit scales + min-subtract | 256 elts / 144 B |
-| Q5_1 MoE (swizzled mul_mm_id) | ~4.35 | 5-bit bit-math (4-bit + per-elt qh bit) | 32 elts / 24 B |
+| Format | Peak TFLOPS | Δ vs Q8_0 | Per-element dequant complexity | Block geometry |
+|---|---|---|---|---|
+| Q8_0 swiz | 13.65 | baseline | one int8 multiply | 32 elts / 34 B |
+| Q4_K swiz | 13.11 | -4% | 4-bit unpack + 6-bit paired scales + min-sub | 256 elts / 144 B |
+| Q4_0 swiz | 13.10 | -4% | 4-bit nibble - 8 | 32 elts / 18 B |
+| Q5_1 swiz | 12.77 | -6% | 4-bit + qh bit + min-add | 32 elts / 24 B |
+| Q5_K swiz | 12.55 | -8% | 4-bit + 1-bit qh + paired scales + min-sub | 256 elts / 176 B |
+| Q6_K swiz | 12.28 | -10% | (4+2)-bit interleaved + 32-bit shift packing | 256 elts / 210 B |
 
-The rank ordering — **Q8_0 ≫ Q4_K > Q5_1** — tracks dequant ALU cycles per element, not bandwidth. This is a substrate prior for the V1 cost model: predict Q8_0 fastest, then Q4_K, then Q5_1, with Q4_0 likely between Q4_K and Q5_1 (simpler scale than Q4_K but more bits than Q4_K's K-block sharing). Q5_K and Q6_K don't have measurements yet — bench them once the kernels land.
+The full ordering — **Q8_0 ≥ Q4_K ≈ Q4_0 > Q5_1 > Q5_K > Q6_K** — at saturated
+batch is tighter than expected (~10% spread, not ~30%) because all formats
+are **bandwidth-bound** at this operating point. The matmul tile + L2 reuse
+amortizes the dequant ALU cycles. Per-format ordering matches dequant
+complexity but differences are small.
 
-Use this rank ordering as a Bayesian prior on the linear-regression cost-model coefficients in Phase 4.2: any per-format coefficient that violates the ordering is a red flag (kernel issue, not a quant property).
+At lower numVecs (single-stream short-prompt regime, where matmul is more
+compute-bound), the ordering should sharpen — bench at numVecs=256 if
+calibrating the cost model for single-user latency. Use the saturated-batch
+ordering as a Bayesian prior on the linear-regression cost-model
+coefficients in Phase 4.2: any per-format coefficient that violates this
+ordering by more than ~3 percentage points is a red flag (kernel issue,
+not a quant property).
 
 ## Stale-data alert: bench grid axis bug (commit `ea03163`)
 
