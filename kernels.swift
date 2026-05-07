@@ -9791,12 +9791,27 @@ kernel void flex_attn_v0(
     // MMA the trailing rows are zero-padded so they contribute 0 to the
     // 8×8 MMA output and are ignored by the softmax/AV loops (which
     // iterate q < Q_PER_TG only).
+    //
+    // 2026-05-06 refactor: O_acc moved to per-lane registers
+    // (`O_local[MAX_Q_PER_TG][MAX_D_PER_LANE]`). Each lane owns
+    // MAX_D/THREADS = 16 disjoint d-slots × MAX_Q_PER_TG = 8 rows
+    // = 128 floats = 512 B per lane. Drops static threadgroup-memory
+    // budget by 16 KB (was 24.9 KB → 8.5 KB), keeping the doubled
+    // accounting (simdgroup_matrix operand-tile double-buffering)
+    // safely under the 32 KB hardware limit.
     threadgroup half  Q_tile[MMA * MAX_D];
     threadgroup half  scores_tile[MMA * MAX_PAGE];
-    threadgroup float O_acc[MAX_Q_PER_TG * MAX_D];
     threadgroup float m_state[MAX_Q_PER_TG];
     threadgroup float l_state[MAX_Q_PER_TG];
     threadgroup float scale_tile[MAX_Q_PER_TG];
+
+    // Per-lane register accumulator for O. Sized to the max specialization
+    // (Q_PER_TG=8, D_PER_LANE=MAX_D/THREADS=16). Slide PSO uses only the
+    // first FC_Q_PER_TG rows × FC_D/THREADS d-slots; remaining slots are
+    // unused but cost only register pressure, no memory traffic.
+    constexpr uint MAX_D_PER_LANE = MAX_D / THREADS;   // 16
+    const     uint D_PER_LANE     = D / THREADS;       // 8 (slide) or 16 (full)
+    float O_local[MAX_Q_PER_TG][MAX_D_PER_LANE];
 
     device const half* Qbase = Q + (slot * H_Q + q_head_base) * D;
     device const uint* bt_s = block_table + slot * max_pages;
@@ -9806,7 +9821,12 @@ kernel void flex_attn_v0(
         uint r = i / D;
         Q_tile[i] = (r < Q_PER_TG) ? Qbase[r * D + (i % D)] : half(0);
     }
-    for (uint i = lid; i < Q_PER_TG * D; i += THREADS) O_acc[i] = 0.0f;
+    // Zero per-lane O accumulator. Pure register init — no threadgroup
+    // memory traffic, no barrier needed (each lane writes only its own
+    // private slots).
+    for (uint q = 0; q < Q_PER_TG; ++q) {
+        for (uint i = 0; i < D_PER_LANE; ++i) O_local[q][i] = 0.0f;
+    }
     if (lid < Q_PER_TG) { m_state[lid] = -INFINITY; l_state[lid] = 0.0f; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -9899,18 +9919,20 @@ kernel void flex_attn_v0(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // AV: scalar cooperative.
-        for (uint d = lid; d < D; d += THREADS) {
+        // AV: scalar cooperative. Each lane owns D/THREADS d-slots in
+        // per-lane registers (`O_local[q][i]`) across all ix iterations.
+        for (uint i = 0; i < D_PER_LANE; ++i) {
+            uint d = lid + i * THREADS;
             half V_reg[MAX_PAGE];
             for (uint k = 0; k < PAGE; ++k) {
                 V_reg[k] = Vbase[k * kv_row_stride + d];
             }
             for (uint q = 0; q < Q_PER_TG; ++q) {
-                float acc = O_acc[q * D + d] * scale_tile[q];
+                float acc = O_local[q][i] * scale_tile[q];
                 for (uint k = 0; k < PAGE; ++k) {
                     acc += float(scores_tile[q * PAGE + k]) * float(V_reg[k]);
                 }
-                O_acc[q * D + d] = acc;
+                O_local[q][i] = acc;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -9928,8 +9950,13 @@ kernel void flex_attn_v0(
             m_partials[pidx] = empty_split ? -INFINITY : m_state[q];
             l_partials[pidx] = empty_split ? 0.0f : l_state[q];
         }
+        // One device store per (lane, q, d-slot) — covers D/THREADS
+        // contiguous-strided d positions per lane.
         device float* O_part = O_partials + pidx * D;
-        for (uint d = lid; d < D; d += THREADS) O_part[d] = O_acc[q * D + d];
+        for (uint i = 0; i < D_PER_LANE; ++i) {
+            uint d = lid + i * THREADS;
+            O_part[d] = O_local[q][i];
+        }
     }
 }
 
@@ -10162,14 +10189,26 @@ kernel void flex_attn_slide_v1_q8(
 // Flex attention v1 full-attention for prefill.
 // llama.cpp-style geometry: ONE TG per (slot, q_head, q_block). Each TG owns
 // Q_BLOCK=8 queries of a SINGLE q_head (not Q_PER_TG grouped like v0).
-// That keeps the tg-mem budget below 32 KB at D=512:
+//
+// 2026-05-06 refactor: moved the 16 KB O_acc accumulator out of threadgroup
+// memory and into per-lane registers (`O_local[Q_ROWS][D_PER_LANE]`). Each
+// of the 32 lanes in the threadgroup owns D/32 = 16 disjoint d-slots
+// across all 8 query rows = 128 floats = 512 B per lane — well within
+// Apple GPU's register budget, and faster than threadgroup memory in the
+// inner accumulate loop. Threadgroup-memory budget at D=512:
 //   Q_tile:      8 * 512 * 2 = 8192 B
 //   scores_tile: 8 * 8 * 2   = 128 B
-//   O_acc:       8 * 512 * 4 = 16384 B
 //   m/l/scale:   8 * 12       = 96 B
 //   q_pos_tg:    8 * 4         = 32 B
 //   ---------------------------------
-//   total:                     ~24.5 KB ✓
+//   total:                     ~8.4 KB (was ~24.5 KB before O_acc → reg)
+// Why it matters: simdgroup_matrix usage causes Metal's compiler to
+// double-buffer operand tiles, putting the effective threadgroup-mem
+// reservation near 2× the static accounting. At ~24.5 KB static the
+// kernel was clearing 49 KB doubled — over the 32 KB hardware limit.
+// At ~8.4 KB static the doubled accounting (~17 KB) is comfortably
+// under, with substantial headroom.
+//
 // Grid: (B * H_Q, q_blocks, N_SPLITS). kv_head = (q_head * H_KV) / H_Q is
 // derived inside the kernel; multiple q_heads that share a KV head re-read
 // the same K — on Apple Silicon with unified memory this hits L1/L2 cache.
@@ -10219,11 +10258,18 @@ kernel void flex_attn_full_prefill(
 
     threadgroup half  Q_tile[Q_ROWS * D];
     threadgroup half  scores_tile[Q_ROWS * PAGE];
-    threadgroup float O_acc[Q_ROWS * D];
     threadgroup float m_state[Q_ROWS];
     threadgroup float l_state[Q_ROWS];
     threadgroup float scale_tile[Q_ROWS];
     threadgroup uint  q_pos_tg[Q_BLOCK];
+
+    // Per-lane register accumulator. Replaces the 16 KB threadgroup
+    // O_acc[Q_ROWS * D] tile. Each lane owns disjoint d-slots
+    // {lid, lid+THREADS, lid+2*THREADS, ...} across all Q_ROWS query
+    // rows. D/THREADS = 512/32 = 16 d-slots × 8 rows = 128 floats per
+    // lane = 512 B, fits comfortably in Apple GPU registers.
+    constexpr uint D_PER_LANE = D / THREADS;   // 16
+    float O_local[Q_ROWS][D_PER_LANE];
 
     device const uint* bt_s = block_table + slot * max_pages;
 
@@ -10238,7 +10284,12 @@ kernel void flex_attn_full_prefill(
             Q_tile[i] = Q[q_flat * D + (i % D)];
         }
     }
-    for (uint i = lid; i < Q_ROWS * D; i += THREADS) O_acc[i] = 0.0f;
+    // Zero the per-lane accumulator (pure-register init, no threadgroup-
+    // memory traffic and no barrier needed because each lane only touches
+    // its own private slots).
+    for (uint r = 0; r < Q_ROWS; ++r) {
+        for (uint i = 0; i < D_PER_LANE; ++i) O_local[r][i] = 0.0f;
+    }
     if (lid < Q_ROWS) { m_state[lid] = -INFINITY; l_state[lid] = 0.0f; }
     if (lid < Q_BLOCK) {
         uint q_pos_in_seq = q_local_base + lid;
@@ -10336,16 +10387,18 @@ kernel void flex_attn_full_prefill(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // AV scalar cooperative: each lane owns D/THREADS=16 dims.
-        for (uint d = lid; d < D; d += THREADS) {
+        // AV scalar cooperative: each lane owns D/THREADS=16 dims, kept
+        // in per-lane registers (`O_local[r][i]`) across all ix iterations.
+        for (uint i = 0; i < D_PER_LANE; ++i) {
+            uint d = lid + i * THREADS;
             half V_reg[PAGE];
             for (uint k = 0; k < PAGE; ++k) V_reg[k] = Vbase[k * kv_row_stride + d];
             for (uint r = 0; r < Q_ROWS; ++r) {
-                float acc = O_acc[r * D + d] * scale_tile[r];
+                float acc = O_local[r][i] * scale_tile[r];
                 for (uint k = 0; k < PAGE; ++k) {
                     acc += float(scores_tile[r * PAGE + k]) * float(V_reg[k]);
                 }
-                O_acc[r * D + d] = acc;
+                O_local[r][i] = acc;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -10362,8 +10415,13 @@ kernel void flex_attn_full_prefill(
             m_partials[pidx] = empty_split ? -INFINITY : m_state[r];
             l_partials[pidx] = empty_split ? 0.0f : l_state[r];
         }
+        // One device store per (lane, r, d-slot) — each lane covers
+        // D_PER_LANE = D/THREADS contiguous-strided d positions.
         device float* O_part = O_partials + pidx * D;
-        for (uint d = lid; d < D; d += THREADS) O_part[d] = O_acc[r * D + d];
+        for (uint i = 0; i < D_PER_LANE; ++i) {
+            uint d = lid + i * THREADS;
+            O_part[d] = O_local[r][i];
+        }
     }
 }
 
