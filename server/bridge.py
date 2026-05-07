@@ -85,19 +85,49 @@ MODEL_NAME = os.environ.get("GEMMA_MODEL_NAME", "gemma-4-a4b")
 # ----------------------------------------------------------------------
 # Coordinator state.
 #
-# A single asyncio task owns ALL FFI calls. HTTP handlers enqueue
-# StreamSpec into _submit_q and read updates from per-stream queues.
-# Because only the coordinator calls g.submit / g.poll, no lock is
-# needed — the coroutine awaits each FFI call before issuing the next.
+# 2026-05-07: ONE dedicated native threading.Thread owns the entire
+# gemma_poll driver loop for the lifetime of the process. HTTP handlers
+# call gemma_submit DIRECTLY (it's thread-safe — Swift-side
+# gIntakeCond.lock+append+signal+unlock, microsecond fast path).
+# Updates fan from the driver thread to per-stream asyncio.Queues via
+# loop.call_soon_threadsafe(rq.put_nowait, u).
+#
+# Why this replaces the old "two asyncio tasks each call to_thread" pattern:
+#   - The old pattern paid an asyncio→threadpool→cgo round-trip per
+#     submit AND per poll cycle (~5-10 ms each). At ~12 AR ticks/sec
+#     that was ~120-240 ms/sec of pure host-side overhead between
+#     productive CBs.
+#   - The old pattern used TWO threadpool workers concurrently calling
+#     into the FFI (submit + poll). Even with internal Swift-side
+#     locking that was correct, it doubled cgo entry overhead.
+#   - sched_sim_bridge's P8 sensitivity sweep showed the dominant
+#     unmodeled cost in the 57-vs-77-tok/s gap is exactly threadpool
+#     dispatch + per-update asyncio scheduling. Native owner thread
+#     predicted 80+ tok/s.
+#
+# Wakeup story: when the engine is idle, gemma_poll cond_waits on
+# gIntakeCond inside Swift. HTTP handlers calling gemma_submit signal
+# that cond, waking the driver thread within microseconds — so cold-
+# start latency is signal latency, not the driver's poll deadline.
 # ----------------------------------------------------------------------
-_submit_q: "asyncio.Queue[g.StreamSpec]" = None  # type: ignore[assignment]
+import threading
+
 _response_qs: dict[int, "asyncio.Queue[g.StreamUpdate]"] = {}
 _next_stream_id_lock: "asyncio.Lock | None" = None
 _next_stream_id = 1
-_submit_pump_task: "asyncio.Task | None" = None
-_poll_pump_task: "asyncio.Task | None" = None
+_engine_thread: "threading.Thread | None" = None
+_engine_thread_stop = threading.Event()
+_engine_loop: "asyncio.AbstractEventLoop | None" = None
 _TOOL_CALL_CLOSE_TOKENS: list[int] = []  # set at startup
 _TURN_END_TOKENS: list[int] = []         # set at startup; chat-template end-of-turn
+
+# Engine-driver poll deadline. 1000 ms means gemma_poll's drive loop
+# runs many CBs per native-thread iteration without ever returning to
+# Python; cgo-entry overhead is amortized to ~1/sec. The deadline only
+# bounds how long gemma_poll cond_waits when the engine is TRULY idle
+# (intake empty, no resident sessions decoding); active work runs back-
+# to-back regardless of the deadline.
+_DRIVER_POLL_DEADLINE_MS = 1000
 
 # 2026-05-07: deleted _conv_cache. The bridge is now stateless across
 # chat-completion requests — no warm-path adoption, no
@@ -116,60 +146,48 @@ async def _next_stream_id_alloc() -> int:
         return sid
 
 
-async def _submit_pump() -> None:
-    """Block on the submit queue; batch-drain on each wake; push to FFI.
+def _push_update_threadsafe(loop: asyncio.AbstractEventLoop,
+                              update: "g.StreamUpdate") -> None:
+    """Schedule `response_q.put_nowait(update)` on the asyncio loop from
+    the native driver thread. asyncio.Queue.put_nowait is itself
+    thread-safe against the get-side; call_soon_threadsafe handles the
+    cross-thread loop wakeup. No await chain, no to_thread."""
+    rq = _response_qs.get(update.stream_id)
+    if rq is None:
+        return
+    try:
+        loop.call_soon_threadsafe(rq.put_nowait, update)
+    except RuntimeError:
+        # Loop closed during shutdown — drop the update silently.
+        pass
 
-    Distinct from the poll pump so submit and poll can run on
-    independent threadpool workers. The engine's gemma_submit is
-    non-driving (just enqueues to an intake queue + signals a cond);
-    gemma_poll's drive loop drains the intake at the top of each
-    iteration. So a submit landing mid-prefill is picked up
-    microseconds later, no roundtrip cap.
+
+def _engine_driver_thread(loop: asyncio.AbstractEventLoop) -> None:
+    """Single-owner FFI driver thread. Lives for the process lifetime.
+    Tight-loops gemma_poll (long deadline; engine self-yields to drive
+    existing work without burning the deadline). Each productive CB
+    inside gemma_poll fans its updates to per-stream asyncio.Queues
+    via loop.call_soon_threadsafe.
+
+    HTTP handlers call gemma_submit on their own thread (asyncio loop
+    thread); the Swift-side gIntakeCond.signal wakes this thread out
+    of cond_wait if engine was idle, so cold-start latency is
+    cond-signal speed (microseconds), not the deadline.
     """
-    while True:
+    print("[engine_driver] thread started "
+          f"(poll_deadline={_DRIVER_POLL_DEADLINE_MS}ms)", flush=True)
+    iters = 0
+    while not _engine_thread_stop.is_set():
         try:
-            # Block on the first item, then drain everything else
-            # already in the queue so we batch when possible (engine's
-            # in-batch shared-prefix leader/follower detection lives
-            # inside gemma_submit's intake encoding).
-            first = await _submit_q.get()
-            specs = [first]
-            try:
-                while True:
-                    specs.append(_submit_q.get_nowait())
-            except asyncio.QueueEmpty:
-                pass
-            rc = await asyncio.to_thread(g.submit, specs)
-            if rc != 0:
-                print(f"[submit_pump] submit returned {rc}", flush=True)
-        except asyncio.CancelledError:
-            return
+            updates = g.poll(_DRIVER_POLL_DEADLINE_MS)
+            iters += 1
+            if updates:
+                for u in updates:
+                    _push_update_threadsafe(loop, u)
         except Exception as e:
-            print(f"[submit_pump] error: {e}", flush=True)
-            await asyncio.sleep(0.05)
-
-
-async def _poll_pump() -> None:
-    """Drive the engine via gemma_poll; fan updates to per-stream queues.
-
-    The Swift-side gemma_poll is now work-conserving: it runs prefill
-    chunks back-to-back at engine speed, breaks ONLY on update emission
-    or true idle. The timeout we pass (100ms) gates how long it
-    cond_waits for new intake when truly idle — never how long it
-    drives existing work.
-    """
-    while True:
-        try:
-            updates = await asyncio.to_thread(g.poll, 100)
-            for u in updates:
-                rq = _response_qs.get(u.stream_id)
-                if rq is not None:
-                    await rq.put(u)
-        except asyncio.CancelledError:
-            return
-        except Exception as e:
-            print(f"[poll_pump] error: {e}", flush=True)
-            await asyncio.sleep(0.05)
+            print(f"[engine_driver] error iter={iters}: {e}", flush=True)
+            _engine_thread_stop.wait(timeout=0.05)
+    print(f"[engine_driver] exiting after {iters} iterations", flush=True)
 
 
 # ----------------------------------------------------------------------
@@ -312,7 +330,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def _startup() -> None:
-    global _submit_q, _next_stream_id_lock, _coord_task
+    global _next_stream_id_lock
 
     if not GGUF_PATH or not Path(GGUF_PATH).exists():
         raise RuntimeError(
@@ -372,27 +390,36 @@ async def _startup() -> None:
     print(f"[bridge] chat-template end-of-turn tokens: {_TURN_END_TOKENS} "
           f"(<end_of_turn>)", flush=True)
 
-    _submit_q = asyncio.Queue()
-    global _submit_pump_task, _poll_pump_task
     _next_stream_id_lock = asyncio.Lock()
-    _submit_pump_task = asyncio.create_task(_submit_pump())
-    _poll_pump_task = asyncio.create_task(_poll_pump())
+
+    # 2026-05-07: spawn the native FFI driver thread. This replaces
+    # the old _submit_pump + _poll_pump asyncio tasks. HTTP handlers
+    # call g.submit() directly (thread-safe via gIntakeCond); the
+    # driver thread tight-loops g.poll() and fans updates via
+    # loop.call_soon_threadsafe. No to_thread overhead on the hot path.
+    global _engine_thread, _engine_loop
+    _engine_loop = asyncio.get_running_loop()
+    _engine_thread_stop.clear()
+    _engine_thread = threading.Thread(
+        target=_engine_driver_thread, args=(_engine_loop,),
+        name="gemma-engine-driver", daemon=True)
+    _engine_thread.start()
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    global _submit_pump_task, _poll_pump_task
-    for name, task in [
-        ("submit_pump", _submit_pump_task),
-        ("poll_pump", _poll_pump_task),
-    ]:
-        if task is None:
-            continue
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    global _engine_thread
+    _engine_thread_stop.set()
+    if _engine_thread is not None:
+        # Driver thread loops until stop flag is set; gemma_poll's
+        # built-in deadline (_DRIVER_POLL_DEADLINE_MS, default 1s)
+        # bounds the wait if it's currently inside a cond_wait.
+        _engine_thread.join(timeout=2.0)
+        if _engine_thread.is_alive():
+            print("[bridge] engine_driver did not exit within 2s "
+                  "of shutdown signal; continuing shutdown anyway",
+                  flush=True)
+        _engine_thread = None
     g.shutdown()
 
 
@@ -535,7 +562,16 @@ async def chat_completions(req: Request) -> Any:
     # stateless across requests; the engine's page-cache is the only
     # cross-request memory and operates without client-side coupling.
 
-    await _submit_q.put(spec)
+    # Direct gemma_submit. Thread-safe via Swift-side gIntakeCond
+    # (briefly takes that lock, appends to gIntakeQueue, signals,
+    # unlocks — microseconds). The signal wakes the engine_driver
+    # thread if it's currently in gemma_poll's cond_wait branch
+    # (engine-idle), so cold-start submission latency is signal
+    # speed, not the driver's poll deadline.
+    rc = g.submit([spec])
+    if rc != 0:
+        _response_qs.pop(stream_id, None)
+        raise HTTPException(500, f"engine submit failed: rc={rc}")
 
     if not stream:
         # Aggregate path: handler awaits the entire response, so handler-
@@ -620,7 +656,7 @@ async def chat_completions(req: Request) -> Any:
             if not clean_close_aggregate:
                 cancel_spec = g.StreamSpec(stream_id=stream_id, action=2)
                 try:
-                    await _submit_q.put(cancel_spec)
+                    g.submit([cancel_spec])
                 except Exception:
                     pass
             _response_qs.pop(stream_id, None)
@@ -717,7 +753,7 @@ async def chat_completions(req: Request) -> Any:
             if not clean_close:
                 cancel_spec = g.StreamSpec(stream_id=stream_id, action=2)
                 try:
-                    await _submit_q.put(cancel_spec)
+                    g.submit([cancel_spec])
                 except Exception:
                     pass
             _response_qs.pop(stream_id, None)
