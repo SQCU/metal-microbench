@@ -2417,27 +2417,38 @@ final class LmEngine {
         let nSoft = softBusy.count
         let nText = textPrefillBusy.count
 
-        // Throughput-prefer-AR: when nAR >= 2 and prefill is single-slot,
-        // running prefill stalls all the AR-ready slots for one CB to
-        // gain only one slot's prefill progress. Net throughput loss.
-        // Run AR; the single-slot prefill waits one CB.
-        if nAR >= 2 && nSoft <= 1 && nText <= 1 {
-            sched_arCount += 1
-            return .arStep
-        }
+        // 2026-05-07: rewrote path selection to ALWAYS prefer prefill
+        // over AR when any session is priming. Previously the rule was
+        // "max wins" — pick whichever category (soft/text/AR) has more
+        // slots. With nAR=7 and nText=1, that picked AR, which then
+        // silenced the 1 priming session's slot for prompt_len AR
+        // ticks via popArPrimingToken (slot runs kernel with the
+        // prompt token loaded; sampled output discarded). For a
+        // 76-token prompt, that's 76 silenced AR ticks for that slot
+        // — a ~10% throughput loss per fresh-session admission.
+        //
+        // Single-slot prefill IS more expensive in the moment (1 CB
+        // of all-8-slots silenced for prefill vs 1 CB of 7 AR + 1
+        // silenced for AR-priming), but saves prompt_len-1 silenced
+        // slot-ticks afterwards. For any prompt_len > 1 it wins; the
+        // sched_sim_token D1 sweep confirmed +4-5% steady-state win
+        // for "always prefill" over "max wins".
+        //
+        // Order: soft > text > AR. Within soft/text, multi if ≥ 2
+        // priming, else single.
 
-        let maxCount = max(nSoft, max(nText, nAR))
-        if maxCount == 0 { return .idle }
-        if nSoft == maxCount {
-            if nSoft >= 2 { sched_softMultiCount += 1; return .softMultiPrefill(softBusy) }
-            sched_softSingleCount += 1
-            return .softSinglePrefill(softBusy[0])
-        }
-        if nText == maxCount {
-            if nText >= 2 { sched_textMultiCount += 1; return .textMultiPrefill(textPrefillBusy) }
-            sched_textSingleCount += 1
-            return .textSinglePrefill(textPrefillBusy[0])
-        }
+        // Soft (image) prefill takes priority — image tokens can't
+        // be AR-primed, so any soft chunk MUST go through prefill.
+        if nSoft >= 2 { sched_softMultiCount += 1; return .softMultiPrefill(softBusy) }
+        if nSoft == 1 { sched_softSingleCount += 1; return .softSinglePrefill(softBusy[0]) }
+        // Text prefill: any priming session with a multi-token chunk
+        // wins over AR. The 1-CB silencing cost during single-slot
+        // prefill is outweighed by avoiding prompt_len ticks of slot-
+        // silencing during AR-priming.
+        if nText >= 2 { sched_textMultiCount += 1; return .textMultiPrefill(textPrefillBusy) }
+        if nText == 1 { sched_textSingleCount += 1; return .textSinglePrefill(textPrefillBusy[0]) }
+        // No priming work — pure AR step.
+        if nAR == 0 { return .idle }
         sched_arCount += 1
         return .arStep
     }
