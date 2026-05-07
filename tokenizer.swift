@@ -33,6 +33,12 @@ struct GemmaBpe {
     let eosId: UInt32
     let unkId: UInt32
     let addBos: Bool
+    // 2026-05-07: pre-computed UTF-8 byte payload per token. Built once
+    // at init; tokenBytes(_:) just reads from this table. Avoids the
+    // 3-allocs-per-call (replacingOccurrences + Array(s.utf8) + return)
+    // hot loop pattern in cotMask, which iterates all VOCAB=262,144
+    // tokens per CoT-active sampling tick.
+    let tokenBytesTable: [[UInt8]]
 
     init(weights: LmWeights, unkId: UInt32 = 3) {
         self.vocab = weights.vocabTokens
@@ -60,6 +66,30 @@ struct GemmaBpe {
             nested[a, default: [:]][b] = rank
         }
         self.mergeRankByFirst = nested
+
+        // Build the tokenBytes lookup table. One pass over vocab.
+        var table: [[UInt8]] = []
+        table.reserveCapacity(vocab.count)
+        let underscoreBar = "▁"
+        for s in vocab {
+            // Empty entries: no byte payload.
+            if s.isEmpty { table.append([]); continue }
+            // Byte token "<0xHH>" → single byte.
+            if s.count == 6, s.hasPrefix("<0x"), s.hasSuffix(">"),
+               let b = UInt8(s.dropFirst(3).dropLast(), radix: 16) {
+                table.append([b])
+                continue
+            }
+            // Special tokens: framing only, no byte payload.
+            if s.hasPrefix("<") && s.hasSuffix(">") && s.count > 2 {
+                table.append([])
+                continue
+            }
+            // Normal token: ▁ → space, then UTF-8 bytes.
+            let mapped = s.replacingOccurrences(of: underscoreBar, with: " ")
+            table.append(Array(mapped.utf8))
+        }
+        self.tokenBytesTable = table
     }
 
     // Encode a prompt into token IDs. When `addBos` is nil, the default from
@@ -118,46 +148,54 @@ struct GemmaBpe {
     // as a group so multi-byte characters don't fragment across tokens.
     // Special tokens (type-3/type-4 in GGUF) are rendered with their raw
     // vocab string so callers can see e.g. `<bos>` in debug output.
+    //
+    // 2026-05-07: rewrote to accumulate ALL output as UTF-8 bytes, then
+    // build the final String once at the end. The previous version did
+    // `out += t.replacingOccurrences(of: "▁", with: " ")` per normal
+    // token (= 1 String alloc + 1 String concat per token) and
+    // `out += s` per byte-run flush. For a 200-token completion that's
+    // ~400 String allocations per decode — noticeable per-request.
+    // The new version uses tokenBytesTable directly (built at init)
+    // and only constructs one String at the end.
     func decode(_ tokens: [UInt32], skipSpecial: Bool = false) -> String {
-        var out = ""
         var byteBuf: [UInt8] = []
-
-        func flushBytes() {
-            if byteBuf.isEmpty { return }
-            if let s = String(bytes: byteBuf, encoding: .utf8) {
-                out += s
-            } else {
-                // Replacement on invalid UTF-8 (rare — means model output
-                // was mid-codepoint and will finish on next step).
-                for b in byteBuf {
-                    out += String(format: "\\x%02X", b)
-                }
-            }
-            byteBuf.removeAll(keepingCapacity: true)
-        }
+        byteBuf.reserveCapacity(tokens.count * 4)   // typical ~3-4 UTF-8 bytes/token
 
         for id in tokens {
-            guard Int(id) < vocab.count else {
-                flushBytes(); out += "<oov:\(id)>"; continue
-            }
-            let t = vocab[Int(id)]
-            // Byte token <0xHH>: accumulate.
-            if t.count == 6, t.hasPrefix("<0x"), t.hasSuffix(">"),
-               let b = UInt8(t.dropFirst(3).dropLast(), radix: 16) {
-                byteBuf.append(b)
+            let i = Int(id)
+            guard i < vocab.count else {
+                // OOV: append literal "<oov:NNN>" bytes.
+                let s = "<oov:\(id)>"
+                byteBuf.append(contentsOf: s.utf8)
                 continue
             }
-            flushBytes()
+            let t = vocab[i]
             // Specials: <bos>, <eos>, <end_of_turn>, etc. — pass through
-            // unless caller wants them stripped.
-            if t.hasPrefix("<") && t.hasSuffix(">") && t.count > 2 {
-                if !skipSpecial { out += t }
+            // unless caller wants them stripped. tokenBytesTable[i] is
+            // empty for specials (by design), so we go through the raw
+            // vocab string here.
+            if t.hasPrefix("<") && t.hasSuffix(">") && t.count > 2
+               && !(t.count == 6 && t.hasPrefix("<0x")) {
+                if !skipSpecial { byteBuf.append(contentsOf: t.utf8) }
                 continue
             }
-            // Normal token: convert ▁ to space.
-            out += t.replacingOccurrences(of: "▁", with: " ")
+            // Byte token or normal token — both pre-resolved in tokenBytesTable.
+            byteBuf.append(contentsOf: tokenBytesTable[i])
         }
-        flushBytes()
+        // One String alloc at end, vs N during the loop.
+        if let s = String(bytes: byteBuf, encoding: .utf8) {
+            return s
+        }
+        // Fallback for invalid UTF-8: render each invalid byte as \xHH.
+        var out = ""
+        out.reserveCapacity(byteBuf.count)
+        for b in byteBuf {
+            if let scalar = Unicode.Scalar(UInt32(b)), b < 0x80 {
+                out.unicodeScalars.append(scalar)
+            } else {
+                out += String(format: "\\x%02X", b)
+            }
+        }
         return out
     }
 
@@ -176,21 +214,8 @@ struct GemmaBpe {
     //     contribute to output bytes; control-only)
     //   - normal tokens → UTF-8 bytes of (token with ▁ → ASCII space)
     func tokenBytes(_ id: UInt32) -> [UInt8] {
-        guard Int(id) < vocab.count else { return [] }
-        let t = vocab[Int(id)]
-        // Byte token <0xHH>.
-        if t.count == 6, t.hasPrefix("<0x"), t.hasSuffix(">"),
-           let b = UInt8(t.dropFirst(3).dropLast(), radix: 16) {
-            return [b]
-        }
-        // Special tokens contribute zero output bytes (they're framing,
-        // not content). decode() emits them visibly for debugging but
-        // for grammar masking they should be treated as empty.
-        if t.hasPrefix("<") && t.hasSuffix(">") && t.count > 2 {
-            return []
-        }
-        // Normal token: ▁ → space, then UTF-8 bytes.
-        let s = t.replacingOccurrences(of: "▁", with: " ")
-        return Array(s.utf8)
+        let i = Int(id)
+        guard i < tokenBytesTable.count else { return [] }
+        return tokenBytesTable[i]
     }
 }

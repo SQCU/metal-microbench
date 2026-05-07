@@ -243,7 +243,10 @@ private func decodeBatchRequest(_ buf: UnsafePointer<UInt8>, _ len: Int) throws 
                 guard cur + bc <= len else { throw DecodeError.truncated }
                 let raw = UnsafeBufferPointer(
                     start: buf.advanced(by: cur), count: bc)
-                if let s = String(bytes: Array(raw), encoding: .utf8) {
+                // Direct String init from UnsafeBufferPointer — skips
+                // the Array intermediate copy that the previous
+                // `String(bytes: Array(raw), ...)` paid.
+                if let s = String(bytes: raw, encoding: .utf8) {
                     cotLabels.append(s)
                 }
                 cur += bc
@@ -260,7 +263,8 @@ private func decodeBatchRequest(_ buf: UnsafePointer<UInt8>, _ len: Int) throws 
                 guard idOff + idBc <= len else { throw DecodeError.truncated }
                 let idRaw = UnsafeBufferPointer(
                     start: buf.advanced(by: idOff), count: idBc)
-                let id = String(bytes: Array(idRaw), encoding: .utf8) ?? ""
+                // Direct UnsafeBufferPointer init — no Array intermediate.
+                let id = String(bytes: idRaw, encoding: .utf8) ?? ""
                 cvs.append(DecodedCV(
                     cvecId: id,
                     layer: Int32(bitPattern: readU32(buf, off + 8)),
@@ -853,9 +857,16 @@ private func encodeBatchResponse(_ updates: [StreamUpdateOut]) -> Data {
 
 // ----------------------------------------------------------------------
 // Drain a session's pending tokens. Updates usage counters.
+//
+// 2026-05-07: pre-size with reserveCapacity to avoid Swift Array geometric
+// regrowth on append. Per-stream per-poll allocation; with 8 streams ×
+// ~12 polls/sec that's 96 small array allocs/sec — small individually
+// but adds up. The reserveCapacity hint at output-token-budget bound
+// prevents the first append from realloc'ing.
 // ----------------------------------------------------------------------
 private func drainSession(_ s: Session, sid: UInt64) -> [UInt32] {
     var out: [UInt32] = []
+    out.reserveCapacity(8)   // typical per-poll drain is 1-8 tokens
     while let t = s.nextToken() {
         out.append(t)
     }
@@ -1008,24 +1019,36 @@ public func gemma_poll(_ timeoutMs: Int32,
 
         // 2. Retry deferred starts (in-batch shared-prefix follower
         //    rule: a follower waits until its leader's session is past
-        //    prefill, then applies).
+        //    prefill, then applies). gDeferred is empty in default
+        //    operation (the LM_BATCH_SHARED_PREFIX_DEFERRAL gate is
+        //    off by default per the 2026-05-07 D2 falsification).
+        //    2026-05-07: snapshot the keys once into a stack-local
+        //    array only when gDeferred has entries; the previous
+        //    `Array(gDeferred.keys)` allocation ran every poll
+        //    iteration regardless of whether the dict had entries.
         if !gDeferred.isEmpty {
             let dbg = ProcessInfo.processInfo.environment["LM_BATCH_DEBUG"] != nil
-            for sid in Array(gDeferred.keys) {
-                guard let pending = gDeferred[sid] else { continue }
+            // Collect keys to apply in this pass; can't iterate the
+            // dict while mutating it (removeValue), so snapshot only
+            // the ready-to-apply keys instead of the full key set.
+            var readyKeys: [UInt64] = []
+            readyKeys.reserveCapacity(gDeferred.count)
+            for (sid, pending) in gDeferred {
                 let leaderReady: Bool
                 if let leader = gStreamToSession[pending.leaderStreamId] {
                     leaderReady = (leader.state == .generating || leader.state == .done)
                 } else {
                     leaderReady = true
                 }
-                if leaderReady {
-                    if dbg {
-                        print("  [batch] stream \(sid) follower applying — leader \(pending.leaderStreamId) ready")
-                    }
-                    applyStreamAction(pending.spec, engine: engine)
-                    gDeferred.removeValue(forKey: sid)
+                if leaderReady { readyKeys.append(sid) }
+            }
+            for sid in readyKeys {
+                guard let pending = gDeferred[sid] else { continue }
+                if dbg {
+                    print("  [batch] stream \(sid) follower applying — leader \(pending.leaderStreamId) ready")
                 }
+                applyStreamAction(pending.spec, engine: engine)
+                gDeferred.removeValue(forKey: sid)
             }
         }
 

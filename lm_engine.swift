@@ -1194,12 +1194,25 @@ final class LmEngine {
     // all B slots occupied when I have ≥B sessions ready?").
     private(set) var totalSlotTicks: Int = 0
 
+    // 2026-05-07: per-CB scratch to avoid heap-allocating 256 KB Swift
+    // Array<UInt32> + 65,536-element copy loops every single-slot /
+    // multi-slot / soft prefill (3 sites used to do this). Single CB at
+    // a time (gEngineLock serializes), so one scratch buffer suffices
+    // across all three prefill paths. Sized at engine init to
+    // B * MAX_PAGES_PER_SLOT * sizeof(UInt32) = 8 * 8192 * 4 = 256 KB.
+    // memcpy in/out instead of per-element loops.
+    private let _savedBTScratch: UnsafeMutablePointer<UInt32>
+    private let _savedBTScratchByteCount: Int
+
     init(weights: LmWeights) {
         self.weights = weights
         self.tokenizer = GemmaBpe(weights: weights)
         self.slotAssignment = Array(repeating: nil, count: B)
         self.pageManager = PageManager(numPhysPages: SCRATCH_PAGE_BASE,
                                         pageSize: PAGE_SLIDE)
+        self._savedBTScratchByteCount = B * MAX_PAGES_PER_SLOT * MemoryLayout<UInt32>.stride
+        self._savedBTScratch = UnsafeMutablePointer<UInt32>.allocate(
+            capacity: B * MAX_PAGES_PER_SLOT)
         // Pre-compute the structured-cot free-line mask once. ~5ms at
         // VOCAB=262144 — runs alongside model load, doesn't show up in
         // request hot path. Reused by every cot-enabled session.
@@ -1530,31 +1543,59 @@ final class LmEngine {
     // collisions can't happen since at any time only one CotState
     // exists per session id.
 
-    // Compute the mask for a CotState's CURRENT phase + cursor. Returns
-    // a [VOCAB] array where 0 = allowed, -INF = forbidden. Caller
-    // additively combines this with any user logit_bias (the
-    // sampling_logit_bias buffer is read by sample_token kernel as a
-    // pure additive bias — -INF saturates regardless of user bias).
-    private func cotMask(state: CotState) -> [Float] {
+    // Write the mask for a CotState's CURRENT phase + cursor directly
+    // to `dst` (a [VOCAB] Float pointer in the GPU sampling-bias buffer).
+    // 0 = allowed, -INF = forbidden. Caller additively combines with
+    // any user logit_bias (the sampling_logit_bias buffer is read by
+    // the sample_token kernel as a pure additive bias — -INF saturates
+    // regardless of user bias).
+    //
+    // 2026-05-07: rewrote to write directly into the GPU buffer instead
+    // of allocating a 1 MB Swift [Float] per call. The literal-phase
+    // path was the dominant thrasher: 262,144 floats × 4 bytes = 1 MB
+    // heap alloc per CoT-active slot per AR tick. At B=8 with 1 CoT
+    // slot, 12 AR ticks/sec, that's 12 MB/sec; at all 8 slots active,
+    // 96 MB/sec.
+    private func cotMask(state: CotState, dst: UnsafeMutablePointer<Float>) {
         let neg: Float = -.infinity
         guard let phase = state.phases.first else {
-            return [Float](repeating: 0, count: VOCAB)
+            // No active phase — clear to zero (allow all).
+            memset(dst, 0, VOCAB * MemoryLayout<Float>.stride)
+            return
         }
         switch phase {
         case .literal(let bytes):
-            let remaining = Array(bytes[state.literalCursor...])
-            var m = [Float](repeating: neg, count: VOCAB)
+            // Fill with -INF, then mark allowed tokens with 0.
+            // memset_pattern4 would be ideal but Foundation's Darwin
+            // memset_pattern4 is the way; fall back to a tight loop
+            // if it's unavailable.
+            var negPattern: Float = neg
+            withUnsafePointer(to: &negPattern) { p in
+                memset_pattern4(dst, p, VOCAB * MemoryLayout<Float>.stride)
+            }
+            // Iterate over the suffix of literal bytes we still owe.
+            // No Array allocation: bytes[state.literalCursor...] is a
+            // SubSequence we use directly via `dropFirst` semantics.
+            let cursor = state.literalCursor
+            let bytesEnd = bytes.count
             for v in 0..<VOCAB {
                 let tBytes = tokenizer.tokenBytes(UInt32(v))
                 if tBytes.isEmpty { continue }
-                if tBytes.count <= remaining.count
-                   && remaining.prefix(tBytes.count).elementsEqual(tBytes) {
-                    m[v] = 0
+                let need = tBytes.count
+                if cursor + need > bytesEnd { continue }
+                // Manual prefix-equality without slicing/Array.
+                var ok = true
+                for i in 0..<need {
+                    if bytes[cursor + i] != tBytes[i] { ok = false; break }
                 }
+                if ok { dst[v] = 0 }
             }
-            return m
         case .freeLine:
-            return freeLineMask
+            // freeLineMask is a one-time-built [Float]; copy via
+            // memcpy with the underlying buffer pointer.
+            freeLineMask.withUnsafeBufferPointer { src in
+                memcpy(dst, src.baseAddress, VOCAB * MemoryLayout<Float>.stride)
+            }
         }
     }
 
@@ -1597,10 +1638,8 @@ final class LmEngine {
                 //   2. Else if user has dense logit_bias, memcpy that.
                 //   3. Else clear bias if dirty.
                 if let cot = s.cot {
-                    let mask = cotMask(state: cot)
-                    mask.withUnsafeBufferPointer { src in
-                        memcpy(biasRow, src.baseAddress, VOCAB * 4)
-                    }
+                    // Direct-to-GPU-buffer write (no [Float] allocation).
+                    cotMask(state: cot, dst: biasRow)
                     // If user ALSO has dense bias, add it on top
                     // (componentwise) so allowed tokens carry the user's
                     // preferences while forbidden ones stay -INF.
@@ -2095,7 +2134,8 @@ final class LmEngine {
         let sslot: Int
         let thisTile: Int
         let remaining: Int
-        let savedBT: [UInt32]
+        // savedBT is now in engine._savedBTScratch (single CB at a time
+        // means one scratch suffices). finalize memcpys back from there.
         let head: PrimingChunk
     }
 
@@ -2132,9 +2172,14 @@ final class LmEngine {
         // Restoration runs in finalize after the GPU CB completes. The kernel
         // reads block_table during execution, so restoration cannot happen
         // before completion.
+        //
+        // 2026-05-07: pre-allocated engine._savedBTScratch + memcpy
+        // replaces the per-CB Swift Array allocation (256 KB heap
+        // alloc per single-slot prefill) and 65,536-element copy
+        // loop. Single CB-at-a-time invariant means one scratch
+        // suffices across all prefill paths.
         let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
-        var savedBT = [UInt32](repeating: 0, count: B * MAX_PAGES_PER_SLOT)
-        for i in 0..<(B * MAX_PAGES_PER_SLOT) { savedBT[i] = btP[i] }
+        memcpy(_savedBTScratch, btP, _savedBTScratchByteCount)
         for slot in 0..<B where slot != sslot {
             // All silenced slots redirect every logical page to the scratch
             // strip. Silenced slots write garbage that gets discarded; same
@@ -2281,7 +2326,7 @@ final class LmEngine {
                                  skipUnembed: !isLastPrefillTick)
         return PreparedSinglePrefill(cb: cb, t0: t0, session: s, sslot: sslot,
                                       thisTile: thisTile, remaining: remaining,
-                                      savedBT: savedBT, head: head)
+                                      head: head)
     }
 
     @discardableResult
@@ -2291,8 +2336,9 @@ final class LmEngine {
         if let err = p.cb.error { print("  GPU prefill error: \(err)"); return false }
 
         // Restore block_table now that the kernel has finished reading it.
+        // Source: engine._savedBTScratch (memcpy'd in at prepare time).
         let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
-        for i in 0..<(B * MAX_PAGES_PER_SLOT) { btP[i] = p.savedBT[i] }
+        memcpy(btP, _savedBTScratch, _savedBTScratchByteCount)
 
         let s = p.session
         // --- Advance session state by thisTile positions. GPU blit
@@ -2578,7 +2624,8 @@ final class LmEngine {
     struct PreparedMultiPrefill {
         let cb: MTLCommandBuffer
         let qLen: Int
-        let savedBT: [UInt32]
+        // savedBT lives in engine._savedBTScratch (single-CB-at-a-time);
+        // see PreparedSinglePrefill comment.
         let slotSession: [Session?]
         let slotTokens: [[UInt32]]
     }
@@ -2600,7 +2647,11 @@ final class LmEngine {
 
     func prepareMultiSlotPrefill(_ sessions: [Session]) -> PreparedMultiPrefill? {
         runAdmissionPass()
-        // Gather each busy slot's priming session + chunk.
+        // Gather each busy slot's priming session + chunk. Per-CB
+        // [Session?]/[[UInt32]] arrays are 8 elements each (~tens of
+        // bytes) — kept as fresh allocs because Swift's Copy-on-Write
+        // would copy them anyway on `return PreparedMultiPrefill(...,
+        // slotSession: ...)` capture.
         var slotSession: [Session?] = Array(repeating: nil, count: B)
         var slotTokens: [[UInt32]] = Array(repeating: [], count: B)
         for s in sessions {
@@ -2622,9 +2673,12 @@ final class LmEngine {
 
         // Each participating slot: ensure pages + install real block_table.
         // Restoration happens in finalize, after the GPU has read block_table.
+        // 2026-05-07: memcpy into engine._savedBTScratch replaces the
+        // per-CB 256 KB Swift Array<UInt32> heap alloc + 65,536-element
+        // copy loop. This was THE big thrasher (3 prefill paths × every
+        // CB × 256 KB).
         let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
-        var savedBT = [UInt32](repeating: 0, count: B * MAX_PAGES_PER_SLOT)
-        for i in 0..<(B * MAX_PAGES_PER_SLOT) { savedBT[i] = btP[i] }
+        memcpy(_savedBTScratch, btP, _savedBTScratchByteCount)
         for b in 0..<B {
             if let s = slotSession[b] {
                 installPendingPrefixKVIfAny(s)
@@ -2742,7 +2796,7 @@ final class LmEngine {
         }
         let cb = buildPrefillCB(weights, qLen: qLen, skipEmbed: false,
                                  skipUnembed: !anyOnFinalTick)
-        return PreparedMultiPrefill(cb: cb, qLen: qLen, savedBT: savedBT,
+        return PreparedMultiPrefill(cb: cb, qLen: qLen,
                                      slotSession: slotSession, slotTokens: slotTokens)
     }
 
@@ -2752,8 +2806,9 @@ final class LmEngine {
         if let err = p.cb.error { print("  GPU multi-prefill error: \(err)"); return false }
 
         // Restore block_table now that the kernel has finished reading it.
+        // Source: engine._savedBTScratch (memcpy'd in at prepare time).
         let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
-        for i in 0..<(B * MAX_PAGES_PER_SLOT) { btP[i] = p.savedBT[i] }
+        memcpy(btP, _savedBTScratch, _savedBTScratchByteCount)
 
         // Per-slot: advance position, pop chunk, promote pages. GPU
         // blit inside buildPrefillCB already copied final-Q-row logits
@@ -2812,7 +2867,8 @@ final class LmEngine {
     struct PreparedSoftPrefill {
         let cb: MTLCommandBuffer
         let qLen: Int
-        let savedBT: [UInt32]
+        // savedBT lives in engine._savedBTScratch (single-CB-at-a-time);
+        // see PreparedSinglePrefill comment.
         let slotSoft: [Int: SoftRef]
     }
 
@@ -2844,9 +2900,10 @@ final class LmEngine {
         // Install real block_table entries for participating slots; silence
         // the rest by redirecting their pages to the scratch strip.
         // block_table restoration runs in finalize.
+        // 2026-05-07: memcpy into engine._savedBTScratch — see other
+        // prefill paths for rationale.
         let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
-        var savedBT = [UInt32](repeating: 0, count: B * MAX_PAGES_PER_SLOT)
-        for i in 0..<(B * MAX_PAGES_PER_SLOT) { savedBT[i] = btP[i] }
+        memcpy(_savedBTScratch, btP, _savedBTScratchByteCount)
         for b in 0..<B {
             if let sr = slotSoft[b] {
                 if !ensurePages(sr.session, forKLen: sr.session.position + qLen + 1) { return nil }
@@ -2932,7 +2989,7 @@ final class LmEngine {
         }
         let cb = buildPrefillCB(weights, qLen: qLen, skipEmbed: true,
                                  skipUnembed: !anyOnFinalTick)
-        return PreparedSoftPrefill(cb: cb, qLen: qLen, savedBT: savedBT, slotSoft: slotSoft)
+        return PreparedSoftPrefill(cb: cb, qLen: qLen, slotSoft: slotSoft)
     }
 
     @discardableResult
@@ -2941,8 +2998,9 @@ final class LmEngine {
         if let err = p.cb.error { print("  GPU multi-soft-prefill error: \(err)"); return false }
 
         // Restore block_table now that the kernel has finished reading it.
+        // Source: engine._savedBTScratch (memcpy'd in at prepare time).
         let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
-        for i in 0..<(B * MAX_PAGES_PER_SLOT) { btP[i] = p.savedBT[i] }
+        memcpy(btP, _savedBTScratch, _savedBTScratchByteCount)
 
         // Per-slot: advance position, promote pages, advance chunk
         // state. Final-Q-row logit copy is done on-GPU by the prefill

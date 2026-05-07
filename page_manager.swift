@@ -103,6 +103,15 @@ final class PageManager {
     private var pages: [PageInfo]
     // Free list of phys pages with refcount==0. LIFO (cache-warm reuse).
     private var freeList: [Int] = []
+    // 2026-05-07: parallel index map for O(1) removal from freeList by
+    // physPage value. Previous shareExisting used `freeList.firstIndex(of:)`
+    // which was O(|freeList|) — at numPoolPages=8192 with 10 page adoptions
+    // per session admission, that was 80K linear ops per admission. With
+    // freeListPos[physPage] = currentIndexInFreeList, both removal paths
+    // (allocFresh's `remove(at:)` and shareExisting's `firstIndex(of:)
+    // + remove(at:)`) become O(1) via the swap-with-last-and-pop helper
+    // freeListPop(at:).
+    private var freeListPos: [Int: Int] = [:]
     // contentIndex[contentHash] = pair of phys pages carrying the
     // 16-token slide-page's data in both cache layouts. See the
     // PageInfo header for why sharing has to be a pair.
@@ -132,6 +141,35 @@ final class PageManager {
         // Free list spans only the pool range. Push in reverse so the
         // lowest-indexed pool page pops first (cache-warm-friendly).
         self.freeList = Array((basePage..<(basePage + poolCount)).reversed())
+        // Build the position-tracking map (parallel structure for O(1)
+        // freeList membership lookups + swap-and-pop removal).
+        self.freeListPos.reserveCapacity(self.freeList.count)
+        for (i, phys) in self.freeList.enumerated() {
+            self.freeListPos[phys] = i
+        }
+    }
+
+    // O(1) removal from `freeList` at a known index. Uses the
+    // swap-with-last-then-pop pattern so removal doesn't shift the
+    // tail; freeListPos for the swapped element is updated. Caller is
+    // responsible for clearing freeListPos for the removed value.
+    private func freeListPop(at idx: Int) -> Int {
+        let last = freeList.count - 1
+        let removed = freeList[idx]
+        if idx != last {
+            let movedPhys = freeList[last]
+            freeList[idx] = movedPhys
+            freeListPos[movedPhys] = idx
+        }
+        freeList.removeLast()
+        freeListPos.removeValue(forKey: removed)
+        return removed
+    }
+
+    // O(1) push onto freeList with position-tracking maintained.
+    private func freeListPush(_ phys: Int) {
+        freeListPos[phys] = freeList.count
+        freeList.append(phys)
     }
 
     // FNV-1a over a page's token IDs, optionally mixed with a cvec-state
@@ -205,7 +243,7 @@ final class PageManager {
         let phys: Int
         if let pick = bestUncached {
             // Pop the LRU-oldest uncached page. No hash to drop.
-            phys = freeList.remove(at: pick.idx)
+            phys = freeListPop(at: pick.idx)
         } else {
             // Forced eviction: free list is all-cached. Pick LRU-oldest
             // cached entry and drop its hash.
@@ -217,7 +255,7 @@ final class PageManager {
                 }
             }
             let pick = oldest!  // freeList non-empty guaranteed above
-            phys = freeList.remove(at: pick.idx)
+            phys = freeListPop(at: pick.idx)
             // Drop the now-orphaned content hash + its pair.
             var p = pages[phys]
             if let h = p.contentHash {
@@ -253,8 +291,11 @@ final class PageManager {
         if p.owners.isEmpty {
             // Page is in free list but still has valid content. Pull it
             // back out before handing out to this session.
-            if let idx = freeList.firstIndex(of: physPage) {
-                freeList.remove(at: idx)
+            // 2026-05-07: O(1) lookup via freeListPos parallel map +
+            // swap-with-last-and-pop, replacing the previous
+            // O(|freeList|) `freeList.firstIndex(of: physPage)` scan.
+            if let idx = freeListPos[physPage] {
+                _ = freeListPop(at: idx)
             }
         }
         p.owners.insert(sessionId)
@@ -305,7 +346,7 @@ final class PageManager {
         }
         p.owners.remove(sessionId)
         if p.owners.isEmpty {
-            freeList.append(physPage)
+            freeListPush(physPage)
             // Do NOT drop contentHash here — leave it for potential reuse.
         }
         pages[physPage] = p
