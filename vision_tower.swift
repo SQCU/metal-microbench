@@ -907,6 +907,90 @@ func dumpFp16(_ buf: MTLBuffer, _ label: String, count: Int = 8, stride: Int = 0
 // _core encodes all vision work into a single command buffer but does not
 // commit or wait. Two public wrappers call it: the sync variant commits
 // and waits before returning; the async variant commits and returns the
+// 2026-05-07: vision scratch pool — eliminates per-call alloc of 11 BN-
+// scaled MTLBuffers + 2 nPooled-scaled per-image scratch buffers
+// (~42 MB+ of fresh allocations per vision call). Vision CBs serialize
+// (gVisionBatchInFlight gate in ffi.swift), so a single pool is safe;
+// buffers grow on high-water-mark demand and never shrink.
+//
+// What's POOLED:
+//   - 11 BN-scaled buffers: posY, posX, paddingMask, patches, x, tmp,
+//     q, k, v, attnOut, mlpOutB, postNormFp32
+//   - 2 BN-scaled fp32-interm buffers: gateAct, upAct
+//   - 2 per-image-pooled scratch: pooled, stdNormed (reused across
+//     images within one CB; later images overwrite earlier images'
+//     pooled/stdNormed contents AFTER the GPU has consumed them
+//     into per-image softTokens — Metal's serial command-queue
+//     ordering enforces the read-before-write dependency)
+//
+// What's NOT POOLED:
+//   - softTokens (returned to caller, must outlive the CB; one
+//     fresh allocation per image. This is the only per-vision-call
+//     alloc that survives — and it's what the cache holds onto.)
+private final class VisionScratchPool {
+    var posYBuf: MTLBuffer!
+    var posXBuf: MTLBuffer!
+    var paddingMaskBuf: MTLBuffer!
+    var patchesBuf: MTLBuffer!
+    var x: MTLBuffer!
+    var tmp: MTLBuffer!
+    var qBuf: MTLBuffer!
+    var kBuf: MTLBuffer!
+    var vBuf: MTLBuffer!
+    var attnOut: MTLBuffer!
+    var gateAct: MTLBuffer!
+    var upAct: MTLBuffer!
+    var mlpOutB: MTLBuffer!
+    var postNormFp32: MTLBuffer!
+    var pooled: MTLBuffer!
+    var stdNormed: MTLBuffer!
+
+    private var capBN: Int = 0
+    private var capH: Int = 0
+    private var capInterm: Int = 0
+    private var capNPooled: Int = 0
+
+    func ensure(BN: Int, h: Int, interm: Int, maxNPooled: Int,
+                 device: MTLDevice) {
+        // Buffers scaling with BN-only (size depends on B*N).
+        if BN > capBN {
+            posYBuf        = device.makeBuffer(length: BN * 4,    options: .storageModeShared)!
+            posXBuf        = device.makeBuffer(length: BN * 4,    options: .storageModeShared)!
+            paddingMaskBuf = device.makeBuffer(length: BN,        options: .storageModeShared)!
+            patchesBuf     = device.makeBuffer(length: BN * 768 * 2, options: .storageModeShared)!
+            capBN = BN
+        }
+        // Buffers scaling with BN*h (resize on either growth).
+        if BN > capBN || h != capH {
+            x            = device.makeBuffer(length: BN * h * 4, options: .storageModeShared)!
+            tmp          = device.makeBuffer(length: BN * h * 4, options: .storageModeShared)!
+            qBuf         = device.makeBuffer(length: BN * h * 4, options: .storageModeShared)!
+            kBuf         = device.makeBuffer(length: BN * h * 4, options: .storageModeShared)!
+            vBuf         = device.makeBuffer(length: BN * h * 4, options: .storageModeShared)!
+            attnOut      = device.makeBuffer(length: BN * h * 4, options: .storageModeShared)!
+            mlpOutB      = device.makeBuffer(length: BN * h * 4, options: .storageModeShared)!
+            postNormFp32 = device.makeBuffer(length: BN * h * 4, options: .storageModeShared)!
+            capH = h
+        }
+        // Buffers scaling with BN*interm.
+        if BN > capBN || interm != capInterm {
+            gateAct = device.makeBuffer(length: BN * interm * 4, options: .storageModeShared)!
+            upAct   = device.makeBuffer(length: BN * interm * 4, options: .storageModeShared)!
+            capInterm = interm
+        }
+        // Buffers scaling with maxNPooled*h (per-image pooled scratch).
+        if maxNPooled > capNPooled || h != capH {
+            pooled    = device.makeBuffer(length: maxNPooled * h * 4, options: .storageModeShared)!
+            stdNormed = device.makeBuffer(length: maxNPooled * h * 4, options: .storageModeShared)!
+            capNPooled = maxNPooled
+        }
+        // Update capBN last (used by the multi-conditional checks above).
+        capBN = max(capBN, BN)
+    }
+}
+
+private let _gVisionScratchPool = VisionScratchPool()
+
 // CB so the caller can wait lazily while other queues proceed.
 private func _runVisionTowerBatchForwardCore(batches: [PatchBatch], weights: VisionWeights,
                                                device: MTLDevice, queue: MTLCommandQueue)
@@ -920,11 +1004,37 @@ private func _runVisionTowerBatchForwardCore(batches: [PatchBatch], weights: Vis
     let interm = weights.interm
     let BN = B * N
 
+    // Compute the max nPooled across this batch's images (used to size
+    // the pooled/stdNormed scratch). For a batch of mixed image sizes,
+    // the larger ones drive the cap.
+    var maxNPooled = 0
+    for batch in batches {
+        let p = (batch.gridH / 3) * (batch.gridW / 3)
+        if p > maxNPooled { maxNPooled = p }
+    }
+    // Resize-or-reuse the scratch pool. Sized for high-water-mark BN /
+    // maxNPooled across the lifetime of the process; never shrinks.
+    // Saves ~42 MB of per-call MTLBuffer creation churn that the codex
+    // audit identified as 11+ buffers per vision call.
+    _gVisionScratchPool.ensure(BN: BN, h: h, interm: interm,
+                                maxNPooled: maxNPooled, device: device)
+    let posYBuf        = _gVisionScratchPool.posYBuf!
+    let posXBuf        = _gVisionScratchPool.posXBuf!
+    let paddingMaskBuf = _gVisionScratchPool.paddingMaskBuf!
+    let patchesBuf     = _gVisionScratchPool.patchesBuf!
+    let x              = _gVisionScratchPool.x!
+    let tmp            = _gVisionScratchPool.tmp!
+    let qBuf           = _gVisionScratchPool.qBuf!
+    let kBuf           = _gVisionScratchPool.kBuf!
+    let vBuf           = _gVisionScratchPool.vBuf!
+    let attnOut        = _gVisionScratchPool.attnOut!
+    let gateAct        = _gVisionScratchPool.gateAct!
+    let upAct          = _gVisionScratchPool.upAct!
+    let mlpOutB        = _gVisionScratchPool.mlpOutB!
+    let postNormFp32   = _gVisionScratchPool.postNormFp32!
+
     // Per-image: positions, padding mask — concatenated into flat [B*N] buffers
     // so per-row kernels walk the whole batch in one dispatch.
-    let posYBuf = device.makeBuffer(length: BN * 4, options: .storageModeShared)!
-    let posXBuf = device.makeBuffer(length: BN * 4, options: .storageModeShared)!
-    let paddingMaskBuf = device.makeBuffer(length: BN, options: .storageModeShared)!
     let pyp = posYBuf.contents().assumingMemoryBound(to: UInt32.self)
     let pxp = posXBuf.contents().assumingMemoryBound(to: UInt32.self)
     let pmp = paddingMaskBuf.contents().assumingMemoryBound(to: UInt8.self)
@@ -938,23 +1048,10 @@ private func _runVisionTowerBatchForwardCore(batches: [PatchBatch], weights: Vis
     }
 
     // Concat patches — each image's [N, 768] fp16 into one [BN, 768] fp16.
-    let patchesBuf = device.makeBuffer(length: BN * 768 * 2, options: .storageModeShared)!
     for (b, batch) in batches.enumerated() {
         let dst = patchesBuf.contents().advanced(by: b * N * 768 * 2)
         memcpy(dst, batch.patches.contents(), N * 768 * 2)
     }
-
-    // Batched working buffers: all per-row state at [BN, ...] layout.
-    let x       = device.makeBuffer(length: BN * h * 4, options: .storageModeShared)!
-    let tmp     = device.makeBuffer(length: BN * h * 4, options: .storageModeShared)!
-    let qBuf    = device.makeBuffer(length: BN * h * 4, options: .storageModeShared)!
-    let kBuf    = device.makeBuffer(length: BN * h * 4, options: .storageModeShared)!
-    let vBuf    = device.makeBuffer(length: BN * h * 4, options: .storageModeShared)!
-    let attnOut = device.makeBuffer(length: BN * h * 4, options: .storageModeShared)!
-    let gateAct = device.makeBuffer(length: BN * interm * 4, options: .storageModeShared)!
-    let upAct   = device.makeBuffer(length: BN * interm * 4, options: .storageModeShared)!
-    let mlpOutB = device.makeBuffer(length: BN * h * 4, options: .storageModeShared)!
-    let postNormFp32 = device.makeBuffer(length: BN * h * 4, options: .storageModeShared)!
 
     // Single CB for the whole batched forward.
     let cb = queue.makeCommandBuffer()!
@@ -1035,8 +1132,15 @@ private func _runVisionTowerBatchForwardCore(batches: [PatchBatch], weights: Vis
     for (b, batch) in batches.enumerated() {
         let outH = batch.gridH / 3, outW = batch.gridW / 3
         let nPooled = outH * outW
-        let pooled    = device.makeBuffer(length: nPooled * h * 4, options: .storageModeShared)!
-        let stdNormed = device.makeBuffer(length: nPooled * h * 4, options: .storageModeShared)!
+        // pooled + stdNormed reused from the pool (sized to max nPooled).
+        // Earlier images' contents are overwritten by later ones; Metal's
+        // serial command-queue ordering guarantees the GPU has consumed
+        // image_a's pooled/stdNormed into image_a's softTokens BEFORE the
+        // image_b encoder dispatches that overwrite begin executing.
+        let pooled    = _gVisionScratchPool.pooled!
+        let stdNormed = _gVisionScratchPool.stdNormed!
+        // softTokens IS returned to the caller (consumed by LM as a
+        // prompt segment / cached in gVisionCache); cannot be pooled.
         let softTokens = device.makeBuffer(length: nPooled * weights.textHidden * 4, options: .storageModeShared)!
 
         // Pool with per-image grid, reading from x at offset.
