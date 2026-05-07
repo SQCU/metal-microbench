@@ -1423,6 +1423,13 @@ final class LmEngine {
     // Admission pass: evict slots whose session no longer wants one, admit
     // ready-but-unslotted residents into free slots round-robin. Grows
     // owned pages + installs block_table entries for freshly-admitted sessions.
+    // Public wrapper so the bridge can run admission before populating
+    // per-slot state (e.g. gpu_capture_active for logprob extraction).
+    // 2026-05-07: needed because the bridge's gCaptureLogits → gpu_capture_active
+    // populate happens BEFORE syncTickStep, and freshly-admitted sessions
+    // don't have s.slot assigned until tick()'s internal admission pass.
+    func runAdmissionPassPublic() { runAdmissionPass() }
+
     private func runAdmissionPass() {
         for slot in 0..<B {
             if let sid = slotAssignment[slot],

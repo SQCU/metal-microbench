@@ -42,6 +42,8 @@ struct ProbeThreadgroupMem {
             "dense_gemv_q8_0_btile_qkv_b4",
             // No b8 of the non-otf variant (would be 45 KB).
             // OTF variant — re-derives RMS-norm inside kb loop (no h_norms).
+            "extract_logprobs",
+            "sample_token",
             "dense_gemv_q8_0_btile_qkv_otf_b1",
             "dense_gemv_q8_0_btile_qkv_otf_b2",
             "dense_gemv_q8_0_btile_qkv_otf_b4",

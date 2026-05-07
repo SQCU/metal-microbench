@@ -335,6 +335,7 @@ let moeQ51PSO      = pso("moe_gemv_q5_1_v3")
 let moeGeluMulFusedPSO = pso("moe_gelu_mul_fused")
 let pagedSplitReducePSO = pso("paged_attn_split_reduce")
 let sampleTokenPSO      = pso("sample_token")
+let extractLogprobsPSO  = pso("extract_logprobs")
 // Two specialized PSOs compiled from the one unified `flex_attn_v0` kernel
 // source. Function constants set head-dim / page / Q-per-TG / mask style;
 // the MSL compiler produces the same asm as the old per-variant kernels.
@@ -754,6 +755,33 @@ let gpu_sampled_tokens = input_tokens
 // each step from session state by step(): memcpy when a session has
 // `logitBiasDense`, memset(0) when it doesn't.
 let sampling_logit_bias  = device.makeBuffer(length: B * VOCAB * 4, options: .storageModeShared)!
+
+// 2026-05-07: GPU-side logprob extraction buffers. Replaces the CPU-side
+// captureLogprobForLatestToken (was ~2 ms/call × B streams × 12 CBs/sec
+// = ~192 ms/sec of CPU work in the gemma_poll critical path between AR
+// ticks). The new extract_logprobs kernel runs on the GPU after
+// sample_token, parallel-reduces max + sum_exp, writes sampled_logprob
+// + top-K (token_id, logprob) pairs.
+//
+// Per-step input contract:
+//   capture_active[slot]  ∈ {0, 1}  — 1 iff this slot's stream was
+//                                      submitted with logprobs=True.
+//   capture_topk[slot]    ∈ [0, MAX_TOPK]
+//                                   — number of top-K pairs to write.
+//                                     0 = sampled_logprob only.
+// Written CPU-side from gCaptureLogits + gTopLogprobs at the start
+// of each AR step.
+//
+// Per-step output:
+//   gpu_sampled_logprobs[slot]
+//   gpu_topk_token_ids[slot * MAX_TOPK + i]    for i in [0, K)
+//   gpu_topk_logprobs[slot * MAX_TOPK + i]      for i in [0, K)
+let MAX_TOPK_LOGPROBS = 50   // ABI cap, matches captureLogprobForLatestToken's `min(topK, 50)`
+let gpu_capture_active   = device.makeBuffer(length: B,            options: .storageModeShared)!
+let gpu_capture_topk     = device.makeBuffer(length: B * 4,        options: .storageModeShared)!
+let gpu_sampled_logprobs = device.makeBuffer(length: B * 4,        options: .storageModeShared)!
+let gpu_topk_token_ids   = device.makeBuffer(length: B * MAX_TOPK_LOGPROBS * 4, options: .storageModeShared)!
+let gpu_topk_logprobs    = device.makeBuffer(length: B * MAX_TOPK_LOGPROBS * 4, options: .storageModeShared)!
 
 // active_exp stays static at identity [0..E_EXP-1]: route_compact writes
 // group_start with prefix counts (empty groups == zero-width), and MoE
@@ -3587,6 +3615,44 @@ func encSampleToken(_ cb: MTLCommandBuffer,
     enc.endEncoding()
 }
 
+// 2026-05-07: GPU-side log_softmax + top-K extraction. Encoded
+// AFTER sample_token in buildStepCB when any slot has logprobs=True.
+// Reads logits + sampling_logit_bias + sampled-token (input_tokens
+// just written by sample_token); writes gpu_sampled_logprobs +
+// gpu_topk_token_ids + gpu_topk_logprobs. One TG per slot; per-slot
+// gating via gpu_capture_active so unused slots cost essentially
+// nothing (single early-return).
+func encExtractLogprobs(_ cb: MTLCommandBuffer,
+                         logits: MTLBuffer,
+                         samplingLogitBias: MTLBuffer,
+                         samplingActive: MTLBuffer,
+                         captureActive: MTLBuffer,
+                         captureTopK: MTLBuffer,
+                         inputTokens: MTLBuffer,
+                         sampledLogprobOut: MTLBuffer,
+                         topkIdsOut: MTLBuffer,
+                         topkLogprobsOut: MTLBuffer,
+                         vocab: Int, maxTopK: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(extractLogprobsPSO)
+    enc.setBuffer(logits,             offset: 0, index: 0)
+    enc.setBuffer(samplingLogitBias,  offset: 0, index: 1)
+    enc.setBuffer(samplingActive,     offset: 0, index: 2)
+    enc.setBuffer(captureActive,      offset: 0, index: 3)
+    enc.setBuffer(captureTopK,        offset: 0, index: 4)
+    enc.setBuffer(inputTokens,        offset: 0, index: 5)
+    enc.setBuffer(sampledLogprobOut,  offset: 0, index: 6)
+    enc.setBuffer(topkIdsOut,         offset: 0, index: 7)
+    enc.setBuffer(topkLogprobsOut,    offset: 0, index: 8)
+    var v = UInt32(vocab)
+    var k = UInt32(maxTopK)
+    enc.setBytes(&v, length: 4, index: 9)
+    enc.setBytes(&k, length: 4, index: 10)
+    enc.dispatchThreadgroups(MTLSize(width: B, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
 // Unified flex-attention dispatcher — one Swift path, one MSL source.
 // Picks the specialized PSO (flexAttn{Slide,Full}V0PSO) and the matching
 // CSR buffer set (flex_full_* at PAGE=16 vs flex_full_full_* at PAGE=8)
@@ -4478,6 +4544,24 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
                     samplingActive: sampling_active,
                     inputTokens: gpu_sampled_tokens,
                     vocab: VOCAB)
+
+    // 2026-05-07: GPU-side logprob + top-K extraction. Always
+    // encoded; per-slot gating via gpu_capture_active (zero for slots
+    // without logprobs=True — those slots' kernels return immediately).
+    // Reads sampled-token from input_tokens just written by sample_token;
+    // writes sampled_logprob + top-K to per-slot output buffers that
+    // the bridge reads after CB completion.
+    encExtractLogprobs(cb,
+                        logits: logits,
+                        samplingLogitBias: sampling_logit_bias,
+                        samplingActive: sampling_active,
+                        captureActive: gpu_capture_active,
+                        captureTopK: gpu_capture_topk,
+                        inputTokens: gpu_sampled_tokens,
+                        sampledLogprobOut: gpu_sampled_logprobs,
+                        topkIdsOut: gpu_topk_token_ids,
+                        topkLogprobsOut: gpu_topk_logprobs,
+                        vocab: VOCAB, maxTopK: MAX_TOPK_LOGPROBS)
     return cb
 }
 
@@ -4781,6 +4865,23 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
                         samplingActive: sampling_active,
                         inputTokens: gpu_sampled_tokens,
                         vocab: VOCAB)
+        // 2026-05-07: extract logprobs at the end of the LAST prefill
+        // tile too — that sample_token produces the FIRST generated
+        // token of the response, and clients with logprobs=True want
+        // its probability + top-K. Mirrors the AR-step extract_logprobs
+        // dispatch in buildStepCB. Per-slot capture_active gating
+        // makes this near-free for non-capturing slots.
+        encExtractLogprobs(cb,
+                            logits: logits,
+                            samplingLogitBias: sampling_logit_bias,
+                            samplingActive: sampling_active,
+                            captureActive: gpu_capture_active,
+                            captureTopK: gpu_capture_topk,
+                            inputTokens: gpu_sampled_tokens,
+                            sampledLogprobOut: gpu_sampled_logprobs,
+                            topkIdsOut: gpu_topk_token_ids,
+                            topkLogprobsOut: gpu_topk_logprobs,
+                            vocab: VOCAB, maxTopK: MAX_TOPK_LOGPROBS)
     }
 }
 

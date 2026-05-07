@@ -11853,6 +11853,155 @@ kernel void sample_token(
 }
 
 // ====================================================================
+// GPU-side logprob + top-K extraction.
+//
+// 2026-05-07: replaces the CPU-side captureLogprobForLatestToken
+// (ffi_batch.swift) which iterated VOCAB=262144 logits twice per slot
+// per CB to compute log-softmax, plus a third pass for top-K via a
+// linear-scan replace-min heap. With B=8 streams × ~12 CBs/sec ×
+// ~2 ms/call, that was ~192 ms/sec of CPU work directly in the
+// gemma_poll outer loop's critical path between AR ticks.
+//
+// This kernel runs on the GPU after sample_token, reusing the same
+// sampling_logit_bias as the sampler. One TG per slot; 32 threads
+// parallel-reduce max + sum_exp; each lane maintains a local top-K
+// (replace-min over its VOCAB/THREADS = 8192-element slice); finally
+// lane 0 selection-sorts the THREADS*K candidate buffer in
+// threadgroup memory to write the global top-K out.
+//
+// Static threadgroup memory: at K_MAX=50:
+//   mx[32]:       128 B
+//   sm[32]:       128 B
+//   cand_lps:     32 * 50 * 4 = 6,400 B
+//   cand_ids:     32 * 50 * 4 = 6,400 B
+//   total:        ~13 KB  (under 32 KB hardware limit)
+//
+// Per-lane register pressure: K_MAX × 8 bytes = 400 B (only first K
+// of these slots are touched; trailing slots are dead reg pressure).
+//
+// Skipped per-slot via `capture_active[slot]==0` — slots without
+// logprobs=True flag never run the work.
+kernel void extract_logprobs(
+    device const half*  logits                 [[buffer(0)]],   // [B, VOCAB]
+    device const float* sampling_logit_bias    [[buffer(1)]],   // [B, VOCAB]
+    device const uint*  sampling_active        [[buffer(2)]],   // [B] 0/1
+    device const uchar* capture_active         [[buffer(3)]],   // [B] 0/1
+    device const uint*  capture_topk           [[buffer(4)]],   // [B] requested K (0..MAX_TOPK)
+    device const uint*  input_tokens           [[buffer(5)]],   // [B] sampled token (written by sample_token)
+    device float*       sampled_logprob_out    [[buffer(6)]],   // [B]
+    device uint*        topk_ids_out           [[buffer(7)]],   // [B, MAX_TOPK]
+    device float*       topk_logprobs_out      [[buffer(8)]],   // [B, MAX_TOPK]
+    constant uint&      VOCAB                  [[buffer(9)]],
+    constant uint&      MAX_TOPK               [[buffer(10)]],
+    uint3 tg_pos                               [[threadgroup_position_in_grid]],
+    uint3 lid3                                 [[thread_position_in_threadgroup]])
+{
+    const uint slot = tg_pos.x;
+    const uint lid  = lid3.x;
+    constexpr uint THREADS = 32;
+    constexpr uint K_MAX   = 50;   // ABI cap — matches captureLogprobForLatestToken's `min(topK, 50)`
+
+    if (sampling_active[slot] == 0 || capture_active[slot] == 0) return;
+
+    device const half*  L    = logits              + slot * VOCAB;
+    device const float* BIAS = sampling_logit_bias + slot * VOCAB;
+
+    // Pass 1: max of (logit + bias). Parallel reduce over THREADS.
+    float local_max = -INFINITY;
+    for (uint v = lid; v < VOCAB; v += THREADS) {
+        float x = float(L[v]) + BIAS[v];
+        if (x > local_max) local_max = x;
+    }
+    threadgroup float mx[THREADS];
+    mx[lid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = THREADS / 2; s > 0; s /= 2) {
+        if (lid < s) mx[lid] = max(mx[lid], mx[lid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float m = mx[0];
+
+    // Pass 2: sum_exp of (logit + bias - m). Parallel reduce.
+    float local_sum = 0.0f;
+    for (uint v = lid; v < VOCAB; v += THREADS) {
+        float x = float(L[v]) + BIAS[v];
+        local_sum += exp(x - m);
+    }
+    threadgroup float sm[THREADS];
+    sm[lid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = THREADS / 2; s > 0; s /= 2) {
+        if (lid < s) sm[lid] += sm[lid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float logZ = m + log(sm[0]);
+
+    // Sampled logprob: log_softmax(sampled_token).
+    if (lid == 0) {
+        const uint sampled = input_tokens[slot];
+        sampled_logprob_out[slot] = float(L[sampled]) + BIAS[sampled] - logZ;
+    }
+
+    // Top-K extraction.
+    const uint K_req = capture_topk[slot];
+    const uint K = K_req < K_MAX ? K_req : K_MAX;
+    if (K == 0) return;
+
+    // Lane-0-only top-K via threadgroup scratch. Slower than parallel-
+    // reduce (~6 ms per slot for VOCAB=262144 vs ~50 µs parallel) but
+    // correct and simple. The parallel version had a per-lane stack
+    // array that the Metal compiler may have placed in threadgroup
+    // memory or spilled in a way that broke the recompute-min logic.
+    // If profiling shows top-K dispatch dominates, revisit with a
+    // proper parallel-reduce design.
+    threadgroup float scratch_lps[K_MAX];
+    threadgroup uint  scratch_ids[K_MAX];
+    if (lid == 0) {
+        for (uint i = 0; i < K_MAX; ++i) {
+            scratch_lps[i] = -INFINITY;
+            scratch_ids[i] = 0xFFFFFFFFu;
+        }
+        uint min_idx = 0;
+        float min_val = -INFINITY;
+        for (uint v = 0; v < VOCAB; ++v) {
+            const float lp = float(L[v]) + BIAS[v] - logZ;
+            if (lp > min_val) {
+                scratch_lps[min_idx] = lp;
+                scratch_ids[min_idx] = v;
+                // Recompute local min over the K-element scratch.
+                float new_min_v = scratch_lps[0];
+                uint  new_min_i = 0;
+                for (uint i = 1; i < K; ++i) {
+                    if (scratch_lps[i] < new_min_v) {
+                        new_min_v = scratch_lps[i];
+                        new_min_i = i;
+                    }
+                }
+                min_val = new_min_v;
+                min_idx = new_min_i;
+            }
+        }
+        // Now sort scratch[0..K) descending so output is top-1, top-2, ...
+        for (uint k = 0; k < K; ++k) {
+            float best_v = scratch_lps[k];
+            uint  best_i = k;
+            for (uint i = k + 1; i < K; ++i) {
+                if (scratch_lps[i] > best_v) {
+                    best_v = scratch_lps[i];
+                    best_i = i;
+                }
+            }
+            if (best_i != k) {
+                float tlp = scratch_lps[k]; scratch_lps[k] = scratch_lps[best_i]; scratch_lps[best_i] = tlp;
+                uint  tid = scratch_ids[k]; scratch_ids[k] = scratch_ids[best_i]; scratch_ids[best_i] = tid;
+            }
+            topk_ids_out[slot * MAX_TOPK + k]      = scratch_ids[k];
+            topk_logprobs_out[slot * MAX_TOPK + k] = scratch_lps[k];
+        }
+    }
+}
+
+// ====================================================================
 // Q4_K cooperative matmul (V1) — first iteration of the missing
 // simdgroup_float8x8 prefill kernel. Mirrors llama.cpp's
 // kernel_mul_mm_q4_K_f32 in shape (cooperative-matrix tiles via

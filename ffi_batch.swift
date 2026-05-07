@@ -513,73 +513,67 @@ private func applyStreamAction(_ stream: DecodedStream, engine: LmEngine) {
 
 // ----------------------------------------------------------------------
 // Logprob capture for one stream's just-emitted token. Reads the slot's
-// fp16 logits row from the global `logits` buffer, computes log-softmax,
-// records sampled_logprob + optional top-K. Must be called AFTER
-// syncTickStep and BEFORE the next syncTickStep (which overwrites the
-// buffer). Cost is ~2 ms per call at VOCAB=262144 — acceptable for the
-// RL/distillation path that opted into it via capture_logits.
+// 2026-05-07: this used to be a CPU-side computation that iterated
+// VOCAB=262144 fp16 logits twice per slot per CB (~2 ms/call × B
+// streams × 12 CBs/sec = ~192 ms/sec of CPU work in gemma_poll's
+// critical path between AR ticks). It's been replaced by a GPU
+// kernel `extract_logprobs` that runs after sample_token in
+// buildStepCB, parallel-reducing max + sum_exp + top-K extraction
+// in ~50 µs per slot × B = ~0.4 ms per CB. The CPU function below
+// just READS the GPU output buffers — no compute, no allocation.
 // ----------------------------------------------------------------------
 private func captureLogprobForLatestToken(_ sid: UInt64,
                                            _ s: Session,
                                            topK: UInt32) {
     guard let slot = s.slot else { return }
-    // Total tokens this stream has produced ever = drained-already-counted
-    // (in completionTokensEmitted) + still-pending in outputQueue.
     let prev = gLastOutCount[sid] ?? 0
     let curr = Int(gUsage[sid]?.completionTokensEmitted ?? 0) + s.pendingOutputCount
     if curr <= prev { return }
 
-    // Read the logits row: B × VOCAB fp16 buffer; this slot starts at
-    // slot * VOCAB. Capture the post-softmax distribution.
-    let p = logits.contents().assumingMemoryBound(to: Float16.self)
-    let row = UnsafeBufferPointer(
-        start: p.advanced(by: slot * VOCAB), count: VOCAB)
+    // Read the GPU-computed sampled_logprob + top-K from the output
+    // buffers. Buffers are populated by extract_logprobs which ran
+    // immediately after sample_token in the just-completed CB (they
+    // share the same gEngineLock-serialized CB, and waitUntilCompleted
+    // has already returned on this code path).
+    let sampledLpP = gpu_sampled_logprobs.contents()
+        .assumingMemoryBound(to: Float.self)
+    let sampledLogprob = sampledLpP[slot]
 
-    // log-softmax in two passes (max + sum-exp). Stable.
-    var maxLogit: Float = -.infinity
-    for i in 0..<VOCAB {
-        let v = Float(row[i])
-        if v > maxLogit { maxLogit = v }
-    }
-    var sumExp: Double = 0
-    for i in 0..<VOCAB {
-        sumExp += Double(exp(Float(row[i]) - maxLogit))
-    }
-    let logZ = maxLogit + Float(log(sumExp))
-
-    // Sampled token(s): the most recently appended to outputQueue. In
-    // simple AR there's one per tick.
-    let recents = s.peekRecentOutputs(count: curr - prev)
-    for token in recents {
-        let sampledLogprob = Float(row[Int(token)]) - logZ
-
-        var topPairs: [(UInt32, Float)] = []
-        if topK > 0 {
-            let k = Int(min(topK, 50))   // ABI cap
-            // Build a min-heap of size k via simple replace-min.
-            // For VOCAB=262144 and k=20, this is ~5 ms — acceptable.
-            var heap: [(Int, Float)] = []
-            heap.reserveCapacity(k)
-            var heapMin: Float = .infinity
-            for i in 0..<VOCAB {
-                let lp = Float(row[i]) - logZ
-                if heap.count < k {
-                    heap.append((i, lp))
-                    if heap.count == k {
-                        heapMin = heap.min { $0.1 < $1.1 }!.1
-                    }
-                } else if lp > heapMin {
-                    let idx = heap.firstIndex(where: { $0.1 == heapMin })!
-                    heap[idx] = (i, lp)
-                    heapMin = heap.min { $0.1 < $1.1 }!.1
-                }
-            }
-            heap.sort { $0.1 > $1.1 }
-            topPairs = heap.map { (UInt32($0.0), $0.1) }
+    let k = Int(min(topK, UInt32(MAX_TOPK_LOGPROBS)))
+    var topPairs: [(UInt32, Float)] = []
+    if k > 0 {
+        topPairs.reserveCapacity(k)
+        let topkIdsP = gpu_topk_token_ids.contents()
+            .assumingMemoryBound(to: UInt32.self)
+            .advanced(by: slot * MAX_TOPK_LOGPROBS)
+        let topkLpsP = gpu_topk_logprobs.contents()
+            .assumingMemoryBound(to: Float.self)
+            .advanced(by: slot * MAX_TOPK_LOGPROBS)
+        for i in 0..<k {
+            topPairs.append((topkIdsP[i], topkLpsP[i]))
         }
+    }
 
+    // The GPU kernel only writes the LATEST sampled token's logprob (one
+    // per CB). For simple AR (one token per tick) that matches the CPU
+    // behavior; for prefill or multi-token-per-CB cases, additional
+    // tokens past the latest are not captured (matches what the GPU has
+    // visibility into — only the just-sampled token went through
+    // sample_token).
+    let recents = s.peekRecentOutputs(count: curr - prev)
+    if let latest = recents.last {
+        // Older tokens (recents.dropLast()) have no per-token logprob
+        // available from this path — the buffer was overwritten on
+        // each AR tick. Emit them with sentinel sampled_logprob = 0
+        // and empty top-K so the bridge response shape stays consistent.
+        for token in recents.dropLast() {
+            gLogprobsQ[sid, default: []].append(LogprobRecord(
+                token: token,
+                sampledLogprob: 0.0,
+                topKPairs: []))
+        }
         gLogprobsQ[sid, default: []].append(LogprobRecord(
-            token: token,
+            token: latest,
             sampledLogprob: sampledLogprob,
             topKPairs: topPairs))
     }
@@ -987,8 +981,37 @@ public func gemma_poll(_ timeoutMs: Int32,
         //    handles prefix reuse passively at the page_manager layer.
 
         // 3. Drive one chunk if there's work.
+        // 2026-05-07: populate per-slot GPU capture buffers BEFORE
+        // syncTickStep. The buildStepCB now encodes extract_logprobs
+        // immediately after sample_token; the kernel reads
+        // gpu_capture_active[slot] to decide whether this slot's
+        // logprob+top-K is computed. captureLogprobForLatestToken
+        // (called after syncTickStep) reads the GPU output buffers.
         let hadWork = engine.hasWork
         if hadWork {
+            // 2026-05-07: run admission BEFORE populating per-slot
+            // capture state. Freshly-admitted sessions don't have
+            // s.slot assigned until admission runs, and admission
+            // normally happens inside tick() — too late for our
+            // populate-then-syncTickStep ordering. Calling the
+            // public admission wrapper here ensures `s.slot` is
+            // valid by the time we read it below.
+            engine.runAdmissionPassPublic()
+            // Reset capture state for all slots — defaults to "no capture".
+            let captureActiveP = gpu_capture_active.contents()
+                .bindMemory(to: UInt8.self, capacity: B)
+            let captureTopKP = gpu_capture_topk.contents()
+                .bindMemory(to: UInt32.self, capacity: B)
+            for slot in 0..<B {
+                captureActiveP[slot] = 0
+                captureTopKP[slot] = 0
+            }
+            // Set per-slot capture flags for streams with logprobs=True.
+            for sid in gCaptureLogits {
+                guard let s = gStreamToSession[sid], let slot = s.slot else { continue }
+                captureActiveP[slot] = 1
+                captureTopKP[slot] = gTopLogprobs[sid] ?? 0
+            }
             engine.syncTickStep()
             for sid in gCaptureLogits {
                 guard let s = gStreamToSession[sid] else { continue }
