@@ -166,4 +166,31 @@ struct GemmaBpe {
         guard Int(id) < vocab.count else { return "<oov:\(id)>" }
         return vocab[Int(id)]
     }
+
+    // Bytes that this token ID contributes to the output text stream when
+    // emitted as an AR step. Used by grammar-constrained sampling
+    // (structured-cot etc.) to compute per-step token masks.
+    //
+    //   - byte tokens "<0xHH>" → [byte]
+    //   - special tokens (e.g. "<bos>", "<end_of_turn>") → empty (don't
+    //     contribute to output bytes; control-only)
+    //   - normal tokens → UTF-8 bytes of (token with ▁ → ASCII space)
+    func tokenBytes(_ id: UInt32) -> [UInt8] {
+        guard Int(id) < vocab.count else { return [] }
+        let t = vocab[Int(id)]
+        // Byte token <0xHH>.
+        if t.count == 6, t.hasPrefix("<0x"), t.hasSuffix(">"),
+           let b = UInt8(t.dropFirst(3).dropLast(), radix: 16) {
+            return [b]
+        }
+        // Special tokens contribute zero output bytes (they're framing,
+        // not content). decode() emits them visibly for debugging but
+        // for grammar masking they should be treated as empty.
+        if t.hasPrefix("<") && t.hasSuffix(">") && t.count > 2 {
+            return []
+        }
+        // Normal token: ▁ → space, then UTF-8 bytes.
+        let s = t.replacingOccurrences(of: "▁", with: " ")
+        return Array(s.utf8)
+    }
 }

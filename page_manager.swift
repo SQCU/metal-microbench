@@ -83,10 +83,23 @@ struct SharedPagePair {
 }
 
 final class PageManager {
+    // Total physical pages this manager describes (for `pages[]` array
+    // sizing). Equals SCRATCH_STRIP + cache-pool count — the manager
+    // tracks every physical page in the K/V buffer, but only the cache
+    // range [basePage, basePage + numPoolPages) is allocated to
+    // sessions; pages [0, SCRATCH_STRIP) are reserved for silenced-slot
+    // scratch and never appear on the free list.
     let numPhysPages: Int
+    // Cache pool range: alloc/free operate over [basePage, basePage + numPoolPages).
+    // Scratch pages live OUTSIDE this range — see SCRATCH_PAGE_BASE.
+    let basePage: Int
+    let numPoolPages: Int
     let pageSize: Int
 
-    // Physical page state: pages[p] describes phys page p.
+    // Physical page state: pages[p] describes phys page p. Sized at
+    // numPhysPages so any phys index (including scratch-strip indices)
+    // can be looked up; only the [basePage, basePage+numPoolPages)
+    // range will ever be referenced through alloc/free paths.
     private var pages: [PageInfo]
     // Free list of phys pages with refcount==0. LIFO (cache-warm reuse).
     private var freeList: [Int] = []
@@ -98,14 +111,27 @@ final class PageManager {
     private var sessionPages: [Int: [Int]] = [:]
     private var clockTick: UInt64 = 0
 
-    init(numPhysPages: Int, pageSize: Int) {
+    init(numPhysPages: Int, pageSize: Int, basePage: Int = 0,
+          numPoolPages: Int? = nil) {
+        // 2026-05-06: split scratch-strip from cache-pool addressing
+        // (codex RCA). PageManager allocates physical-page indices
+        // from [basePage, basePage + numPoolPages); pages outside that
+        // range are reserved (typically scratch at low indices). The
+        // single-arg `init(numPhysPages:pageSize:)` default keeps the
+        // legacy behavior (pool = entire range starting at 0) so
+        // existing tests / callers that don't reserve a scratch strip
+        // are unchanged.
+        let poolCount = numPoolPages ?? numPhysPages
         self.numPhysPages = numPhysPages
+        self.basePage = basePage
+        self.numPoolPages = poolCount
         self.pageSize = pageSize
         self.pages = (0..<numPhysPages).map { _ in
             PageInfo(owners: [], contentHash: nil, pairMate: nil, lastAccessTick: 0)
         }
-        // Initially every page is free. Push in reverse so page 0 pops first.
-        self.freeList = Array((0..<numPhysPages).reversed())
+        // Free list spans only the pool range. Push in reverse so the
+        // lowest-indexed pool page pops first (cache-warm-friendly).
+        self.freeList = Array((basePage..<(basePage + poolCount)).reversed())
     }
 
     // FNV-1a over a page's token IDs, optionally mixed with a cvec-state
@@ -144,40 +170,71 @@ final class PageManager {
         return contentIndex[hash]
     }
 
-    // Grab a fresh phys page for `sessionId`. Fails with `outOfPages` if
-    // the free list is empty. The page is single-owner and its content
-    // hash is invalidated at alloc time (we're about to overwrite the KV).
+    // Grab a phys page for `sessionId`. The free list holds all
+    // refcount==0 pages; some carry valid content hashes (cache entries
+    // from prior sessions), some don't (genuinely uncached). We pick in
+    // this order:
+    //   1. The LRU-OLDEST uncached page (no hash to drop, free reuse).
+    //   2. Otherwise: the LRU-OLDEST cached page → evict its hash, reuse.
     //
-    // Released pages keep their content hash until they're re-allocated
-    // here — that's how we let a later session probe findByHash and
-    // adopt an already-computed prefix without prefilling it. Only at
-    // the moment a fresh allocation *commits to overwriting* do we drop
-    // the cached hash.
+    // Critically we DO NOT drop a content hash unless step 1 found nothing
+    // and we're forced to overwrite. The previous "drop on every pop"
+    // logic shredded cache entries that the SAME request was about to
+    // probe for: iter N's session pop-and-evicts iter N-1's pages off
+    // the free list (because the entire free list was content-cached
+    // immediately after iter N-1 closed), then iter N's later probes
+    // for those same hashes miss. With LRU-no-eager-eviction, iter N
+    // shareExisting-adopts iter N-1's pages first (refcount++, removes
+    // them from free list), and only then allocFresh runs for the
+    // genuine tail — by which point the free list contains uncached
+    // pages.
     func allocFresh(sessionId: Int) throws -> Int {
-        guard let phys = freeList.popLast() else {
+        guard !freeList.isEmpty else {
             throw PageManagerError.outOfPages(needed: 1, available: 0)
+        }
+        // Step 1: find the LRU-oldest uncached page on the free list.
+        var bestUncached: (idx: Int, tick: UInt64)? = nil
+        for (i, phys) in freeList.enumerated() {
+            if pages[phys].contentHash == nil {
+                let tick = pages[phys].lastAccessTick
+                if bestUncached == nil || tick < bestUncached!.tick {
+                    bestUncached = (i, tick)
+                }
+            }
+        }
+        let phys: Int
+        if let pick = bestUncached {
+            // Pop the LRU-oldest uncached page. No hash to drop.
+            phys = freeList.remove(at: pick.idx)
+        } else {
+            // Forced eviction: free list is all-cached. Pick LRU-oldest
+            // cached entry and drop its hash.
+            var oldest: (idx: Int, tick: UInt64)? = nil
+            for (i, p) in freeList.enumerated() {
+                let tick = pages[p].lastAccessTick
+                if oldest == nil || tick < oldest!.tick {
+                    oldest = (i, tick)
+                }
+            }
+            let pick = oldest!  // freeList non-empty guaranteed above
+            phys = freeList.remove(at: pick.idx)
+            // Drop the now-orphaned content hash + its pair.
+            var p = pages[phys]
+            if let h = p.contentHash {
+                contentIndex.removeValue(forKey: h)
+                if let partner = p.pairMate,
+                   partner >= 0 && partner < pages.count,
+                   pages[partner].contentHash == h {
+                    pages[partner].contentHash = nil
+                    pages[partner].pairMate = nil
+                }
+                p.contentHash = nil
+                p.pairMate = nil
+            }
+            pages[phys] = p
         }
         clockTick += 1
         var p = pages[phys]
-        // Invalidate stale content hash — the KV is about to be rewritten.
-        // Pair invariant: if this page was part of a promoted pair, the
-        // partner's K/V alone is no longer useful (a content-hash hit
-        // must produce BOTH phys pages to correctly cover slide + full
-        // caches). Drop the index entry AND clear the partner's hash so
-        // a later session can't findByHash and get an incomplete pair.
-        if let h = p.contentHash {
-            if contentIndex[h] != nil {
-                contentIndex.removeValue(forKey: h)
-            }
-            if let partner = p.pairMate,
-               partner >= 0 && partner < pages.count,
-               pages[partner].contentHash == h {
-                pages[partner].contentHash = nil
-                pages[partner].pairMate = nil
-            }
-            p.contentHash = nil
-            p.pairMate = nil
-        }
         p.owners = [sessionId]
         p.lastAccessTick = clockTick
         pages[phys] = p

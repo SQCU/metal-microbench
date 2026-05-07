@@ -28,7 +28,12 @@ safetensors_path = "/Users/mdot/models/gemma-4-a4b-bf16/model-00001-of-00002.saf
 # chat_template_path = "/Users/mdot/models/gemma-4-a4b-bf16/chat_template.jinja"
 
 # Display name returned by /v1/models and shown in client status bars.
-display_name = "gemma-4-a4b-q4km"
+# Override per-config from the orchestrator (e.g. "gemma-4-a4b-fp16",
+# "gemma-4-a4b-unsloth_dyn") so the response shape correctly identifies
+# what's loaded. The default is neutral; do NOT put a uniform-quant
+# label here — it would misrepresent any heterogeneous-quant GGUF
+# that gets loaded.
+display_name = "gemma-4-a4b"
 
 [server]
 # Port 8001 matches the SVG / quant-search harness expectation

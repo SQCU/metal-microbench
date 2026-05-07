@@ -41,6 +41,132 @@ func pso(_ name: String) -> MTLComputePipelineState {
     return try! device.makeComputePipelineState(function: f)
 }
 
+// PSO with function-constant specialization. Caller's closure populates an
+// MTLFunctionConstantValues; we then materialize the specialized variant
+// of the kernel and build a PSO from it.
+func psoFC(_ name: String, _ setup: (MTLFunctionConstantValues) -> Void) -> MTLComputePipelineState {
+    let fcv = MTLFunctionConstantValues()
+    setup(fcv)
+    do {
+        let f = try lib.makeFunction(name: name, constantValues: fcv)
+        return try device.makeComputePipelineState(function: f)
+    } catch {
+        fail("psoFC(\(name)): \(error)")
+    }
+}
+
+// ===========================================================================
+// Kernel-capability matrix — the single source of truth for which
+// (tensor_class, format) cells the engine has kernels for. Same JSON file
+// the Python search reads (tools/quant_search/quant_driver.py); both
+// interfaces share one definition so they can never silently drift.
+//
+// At engine boot we load and validate it (asserting every format declared
+// has the right block geometry; every tensor_class has a non-empty allowed
+// list). The auto-loaders in bootstrap.swift then check each tensor's
+// dtype against `allowedFormats(for: tensor_class)` and fail loud with a
+// helpful message if a GGUF demands something not declared here.
+// ===========================================================================
+
+struct KernelFormatInfo: Codable {
+    let blk_bytes: Int
+    let blk_elems: Int
+    let bpw_eff: Float
+    let notes: String
+}
+
+struct KernelTensorClassInfo: Codable {
+    let kind: String
+    let role: String
+    let allowed: [String]
+}
+
+struct KernelLlamaQuantizeMix: Codable {
+    let tag: String
+    let kind: String
+    let format: String?
+    let moe_up: String?
+    let moe_down: String?
+    let dense_default: String?
+    let note: String?
+}
+
+struct KernelCapabilities: Codable {
+    let version: Int
+    let description: String
+    let formats: [String: KernelFormatInfo]
+    let tensor_classes: [String: KernelTensorClassInfo]
+    let llama_quantize_mixes: [KernelLlamaQuantizeMix]
+}
+
+let kernelCapabilities: KernelCapabilities = {
+    let envPath = ProcessInfo.processInfo.environment["KERNEL_CAPABILITIES_JSON"]
+    let candidates: [String] = [
+        envPath,
+        "/Users/mdot/metal-microbench/kernel_capabilities.json",
+        FileManager.default.currentDirectoryPath + "/kernel_capabilities.json",
+    ].compactMap { $0 }
+    var loaded: KernelCapabilities? = nil
+    var triedPaths: [String] = []
+    for path in candidates {
+        triedPaths.append(path)
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { continue }
+        do {
+            loaded = try JSONDecoder().decode(KernelCapabilities.self, from: data)
+            break
+        } catch {
+            fail("kernel_capabilities.json at \(path) failed to decode: \(error)")
+        }
+    }
+    guard let caps = loaded else {
+        fail("kernel_capabilities.json not found at any of: \(triedPaths.joined(separator: ", "))")
+    }
+    precondition(caps.version == 1, "kernel_capabilities.json version \(caps.version) — engine expects 1")
+    precondition(!caps.formats.isEmpty, "kernel_capabilities.json: empty formats")
+    precondition(!caps.tensor_classes.isEmpty, "kernel_capabilities.json: empty tensor_classes")
+    return caps
+}()
+
+// Map each format's GGMLType to its declared block geometry. Used by the
+// auto-loaders to pick the right loadDenseSwizzled / loadMoESwizzled args.
+func kernelFormatBlockGeometry(_ dtype: GGMLType) -> (blkBytes: Int, blkElems: Int)? {
+    let tag = ggmlTypeToCapabilityTag(dtype)
+    guard let info = kernelCapabilities.formats[tag] else { return nil }
+    return (info.blk_bytes, info.blk_elems)
+}
+
+// Convert GGMLType to the JSON's format tag (uppercase).
+func ggmlTypeToCapabilityTag(_ dtype: GGMLType) -> String {
+    switch dtype {
+    case .q8_0: return "Q8_0"
+    case .q6_K: return "Q6_K"
+    case .q5_K: return "Q5_K"
+    case .q5_1: return "Q5_1"
+    case .q5_0: return "Q5_0"
+    case .q4_K: return "Q4_K"
+    case .q4_1: return "Q4_1"
+    case .q4_0: return "Q4_0"
+    case .q3_K: return "Q3_K"
+    case .q2_K: return "Q2_K"
+    case .f16:  return "F16"
+    case .f32:  return "F32"
+    case .bf16: return "BF16"
+    default:    return "\(dtype)"
+    }
+}
+
+// Assert that `dtype` is allowed for `tensorClass` per the capabilities
+// matrix. Called from the auto-loaders before each tensor load.
+func assertCapability(_ tensorClass: String, _ dtype: GGMLType, tensorName: String) {
+    guard let cls = kernelCapabilities.tensor_classes[tensorClass] else {
+        fail("kernel_capabilities.json has no entry for tensor class '\(tensorClass)'")
+    }
+    let tag = ggmlTypeToCapabilityTag(dtype)
+    if !cls.allowed.contains(tag) {
+        fail("\(tensorName): dtype \(tag) not in allowed list for class '\(tensorClass)' (allowed: \(cls.allowed)). Either add a kernel + extend kernel_capabilities.json, or re-quantize with an allowed format.")
+    }
+}
+
 // ===========================================================================
 // Inlined GGUF v3 reader (was gguf_loader.swift; inlined here so swiftc
 // treats forward_graph.swift as a single top-level source file).

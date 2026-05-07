@@ -79,7 +79,7 @@ final class VisionResidency {
         self.file = file
     }
 
-    // Hydrate to .pinned. Called by gemma_submit_image_path before vision forward.
+    // Hydrate to .pinned. Called by gemma_submit_image_bytes before vision forward.
     // Idempotent: no-op if already pinned. Re-pins from .volatile if pages
     // still live; otherwise rehydrates from source tier.
     func ensurePinned() throws {

@@ -606,10 +606,13 @@ final class Session {
     // step's input; kept separate from the chunk queue for state clarity.
     fileprivate var nextGeneratedInput: UInt32 = 0
     // Teacher-forcing: override the token that will be fed to the next
-    // AR tick instead of the sampled one. Used by /v1/perplexity to
-    // drive the session through a known completion while reading
-    // logits at each position. Caller is responsible for ensuring the
-    // session is in .generating state when this is set.
+    // AR tick instead of the sampled one. Originally driven by the
+    // (now-removed) /v1/perplexity endpoint to walk a session through
+    // a known completion while reading logits at each position. Caller
+    // is responsible for ensuring the session is in .generating state
+    // when this is set.
+    // TODO: no live callers as of 2026-05-05 — candidate for deletion
+    // once we confirm no out-of-tree consumers depend on it.
     func forceNextInput(_ token: UInt32) { nextGeneratedInput = token }
 
     // Pause/resume the session for external orchestration. While
@@ -1424,13 +1427,31 @@ final class LmEngine {
             if pick.slot != nil { cursor += 1; continue }
             pick.slot = slot
             slotAssignment[slot] = pick.id
-            // Pre-grow pages. Use the max of (current prefill/gen tail) and a
-            // baseline window so short-prompt runs don't keep re-growing one
-            // page at a time during AR priming. 1024 tokens (= 64 slide pages)
-            // is a reasonable floor — cheap relative to the pool, and matches
-            // the size of a typical chat turn's KV residency.
+            // Reserve enough for the chat-turn-typical context (1024
+            // tokens = 128 pages) + currently-pending prefill, NOT
+            // the entire `maxNewTokens` budget. The 1024 floor is
+            // load-bearing: block_table entries beyond `ownedPages`
+            // are stale pointers, and AR/prefill kernels read
+            // block_table at logical-page positions up to the
+            // session's max-context — under-reserving makes those
+            // reads target wrong physical pages and silently corrupt
+            // KV cache.
+            //
+            // Growth past the 1024 floor happens lazily on AR ticks
+            // via `ensurePages(s, forKLen: s.position + 2)` in
+            // finalizeARStep — that's the page allocator's own future
+            // work and does not need to be preempted here.
+            //
+            // The previous version added `pick.maxNewTokens + 8` to
+            // the lookahead. With maxNewTokens=8192 (a normal client
+            // setting for long-form responses), that meant ~1025
+            // pages per session × 8 admitted streams = 8200 pages
+            // required at admission burst — guaranteed pool exhaustion
+            // on any admission burst with realistic max_tokens. That
+            // pattern is removed; only the 1024-token typical-context
+            // floor remains.
             let pendingPrime = pick.pendingPrimingCount
-            let lookahead = max(pick.position + pendingPrime + pick.maxNewTokens + 8, 1024)
+            let lookahead = max(pick.position + pendingPrime + 8, 1024)
             _ = ensurePages(pick, forKLen: lookahead)
             installBlockTable(pick, slot: slot)
             cursor += 1

@@ -56,6 +56,14 @@ func runLmARProfile(ggufPath: String) {
     do { w = try loadLmWeights(ggufPath: ggufPath) }
     catch { print("  loadLmWeights failed: \(error)"); return }
 
+    // This profiler dispatches Q8_0-specific kernels by name (the whole point
+    // is to A/B compare Q8_0 kernel variants). For non-Q8_0 dense formats the
+    // measurements would be meaningless because the kernels would interpret
+    // weight bytes incorrectly. Fail loud rather than silently produce garbage.
+    let l0 = w.layers[0]
+    precondition(l0.attnQFormat == .q8_0 && l0.ffnDownFormat == .q8_0,
+                 "LM_PROFILE_AR requires Q8_0 dense layers (got Q=\(l0.attnQFormat), FFN-down=\(l0.ffnDownFormat)). Use the Q4_K_M GGUF for AR-step profiling.")
+
     // Pre-fill all B slots' K/V cache to kctx positions via a normal
     // prefill, so the AR step we time has a realistic K/V context to
     // attend over (not k_len=1). Use the existing fast-prefill path.

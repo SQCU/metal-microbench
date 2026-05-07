@@ -5,7 +5,10 @@
 //   - Swift preprocessor (PIL-compatible bicubic+antialias resize, patchify)
 //   - Vision tower weight loader (BF16 safetensors → FP16)
 //   - Kernel dispatch wrappers (encGemvFp16V5, encVision*, encRMSNormGFp32*, …)
-//   - runVisionTowerForward — 27-layer forward producing [nPooled, 2816] fp32
+//   - runVisionTowerBatchForward — 27-layer forward producing per-image
+//     [nPooled, 2816] fp32 soft tokens. Handles B=1 and B>1 uniformly;
+//     the flat [B*N, ...] buffer layout reduces to [N, ...] at B=1 with
+//     the same kernel dispatches.
 //     soft tokens for the multimodal LM input stream
 //
 // Depends on kernels.swift (MSL source) and common.swift (device/queue/safetensors).
@@ -80,11 +83,10 @@ func gemma4AspectResizeTarget(height h: Int, width w: Int,
 /// Decode PNG/JPEG to a [3, H, W] RGB uint8 buffer via CoreGraphics. Force
 /// an alpha-ignored render into a tightly-packed RGBA bitmap, then pluck
 /// the three RGB channels out.
-private func loadImageRGB(_ path: String) throws -> (width: Int, height: Int, rgb: [UInt8]) {
-    let url = URL(fileURLWithPath: path)
-    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+private func loadImageRGBFromBytes(_ data: Data) throws -> (width: Int, height: Int, rgb: [UInt8]) {
+    guard let src = CGImageSourceCreateWithData(data as CFData, nil),
           let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
-        throw PreprocessError.imageDecodeFailed(path)
+        throw PreprocessError.imageDecodeFailed("CGImageSource")
     }
     let w = cg.width, h = cg.height
     var rgba = [UInt8](repeating: 0, count: w * h * 4)
@@ -202,13 +204,29 @@ private func bicubicResizePlaneFloat(src: UnsafePointer<UInt8>, srcW: Int, srcH:
 }
 
 /// Full preprocessor: PNG → [maxPatches, 768] fp16 patch tensor.
-func gemma4ImagePreprocess(path: String,
+// Demo/test-harness convenience: read the file, call gemma4ImagePreprocess.
+// The serving FFI (gemma_submit_image_bytes) never touches this — it gets
+// bytes directly from the HTTP body.
+func gemma4ImagePreprocessFromPath(path: String,
+                                     maxSoftTokens: Int = 280,
+                                     patchSize: Int = 16,
+                                     poolingKernel: Int = 3,
+                                     device: MTLDevice) throws -> PatchBatch {
+    let data = try Data(contentsOf: URL(fileURLWithPath: path))
+    return try gemma4ImagePreprocess(data: data,
+                                       maxSoftTokens: maxSoftTokens,
+                                       patchSize: patchSize,
+                                       poolingKernel: poolingKernel,
+                                       device: device)
+}
+
+func gemma4ImagePreprocess(data: Data,
                              maxSoftTokens: Int = 280,
                              patchSize: Int = 16,
                              poolingKernel: Int = 3,
                              device: MTLDevice) throws -> PatchBatch {
-    // Step 1: decode image
-    let (origW, origH, rgbBytes) = try loadImageRGB(path)
+    // Step 1: decode image (PNG/JPEG/HEIC/etc. — whatever CGImageSource handles).
+    let (origW, origH, rgbBytes) = try loadImageRGBFromBytes(data)
 
     // Step 2: target size
     let maxPatches = maxSoftTokens * poolingKernel * poolingKernel
@@ -873,289 +891,6 @@ func dumpFp16(_ buf: MTLBuffer, _ label: String, count: Int = 8, stride: Int = 0
     print(s)
 }
 
-// Sync wrapper — blocks until the final vision CB completes. Preserves
-// the original public contract for callers that don't want to own the CB.
-func runVisionTowerForward(batch: PatchBatch, weights: VisionWeights,
-                             device: MTLDevice, queue: MTLCommandQueue) -> (MTLBuffer, Int) {
-    let (buf, n, cb) = runVisionTowerForwardAsync(batch: batch, weights: weights,
-                                                    device: device, queue: queue)
-    cb.waitUntilCompleted()
-    if let e = cb.error { print("  [vision] GPU err: \(e)") }
-    return (buf, n)
-}
-
-// Async version: commits the final CB but doesn't wait. Caller must call
-// waitUntilCompleted() on the returned CB before reading softTokens.
-// Intended path: submit vision CBs to a dedicated vision queue while the
-// LM engine runs on the main queue. Vision work overlaps with LM decode;
-// the consumer (LmEngine soft-token chunk reader) waits on the CB only
-// at the point where it actually needs the data.
-func runVisionTowerForwardAsync(batch: PatchBatch, weights: VisionWeights,
-                                  device: MTLDevice, queue: MTLCommandQueue)
-                                  -> (MTLBuffer, Int, MTLCommandBuffer) {
-    let debug = ProcessInfo.processInfo.environment["VISION_DEBUG"] != nil
-    // Run the full pipeline over all `maxPatches` slots — real patches plus
-    // the zero-padded tail — to match HF's batched image-processor flow.
-    // Attention softmax consumes a padding_mask that -INF's padded K slots.
-    // Pool still operates on the real grid only (outH*outW, independent of
-    // padding). An env flag LM_MM_NO_PAD_ATTN=1 forces the legacy N=nReal
-    // path for A/B comparison.
-    let useMaxPatches = ProcessInfo.processInfo.environment["LM_MM_NO_PAD_ATTN"] == nil
-    let N = useMaxPatches ? batch.maxPatches : batch.numRealPatches
-    let gridH = batch.gridH, gridW = batch.gridW
-    let h = weights.hidden, H = weights.numHeads, HD = weights.headDim
-    let interm = weights.interm
-    let outH = gridH / 3, outW = gridW / 3
-    let nPooled = outH * outW
-
-    // Positions (per-patch). Real patches: (y, x). Padding: (0, 0) (safe
-    // default; the padding_mask is what actually silences these slots).
-    let posYBuf = device.makeBuffer(length: N * 4, options: .storageModeShared)!
-    let posXBuf = device.makeBuffer(length: N * 4, options: .storageModeShared)!
-    let pyp = posYBuf.contents().assumingMemoryBound(to: UInt32.self)
-    let pxp = posXBuf.contents().assumingMemoryBound(to: UInt32.self)
-    for i in 0..<N {
-        pyp[i] = UInt32(max(batch.positions[i].0, 0))   // clamp -1 (legacy) to 0
-        pxp[i] = UInt32(max(batch.positions[i].1, 0))
-    }
-    // Padding mask: 1 at slots [numRealPatches, maxPatches), 0 elsewhere.
-    // One byte per slot; read by vision_attn_prefill_fp32 when
-    // use_padding_mask != 0.
-    let paddingMaskBuf = device.makeBuffer(length: N, options: .storageModeShared)!
-    let pmp = paddingMaskBuf.contents().assumingMemoryBound(to: UInt8.self)
-    for i in 0..<N {
-        pmp[i] = (i < batch.numRealPatches) ? 0 : 1
-    }
-
-    // Scratch buffers. The residual stream `x` is fp32 and — as of the
-    // outlier-channel fix — every per-layer intermediate (Q/K/V, attention
-    // output, MLP activations) is fp32 as well. Gemma-4 vision trains in
-    // bf16 (fp32 exponent range); dim 213 alone hits 2934 at layer 26.
-    // Our previous fp16 intermediates lost too much precision on these
-    // outlier channels and the LM downstream couldn't make sense of the
-    // resulting soft tokens. Fp32 doubles intermediate memory (tiny vs
-    // the KV cache); the perf cost is a few extra cycles on fp32 math
-    // relative to fp16, but these are L1/L2-cache-resident buffers and
-    // the forward is dominated by weight-memory traffic from the GEMVs.
-    let x       = device.makeBuffer(length: N * h * 4, options: .storageModeShared)!
-    let tmp     = device.makeBuffer(length: N * h * 4, options: .storageModeShared)!
-    let qBuf    = device.makeBuffer(length: N * h * 4, options: .storageModeShared)!
-    let kBuf    = device.makeBuffer(length: N * h * 4, options: .storageModeShared)!
-    let vBuf    = device.makeBuffer(length: N * h * 4, options: .storageModeShared)!
-    let attnOut = device.makeBuffer(length: N * h * 4, options: .storageModeShared)!
-    let gateAct = device.makeBuffer(length: N * interm * 4, options: .storageModeShared)!
-    let upAct   = device.makeBuffer(length: N * interm * 4, options: .storageModeShared)!
-    let mlpOutB = device.makeBuffer(length: N * h * 4, options: .storageModeShared)!
-    // Post-norm outputs feed the fp32 residual adds.
-    let postNormFp32 = device.makeBuffer(length: N * h * 4, options: .storageModeShared)!
-    // stdNormed is fp32 now so the embed_vision projection can take fp32
-    // input. pooled stays fp16 (pooling averages out per-token noise).
-    let pooled  = device.makeBuffer(length: nPooled * h * 4, options: .storageModeShared)!
-    let stdNormed = device.makeBuffer(length: nPooled * h * 4, options: .storageModeShared)!
-    let softTokens = device.makeBuffer(length: nPooled * weights.textHidden * 4, options: .storageModeShared)!  // fp32
-
-    // Multi-CB in debug mode so we can inspect buffers between stages.
-    func commitOne(_ cb: MTLCommandBuffer) {
-        cb.commit(); cb.waitUntilCompleted()
-        if let e = cb.error { print("  GPU err: \(e)") }
-    }
-
-    // VISION_DUMP_STAGES=<dir> — dump per-stage tensors into dir. Use bytesPerElem
-    // to distinguish fp16 vs fp32 dumps.
-    let dumpStagesDir = ProcessInfo.processInfo.environment["VISION_DUMP_STAGES"]
-    let debugLayer = Int(ProcessInfo.processInfo.environment["VISION_DEBUG_LAYER"] ?? "") ?? -1
-    // Fast path: single CB for the entire forward when neither dumping nor
-    // per-step debugging is requested. Slow path: commit at each dump point
-    // so buffer contents can be read back.
-    let fastPath = (dumpStagesDir == nil) && (debugLayer < 0) && !debug
-    func dumpStage(_ name: String, _ buf: MTLBuffer, _ nElem: Int, bytesPerElem: Int = 2) {
-        guard let d = dumpStagesDir else { return }
-        let nBytes = nElem * bytesPerElem
-        let data = Data(bytes: buf.contents(), count: nBytes)
-        let url = URL(fileURLWithPath: d).appendingPathComponent("swift_\(name).bin")
-        try? data.write(to: url)
-    }
-
-    // Single-CB fast path: encode everything into one CB, commit once at end.
-    var cb0 = queue.makeCommandBuffer()!
-    // 1) Patch embed: [N, 768] @ W.T → [N, 1152] — write fp32 to x.
-    encGemvFp16InFp32Out(cb0, x: batch.patches, W: weights.patchEmbedW, out: x,
-                           B: N, Din: 768, Dout: h)
-    // 2) 2D positional embedding add: fp32 x + fp16 pos → fp32 x.
-    encVisionPosEmbedAddFp32(cb0, x: x, posTable: weights.posEmbedTable,
-                               posMax: weights.posMax, out: x,
-                               N: N, nPatchesX: gridW, hidden: h)
-    if !fastPath {
-        commitOne(cb0)
-        dumpStage("patch_embed", x, N * h, bytesPerElem: 4)
-    }
-
-    // 3) 27 encoder layers. Gemma4V uses kq_scale = 1.0 (not 1/sqrt(HD))
-    // per gemma4v.cpp line 93 — Q/K are RMSNorm'd so no additional scaling.
-    let qkScale: Float = 1.0
-
-    for L in 0..<weights.numLayers {
-        let lw = weights.layers[L]
-        let splitCBs = (L == debugLayer)
-        // In fast path we never make a new layerCB — everything appends to cb0.
-        let layerCB: MTLCommandBuffer = fastPath ? cb0 : queue.makeCommandBuffer()!
-
-        // Helper: either batch into a single CB, or commit+dump+sample after
-        // each step when splitCBs is true. At-CB granularity lets us pin the
-        // NaN source.
-        func step(_ tag: String, _ op: (MTLCommandBuffer) -> Void, dumpBuf: MTLBuffer, dumpStride: Int = 0, sampleCount: Int = 0) {
-            if splitCBs {
-                let c = queue.makeCommandBuffer()!
-                op(c)
-                commitOne(c)
-                dumpFp16(dumpBuf, "L\(L) \(tag)", stride: dumpStride)
-                if sampleCount > 0 {
-                    let p = dumpBuf.contents().assumingMemoryBound(to: Float16.self)
-                    var nan = 0, inf = 0, maxAbs: Float = 0, firstNaNIdx = -1
-                    for s in 0..<sampleCount {
-                        let v = Float(p[s])
-                        if v.isNaN { nan += 1; if firstNaNIdx < 0 { firstNaNIdx = s } }
-                        else if v.isInfinite { inf += 1 }
-                        else { maxAbs = max(maxAbs, abs(v)) }
-                    }
-                    if nan > 0 || inf > 0 || maxAbs > 500 {
-                        print("      ⚠ \(tag): \(nan) NaN (first @ \(firstNaNIdx)), \(inf) Inf / maxAbs=\(String(format: "%.2f", maxAbs))")
-                    }
-                }
-            } else {
-                op(layerCB)
-            }
-        }
-
-        // === Attention sub-block (fp32 intermediates throughout) ===
-        // bf16 emulation: quantize after every HF bf16 op boundary so our
-        // per-layer rounding trajectory matches the reference. Without this,
-        // our fp32 buffers carry mantissa bits HF truncates, and the resulting
-        // drift compounds to MSE ~0.05 at ev_out (enough to break LM image
-        // understanding). Each `q_*` step rounds fp32 → bf16 in place.
-        let total = N * h
-        // VISION_GEMM_QUANT_UNFOLD=1 → keep the separate bf16-quantize passes
-        // after each GEMM (for A/B). Default folds them into the GEMM tail
-        // store (saves 5 dispatches per layer × 27 layers = 135 per image).
-        let foldGemmQuant = ProcessInfo.processInfo.environment["VISION_GEMM_QUANT_UNFOLD"] == nil
-        step("input_norm", { encRMSNormGFp32($0, x: x, gammaBuf: lw.inputNorm, out: tmp, D: h, numVecs: N) }, dumpBuf: tmp, sampleCount: total)
-        step("q_inputNorm", { encQuantizeFp32ToBf16($0, x: tmp, N: h, numVecs: N) }, dumpBuf: tmp, sampleCount: total)
-        step("qProj",      { encGemvFp32V5($0, x: tmp, W: lw.qProj, out: qBuf, B: N, Din: h, Dout: h, quantOut: foldGemmQuant) }, dumpBuf: qBuf, sampleCount: total)
-        if !foldGemmQuant { step("q_qProj",    { encQuantizeFp32ToBf16($0, x: qBuf, N: h, numVecs: N) }, dumpBuf: qBuf, sampleCount: total) }
-        step("kProj",      { encGemvFp32V5($0, x: tmp, W: lw.kProj, out: kBuf, B: N, Din: h, Dout: h, quantOut: foldGemmQuant) }, dumpBuf: kBuf, sampleCount: total)
-        if !foldGemmQuant { step("q_kProj",    { encQuantizeFp32ToBf16($0, x: kBuf, N: h, numVecs: N) }, dumpBuf: kBuf, sampleCount: total) }
-        step("vProj",      { encGemvFp32V5($0, x: tmp, W: lw.vProj, out: vBuf, B: N, Din: h, Dout: h, quantOut: foldGemmQuant) }, dumpBuf: vBuf, sampleCount: total)
-        if !foldGemmQuant { step("q_vProj",    { encQuantizeFp32ToBf16($0, x: vBuf, N: h, numVecs: N) }, dumpBuf: vBuf, sampleCount: total) }
-        step("qNorm",      { encRMSNormGFp32($0, x: qBuf, gammaBuf: lw.qNorm, out: qBuf, D: HD, numVecs: N * H) }, dumpBuf: qBuf, sampleCount: total)
-        step("q_qNorm",    { encQuantizeFp32ToBf16($0, x: qBuf, N: h, numVecs: N) }, dumpBuf: qBuf, sampleCount: total)
-        step("kNorm",      { encRMSNormGFp32($0, x: kBuf, gammaBuf: lw.kNorm, out: kBuf, D: HD, numVecs: N * H) }, dumpBuf: kBuf, sampleCount: total)
-        step("q_kNorm",    { encQuantizeFp32ToBf16($0, x: kBuf, N: h, numVecs: N) }, dumpBuf: kBuf, sampleCount: total)
-        step("vNorm",      { encRMSNormNoScaleFp32($0, x: vBuf, out: vBuf, D: HD, numVecs: N * H) }, dumpBuf: vBuf, sampleCount: total)
-        step("q_vNorm",    { encQuantizeFp32ToBf16($0, x: vBuf, N: h, numVecs: N) }, dumpBuf: vBuf, sampleCount: total)
-        step("qRoPE",      { encVision2DRopeFp32($0, x: qBuf, posX: posXBuf, posY: posYBuf, N: N, H: H, HD: HD, theta: 100.0) }, dumpBuf: qBuf, sampleCount: total)
-        step("q_qRoPE",    { encQuantizeFp32ToBf16($0, x: qBuf, N: h, numVecs: N) }, dumpBuf: qBuf, sampleCount: total)
-        step("kRoPE",      { encVision2DRopeFp32($0, x: kBuf, posX: posXBuf, posY: posYBuf, N: N, H: H, HD: HD, theta: 100.0) }, dumpBuf: kBuf, sampleCount: total)
-        step("q_kRoPE",    { encQuantizeFp32ToBf16($0, x: kBuf, N: h, numVecs: N) }, dumpBuf: kBuf, sampleCount: total)
-        step("attn",       { encVisionAttnPrefillFp32($0, Q: qBuf, K: kBuf, V: vBuf, O: attnOut, N: N, H: H, HD: HD, qkScale: qkScale, paddingMask: useMaxPatches ? paddingMaskBuf : nil) }, dumpBuf: attnOut, sampleCount: total)
-        step("q_attn",     { encQuantizeFp32ToBf16($0, x: attnOut, N: h, numVecs: N) }, dumpBuf: attnOut, sampleCount: total)
-        step("oProj",      { encGemvFp32V5($0, x: attnOut, W: lw.oProj, out: tmp, B: N, Din: h, Dout: h, quantOut: foldGemmQuant) }, dumpBuf: tmp, sampleCount: total)
-        if !foldGemmQuant { step("q_oProj",    { encQuantizeFp32ToBf16($0, x: tmp, N: h, numVecs: N) }, dumpBuf: tmp, sampleCount: total) }
-        step("postAttnNorm", { encRMSNormGFp32($0, x: tmp, gammaBuf: lw.postAttnNorm, out: postNormFp32, D: h, numVecs: N) }, dumpBuf: postNormFp32, sampleCount: total)
-        step("q_postAttnNorm", { encQuantizeFp32ToBf16($0, x: postNormFp32, N: h, numVecs: N) }, dumpBuf: postNormFp32, sampleCount: total)
-        step("resid1",     { encAddInplaceFp32Fp32($0, dst: x, src: postNormFp32, N: h, numVecs: N) }, dumpBuf: x, sampleCount: total)
-        step("q_resid1",   { encQuantizeFp32ToBf16($0, x: x, N: h, numVecs: N) }, dumpBuf: x, sampleCount: total)
-        // === FFN sub-block ===
-        step("preFfnNorm", { encRMSNormGFp32($0, x: x, gammaBuf: lw.preFfnNorm, out: tmp, D: h, numVecs: N) }, dumpBuf: tmp, sampleCount: total)
-        step("q_preFfnNorm", { encQuantizeFp32ToBf16($0, x: tmp, N: h, numVecs: N) }, dumpBuf: tmp, sampleCount: total)
-        if ProcessInfo.processInfo.environment["VISION_FFN_UNFUSED"] == nil {
-            step("ffnFused", { encVisionFfnGateUpGeluFp32($0, x: tmp, Wgate: lw.gateProj, Wup: lw.upProj, out: gateAct, B: N, Din: h, Dout: interm) }, dumpBuf: gateAct, sampleCount: N * interm)
-        } else {
-            step("gateProj",   { encGemvFp32V5($0, x: tmp, W: lw.gateProj, out: gateAct, B: N, Din: h, Dout: interm) }, dumpBuf: gateAct, sampleCount: N * interm)
-            step("q_gateProj", { encQuantizeFp32ToBf16($0, x: gateAct, N: interm, numVecs: N) }, dumpBuf: gateAct, sampleCount: N * interm)
-            step("upProj",     { encGemvFp32V5($0, x: tmp, W: lw.upProj, out: upAct, B: N, Din: h, Dout: interm) }, dumpBuf: upAct, sampleCount: N * interm)
-            step("q_upProj",   { encQuantizeFp32ToBf16($0, x: upAct, N: interm, numVecs: N) }, dumpBuf: upAct, sampleCount: N * interm)
-            step("geluMul",    { encGeluMulFp32($0, gate: gateAct, up: upAct, N: interm, numVecs: N) }, dumpBuf: gateAct, sampleCount: N * interm)
-            step("q_geluMul",  { encQuantizeFp32ToBf16($0, x: gateAct, N: interm, numVecs: N) }, dumpBuf: gateAct, sampleCount: N * interm)
-        }
-        if splitCBs {
-            let gp = gateAct.contents().assumingMemoryBound(to: Float16.self)
-            let patchBad = 643, dimBad = 2040
-            let idx = patchBad * interm + dimBad
-            let v = Float(gp[idx])
-            print(String(format: "    post-gelu probe: gateAct[%d,%d]=%@",
-                         patchBad, dimBad, v.isNaN ? "NaN" : String(format: "%.4f", v)))
-            // Scan a small neighborhood
-            for offset in -8...8 {
-                let ni = idx + offset
-                if ni >= 0 && ni < N * interm {
-                    let nv = Float(gp[ni])
-                    if nv.isNaN { print("     NaN at linear idx \(ni) (offset \(offset))") }
-                }
-            }
-        }
-        step("downProj",   { encGemvFp32V5($0, x: gateAct, W: lw.downProj, out: mlpOutB, B: N, Din: interm, Dout: h, quantOut: foldGemmQuant) }, dumpBuf: mlpOutB, sampleCount: total)
-        if !foldGemmQuant { step("q_downProj", { encQuantizeFp32ToBf16($0, x: mlpOutB, N: h, numVecs: N) }, dumpBuf: mlpOutB, sampleCount: total) }
-        step("postFfnNorm",{ encRMSNormGFp32($0, x: mlpOutB, gammaBuf: lw.postFfnNorm, out: postNormFp32, D: h, numVecs: N) }, dumpBuf: postNormFp32, sampleCount: total)
-        step("q_postFfnNorm", { encQuantizeFp32ToBf16($0, x: postNormFp32, N: h, numVecs: N) }, dumpBuf: postNormFp32, sampleCount: total)
-        step("resid2",     { encAddInplaceFp32Fp32($0, dst: x, src: postNormFp32, N: h, numVecs: N) }, dumpBuf: x, sampleCount: total)
-        step("q_resid2",   { encQuantizeFp32ToBf16($0, x: x, N: h, numVecs: N) }, dumpBuf: x, sampleCount: total)
-
-        if !splitCBs && !fastPath {
-            commitOne(layerCB)
-        }
-        if dumpStagesDir != nil {
-            dumpStage("layer_\(L)", x, N * h, bytesPerElem: 4)
-        }
-        if debug && (L == 0 || L == 1 || L == 13 || L == 26) && !splitCBs {
-            dumpFp16(x, "after layer \(L) (x[tok0, 0..7])", stride: 0)
-        }
-    }
-
-    // 4) Pool 3×3 avg over the patch grid. Both fp32 I/O now.
-    let cbTail: MTLCommandBuffer = fastPath ? cb0 : queue.makeCommandBuffer()!
-    encVisionPool2DFp32InFp32Out(cbTail, x: x, out: pooled, gridW: gridW, outW: outW,
-                                   outH: outH, kernelSize: 3, hidden: h)
-
-    let sqrtH = Float(h).squareRoot()
-    if !fastPath {
-        commitOne(cbTail)
-        dumpStage("pooled_raw", pooled, nPooled * h, bytesPerElem: 4)
-    }
-
-    let cbStd: MTLCommandBuffer = fastPath ? cb0 : queue.makeCommandBuffer()!
-    encVisionScaledStdNormFp32(cbStd, x: pooled, bias: weights.stdBias, scale: weights.stdScale,
-                                out: stdNormed, D: h, numVecs: nPooled, globalScale: sqrtH)
-    if !fastPath {
-        commitOne(cbStd)
-        dumpStage("std_normed", stdNormed, nPooled * h, bytesPerElem: 4)
-    }
-
-    // 7) embed_vision.embedding_pre_projection_norm: RMSNorm(no scale), fp32.
-    let cbPre: MTLCommandBuffer = fastPath ? cb0 : queue.makeCommandBuffer()!
-    encRMSNormNoScaleFp32(cbPre, x: stdNormed, out: stdNormed, D: h, numVecs: nPooled)
-    if !fastPath {
-        commitOne(cbPre)
-        dumpStage("pre_proj_norm", stdNormed, nPooled * h, bytesPerElem: 4)
-    }
-
-    // 8) embed_vision.embedding_projection: fp32 input, fp16 weights, fp32 output.
-    let cbProj: MTLCommandBuffer = fastPath ? cb0 : queue.makeCommandBuffer()!
-    encGemvFp32V5(cbProj, x: stdNormed, W: weights.embedVisionProj, out: softTokens,
-                    B: nPooled, Din: h, Dout: weights.textHidden)
-
-    // Commit without waiting — caller owns the wait. In fast path this is
-    // the single aggregate CB; in slow (debug) path earlier stages have
-    // already completed synchronously via commitOne, so this final CB
-    // is the only outstanding GPU work.
-    cbProj.commit()
-    if dumpStagesDir != nil {
-        // Dump path needs completed data; stall here so the bin file is
-        // valid. Non-dump (production) path skips the wait entirely.
-        cbProj.waitUntilCompleted()
-        dumpStage("ev_out", softTokens, nPooled * weights.textHidden, bytesPerElem: 4)
-    }
-    return (softTokens, nPooled, cbProj)
-}
 
 // Batched vision forward over B images at once. Slot-parallel layout:
 // per-row ops (GEMMs, RMSNorm, RoPE, residuals) run with numVecs = B × N_max,
@@ -1163,19 +898,20 @@ func runVisionTowerForwardAsync(batch: PatchBatch, weights: VisionWeights,
 // layer with a batch-slot axis in the grid (each slot's K/V lives in its
 // own [N, H, D] region — cross-slot attention is impossible by construction).
 //
-// B=1 degenerates to runVisionTowerForward (we just forward the call to
-// avoid the batched-plumbing overhead on single-image paths).
+// Handles B=1 and B>1 uniformly: the flat [B*N, ...] buffer layout reduces
+// to [N, ...] at B=1 and runs the same kernel dispatches.
 //
 // Returns per-image (softTokens, nPooled) — each image has its own grid
 // and thus its own pooled-token count, so outputs remain variable-length.
-func runVisionTowerBatchForward(batches: [PatchBatch], weights: VisionWeights,
-                                  device: MTLDevice, queue: MTLCommandQueue) -> [(MTLBuffer, Int)] {
+//
+// _core encodes all vision work into a single command buffer but does not
+// commit or wait. Two public wrappers call it: the sync variant commits
+// and waits before returning; the async variant commits and returns the
+// CB so the caller can wait lazily while other queues proceed.
+private func _runVisionTowerBatchForwardCore(batches: [PatchBatch], weights: VisionWeights,
+                                               device: MTLDevice, queue: MTLCommandQueue)
+                                               -> ([(MTLBuffer, Int)], MTLCommandBuffer) {
     precondition(!batches.isEmpty)
-    if batches.count == 1 {
-        let (buf, n) = runVisionTowerForward(batch: batches[0], weights: weights,
-                                               device: device, queue: queue)
-        return [(buf, n)]
-    }
     let B = batches.count
     let N = batches[0].maxPatches
     precondition(batches.allSatisfy { $0.maxPatches == N },
@@ -1323,7 +1059,32 @@ func runVisionTowerBatchForward(batches: [PatchBatch], weights: VisionWeights,
         results.append((softTokens, nPooled))
     }
 
+    return (results, cb)
+}
+
+// Sync wrapper — commits the CB and blocks until all vision kernels finish.
+// Use when the caller needs the soft-token buffers immediately.
+func runVisionTowerBatchForward(batches: [PatchBatch], weights: VisionWeights,
+                                  device: MTLDevice, queue: MTLCommandQueue) -> [(MTLBuffer, Int)] {
+    let (results, cb) = _runVisionTowerBatchForwardCore(
+        batches: batches, weights: weights, device: device, queue: queue)
     cb.commit(); cb.waitUntilCompleted()
     if let e = cb.error { print("  [vision batch] GPU err: \(e)") }
     return results
+}
+
+// Async wrapper — encodes the vision forward and returns the **uncommitted**
+// CB plus the per-image (rawSoftTokens, nPooled) results. The caller is
+// responsible for `cb.commit()` (after attaching any
+// `addCompletedHandler`s — Metal asserts when handlers are added after
+// commit) and for ensuring the soft-token buffers are read only after
+// the CB completes (either via downstream same-queue CB ordering or a
+// completion handler). Used so vision work overlaps with LM decode on
+// other queues.
+func runVisionTowerBatchForwardAsync(batches: [PatchBatch], weights: VisionWeights,
+                                      device: MTLDevice, queue: MTLCommandQueue)
+                                      -> ([(MTLBuffer, Int)], MTLCommandBuffer) {
+    let (results, cb) = _runVisionTowerBatchForwardCore(
+        batches: batches, weights: weights, device: device, queue: queue)
+    return (results, cb)
 }

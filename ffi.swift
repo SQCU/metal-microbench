@@ -16,8 +16,11 @@ import Foundation
 import Metal
 import CryptoKit
 
-private let ffiLock = NSRecursiveLock()
-private var gEngine: LmEngine?
+// Module-internal so the engine's chainAdvance / per-path completion
+// ffiLock and gEngine moved to bootstrap.swift so the executable build
+// (which excludes ffi.swift) can still resolve them in lm_engine.swift /
+// buildStepCB. ffi.swift retains gEngine's lifecycle (assigned at
+// gemma_init, cleared at teardown).
 private var gVisionResidency: VisionResidency?
 private var gPressureSource: DispatchSourceMemoryPressure?
 private var gSessions: [Int32: Session] = [:]
@@ -28,26 +31,33 @@ private var gNextHandle: Int32 = 1
 // per repeated image on M5) and just reuse the already-padded MTLBuffer.
 // The same MTLBuffer can back N concurrent sessions: Session.submit(softTokens:)
 // stores it in a .softTokens chunk which is read-only from the kernel side.
-// Cache entry. `pendingCB` is the in-flight vision CB that produced this
-// buffer; it gets cleared after the first .waitUntilCompleted(). Subsequent
-// users of the same cache entry see pendingCB == nil and skip the wait.
-// Under the async pipeline, LM decode can already be running by the time
-// this wait happens — the CB has usually already completed on the GPU.
-private class CachedSofts {
+// Cache entry. `eventTicket` is the value the vision pad-blit CB signals
+// on `gVisionEvent` after writing this buffer; LM consumers
+// `cb.encodeWaitForEvent(gVisionEvent, value: eventTicket)` so the GPU
+// itself waits before reading. Under the async pipeline the CPU never
+// blocks — the wait is purely a GPU-side queue ordering primitive.
+//
+// Once a consumer's CB has actually read the buffer, the ticket can be
+// reset to 0 (no-wait) so subsequent consumers don't re-wait
+// unnecessarily — but the wait is cheap (event already signaled) so
+// leaving it in place is harmless.
+internal class CachedSofts {
     let buffer: MTLBuffer       // padded to targetSoft rows, fp32
     let count: Int              // always targetSoft=280 currently
     var lastUsed: UInt64        // monotonic tick counter for LRU
     let bytes: Int              // buffer.length, for stats
-    var pendingCB: MTLCommandBuffer?   // non-nil until the vision CB is waited on
-    init(buffer: MTLBuffer, count: Int, lastUsed: UInt64, bytes: Int, pendingCB: MTLCommandBuffer?) {
+    var eventTicket: UInt64     // 0 = no wait needed (already signaled past, or never had one)
+    init(buffer: MTLBuffer, count: Int, lastUsed: UInt64, bytes: Int, eventTicket: UInt64) {
         self.buffer = buffer; self.count = count; self.lastUsed = lastUsed
-        self.bytes = bytes; self.pendingCB = pendingCB
+        self.bytes = bytes; self.eventTicket = eventTicket
     }
 }
 private var gVisionCache: [Data: CachedSofts] = [:]
-private var gVisionCacheHits: UInt64 = 0
-private var gVisionCacheMisses: UInt64 = 0
+internal var gVisionCacheHits: UInt64 = 0
+internal var gVisionCacheMisses: UInt64 = 0
 private var gVisionCacheTick: UInt64 = 0
+// Convenience for stats endpoints in ffi_batch.swift.
+internal var gVisionCacheEntryCount: Int { return gVisionCache.count }
 private let gVisionCacheMaxEntries = 64    // ~200 MB at 280 × 2816 × 4 B each
 
 // Dedicated command queue for vision tower work. Runs concurrently with
@@ -59,7 +69,6 @@ var gVisionQueue: MTLCommandQueue?
 
 @_cdecl("gemma_init")
 public func gemma_init(_ ggufPath: UnsafePointer<CChar>?) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     guard let gp = ggufPath else { return -1 }
     let pathStr = String(cString: gp)
     do {
@@ -95,8 +104,7 @@ private func subscribePressureSource() {
         eventMask: [.warning, .critical], queue: q)
     src.setEventHandler {
         let evt = src.data
-        ffiLock.lock(); defer { ffiLock.unlock() }
-        if evt.contains(.critical) {
+            if evt.contains(.critical) {
             print("[gemma] memory pressure CRITICAL — dropping vision working set + soft cache")
             gVisionResidency?.forceDrop()
             let evicted = gVisionCache.count
@@ -115,115 +123,120 @@ private func subscribePressureSource() {
 
 @_cdecl("gemma_is_ready")
 public func gemma_is_ready() -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     return gEngine != nil ? 1 : 0
 }
 
-// --- Session lifecycle ---
+// Per-session FFI exports (open_session / close_session / pause_session /
+// gemma_submit / gemma_append / gemma_tick) deleted 2026-04-26. Replaced
+// by the unified batch-shaped FFI in ffi_batch.swift: gemma_submit and
+// gemma_poll take a BatchRequest carrying N streams' actions. The
+// bridge no longer holds per-session handles; it submits StreamSpec
+// records keyed by client-assigned stream_id. See notes/specs/
+// batch_ffi_abi.md and notes/decisions/2026-04-26-remove-session-
+// concurrency-primitives.md.
 
-@_cdecl("gemma_open_session")
-public func gemma_open_session(_ maxNewTokens: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
+// Phase-1 validator entry — see docs/dataflow_pipeline_spec.md.
+//
+// Runs the `sample_token` kernel against caller-supplied logits +
+// per-slot sampling params, writes chosen token ids to outSampledPtr.
+// Self-contained: allocates scratch, dispatches the kernel on a fresh
+// CB, blocks until done, returns. Intended ONLY for the Python-side
+// unit/statistical validator; the real engine integration in Phase 2
+// will dispatch the kernel as part of the step CB (no per-call CB).
+//
+// For T<=0 slots: bit-exact argmax vs CPU.
+// For T>0 slots: per-slot inverse-CDF draw using philox(seed, step, slot).
+//                Same tuple → same draw (reproducible); distribution
+//                matches CPU softmax within sampling noise.
+@_cdecl("gemma_test_sample_token")
+public func gemma_test_sample_token(
+    _ logitsPtr: UnsafePointer<UInt16>?,    // [B*VOCAB] fp16 bit-pattern
+    _ biasPtr: UnsafePointer<Float>?,       // [B*VOCAB] fp32 — pass zeros if unused
+    _ tempPtr: UnsafePointer<Float>?,       // [B]
+    _ minPPtr: UnsafePointer<Float>?,       // [B]
+    _ seedPtr: UnsafePointer<UInt32>?,      // [B]
+    _ stepPtr: UnsafePointer<UInt32>?,      // [B]
+    _ activePtr: UnsafePointer<UInt32>?,    // [B]
+    _ outSampledPtr: UnsafeMutablePointer<UInt32>?
+) -> Int32 {
+    guard let lp = logitsPtr, let bp = biasPtr, let tp = tempPtr,
+          let mp = minPPtr, let sp = seedPtr, let stp = stepPtr,
+          let ap = activePtr, let op = outSampledPtr
+    else { return -1 }
+
+    let bVocabBytesHalf = B * VOCAB * 2
+    let bVocabBytesFloat = B * VOCAB * 4
+    guard let logitsBuf = device.makeBuffer(length: bVocabBytesHalf, options: .storageModeShared),
+          let biasBuf   = device.makeBuffer(length: bVocabBytesFloat, options: .storageModeShared),
+          let tempBuf   = device.makeBuffer(length: B * 4, options: .storageModeShared),
+          let minPBuf   = device.makeBuffer(length: B * 4, options: .storageModeShared),
+          let seedBuf   = device.makeBuffer(length: B * 4, options: .storageModeShared),
+          let stepBuf   = device.makeBuffer(length: B * 4, options: .storageModeShared),
+          let activeBuf = device.makeBuffer(length: B * 4, options: .storageModeShared),
+          let tokBuf    = device.makeBuffer(length: B * 4, options: .storageModeShared)
+    else { return -2 }
+
+    memcpy(logitsBuf.contents(), lp, bVocabBytesHalf)
+    memcpy(biasBuf.contents(),   bp, bVocabBytesFloat)
+    memcpy(tempBuf.contents(),   tp, B * 4)
+    memcpy(minPBuf.contents(),   mp, B * 4)
+    memcpy(seedBuf.contents(),   sp, B * 4)
+    memcpy(stepBuf.contents(),   stp, B * 4)
+    memcpy(activeBuf.contents(), ap, B * 4)
+
+    let cb = queue.makeCommandBuffer()!
+    encSampleToken(cb, logits: logitsBuf,
+                    samplingLogitBias: biasBuf,
+                    samplingTemp: tempBuf, samplingMinP: minPBuf,
+                    samplingSeed: seedBuf, samplingStep: stepBuf,
+                    samplingActive: activeBuf,
+                    inputTokens: tokBuf, vocab: VOCAB)
+    cb.commit(); cb.waitUntilCompleted()
+    if let e = cb.error { print("test_sample_token: GPU err \(e)"); return -3 }
+
+    memcpy(op, tokBuf.contents(), B * 4)
+    return 0
+}
+
+// Profiling readout for AR-step throughput debugging. Exposes the engine's
+// running totals: AR steps observed, GPU exec ms summed, wall ms summed.
+// gap = (wall - gpu) / steps  →  CPU/scheduling overhead per step.
+@_cdecl("gemma_engine_ar_profile")
+public func gemma_engine_ar_profile(_ outSteps: UnsafeMutablePointer<Int32>?,
+                                     _ outGpuMs: UnsafeMutablePointer<Double>?,
+                                     _ outWallMs: UnsafeMutablePointer<Double>?) -> Int32 {
     guard let engine = gEngine else { return -1 }
-    guard let s = engine.openSession(maxNewTokens: Int(maxNewTokens)) else { return -1 }
-    let h = gNextHandle
-    gNextHandle += 1
-    gSessions[h] = s
-    return h
-}
-
-@_cdecl("gemma_close_session")
-public func gemma_close_session(_ sid: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let engine = gEngine, let s = gSessions[sid] else { return -1 }
-    engine.closeSession(s)
-    gSessions.removeValue(forKey: sid)
+    outSteps?.pointee = Int32(engine.prof_arSteps)
+    outGpuMs?.pointee = engine.prof_gpuMsSum
+    outWallMs?.pointee = engine.prof_wallMsSum
     return 0
 }
 
-@_cdecl("gemma_pause_session")
-public func gemma_pause_session(_ sid: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid] else { return -1 }
-    s.pause()
+@_cdecl("gemma_engine_ar_profile_detailed")
+public func gemma_engine_ar_profile_detailed(_ outSteps: UnsafeMutablePointer<Int32>?,
+                                              _ outGpuMs: UnsafeMutablePointer<Double>?,
+                                              _ outWallMs: UnsafeMutablePointer<Double>?,
+                                              _ outHandlerMs: UnsafeMutablePointer<Double>?,
+                                              _ outFinalizeMs: UnsafeMutablePointer<Double>?,
+                                              _ outPrepMs: UnsafeMutablePointer<Double>?) -> Int32 {
+    guard let engine = gEngine else { return -1 }
+    outSteps?.pointee = Int32(engine.prof_arSteps)
+    outGpuMs?.pointee = engine.prof_gpuMsSum
+    outWallMs?.pointee = engine.prof_wallMsSum
+    outHandlerMs?.pointee = engine.prof_handlerLatencyMsSum
+    outFinalizeMs?.pointee = engine.prof_finalizeMsSum
+    outPrepMs?.pointee = engine.prof_prepMsSum
     return 0
 }
 
-// --- Submit / append tokens ---
-
-@_cdecl("gemma_submit")
-public func gemma_submit(_ sid: Int32, _ tokens: UnsafePointer<UInt32>?, _ n: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid], let t = tokens, n > 0 else { return -1 }
-    let arr = Array(UnsafeBufferPointer(start: t, count: Int(n)))
-    s.submit(arr)
-    return 0
-}
-
-@_cdecl("gemma_append")
-public func gemma_append(_ sid: Int32, _ tokens: UnsafePointer<UInt32>?, _ n: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid], let t = tokens, n > 0 else { return -1 }
-    let arr = Array(UnsafeBufferPointer(start: t, count: Int(n)))
-    s.append(arr)
-    return 0
-}
-
-// --- Scheduler + output drain ---
-
-@_cdecl("gemma_tick")
-public func gemma_tick() -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let engine = gEngine else { return 0 }
-    return Int32(engine.tick())
-}
-
-@_cdecl("gemma_has_work")
-public func gemma_has_work() -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    return (gEngine?.hasWork ?? false) ? 1 : 0
-}
-
-@_cdecl("gemma_poll")
-public func gemma_poll(_ sid: Int32,
-                       _ outBuf: UnsafeMutablePointer<UInt32>?,
-                       _ maxTokens: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid], let buf = outBuf else { return -1 }
-    var count: Int32 = 0
-    while count < maxTokens, let tok = s.nextToken() {
-        buf[Int(count)] = tok
-        count += 1
-    }
-    return count
-}
-
-// State enum mirrored on the Python side:
-//   0 = idle, 1 = priming, 2 = generating, 3 = paused, 4 = done
-@_cdecl("gemma_session_state")
-public func gemma_session_state(_ sid: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid] else { return -1 }
-    switch s.state {
-    case .idle:       return 0
-    case .priming:    return 1
-    case .generating: return 2
-    case .paused:     return 3
-    case .done:       return 4
-    }
-}
-
-// Current session position (tokens consumed by K/V cache so far).
-// Used by /v1/perplexity to poll for prefill/AR completion: after
-// submit(N tokens), position advances by N once the prefill/AR tick
-// has run. Polling position>expected tells us when logits are ready
-// to read.
-@_cdecl("gemma_session_position")
-public func gemma_session_position(_ sid: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid] else { return -1 }
-    return Int32(s.positionForDebug)
-}
+// Per-session FFI exports (gemma_has_work / gemma_poll / gemma_poll_all /
+// gemma_session_set_structured_cot / gemma_session_state /
+// gemma_session_position) deleted 2026-04-26. Has_work and the bulk
+// drain are no longer meaningful since the batch-shaped gemma_poll
+// internally drives the engine and returns updates for all live
+// streams in one call. Structured-cot is now SamplingParams.cot_labels
+// on every submit; per-session state/position are reported via the
+// batch StreamUpdate's state + counters fields.
 
 // --- Tokenizer (so Python doesn't have to bundle a second one) ---
 
@@ -235,7 +248,6 @@ public func gemma_tokenize(_ text: UnsafePointer<CChar>?, _ textLen: Int32,
                            _ addBos: Int32,
                            _ outTokens: UnsafeMutablePointer<UInt32>?,
                            _ maxTokens: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     guard let engine = gEngine, let t = text, textLen >= 0 else { return -1 }
     let raw = UnsafeBufferPointer(start: t, count: Int(textLen))
     let bytes = raw.map { UInt8(bitPattern: $0) }
@@ -253,7 +265,6 @@ public func gemma_tokenize(_ text: UnsafePointer<CChar>?, _ textLen: Int32,
 public func gemma_detokenize(_ tokens: UnsafePointer<UInt32>?, _ n: Int32,
                              _ outBuf: UnsafeMutablePointer<CChar>?,
                              _ maxBytes: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     guard let engine = gEngine, let t = tokens, n >= 0 else { return -1 }
     let toks = Array(UnsafeBufferPointer(start: t, count: Int(n)))
     let str = engine.detokenize(toks)
@@ -266,71 +277,24 @@ public func gemma_detokenize(_ tokens: UnsafePointer<UInt32>?, _ n: Int32,
 
 @_cdecl("gemma_bos_id")
 public func gemma_bos_id() -> UInt32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     return gEngine?.weights.bosTokenId ?? 0
 }
 
 @_cdecl("gemma_eos_id")
 public func gemma_eos_id() -> UInt32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     return gEngine?.weights.eosTokenId ?? 0
 }
 
 // --- Introspection ---
-
-@_cdecl("gemma_active_session_count")
-public func gemma_active_session_count() -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    return Int32(gSessions.count)
-}
-
-// Fill out_sids with the currently-open session handles, return count.
-// If out_sids is nil, returns the count that would be written.
-@_cdecl("gemma_active_session_ids")
-public func gemma_active_session_ids(_ outSids: UnsafeMutablePointer<Int32>?,
-                                      _ maxN: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    let sorted = gSessions.keys.sorted()
-    if outSids == nil { return Int32(sorted.count) }
-    let n = min(sorted.count, Int(maxN))
-    for i in 0..<n { outSids![i] = sorted[i] }
-    return Int32(n)
-}
-
-// Snapshot one session's KV state for the cache-tenancy viz.
-//   outPosition: session.position (current k_len, i.e. token count)
-//   outState:    SessionState enum (0..4), see gemma_session_state
-//   outPages:    fill with phys page IDs this session owns (ordered)
-//   returns:     number of pages written, or query-size when outPages is nil
-@_cdecl("gemma_session_snapshot")
-public func gemma_session_snapshot(_ sid: Int32,
-                                    _ outPosition: UnsafeMutablePointer<Int32>?,
-                                    _ outState: UnsafeMutablePointer<Int32>?,
-                                    _ outPages: UnsafeMutablePointer<UInt32>?,
-                                    _ maxPages: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid] else { return -1 }
-    if let op = outPosition { op.pointee = Int32(s.positionForDebug) }
-    if let os = outState {
-        switch s.state {
-        case .idle: os.pointee = 0
-        case .priming: os.pointee = 1
-        case .generating: os.pointee = 2
-        case .paused: os.pointee = 3
-        case .done: os.pointee = 4
-        }
-    }
-    let pages = s.ownedPagesForDebug
-    if outPages == nil { return Int32(pages.count) }
-    let n = min(pages.count, Int(maxPages))
-    for i in 0..<n { outPages![i] = UInt32(pages[i]) }
-    return Int32(n)
-}
+// gemma_active_session_count, gemma_active_session_ids,
+// gemma_session_snapshot deleted 2026-04-26: per-session bookkeeping
+// has moved to the bridge. Engine-level totals (cached_pages,
+// active_streams, etc.) are reported by gemma_status; per-stream
+// state + position is in StreamUpdate.
 
 // Refcount (owner-count) for a physical page. > 1 ⇒ shared across sessions.
 @_cdecl("gemma_page_refcount")
 public func gemma_page_refcount(_ phys: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     guard let engine = gEngine else { return 0 }
     return Int32(engine.pageManager.pageRefcount(Int(phys)))
 }
@@ -340,7 +304,6 @@ public func gemma_page_refcount(_ phys: Int32) -> Int32 {
 public func gemma_page_owners(_ phys: Int32,
                                _ outSids: UnsafeMutablePointer<Int32>?,
                                _ maxN: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     guard let engine = gEngine else { return 0 }
     let owners = engine.pageManager.ownersOfPage(Int(phys))
     if outSids == nil { return Int32(owners.count) }
@@ -349,26 +312,9 @@ public func gemma_page_owners(_ phys: Int32,
     return Int32(n)
 }
 
-// Bulk counts for a session: page_count + shared_count (= number of this
-// session's pages with refcount > 1). Consolidated into ONE FFI call so
-// UI pollers don't spam one-per-page calls — which serialize against the
-// pump's tick() via ffiLock and collapse AR throughput (measured 3-4×
-// slowdown at 2 Hz polling, vs negligible with this shape).
-@_cdecl("gemma_session_counts")
-public func gemma_session_counts(_ sid: Int32,
-                                  _ outPageCount: UnsafeMutablePointer<Int32>?,
-                                  _ outSharedCount: UnsafeMutablePointer<Int32>?) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let engine = gEngine, let s = gSessions[sid] else { return -1 }
-    let owned = s.ownedPagesForDebug
-    var shared = 0
-    for phys in owned {
-        if engine.pageManager.pageRefcount(phys) > 1 { shared += 1 }
-    }
-    if let pc = outPageCount   { pc.pointee = Int32(owned.count) }
-    if let sc = outSharedCount { sc.pointee = Int32(shared) }
-    return 0
-}
+// gemma_session_counts deleted 2026-04-26: per-session page counts are
+// now per-stream, surfaced via StreamUpdate.cache_hits / cache_misses
+// (measured in tokens; pages are an internal implementation detail).
 
 // One-shot snapshot of every active session's aggregate KV stats. Writes
 // a packed Int32 array into outBuf of shape [N, 5] where each row is
@@ -383,10 +329,112 @@ public func gemma_session_counts(_ sid: Int32,
 // serialized lock contention per second → measurable AR throughput
 // collapse. This bulk variant takes one lock once, runs all the Swift-
 // side bookkeeping, releases. Observed: 130 ms/poll → ~30 ms/poll.
+// ── Heretic per-write directional ablation ──────────────────────────
+// Configure engine-level write ablations. `component` is 0 for the
+// attention out-projection write (`mlp_out` pre-residual-add) and 1 for
+// the FFN combined write (`ffn_combined` pre-residual-add-with-scale).
+// `cvecPtr` points to HIDDEN fp16 halves (the unit-norm r̂ for this
+// layer); we copy into a fresh MTLBuffer so the caller can free their
+// buffer after the call. alpha is heretic's α(L) for this layer —
+// typically 0-1 for ablation, negative for amplification-induction.
+// Re-calling with the same (layer, component) replaces the prior entry.
+@_cdecl("gemma_engine_set_write_ablation")
+public func gemma_engine_set_write_ablation(
+    _ layer: Int32, _ component: Int32,
+    _ cvecPtr: UnsafePointer<UInt8>?, _ cvecByteCount: Int32,
+    _ alpha: Float
+) -> Int32 {
+    guard let engine = gEngine else { return -1 }
+    guard let comp = AblationComponent(rawValue: component) else { return -2 }
+    guard let p = cvecPtr, cvecByteCount == Int32(HIDDEN * 2) else { return -3 }
+    let buf = device.makeBuffer(length: Int(cvecByteCount), options: .storageModeShared)!
+    memcpy(buf.contents(), p, Int(cvecByteCount))
+    let entry = LayerComponentAblation(layer: Int(layer), component: comp,
+                                         rHatBuf: buf, alpha: alpha)
+    if let i = engine.writeAblations.firstIndex(
+        where: { $0.layer == Int(layer) && $0.component == comp }) {
+        engine.writeAblations[i] = entry
+    } else {
+        engine.writeAblations.append(entry)
+    }
+    return 0
+}
+
+@_cdecl("gemma_engine_clear_write_ablations")
+public func gemma_engine_clear_write_ablations() -> Int32 {
+    gEngine?.writeAblations.removeAll()
+    return 0
+}
+
+// Count of currently-configured ablation entries. Handy for testing.
+@_cdecl("gemma_engine_write_ablation_count")
+public func gemma_engine_write_ablation_count() -> Int32 {
+    return Int32(gEngine?.writeAblations.count ?? 0)
+}
+
+// Scheduler globals in one call: batch size, resident count, lifetime
+// totals, last step ms. Used by the /api/extra/scheduler observability
+// endpoint. Complements gemma_kv_snapshot_summary (per-session KV stats)
+// with per-engine counters that the latter doesn't expose.
+@_cdecl("gemma_engine_scheduler_stats")
+public func gemma_engine_scheduler_stats(
+    _ outB:              UnsafeMutablePointer<Int32>?,
+    _ outResidentCount:  UnsafeMutablePointer<Int32>?,
+    _ outTotalSteps:     UnsafeMutablePointer<Int64>?,
+    _ outTotalTokens:    UnsafeMutablePointer<Int64>?,
+    _ outTotalSlotTicks: UnsafeMutablePointer<Int64>?,
+    _ outLastStepMs:     UnsafeMutablePointer<Double>?
+) -> Int32 {
+    guard let e = gEngine else { return -1 }
+    if let p = outB              { p.pointee = Int32(B) }
+    if let p = outResidentCount  { p.pointee = Int32(e.residentSessions.count) }
+    if let p = outTotalSteps     { p.pointee = Int64(e.totalSteps) }
+    if let p = outTotalTokens    { p.pointee = Int64(e.totalTokensGenerated) }
+    if let p = outTotalSlotTicks { p.pointee = Int64(e.totalSlotTicks) }
+    if let p = outLastStepMs     { p.pointee = e.lastStepMs }
+    return 0
+}
+
+// Per-session scheduler rows: [sid, state, slot, position, chunk_queue_depth]
+// packed Int32 per row. `slot == -1` means resident but not currently
+// bound to an active-batch slot (the "starving" case this endpoint is
+// designed to make visible). Bulk single-lock call — same design as
+// gemma_kv_snapshot_summary to avoid starving AR throughput under
+// polling load.
+@_cdecl("gemma_scheduler_snapshot")
+public func gemma_scheduler_snapshot(_ outBuf: UnsafeMutablePointer<Int32>?,
+                                      _ maxSessions: Int32) -> Int32 {
+    guard let engine = gEngine else { return 0 }
+    let sids = Array(gSessions.keys).sorted()
+    if outBuf == nil { return Int32(sids.count) }
+    let stride = 5
+    var written = 0
+    for sid in sids {
+        if written >= Int(maxSessions) { break }
+        guard let s = gSessions[sid] else { continue }
+        let stateCode: Int32
+        switch s.state {
+        case .idle:       stateCode = 0
+        case .priming:    stateCode = 1
+        case .generating: stateCode = 2
+        case .paused:     stateCode = 3
+        case .done:       stateCode = 4
+        }
+        let base = written * stride
+        outBuf![base + 0] = sid
+        outBuf![base + 1] = stateCode
+        outBuf![base + 2] = Int32(s.slot ?? -1)
+        outBuf![base + 3] = Int32(s.positionForDebug)
+        outBuf![base + 4] = Int32(s.chunkQueueDepthForDebug)
+        _ = engine  // quiet unused-capture when no page lookups needed
+        written += 1
+    }
+    return Int32(written)
+}
+
 @_cdecl("gemma_kv_snapshot_summary")
 public func gemma_kv_snapshot_summary(_ outBuf: UnsafeMutablePointer<Int32>?,
                                        _ maxSessions: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     guard let engine = gEngine, let out = outBuf else { return 0 }
     let sids = Array(gSessions.keys).sorted()
     let stride = 5
@@ -422,12 +470,11 @@ public func gemma_kv_snapshot_summary(_ outBuf: UnsafeMutablePointer<Int32>?,
 
 // Bind the vision tower to a safetensors file. This is a CHEAP call now:
 // it only creates the zero-copy bf16 source buffers (mmap-backed, ~0 RAM).
-// The fp16 working weights are hydrated on first gemma_submit_image_path,
+// The fp16 working weights are hydrated on first gemma_submit_image_bytes,
 // and may be dropped/reloaded across memory-pressure events. Returns 0 on
 // success, -1 on failure.
 @_cdecl("gemma_vision_init")
 public func gemma_vision_init(_ safetensorsPath: UnsafePointer<CChar>?) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     guard let p = safetensorsPath else { return -1 }
     let pathStr = String(cString: p)
     do {
@@ -443,14 +490,12 @@ public func gemma_vision_init(_ safetensorsPath: UnsafePointer<CChar>?) -> Int32
 
 @_cdecl("gemma_vision_is_ready")
 public func gemma_vision_is_ready() -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     return gVisionResidency != nil ? 1 : 0
 }
 
 // Current residency state: 0=unloaded, 1=volatile, 2=pinned, -1=not bound.
 @_cdecl("gemma_vision_residency_state")
 public func gemma_vision_residency_state() -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     guard let r = gVisionResidency else { return -1 }
     switch r.state {
     case .unloaded: return 0
@@ -462,7 +507,6 @@ public func gemma_vision_residency_state() -> Int32 {
 // Working-set size in bytes. 0 when unloaded.
 @_cdecl("gemma_vision_residency_bytes")
 public func gemma_vision_residency_bytes() -> UInt64 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     return UInt64(gVisionResidency?.workingSetBytes() ?? 0)
 }
 
@@ -470,7 +514,6 @@ public func gemma_vision_residency_bytes() -> UInt64 {
 // Auto-called by the pressure source on .warning.
 @_cdecl("gemma_vision_allow_evict")
 public func gemma_vision_allow_evict() -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     gVisionResidency?.allowEvict()
     return 0
 }
@@ -479,69 +522,47 @@ public func gemma_vision_allow_evict() -> Int32 {
 // event from tests; real pressure source calls this automatically).
 @_cdecl("gemma_vision_force_drop")
 public func gemma_vision_force_drop() -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     gVisionResidency?.forceDrop()
     return 0
 }
 
 // Preprocess + vision-tower + submit soft tokens to a session, bracketed
 // by BOI (255999) / EOI (258882) markers the way Gemma-4 expects for an
-// inline image in a user turn. PNG bytes are read from the given file path
-// (Python writes to tempfile, passes path, cleans up after).
+// inline image in a user turn. Image bytes (PNG / JPEG / HEIC / whatever
+// CGImageSource can decode) are passed directly from the caller — no
+// filesystem round-trip.
 //
-// Cache-aware: hashes the raw file bytes (SHA-256); on hit, reuses the
-// previously-padded soft-tokens MTLBuffer and skips preprocess + vision
-// entirely. The same buffer can back concurrent sessions safely since
-// Session.submit(softTokens:) treats the buffer as read-only. LRU-evicts
-// when gVisionCacheMaxEntries is exceeded.
+// Cache-aware: SHA-256 of the raw bytes keys a padded soft-token buffer;
+// on hit, reuses it and skips preprocess + vision entirely. The same
+// buffer can back concurrent sessions safely since Session.submit(soft-
+// Tokens:) treats the buffer as read-only. LRU-evicts when
+// gVisionCacheMaxEntries is exceeded.
 //
 // Returns number of soft tokens submitted (280 on success), or -1 on error.
-@_cdecl("gemma_submit_image_path")
-public func gemma_submit_image_path(_ sid: Int32,
-                                     _ pngPath: UnsafePointer<CChar>?) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid] else { return -1 }
-    guard let p = pngPath else { return -1 }
-    let pathStr = String(cString: p)
-
-    guard let padded = ensureCachedSofts(pngPath: pathStr) else { return -1 }
-
-    // Bracket with BOI + EOI the same way runLmMultimodal does. The softs
-    // chunk carries `pendingCB` so the LM tick can wait on the vision CB
-    // lazily — vision computation overlaps with LM decode on other sessions.
-    let BOI: UInt32 = 255999
-    let EOI: UInt32 = 258882
-    s.submit([BOI])
-    s.submit(softTokens: padded.buffer, count: padded.count, isFp32: true,
-             pendingCB: padded.pendingCB)
-    s.submit([EOI])
-    // After the first handoff, clear pendingCB from the cache entry so the
-    // next cache hit on the same image doesn't wait again.
-    padded.pendingCB = nil
-    return Int32(padded.count)
-}
+// gemma_submit_image_bytes (per-session) deleted 2026-04-26 — replaced
+// by Segment(kind=1, image_bytes=...) on the unified gemma_submit path.
+// The flow it ran (hash → ensureCachedSofts → submit BOI/softs/EOI) is
+// preserved verbatim in ffi_batch.swift's submitImageSegment helper.
 
 // Pre-warm the cache without attaching to a session. Intended for
 // POST /v1/images/prewarm: an agent can pre-populate entries it expects
 // to re-reference later so the first "real" request sees a hit.
 //
-// Unlike gemma_submit_image_path, this WAITS for the vision CB to
-// complete before returning. The async pipeline exists to let vision
-// overlap with LM decode on concurrent sessions, but for the prewarm
-// use case the whole point is "ensure this image is ready before the
-// caller's next step" — returning with the CB still in flight defeats
-// that semantic and makes batched-decode workflows (labeler, etc.)
-// silently lose the batching win.
+// "Prewarmed" means the entry exists and a vision-event ticket is
+// allocated. The pad-blit CB may still be running when this returns —
+// the LM consumer's pre-prefill CB encodeWaitForEvent's the ticket and
+// the GPU itself waits if needed. Per notes/engine_debloat.md: the HTTP
+// handler does not block on GPU work; the consumer encodes the wait.
 //
 // Returns soft-token count on success (cache hit or miss), -1 on error.
-@_cdecl("gemma_vision_prewarm_path")
-public func gemma_vision_prewarm_path(_ pngPath: UnsafePointer<CChar>?) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let p = pngPath else { return -1 }
-    let pathStr = String(cString: p)
-    guard let padded = ensureCachedSofts(pngPath: pathStr) else { return -1 }
-    padded.pendingCB?.waitUntilCompleted()
-    padded.pendingCB = nil
+@_cdecl("gemma_vision_prewarm_bytes")
+public func gemma_vision_prewarm_bytes(_ ptr: UnsafePointer<UInt8>?,
+                                         _ byteCount: Int32) -> Int32 {
+    guard let p = ptr, byteCount > 0 else { return -1 }
+    let data = Data(bytes: p, count: Int(byteCount))
+    // No ffiLock — ensureCachedSofts has its own fine-grained locking and
+    // runs preprocess in parallel across concurrent callers.
+    guard let padded = ensureCachedSofts(data: data) else { return -1 }
     return Int32(padded.count)
 }
 
@@ -551,7 +572,6 @@ public func gemma_vision_prewarm_path(_ pngPath: UnsafePointer<CChar>?) -> Int32
 @_cdecl("gemma_vision_last_cache_key")
 public func gemma_vision_last_cache_key(_ outHex: UnsafeMutablePointer<CChar>?,
                                          _ maxBytes: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     guard let h = gLastCacheKeyHex else { return -1 }
     let data = Array(h.utf8)
     if outHex == nil { return Int32(data.count) }
@@ -571,7 +591,6 @@ public func gemma_vision_last_cache_key(_ outHex: UnsafeMutablePointer<CChar>?,
 public func gemma_vision_fetch_softs_by_key(_ hexKey: UnsafePointer<CChar>?,
                                              _ outPtr: UnsafeMutablePointer<UInt8>?,
                                              _ maxBytes: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     guard let k = hexKey else { return -1 }
     let hex = String(cString: k)
     guard hex.count == 64 else { return -1 }
@@ -586,6 +605,14 @@ public func gemma_vision_fetch_softs_by_key(_ hexKey: UnsafePointer<CChar>?,
     guard let entry = gVisionCache[hashData] else { return -1 }
     let need = entry.buffer.length
     if outPtr == nil { return Int32(need) }
+    // CPU-CPU read API: caller is asking for bytes back. The pad-blit CB
+    // may still be in flight on the vision queue; wait on the
+    // shared-event ticket so the bytes are coherent before memcpy.
+    // This is a legitimate CPU sync point — "give me the bytes" is a
+    // synchronous semantic by definition.
+    if entry.eventTicket > 0 {
+        _ = gVisionEvent.wait(untilSignaledValue: entry.eventTicket, timeoutMS: 30_000)
+    }
     let n = min(need, Int(maxBytes))
     memcpy(outPtr!, entry.buffer.contents(), n)
     return Int32(n)
@@ -603,7 +630,6 @@ public func gemma_vision_fetch_softs_by_key(_ hexKey: UnsafePointer<CChar>?,
 @_cdecl("gemma_control_list_ids")
 public func gemma_control_list_ids(_ outPtr: UnsafeMutablePointer<CChar>?,
                                     _ maxBytes: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     let ids = gCvecRegistry.keys.sorted().joined(separator: ",")
     let bytes = Array(ids.utf8)
     if outPtr == nil { return Int32(bytes.count) }
@@ -611,249 +637,30 @@ public func gemma_control_list_ids(_ outPtr: UnsafeMutablePointer<CChar>?,
     for i in 0..<n { outPtr![i] = CChar(bitPattern: bytes[i]) }
     return Int32(n)
 }
-
-@_cdecl("gemma_control_register_fp16")
-public func gemma_control_register_fp16(_ idPtr: UnsafePointer<CChar>?,
-                                         _ dataPtr: UnsafePointer<UInt8>?,
-                                         _ nBytes: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let ip = idPtr, let dp = dataPtr else { return -1 }
+// Read back an already-registered fp16 cvec. Clients that interpolate
+// directions (heretic's fractional direction_index) or feed a registered
+// direction to the heretic per-write ablation need the raw bytes. Writes
+// HIDDEN fp16 halves into outPtr and returns bytes written, or -1 if the
+// id isn't registered. Passing outPtr=nil returns the needed byte count.
+@_cdecl("gemma_control_get_fp16")
+public func gemma_control_get_fp16(_ idPtr: UnsafePointer<CChar>?,
+                                     _ outPtr: UnsafeMutablePointer<UInt8>?,
+                                     _ maxBytes: Int32) -> Int32 {
+    let need = HIDDEN * 2
+    guard let p = outPtr else { return Int32(need) }
+    guard let ip = idPtr else { return -1 }
     let id = String(cString: ip)
-    if id.isEmpty { return -1 }
-    let expected = HIDDEN * 2
-    guard Int(nBytes) == expected else {
-        print("[cvec] register id=\(id): size mismatch (got \(nBytes), expected \(expected))")
-        return -1
-    }
-    guard let buf = device.makeBuffer(length: expected, options: .storageModeShared) else { return -1 }
-    memcpy(buf.contents(), dp, expected)
-    gCvecRegistry[id] = buf
-    return 0
+    guard let buf = gCvecRegistry[id] else { return -1 }
+    let n = min(need, Int(maxBytes))
+    memcpy(p, buf.contents(), n)
+    return Int32(n)
 }
-
-// Attach a cvector to a session with an ADSR envelope. Activation time
-// (startPosition / startTurn) is captured as the session's current
-// counters — the envelope's elapsed time is measured relative to that.
-// Shape: 0=linear, 1=expIn, 2=expOut, 3=cubic (smoothstep).
-// Units: 0=tokens, 1=turns.
-@_cdecl("gemma_session_add_control")
-public func gemma_session_add_control(_ sid: Int32,
-                                       _ cvecIdPtr: UnsafePointer<CChar>?,
-                                       _ layer: Int32,
-                                       _ polarity: Float,
-                                       _ peakMagnitude: Float,
-                                       _ attack: Float,
-                                       _ decay: Float,
-                                       _ sustainLevel: Float,
-                                       _ release: Float,
-                                       _ shape: Int32,
-                                       _ units: Int32,
-                                       _ mode: Int32) -> Int32 {
-    // mode: 0 = additive (residual += mag * cvec)
-    //       1 = project  (residual projection onto cvec coerced to mag)
-    // Additive stays the default for backward compat; mode=1 adds
-    // representation-engineering primitives (target=0 removes the
-    // feature, nonzero target coerces to a specific level).
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid] else { return -1 }
-    guard let ip = cvecIdPtr else { return -1 }
-    let cvecId = String(cString: ip)
-    guard let buf = gCvecRegistry[cvecId] else {
-        print("[cvec] session \(sid) add_control: no cvec registered for id=\(cvecId)")
-        return -1
-    }
-    let shapes: [CvecShape] = [.linear, .expIn, .expOut, .cubic]
-    let shapeVal = shapes[max(0, min(shapes.count - 1, Int(shape)))]
-    let unitsVal: CvecUnits = (units == 0 ? .tokens : .turns)
-    let modeVal: CvecMode = (mode == 1 ? .project : .additive)
-    let env = CvecEnvelope(attack: attack, decay: decay, sustainLevel: sustainLevel,
-                            release: release, peakMagnitude: peakMagnitude,
-                            shape: shapeVal, units: unitsVal)
-    let t = s.currentTimeCoords
-    let ctrl = ActiveControl(cvecId: cvecId, buffer: buf, layer: Int(layer),
-                              envelope: env, polarity: polarity,
-                              startPosition: t.position, startTurn: t.turn,
-                              mode: modeVal)
-    s.addControl(ctrl)
-    return 0
-}
-
-// Drop all active controls on a session (e.g. at turn-end or on reset).
-@_cdecl("gemma_session_clear_controls")
-public func gemma_session_clear_controls(_ sid: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid] else { return -1 }
-    s.clearControls()
-    return 0
-}
-
-// Teacher-forcing + logit readback used by /v1/perplexity to walk a
-// known completion under controls and compute per-position logprobs.
-// The UI compares perplexity across lanes + control-configs to spot
-// locally-unstable fitted directions (distributions collapsed to a
-// single fixed-point token) versus genuinely-shifted trajectories.
-//
-// Workflow from Python:
-//   1. open_session, attach controls, submit(prompt), drain.
-//   2. read slot logits  → first completion token's logit distribution
-//   3. set_next_input(completion[0]); tick(); read slot logits → next
-//   4. ... repeat over completion length.
-// The session's AR tick path uses nextGeneratedInput as the input
-// token; forceNextInput overrides it with the caller's choice.
-
-// Copy the current slot's logits ([VOCAB] fp16) into the caller's
-// buffer. The logits represent the model's prediction for the
-// position that the session is about to consume (i.e. the NEXT
-// token's distribution). Returns VOCAB on success, negative on error.
-@_cdecl("gemma_session_get_slot_logits")
-public func gemma_session_get_slot_logits(_ sid: Int32,
-                                           _ outBuf: UnsafeMutablePointer<Float16>?) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid], let slot = s.slot, let out = outBuf else { return -1 }
-    let logP = logits.contents().assumingMemoryBound(to: Float16.self)
-    let base = slot * VOCAB
-    for i in 0..<VOCAB { out[i] = logP[base + i] }
-    return Int32(VOCAB)
-}
-
-// Pause/resume used by /v1/perplexity. While paused, the pump skips
-// the session (wantsSlot=false), so the caller can control exactly
-// when forward passes happen relative to logit reads.
-@_cdecl("gemma_session_pause")
-public func gemma_session_pause(_ sid: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid] else { return -1 }
-    s.pauseForExternal()
-    return 0
-}
-
-@_cdecl("gemma_session_resume")
-public func gemma_session_resume(_ sid: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid] else { return -1 }
-    s.resumeFromExternalPause()
-    return 0
-}
-
-// Teacher-force: override the token the next AR tick will consume.
-// Session must be in .generating state (call after prefill has
-// completed and the session has entered AR). Does not itself trigger
-// a tick — caller drives tick() separately.
-@_cdecl("gemma_session_set_next_input")
-public func gemma_session_set_next_input(_ sid: Int32,
-                                          _ token: UInt32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid] else { return -1 }
-    s.forceNextInput(token)
-    return 0
-}
-
-// Session sampling config. temperature=0 is greedy argmax (default,
-// matches prior behavior exactly). Positive values enable stochastic
-// softmax sampling with the session's own RNG — each re-run produces
-// a different trajectory, useful for demonstrating intervention effect
-// as a DISTRIBUTIONAL shift rather than a single argmax-flip. No top-p
-// / top-k filtering yet; temperature alone is enough for visible
-// trajectory diversity at the demo's scale.
-@_cdecl("gemma_session_set_temperature")
-public func gemma_session_set_temperature(_ sid: Int32,
-                                           _ temperature: Float) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid] else { return -1 }
-    s.samplingTemperature = max(0, temperature)
-    return 0
-}
-
-// Signal a control's sustain → release transition (begin the release
-// ramp NOW). Pass the same cvec_id used at add_control time.
-@_cdecl("gemma_session_release_control")
-public func gemma_session_release_control(_ sid: Int32,
-                                           _ cvecIdPtr: UnsafePointer<CChar>?) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid] else { return -1 }
-    guard let ip = cvecIdPtr else { return -1 }
-    let t = s.currentTimeCoords
-    s.releaseControl(cvecId: String(cString: ip), position: t.position, turn: t.turn)
-    return 0
-}
-
-// Attach a detector: a named direction that gets measured against the
-// post-FFN residual at the specified layer every tick. The resulting
-// scalar intensity is visible to triggers and readable via
-// gemma_session_read_intensity. `name` is a session-scoped alias used
-// by gemma_session_add_trigger; `cvecId` picks an already-registered
-// vector from the registry (detectors and effectors share the same
-// registry since they're both HIDDEN-length fp16 vectors).
-@_cdecl("gemma_session_add_detector")
-public func gemma_session_add_detector(_ sid: Int32,
-                                        _ namePtr: UnsafePointer<CChar>?,
-                                        _ cvecIdPtr: UnsafePointer<CChar>?,
-                                        _ layer: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid] else { return -1 }
-    guard let np = namePtr, let ip = cvecIdPtr else { return -1 }
-    let name = String(cString: np)
-    let cvecId = String(cString: ip)
-    guard let buf = gCvecRegistry[cvecId] else {
-        print("[cvec] session \(sid) add_detector: no cvec registered for id=\(cvecId)")
-        return -1
-    }
-    s.addDetector(DetectorAttachment(name: name, cvecId: cvecId,
-                                      buffer: buf, layer: Int(layer)))
-    return 0
-}
-
-// Attach a gated trigger: when `detectorName`'s intensity crosses
-// `threshold` in the direction set by `conditionCode`, restart the
-// envelope of the effector control whose cvecId matches
-// `effectorCvecId`. conditionCode: 0 = onExceed, 1 = onFall.
-@_cdecl("gemma_session_add_trigger")
-public func gemma_session_add_trigger(_ sid: Int32,
-                                       _ detNamePtr: UnsafePointer<CChar>?,
-                                       _ conditionCode: Int32,
-                                       _ threshold: Float,
-                                       _ effectorCvecIdPtr: UnsafePointer<CChar>?) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid] else { return -1 }
-    guard let dp = detNamePtr, let ep = effectorCvecIdPtr else { return -1 }
-    let cond: TriggerCondition = (conditionCode == 0
-        ? .onExceed(threshold: threshold)
-        : .onFall(threshold: threshold))
-    s.addTrigger(SessionTrigger(detectorName: String(cString: dp),
-                                 condition: cond,
-                                 effectorCvecId: String(cString: ep)))
-    return 0
-}
-
-// Drop all detectors / triggers on a session.
-@_cdecl("gemma_session_clear_detectors")
-public func gemma_session_clear_detectors(_ sid: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid] else { return -1 }
-    s.clearDetectors(); s.clearTriggers()
-    return 0
-}
-
-// Peek the most recent intensity reading for a detector (for telemetry
-// / UI, not for the main feedback path — triggers already consume this
-// internally). Returns 0.0 for unknown detector names.
-@_cdecl("gemma_session_read_intensity")
-public func gemma_session_read_intensity(_ sid: Int32,
-                                          _ namePtr: UnsafePointer<CChar>?) -> Float {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid] else { return 0 }
-    guard let np = namePtr else { return 0 }
-    let name = String(cString: np)
-    return s.detectors.first(where: { $0.name == name })?.lastIntensity ?? 0
-}
-
 // Pairwise prose cvec constructor: set the layer whose residual should
 // be blitted into the capture buffer after each tick's post-FFN write.
 // Pass -1 to disable. Active for as long as it's set — caller is
 // responsible for resetting after it's done capturing.
 @_cdecl("gemma_set_capture_layer")
 public func gemma_set_capture_layer(_ layer: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     gResidualCaptureLayer = Int(layer)
     return 0
 }
@@ -864,23 +671,130 @@ public func gemma_set_capture_layer(_ layer: Int32) -> Int32 {
 // and off the rest of the time (tiny but not zero per-layer blit cost).
 @_cdecl("gemma_set_capture_all_layers")
 public func gemma_set_capture_all_layers(_ enabled: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     gCaptureAllLayers = (enabled != 0)
     return 0
 }
 
-// Copy the NUM_LAYERS × HIDDEN × fp16 all-layer capture buffer into
-// the caller's output. Returns bytes written, or if outPtr is nil,
-// the needed size.
+// Copy the NUM_LAYERS × HIDDEN × fp16 all-layer capture buffer for
+// slot 0 into the caller's output. Returns bytes written, or if outPtr
+// is nil, the needed size. Since the underlying buffer is now B-wide
+// per layer, this gathers L-strided slot-0 strips.
 @_cdecl("gemma_get_all_layer_residuals")
 public func gemma_get_all_layer_residuals(_ outPtr: UnsafeMutablePointer<UInt8>?,
                                            _ maxBytes: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
+    return gemma_get_all_slot_layer_residuals(0, outPtr, maxBytes)
+}
+
+// Copy NUM_LAYERS × HIDDEN × fp16 for a specific batch slot out of the
+// B-wide all-layer capture buffer. Layout in the buffer is [L][slot][v]
+// so per-slot extraction is a non-contiguous gather over L strides —
+// 30 memcpys of 5.6 KB each on Gemma-4-A4B, negligible cost.
+@_cdecl("gemma_get_all_slot_layer_residuals")
+public func gemma_get_all_slot_layer_residuals(_ slot: Int32,
+                                                 _ outPtr: UnsafeMutablePointer<UInt8>?,
+                                                 _ maxBytes: Int32) -> Int32 {
     let need = NUM_LAYERS * HIDDEN * 2
     guard let p = outPtr else { return Int32(need) }
+    let s = Int(slot)
+    if s < 0 || s >= B { return -1 }
     let n = min(need, Int(maxBytes))
-    memcpy(p, gAllLayerCaptureBuf.contents(), n)
+    let src = gAllLayerCaptureBuf.contents()
+    let layerStride = B * HIDDEN * 2
+    let slotOffset = s * HIDDEN * 2
+    var written = 0
+    let perLayerBytes = HIDDEN * 2
+    for L in 0..<NUM_LAYERS {
+        if written + perLayerBytes > n { break }
+        memcpy(p.advanced(by: written),
+                src.advanced(by: L * layerStride + slotOffset),
+                perLayerBytes)
+        written += perLayerBytes
+    }
+    return Int32(written)
+}
+
+// Per-layer Q/K/V capture toggle. When enabled, after each layer's
+// q_norm+RoPE, k_norm+RoPE, and v_norm_noscale, the slot-0 per-head
+// Q/K/V tensors get blitted into gQ/K/VCaptureBuf at layer-indexed
+// slots. Used by the synthetic-KV fitting pipeline offline; cost is
+// near-zero when disabled.
+@_cdecl("gemma_set_capture_qkv")
+public func gemma_set_capture_qkv(_ enabled: Int32) -> Int32 {
+    gCaptureQKV = (enabled != 0)
+    return 0
+}
+
+// Readback for the Q capture buffer. Layout is
+// [NUM_LAYERS, MAX_Q_HEADS * MAX_HD] fp16 halves, conservatively sized
+// so each per-layer slice has enough room for either SLIDE (H=16,
+// HD=256) or FULL (H=16, HD=512) layers. Only the first (H_L × HD_L)
+// halves per layer slice are valid; clients consult
+// gemma_get_layer_head_shape to split correctly.
+@_cdecl("gemma_get_captured_q")
+public func gemma_get_captured_q(_ outPtr: UnsafeMutablePointer<UInt8>?,
+                                  _ maxBytes: Int32) -> Int32 {
+    let need = NUM_LAYERS * MAX_Q_HEADS * MAX_HD * 2
+    guard let p = outPtr else { return Int32(need) }
+    let n = min(need, Int(maxBytes))
+    memcpy(p, gQCaptureBuf.contents(), n)
     return Int32(n)
+}
+
+@_cdecl("gemma_get_captured_k")
+public func gemma_get_captured_k(_ outPtr: UnsafeMutablePointer<UInt8>?,
+                                  _ maxBytes: Int32) -> Int32 {
+    let need = NUM_LAYERS * MAX_KV_HEADS * MAX_HD * 2
+    guard let p = outPtr else { return Int32(need) }
+    let n = min(need, Int(maxBytes))
+    memcpy(p, gKCaptureBuf.contents(), n)
+    return Int32(n)
+}
+
+@_cdecl("gemma_get_captured_v")
+public func gemma_get_captured_v(_ outPtr: UnsafeMutablePointer<UInt8>?,
+                                  _ maxBytes: Int32) -> Int32 {
+    let need = NUM_LAYERS * MAX_KV_HEADS * MAX_HD * 2
+    guard let p = outPtr else { return Int32(need) }
+    let n = min(need, Int(maxBytes))
+    memcpy(p, gVCaptureBuf.contents(), n)
+    return Int32(n)
+}
+
+// Return per-layer attention shape info so clients can slice the
+// Q/K/V capture buffers correctly. Writes NUM_LAYERS × 4 int32 values
+// as (num_q_heads, num_kv_heads, head_dim, is_full). Also returns the
+// per-slice STRIDE as MAX_Q_HEADS * MAX_HD (for Q) and MAX_KV_HEADS *
+// MAX_HD (for K and V) — clients use the stride for offset arithmetic
+// and the per-layer (H, KV_H, HD) for valid-element count.
+@_cdecl("gemma_get_layer_attn_shapes")
+public func gemma_get_layer_attn_shapes(_ outPtr: UnsafeMutablePointer<Int32>?,
+                                         _ maxInts: Int32) -> Int32 {
+    let need = NUM_LAYERS * 4
+    guard let p = outPtr else { return Int32(need) }
+    guard let engine = gEngine else { return -1 }
+    let n = min(need, Int(maxInts))
+    var idx = 0
+    for L in 0..<NUM_LAYERS {
+        if idx + 4 > n { break }
+        let lw = engine.weights.layers[L]
+        let H: Int = lw.isFull ? FULL_H : SLIDE_H
+        p[idx + 0] = Int32(H)
+        p[idx + 1] = Int32(lw.KV_H)
+        p[idx + 2] = Int32(lw.HD)
+        p[idx + 3] = Int32(lw.isFull ? 1 : 0)
+        idx += 4
+    }
+    return Int32(idx)
+}
+
+// Strides for slicing the capture buffers. Q stride is MAX_Q_HEADS *
+// MAX_HD halves; K/V stride is MAX_KV_HEADS * MAX_HD halves.
+@_cdecl("gemma_get_qkv_capture_strides")
+public func gemma_get_qkv_capture_strides(_ outQStride: UnsafeMutablePointer<Int32>?,
+                                           _ outKVStride: UnsafeMutablePointer<Int32>?) -> Int32 {
+    if let p = outQStride { p.pointee = Int32(MAX_Q_HEADS * MAX_HD) }
+    if let p = outKVStride { p.pointee = Int32(MAX_KV_HEADS * MAX_HD) }
+    return 0
 }
 
 // Copy the most-recently-captured residual (HIDDEN × fp16 = 5632 B)
@@ -892,193 +806,267 @@ public func gemma_get_all_layer_residuals(_ outPtr: UnsafeMutablePointer<UInt8>?
 @_cdecl("gemma_get_captured_residual")
 public func gemma_get_captured_residual(_ outPtr: UnsafeMutablePointer<UInt8>?,
                                          _ maxBytes: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     let need = HIDDEN * 2
     guard let p = outPtr else { return Int32(need) }
     let n = min(need, Int(maxBytes))
     memcpy(p, gResidualCaptureBuf.contents(), n)
     return Int32(n)
 }
-
-// Drain per-token samples as a JSON array and copy into caller-provided
-// buffer. Returns bytes written (truncated if buffer too small — caller
-// should size generously, ~200 bytes per sample is a safe upper bound).
-// If outPtr is nil, returns the number of bytes that WOULD be written
-// without draining — use this to size your buffer. Otherwise the queue
-// IS drained (consumed) on each call.
-@_cdecl("gemma_session_poll_samples_json")
-public func gemma_session_poll_samples_json(_ sid: Int32,
-                                             _ outPtr: UnsafeMutablePointer<CChar>?,
-                                             _ maxBytes: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid] else { return -1 }
-    // When asked for a size only (outPtr == nil), don't drain — serialize
-    // a snapshot of the current queue without consuming it. A subsequent
-    // call with a buffer drains for real.
-    if outPtr == nil {
-        // Quick upper bound: each sample serializes to O(150 bytes)
-        // typical; give the caller enough headroom.
-        return Int32(s.pendingSamplesCount * 256 + 4)
-    }
-    let json = s.drainSamplesJson()
-    let bytes = Array(json.utf8)
-    let n = min(bytes.count, Int(maxBytes))
-    for i in 0..<n { outPtr![i] = CChar(bitPattern: bytes[i]) }
-    return Int32(n)
-}
-
-// Submit pre-computed soft tokens to a session. The client is handing
-// back softs they received from a previous image submission — the server
-// brackets with BOI/EOI and appends to the chunk queue without running
-// the vision tower. This is the inverse of gemma_vision_fetch_softs_by_key.
+// Fine-grained locks for the image-submit critical path. ffiLock is NOT
+// held during preprocess / vision CB submission — text-only sessions'
+// tick() threads proceed concurrently while vision work runs.
 //
-// `byteCount` must equal `nTokens * HIDDEN * (isFp32 ? 4 : 2)`.
-// Returns nTokens on success, -1 on error.
-@_cdecl("gemma_submit_softs")
-public func gemma_submit_softs(_ sid: Int32,
-                                _ ptr: UnsafePointer<UInt8>?,
-                                _ byteCount: Int32,
-                                _ nTokens: Int32,
-                                _ isFp32: Int32) -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
-    guard let s = gSessions[sid] else { return -1 }
-    guard let src = ptr, nTokens > 0 else { return -1 }
-    let fp32 = isFp32 != 0
-    let bpe = fp32 ? 4 : 2
-    let expected = Int(nTokens) * HIDDEN * bpe
-    guard Int(byteCount) == expected else {
-        print("gemma_submit_softs: size mismatch (got \(byteCount), expected \(expected) for \(nTokens) tokens at hidden=\(HIDDEN), fp32=\(fp32))")
-        return -1
-    }
-    guard let buf = device.makeBuffer(length: expected, options: .storageModeShared) else { return -1 }
-    memcpy(buf.contents(), src, expected)
+// - gVisionCacheLock: guards the cache dict + tick counter + hit/miss
+//   counters + gLastCacheKeyHex. Held only for microseconds at a time
+//   (dict reads/writes).
+// - gResidencyLock: serializes residency state transitions (ensurePinned,
+//   forceDrop). The first caller pays the hydrate cost (~10 ms GPU); all
+//   subsequent callers fast-path through the .pinned check.
+// - gVisionBatchLock: guards the pending-batch queue + dispatcher-active
+//   flag. The first concurrent miss becomes the batch "leader" — waits a
+//   short window for peers' preprocess to complete, then dispatches one
+//   runVisionTowerBatchForwardAsync call covering all pending images.
+//
+// Residency is kept pinned indefinitely after first use — on an M5 Max
+// the ~1.5 GB working set is a trivial budget, and the prior allowEvict
+// defer raced with concurrent callers' in-flight vision CBs. Pressure-
+// source forceDrop() still runs if the OS actually needs the pages back.
+private let gVisionCacheLock = NSLock()
+private let gResidencyLock = NSLock()
+private let gVisionBatchLock = NSLock()
+private var gLastCacheKeyHex: String?
 
-    let BOI: UInt32 = 255999
-    let EOI: UInt32 = 258882
-    s.submit([BOI])
-    s.submit(softTokens: buf, count: Int(nTokens), isFp32: fp32)
-    s.submit([EOI])
-    return nTokens
+// Vision-batch dispatcher: completion-driven gather + non-blocking submit
+// (see notes/engine_debloat.md).
+//
+// HTTP submit pre-allocates the padded buffer + reserves an
+// MTLSharedEvent ticket and installs the CachedSofts entry in the cache
+// IMMEDIATELY. Then it enqueues a `VisionBatchPending` carrying that
+// entry and returns to the caller. No semaphore. No leader. No poll.
+//
+// The vision dispatcher's completion handler then runs:
+//   - For each pending item, encode a pad-blit CB that fills the
+//     pre-allocated buffer from the raw vision-tower output.
+//   - The pad-blit CB encodeSignalEvent's the reserved ticket.
+//   - LM consumers' `encodeWaitForEvent(ticket)` (already wired in
+//     prepareSinglePrefill / prepareMultiSlotSoftPrefill) gates the
+//     downstream prefill on the pad-blit completing — entirely on GPU,
+//     CPU never blocks.
+//
+// Cache hits return the existing entry instantly. The caller's chunk
+// queue carries the entry's eventTicket; the LM prefill encodes a
+// GPU-side wait that resolves immediately if the ticket is already
+// signaled past, or waits for the in-flight pad-blit otherwise.
+private struct VisionBatchPending {
+    let batch: PatchBatch
+    let entry: CachedSofts   // pre-allocated buffer + reserved ticket
 }
 
-// Internal: hash the file, check/populate the cache. Shared by submit + prewarm.
-private var gLastCacheKeyHex: String?
-private func ensureCachedSofts(pngPath: String) -> CachedSofts? {
-    guard let residency = gVisionResidency else {
-        print("ensureCachedSofts: vision not initialized")
-        return nil
-    }
-    guard let fileData = try? Data(contentsOf: URL(fileURLWithPath: pngPath)) else {
-        print("ensureCachedSofts: failed to read \(pngPath)")
-        return nil
-    }
-    let hash = SHA256.hash(data: fileData)
-    let hashData = Data(hash)
-    gLastCacheKeyHex = hash.map { String(format: "%02x", $0) }.joined()
+private var gVisionBatchPending: [VisionBatchPending] = []
+// In-flight flag: set true while a vision CB is committed and running
+// (or while the completion handler is running). New submitters who find
+// it true append to the queue and skip the kick — the in-flight CB's
+// completion handler will drain them. Cleared inside the handler when
+// the post-CB queue drain finds nothing left to do.
+private var gVisionBatchInFlight: Bool = false
 
+private func _installCachedSofts(hashData: Data, entry: CachedSofts) {
+    gVisionCacheLock.lock()
+    gVisionCache[hashData] = entry
+    if gVisionCache.count > gVisionCacheMaxEntries {
+        if let (oldKey, _) = gVisionCache.min(by: { $0.value.lastUsed < $1.value.lastUsed }) {
+            gVisionCache.removeValue(forKey: oldKey)
+        }
+    }
+    gVisionCacheLock.unlock()
+}
+
+// Drain the pending-batch queue into one runVisionTowerBatchForwardAsync
+// call. Self-perpetuating: the vision CB's completion handler re-calls
+// this to drain anything that arrived during the GPU work. Caller must
+// hold the gVisionBatchInFlight=true invariant: either as the original
+// kicker (set just before calling) or by virtue of being inside the
+// completion handler chain (in-flight remains true across the handler).
+//
+// On entry: gVisionBatchInFlight is true. On exit: either dispatched a
+// new vision CB (handler re-calls us) or cleared in-flight (queue empty).
+private func _kickVisionDispatch(weights: VisionWeights) {
+    // Atomically drain whatever is currently queued. If empty, clear the
+    // in-flight flag inside the same critical section so we don't race
+    // with a new submitter who would otherwise see in-flight=true and
+    // not kick — that would leak a never-dispatched item.
+    gVisionBatchLock.lock()
+    let items = gVisionBatchPending
+    gVisionBatchPending.removeAll(keepingCapacity: true)
+    if items.isEmpty {
+        gVisionBatchInFlight = false
+        gVisionBatchLock.unlock()
+        return
+    }
+    gVisionBatchLock.unlock()
+
+    let vq = gVisionQueue ?? queue
+    let batches = items.map { $0.batch }
+    if ProcessInfo.processInfo.environment["VISION_BATCH_DEBUG"] != nil {
+        FileHandle.standardError.write("[vision-batch] dispatching B=\(batches.count)\n".data(using: .utf8)!)
+    }
+    let (batchResults, visionCB) = runVisionTowerBatchForwardAsync(
+        batches: batches, weights: weights, device: device, queue: vq)
+
+    // Vision CB completion handler: encode per-item pad-blit CBs into
+    // the pre-allocated entry buffers, signal each item's pre-reserved
+    // event ticket, then re-kick to drain anything that arrived during
+    // this CB. No CPU sync — LM consumers wait on event tickets via
+    // GPU-side encodeWaitForEvent.
+    visionCB.addCompletedHandler { _ in
+        // One pad-blit CB for the whole batch: K blits + K signal-events
+        // in one CB instead of K separate CBs (each ~100µs of Metal
+        // overhead). Items run sequentially within this CB on the vision
+        // queue; signals fire in encode order, so the event's signaledValue
+        // passes through each ticket monotonically — LM consumers waiting
+        // on any ticket get woken when that one is reached.
+        let padCB = vq.makeCommandBuffer()!
+        let blit = padCB.makeBlitCommandEncoder()!
+        for (i, item) in items.enumerated() {
+            let (rawSoftTokens, rawNPooled) = batchResults[i]
+            if rawNPooled > 0 {
+                let copyRows = min(rawNPooled, item.entry.count)
+                blit.copy(from: rawSoftTokens, sourceOffset: 0,
+                          to: item.entry.buffer, destinationOffset: 0,
+                          size: copyRows * HIDDEN * 4)
+            } else {
+                FileHandle.standardError.write(
+                    "[vision] image extraction returned 0 softs (failure)\n".data(using: .utf8)!)
+            }
+        }
+        blit.endEncoding()
+        // Signal each item's ticket at the same point in the CB timeline
+        // (after the blits). Even failed items get signaled so LM
+        // consumers don't deadlock; their buffers remain zero-init.
+        for item in items {
+            padCB.encodeSignalEvent(gVisionEvent, value: item.entry.eventTicket)
+        }
+        padCB.commit()
+        _kickVisionDispatch(weights: weights)
+    }
+    visionCB.commit()
+}
+
+internal func ensureCachedSofts(data: Data) -> CachedSofts? {
+    // Hash outside any lock — SHA-256 on ~10–200 KB is microseconds and
+    // has no shared state.
+    let hash = SHA256.hash(data: data)
+    let hashData = Data(hash)
+    let hashHex = hash.map { String(format: "%02x", $0) }.joined()
+
+    // Fast path: cache hit. Brief critical section on the dict only.
+    gVisionCacheLock.lock()
     gVisionCacheTick &+= 1
+    gLastCacheKeyHex = hashHex
     if var hit = gVisionCache[hashData] {
         hit.lastUsed = gVisionCacheTick
         gVisionCache[hashData] = hit
         gVisionCacheHits &+= 1
+        gVisionCacheLock.unlock()
         return hit
     }
     gVisionCacheMisses &+= 1
+    let tickAtMiss = gVisionCacheTick
+    gVisionCacheLock.unlock()
 
-    // Miss: run preprocess + vision tower. Ensure the residency is .pinned
-    // for the duration of the forward pass, then flip to .volatile so the
-    // OS can reclaim the working set when we're idle again.
+    // Miss: hydrate residency (first-call only; subsequent .pinned checks
+    // are ~nanoseconds). Separate lock so the residency transition doesn't
+    // block cache dict reads.
+    gResidencyLock.lock()
+    guard let residency = gVisionResidency else {
+        gResidencyLock.unlock()
+        print("ensureCachedSofts: vision not initialized")
+        return nil
+    }
     do {
         try residency.ensurePinned()
     } catch {
+        gResidencyLock.unlock()
         print("ensureCachedSofts: vision hydrate failed: \(error)")
         return nil
     }
-    defer { residency.allowEvict() }
     guard let visWeights = residency.weights else {
+        gResidencyLock.unlock()
         print("ensureCachedSofts: residency returned nil weights")
         return nil
     }
+    gResidencyLock.unlock()
 
+    // Preprocess: pure CPU, no shared state. Runs in parallel across
+    // concurrent callers on M5 Max's plentiful cores.
     let batch: PatchBatch
-    do { batch = try gemma4ImagePreprocess(path: pngPath, device: device) }
+    do { batch = try gemma4ImagePreprocess(data: data, device: device) }
     catch {
         print("ensureCachedSofts: preprocess failed: \(error)")
         return nil
     }
-    // Submit vision work on the dedicated vision queue so LM-queue CBs
-    // (running concurrently from other sessions) aren't serialized behind it.
-    let vq = gVisionQueue ?? queue
-    let (rawSoftTokens, rawNPooled, cb) = runVisionTowerForwardAsync(
-        batch: batch, weights: visWeights, device: device, queue: vq)
-    if rawNPooled == 0 { return nil }
 
-    // Allocate the padded [image_seq_length=280, HIDDEN] fp32 target and
-    // zero-init on CPU (trivial — 3 MB memset). The GPU blit below copies
-    // rawSoftTokens' computed rows into the head. This keeps the padded
-    // tail bytes quietly at zero, matching what the old sync memcpy did.
+    // Pre-allocate the padded buffer + reserve an event ticket up front,
+    // so the cache entry exists IMMEDIATELY (deduplication: a second
+    // submit of the same hash hits the cache and shares the in-flight
+    // ticket). The vision dispatcher's completion handler will fill the
+    // buffer + signal the ticket. No semaphore, no CPU wait — LM
+    // consumers gate downstream work via GPU-side encodeWaitForEvent.
     let targetSoft = 280
-    let padded = device.makeBuffer(length: targetSoft * HIDDEN * 4,
-                                    options: .storageModeShared)!
+    guard let padded = device.makeBuffer(length: targetSoft * HIDDEN * 4,
+                                          options: .storageModeShared)
+    else {
+        print("ensureCachedSofts: makeBuffer failed (out of memory?)")
+        return nil
+    }
     memset(padded.contents(), 0, padded.length)
-    let copyRows = min(rawNPooled, targetSoft)
-
-    // Blit on the vision queue — runs after `cb` completes (same queue,
-    // serialized). When `padCB` completes, `padded` is fully materialized.
-    // The consumer (LM tick softTokens reader) waits on `padCB` before
-    // reading, so vision work pipelines against LM decode: the LM queue
-    // can process other sessions while vision's two CBs churn on vq.
-    let padCB = vq.makeCommandBuffer()!
-    let blit = padCB.makeBlitCommandEncoder()!
-    blit.copy(from: rawSoftTokens, sourceOffset: 0,
-              to: padded, destinationOffset: 0,
-              size: copyRows * HIDDEN * 4)
-    blit.endEncoding()
-    padCB.commit()
-
+    let ticket = nextVisionEventTicket()
     let entry = CachedSofts(buffer: padded, count: targetSoft,
-                             lastUsed: gVisionCacheTick, bytes: padded.length,
-                             pendingCB: padCB)
-    gVisionCache[hashData] = entry
+                             lastUsed: tickAtMiss, bytes: padded.length,
+                             eventTicket: ticket)
+    _installCachedSofts(hashData: hashData, entry: entry)
 
-    // LRU evict if over cap.
-    if gVisionCache.count > gVisionCacheMaxEntries {
-        // Evict lowest lastUsed. O(N) at cap=64 so fine.
-        if let (oldKey, _) = gVisionCache.min(by: { $0.value.lastUsed < $1.value.lastUsed }) {
-            gVisionCache.removeValue(forKey: oldKey)
-        }
+    let pending = VisionBatchPending(batch: batch, entry: entry)
+    let shouldKick: Bool
+    gVisionBatchLock.lock()
+    gVisionBatchPending.append(pending)
+    shouldKick = !gVisionBatchInFlight
+    if shouldKick { gVisionBatchInFlight = true }
+    gVisionBatchLock.unlock()
+    if shouldKick {
+        _kickVisionDispatch(weights: visWeights)
     }
     return entry
 }
 
 @_cdecl("gemma_vision_cache_entries")
 public func gemma_vision_cache_entries() -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     return Int32(gVisionCache.count)
 }
 
 @_cdecl("gemma_vision_cache_hits")
 public func gemma_vision_cache_hits() -> UInt64 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     return gVisionCacheHits
 }
 
 @_cdecl("gemma_vision_cache_misses")
 public func gemma_vision_cache_misses() -> UInt64 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     return gVisionCacheMisses
 }
 
 @_cdecl("gemma_vision_cache_bytes")
 public func gemma_vision_cache_bytes() -> UInt64 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     return gVisionCache.values.reduce(0) { $0 + UInt64($1.bytes) }
 }
 
 @_cdecl("gemma_vision_cache_clear")
 public func gemma_vision_cache_clear() -> Int32 {
-    ffiLock.lock(); defer { ffiLock.unlock() }
     let n = gVisionCache.count
     gVisionCache.removeAll()
     return Int32(n)
+}
+
+@_cdecl("gemma_max_q_len")
+public func gemma_max_q_len() -> Int32 {
+    return Int32(MAX_Q_LEN)
 }

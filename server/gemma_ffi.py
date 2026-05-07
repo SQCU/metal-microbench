@@ -93,6 +93,9 @@ _lib.gemma_register_resource.argtypes = [
 ]
 _lib.gemma_register_resource.restype = C.c_int32
 
+_lib.gemma_max_q_len.argtypes = []
+_lib.gemma_max_q_len.restype = C.c_int32
+
 
 # ----------------------------------------------------------------------
 # Stream / sampling / segment dataclasses (Python-side shape).
@@ -518,6 +521,12 @@ def poll(timeout_ms: int = 100) -> list[StreamUpdate]:
         if n == 0:
             return []
         return _decode_response(bytes(_POLL_BUF[:n]))
+
+
+def max_q_len() -> int:
+    """Engine-side cap on a single teacher-forced eval call (in tokens).
+    Longer corpora are stride-windowed by the caller."""
+    return _lib.gemma_max_q_len()
 
 
 def status() -> ServerStats:

@@ -1221,6 +1221,220 @@ kernel void dense_gemv_q4k_v4(
     for (uint b = 0; b < B; ++b) output[b * D_out + n] = half(accs[b]);
 }
 
+// -------- Q5_K dequant helpers + AR GEMV --------
+// block_q5_K (176 bytes / 256 elts):
+//   half d, half dmin, uchar scales[12], uchar qh[32], uchar qs[128]
+// Sub-tile structure (16 sub-tiles of 16 elts each, indexed by il_orig ∈ [0,16)):
+//   q_off  = 32*(il_orig/4) + 16*(il_orig & 1)   // base byte in qs[128]
+//   qh_off = 16*(il_orig & 1)                    // base byte in qh[32]
+//   ul     = 1 << (il_orig / 2)                  // bit selector in qh
+//   is     = (il_orig / 4) * 2                   // scales-pair index
+//   ph     = il_orig & 3                         // phase ∈ {0..3}
+// Phase ph: lo nibble for ph<2, hi nibble for ph>=2; d /= 16 for ph>=2;
+//           qh adds 16 for ph<2, 256 for ph>=2; sc index (ph/2) ∈ {0,1}.
+
+// Forward-shadowed in AR section to avoid ordering against the int-typed
+// version defined in the prefill section (line ~7500). Mirrors that function
+// verbatim with uint args.
+static inline uchar2 get_scale_min_k4_just2(
+    uint j, uint k, device const uchar* q)
+{
+    if (j < 4) {
+        return uchar2(q[j + 0 + k] & 0x3F, q[j + 4 + k] & 0x3F);
+    }
+    return uchar2((q[j + 4 + k] & 0x0F) | ((q[j - 4 + k] & 0xC0) >> 2),
+                  (q[j + 4 + k] >> 4)   | ((q[j - 0 + k] & 0xC0) >> 2));
+}
+
+// Dense GEMV with Q5_K weights, v4 pattern (one thread per output column,
+// MAX_B accumulators per thread amortizes W reads across batch).
+kernel void dense_gemv_q5_K_v4(
+    device const half* hidden           [[buffer(0)]],
+    device const uchar* W_q5k           [[buffer(1)]],
+    device half* output                 [[buffer(2)]],
+    constant uint& B                    [[buffer(3)]],
+    constant uint& D_in                 [[buffer(4)]],
+    constant uint& D_out                [[buffer(5)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    constexpr uint MAX_B = 8;
+    uint n_block = tg.x; uint t = lid.x;
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+
+    constexpr uint BLK = 176;
+    uint nbc = D_in / 256;
+    uint col_bytes = nbc * BLK;
+    device const uchar* W_col = W_q5k + n * col_bytes;
+
+    float accs[MAX_B];
+    for (uint b = 0; b < MAX_B; ++b) accs[b] = 0.0f;
+
+    for (uint kb = 0; kb < nbc; ++kb) {
+        device const uchar* blk = W_col + kb * BLK;
+        float d_all = float(*(device const half*)(blk + 0));
+        float dmin  = float(*(device const half*)(blk + 2));
+        device const uchar* scales = blk + 4;
+        device const uchar* qh     = blk + 16;
+        device const uchar* qs     = blk + 48;
+
+        for (uint il_orig = 0; il_orig < 16; ++il_orig) {
+            uint q_off  = 32u * (il_orig / 4u) + 16u * (il_orig & 1u);
+            uint qh_off = 16u * (il_orig & 1u);
+            uchar ul    = uchar(1u << (il_orig / 2u));
+            uint is     = (il_orig / 4u) * 2u;
+            uint ph     = il_orig & 3u;
+            uchar2 sc   = get_scale_min_k4_just2(is, ph / 2u, scales);
+            float d_eff = (ph < 2u) ? d_all : (d_all / 16.0f);
+            float dl    = d_eff * float(sc[0]);
+            float ml    = dmin  * float(sc[1]);
+            uchar mask  = (ph < 2u) ? 0x0F : 0xF0;
+            float qhv   = (ph < 2u) ? 16.0f : 256.0f;
+            uint base_k = kb * 256u + il_orig * 16u;
+            for (uint i = 0; i < 16; ++i) {
+                float v = float(qs[q_off + i] & mask)
+                        + (((qh[qh_off + i] & ul) != 0) ? qhv : 0.0f);
+                float w = dl * v - ml;
+                for (uint b = 0; b < B; ++b) {
+                    accs[b] += float(hidden[b * D_in + base_k + i]) * w;
+                }
+            }
+        }
+    }
+    for (uint b = 0; b < B; ++b) output[b * D_out + n] = half(accs[b]);
+}
+
+// -------- Q6_K dequant + AR GEMV --------
+// block_q6_K (210 bytes / 256 elts):
+//   uchar ql[128], uchar qh[64], int8 scales[16], half d
+// 16 sub-tiles of 16 elts (il ∈ [0,16)), each producing 4 packed 32-bit q's
+// of 4 bytes each (16 elts total). Centered Q6 (-32 offset baked into ml).
+
+kernel void dense_gemv_q6_K_v4(
+    device const half* hidden           [[buffer(0)]],
+    device const uchar* W_q6k           [[buffer(1)]],
+    device half* output                 [[buffer(2)]],
+    constant uint& B                    [[buffer(3)]],
+    constant uint& D_in                 [[buffer(4)]],
+    constant uint& D_out                [[buffer(5)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    constexpr uint MAX_B = 8;
+    uint n_block = tg.x; uint t = lid.x;
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+
+    constexpr uint BLK = 210;
+    uint nbc = D_in / 256;
+    uint col_bytes = nbc * BLK;
+    device const uchar* W_col = W_q6k + n * col_bytes;
+
+    float accs[MAX_B];
+    for (uint b = 0; b < MAX_B; ++b) accs[b] = 0.0f;
+
+    for (uint kb = 0; kb < nbc; ++kb) {
+        device const uchar* blk = W_col + kb * BLK;
+        device const ushort* ql_u16    = (device const ushort*)(blk + 0);
+        device const ushort* qh_u16    = (device const ushort*)(blk + 128);
+        device const char*   scales_i8 = (device const char*)(blk + 192);
+        float d_all = float(*(device const half*)(blk + 208));
+
+        for (uint il = 0; il < 16; ++il) {
+            uint ql_base = 32u * (il / 8u) + 16u * ((il / 2u) & 1u) + 8u * (il & 1u);
+            uint qh_base = 16u * (il / 8u) + 8u * (il & 1u);
+            float sc = float(scales_i8[(il % 2u) + 2u * (il / 2u)]);
+            uint ph = (il / 2u) & 3u;
+
+            uint kmask1 = (ph > 1u) ? ((ph > 2u) ? 0xC0C0C0C0u : 0x30303030u)
+                                    : ((ph > 0u) ? 0x0C0C0C0Cu : 0x03030303u);
+            uint kmask2 = (ph > 1u) ? 0xF0F0F0F0u : 0x0F0F0F0Fu;
+            float ml  = d_all * sc * 32.0f;
+            float dl0 = d_all * sc;
+            float dl1 = dl0 / 256.0f;
+            float dl2 = dl1 / 256.0f;
+            float dl3 = dl2 / 256.0f;
+            uint shr_h = (ph > 2u) ? 2u : 0u;
+            uint shl_h = (ph > 1u) ? 0u : ((ph > 0u) ? 2u : 4u);
+            uint shr_l = (ph > 1u) ? 4u : 0u;
+
+            uint base_k = kb * 256u + il * 16u;
+            for (uint i = 0; i < 4; ++i) {
+                uint low  = (uint(ql_u16[ql_base + 2u*i]) | (uint(ql_u16[ql_base + 2u*i + 1u]) << 16)) & kmask2;
+                uint high = (uint(qh_u16[qh_base + 2u*i]) | (uint(qh_u16[qh_base + 2u*i + 1u]) << 16)) & kmask1;
+                uint q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+                float w0 = dl0 * float(q & 0x000000FFu)         - ml;
+                float w1 = dl1 * float(q & 0x0000FF00u)         - ml;
+                float w2 = dl2 * float(q & 0x00FF0000u)         - ml;
+                float w3 = dl3 * float(q & 0xFF000000u)         - ml;
+                uint k0 = base_k + i * 4u;
+                for (uint b = 0; b < B; ++b) {
+                    device const half* hb = hidden + b * D_in;
+                    accs[b] += float(hb[k0 + 0]) * w0
+                             + float(hb[k0 + 1]) * w1
+                             + float(hb[k0 + 2]) * w2
+                             + float(hb[k0 + 3]) * w3;
+                }
+            }
+        }
+    }
+    for (uint b = 0; b < B; ++b) output[b * D_out + n] = half(accs[b]);
+}
+
+// -------- Q5_1 dense AR GEMV (32-elt blocks, 24 B) --------
+// block_q5_1 (24 bytes per 32 elts):
+//   half d, half m, uchar qh[4], uchar qs[16]
+// Per-element: q_lo = (qs[p] & 0xF) | (((qh[p/8] >> (p%8)) & 1) << 4); w_lo = d*q_lo + m
+//              q_hi = ((qs[p] >> 4) & 0xF) | (((qh[(p+16)/8] >> ((p+16)%8)) & 1) << 4); w_hi = d*q_hi + m
+
+kernel void dense_gemv_q5_1_v4(
+    device const half* hidden           [[buffer(0)]],
+    device const uchar* W_q51           [[buffer(1)]],
+    device half* output                 [[buffer(2)]],
+    constant uint& B                    [[buffer(3)]],
+    constant uint& D_in                 [[buffer(4)]],
+    constant uint& D_out                [[buffer(5)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    constexpr uint MAX_B = 8;
+    uint n_block = tg.x; uint t = lid.x;
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+
+    constexpr uint BLK = 24;
+    uint nbc = D_in / 32;
+    uint col_bytes = nbc * BLK;
+    device const uchar* W_col = W_q51 + n * col_bytes;
+
+    float accs[MAX_B];
+    for (uint b = 0; b < MAX_B; ++b) accs[b] = 0.0f;
+
+    for (uint kb = 0; kb < nbc; ++kb) {
+        device const uchar* blk = W_col + kb * BLK;
+        float d = float(*(device const half*)(blk));
+        float m = float(*(device const half*)(blk + 2));
+        device const uchar* qh = blk + 4;
+        device const uchar* qs = blk + 8;
+        uint base_k = kb * 32;
+        for (uint p = 0; p < 16; ++p) {
+            uchar qsp = qs[p];
+            uint h_lo = (qh[p / 8]       >> (p       % 8)) & 1u;
+            uint h_hi = (qh[(p + 16) / 8] >> ((p + 16) % 8)) & 1u;
+            uint q_lo = (uint(qsp) & 0xFu)        | (h_lo << 4);
+            uint q_hi = ((uint(qsp) >> 4) & 0xFu) | (h_hi << 4);
+            float w_lo = d * float(q_lo) + m;
+            float w_hi = d * float(q_hi) + m;
+            for (uint b = 0; b < B; ++b) {
+                accs[b] += float(hidden[b * D_in + base_k + p])      * w_lo
+                         + float(hidden[b * D_in + base_k + p + 16]) * w_hi;
+            }
+        }
+    }
+    for (uint b = 0; b < B; ++b) output[b * D_out + n] = half(accs[b]);
+}
+
 // -------- Q8_0 GGUF-native dequant (used for most Gemma-4 dense weights) --------
 // block_q8_0 (34 bytes per 32-element block):
 //   half d;            // 2 B — single scale for the whole block
@@ -1254,7 +1468,7 @@ kernel void dense_gemv_q8_0_v5(
 
     float acc = 0.0f;
     device const half* hid_b = hidden + b * D_in;
-    for (uint kb = kb_begin; kb < kb_end; ++kb) {
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
         device const uchar* blk = W_col + kb * BLK;
         float d = float(*(device const half*)(blk));
         device const char* qs = (device const char*)(blk + 2);
@@ -1307,7 +1521,7 @@ kernel void dense_gemv_q8_0_v6(
 
     float acc = 0.0f;
     device const half* hid_b = hidden + b * D_in;
-    for (uint kb = kb_begin; kb < kb_end; ++kb) {
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
         // In swizzled layout, the 32 adjacent-column blocks for this kb are
         // packed contiguously: offset = kb * 32 * 34 + lid_sg * 34.
         device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
@@ -1373,6 +1587,10 @@ inline void dense_gemv_q8_0_btile_impl(
     uint super_bytes = nbc * 32 * BLK;
     device const uchar* W_super = W_sw + n_block * super_bytes;
 
+    // Original kb_per_sg split: contiguous range per SG, restored to keep
+    // Q8_0 logit output bit-identical to the pre-LUT baseline. For Q8_0 at
+    // K=2816, nbc=88, divides cleanly across N_SPLITS=4. Other formats
+    // with non-divisible nbc use a strided variant — see q5_K_btile_impl etc.
     uint kb_per_sg = nbc / N_SPLITS;
     uint kb_begin = sg_id * kb_per_sg;
     uint kb_end = kb_begin + kb_per_sg;
@@ -1468,6 +1686,764 @@ kernel void dense_gemv_q8_0_btile_b8(
     dense_gemv_q8_0_btile_impl<8>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
 }
 
+// =============================================================================
+// F16 btile GEMV — unquantized baseline riding the same dispatcher as the
+// quant zoo. Structural twin of dense_gemv_q8_0_btile_impl with two
+// simplifications: (1) W is plain row-major [D_out, D_in] half (matches GGUF
+// native layout, no swizzle, no super-column packing); (2) no per-block scale
+// and no int->float dequant — values flow straight through float(half).
+// Same N_SPLITS=4 split-K, same kb=32-wide K-tiling for SG-coalesced loads,
+// same B_TILE register accumulators, same per-batch threadgroup reduction.
+// Each TG handles 32 output rows; thread lid_sg maps to row n_block*32 + lid_sg.
+// =============================================================================
+template<uint B_TILE>
+inline void dense_gemv_f16_btile_impl(
+    device const half* hidden,
+    device const half* W,
+    device half* output,
+    constant uint& D_in,
+    constant uint& D_out,
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+
+    uint n_block = tg.x;
+    uint lid_sg = lid.x % 32;
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+
+    uint nbc = D_in / 32;
+
+    // Contiguous-range split per SG, matching Q8_0 btile. For divisible nbc,
+    // each SG owns kb_per_sg = nbc / N_SPLITS consecutive blocks.
+    uint kb_per_sg = nbc / N_SPLITS;
+    uint kb_begin = sg_id * kb_per_sg;
+    uint kb_end = kb_begin + kb_per_sg;
+
+    // B_TILE accumulators per thread, fully unrollable since B_TILE is constexpr.
+    float accs[B_TILE];
+    for (uint b = 0; b < B_TILE; ++b) accs[b] = 0.0f;
+
+    // Row base for this thread's output: 32 contiguous fp16 elements per kb.
+    device const half* w_row = W + n * D_in;
+
+    for (uint kb = kb_begin; kb < kb_end; ++kb) {
+        uint base_k = kb * 32;
+        device const half* w_blk = w_row + base_k;
+        for (uint p = 0; p < 32; ++p) {
+            float w_p = float(w_blk[p]);
+            // Compile-time unrolled inner loop: B_TILE FMAs into B_TILE register accs.
+            for (uint b = 0; b < B_TILE; ++b) {
+                accs[b] += float(hidden[b * D_in + base_k + p]) * w_p;
+            }
+        }
+    }
+
+    // Per-batch reduction across N_SPLITS SGs, write each output.
+    for (uint b = 0; b < B_TILE; ++b) {
+        partials[sg_id][lid_sg] = accs[b];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            output[b * D_out + n] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_f16_btile_b1")]]
+kernel void dense_gemv_f16_btile_b1(
+    device const half* hidden  [[buffer(0)]],
+    device const half* W       [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_f16_btile_impl<1>(hidden, W, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_f16_btile_b2")]]
+kernel void dense_gemv_f16_btile_b2(
+    device const half* hidden  [[buffer(0)]],
+    device const half* W       [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_f16_btile_impl<2>(hidden, W, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_f16_btile_b4")]]
+kernel void dense_gemv_f16_btile_b4(
+    device const half* hidden  [[buffer(0)]],
+    device const half* W       [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_f16_btile_impl<4>(hidden, W, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_f16_btile_b8")]]
+kernel void dense_gemv_f16_btile_b8(
+    device const half* hidden  [[buffer(0)]],
+    device const half* W       [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_f16_btile_impl<8>(hidden, W, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+// =============================================================================
+// Q5_K btile GEMV — structural mirror of dense_gemv_q8_0_btile_impl, swapping
+// only the per-element dequant. Same N_SPLITS=4 split-K, same swizzled W
+// layout [n_super, kb, 32 cols, BLK], same B_TILE register accumulator
+// pattern, same per-batch threadgroup reduction. Block size differs:
+// 256 elts × 176 B for Q5_K vs 32 elts × 34 B for Q8_0.
+// =============================================================================
+
+template<uint B_TILE>
+inline void dense_gemv_q5_K_btile_impl(
+    device const half* hidden,
+    device const uchar* W_sw,
+    device half* output,
+    constant uint& D_in,
+    constant uint& D_out,
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 176;
+    constexpr uint K_PER_BLK = 256;
+
+    uint n_block = tg.x;
+    uint lid_sg = lid.x % 32;
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+
+    uint nbc = D_in / K_PER_BLK;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
+
+    float accs[B_TILE];
+    for (uint b = 0; b < B_TILE; ++b) accs[b] = 0.0f;
+
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        float d_all = float(*(device const half*)(blk + 0));
+        float dmin  = float(*(device const half*)(blk + 2));
+        device const uchar* scales = blk + 4;
+        device const uchar* qh     = blk + 16;
+        device const uchar* qs     = blk + 48;
+        for (uint il_orig = 0; il_orig < 16; ++il_orig) {
+            uint q_off  = 32u * (il_orig / 4u) + 16u * (il_orig & 1u);
+            uint qh_off = 16u * (il_orig & 1u);
+            uchar ul    = uchar(1u << (il_orig / 2u));
+            uint is     = (il_orig / 4u) * 2u;
+            uint ph     = il_orig & 3u;
+            uchar2 sc   = get_scale_min_k4_just2(is, ph / 2u, scales);
+            float d_eff = (ph < 2u) ? d_all : (d_all / 16.0f);
+            float dl    = d_eff * float(sc[0]);
+            float ml    = dmin  * float(sc[1]);
+            uchar mask  = (ph < 2u) ? 0x0F : 0xF0;
+            float qhv   = (ph < 2u) ? 16.0f : 256.0f;
+            uint base_k = kb * K_PER_BLK + il_orig * 16u;
+            for (uint i = 0; i < 16; ++i) {
+                float v = float(qs[q_off + i] & mask)
+                        + (((qh[qh_off + i] & ul) != 0) ? qhv : 0.0f);
+                float w_p = dl * v - ml;
+                for (uint b = 0; b < B_TILE; ++b) {
+                    accs[b] += float(hidden[b * D_in + base_k + i]) * w_p;
+                }
+            }
+        }
+    }
+
+    for (uint b = 0; b < B_TILE; ++b) {
+        partials[sg_id][lid_sg] = accs[b];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            output[b * D_out + n] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_q5_K_btile_b1")]]
+kernel void dense_gemv_q5_K_btile_b1(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q5_K_btile_impl<1>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q5_K_btile_b2")]]
+kernel void dense_gemv_q5_K_btile_b2(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q5_K_btile_impl<2>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q5_K_btile_b4")]]
+kernel void dense_gemv_q5_K_btile_b4(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q5_K_btile_impl<4>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q5_K_btile_b8")]]
+kernel void dense_gemv_q5_K_btile_b8(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q5_K_btile_impl<8>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+// =============================================================================
+// Q6_K btile GEMV — same skeleton, Q6_K dequant inside the kb loop.
+// Block: 210 B / 256 elts. ql[128], qh[64], int8 scales[16], half d (offset 208).
+// Per-subtile (il ∈ [0,16)) produces 16 weights via the kmask-shift-pack pattern.
+// =============================================================================
+
+template<uint B_TILE>
+inline void dense_gemv_q6_K_btile_impl(
+    device const half* hidden,
+    device const uchar* W_sw,
+    device half* output,
+    constant uint& D_in,
+    constant uint& D_out,
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 210;
+    constexpr uint K_PER_BLK = 256;
+
+    uint n_block = tg.x;
+    uint lid_sg = lid.x % 32;
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+
+    uint nbc = D_in / K_PER_BLK;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
+
+    float accs[B_TILE];
+    for (uint b = 0; b < B_TILE; ++b) accs[b] = 0.0f;
+
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        device const ushort* ql_u16    = (device const ushort*)(blk + 0);
+        device const ushort* qh_u16    = (device const ushort*)(blk + 128);
+        device const char*   scales_i8 = (device const char*)(blk + 192);
+        float d_all = float(*(device const half*)(blk + 208));
+
+        for (uint il = 0; il < 16; ++il) {
+            uint ql_base = 32u * (il / 8u) + 16u * ((il / 2u) & 1u) + 8u * (il & 1u);
+            uint qh_base = 16u * (il / 8u) + 8u * (il & 1u);
+            float sc = float(scales_i8[(il % 2u) + 2u * (il / 2u)]);
+            uint ph = (il / 2u) & 3u;
+
+            uint kmask1 = (ph > 1u) ? ((ph > 2u) ? 0xC0C0C0C0u : 0x30303030u)
+                                    : ((ph > 0u) ? 0x0C0C0C0Cu : 0x03030303u);
+            uint kmask2 = (ph > 1u) ? 0xF0F0F0F0u : 0x0F0F0F0Fu;
+            float ml  = d_all * sc * 32.0f;
+            float dl0 = d_all * sc;
+            float dl1 = dl0 / 256.0f;
+            float dl2 = dl1 / 256.0f;
+            float dl3 = dl2 / 256.0f;
+            uint shr_h = (ph > 2u) ? 2u : 0u;
+            uint shl_h = (ph > 1u) ? 0u : ((ph > 0u) ? 2u : 4u);
+            uint shr_l = (ph > 1u) ? 4u : 0u;
+
+            uint base_k = kb * K_PER_BLK + il * 16u;
+            for (uint i = 0; i < 4; ++i) {
+                uint low  = (uint(ql_u16[ql_base + 2u*i]) | (uint(ql_u16[ql_base + 2u*i + 1u]) << 16)) & kmask2;
+                uint high = (uint(qh_u16[qh_base + 2u*i]) | (uint(qh_u16[qh_base + 2u*i + 1u]) << 16)) & kmask1;
+                uint q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+                float w0 = dl0 * float(q & 0x000000FFu) - ml;
+                float w1 = dl1 * float(q & 0x0000FF00u) - ml;
+                float w2 = dl2 * float(q & 0x00FF0000u) - ml;
+                float w3 = dl3 * float(q & 0xFF000000u) - ml;
+                uint k0 = base_k + i * 4u;
+                for (uint b = 0; b < B_TILE; ++b) {
+                    device const half* hb = hidden + b * D_in;
+                    accs[b] += float(hb[k0 + 0]) * w0
+                             + float(hb[k0 + 1]) * w1
+                             + float(hb[k0 + 2]) * w2
+                             + float(hb[k0 + 3]) * w3;
+                }
+            }
+        }
+    }
+
+    for (uint b = 0; b < B_TILE; ++b) {
+        partials[sg_id][lid_sg] = accs[b];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            output[b * D_out + n] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_q6_K_btile_b1")]]
+kernel void dense_gemv_q6_K_btile_b1(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q6_K_btile_impl<1>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q6_K_btile_b2")]]
+kernel void dense_gemv_q6_K_btile_b2(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q6_K_btile_impl<2>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q6_K_btile_b4")]]
+kernel void dense_gemv_q6_K_btile_b4(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q6_K_btile_impl<4>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q6_K_btile_b8")]]
+kernel void dense_gemv_q6_K_btile_b8(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q6_K_btile_impl<8>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+// =============================================================================
+// Q5_1 btile GEMV — block: 24 B / 32 elts. half d, half m, uchar qh[4], uchar qs[16].
+// Same outer skeleton as Q8_0 (32-elt blocks); inner dequant is 5-bit unpack.
+// =============================================================================
+
+template<uint B_TILE>
+inline void dense_gemv_q5_1_btile_impl(
+    device const half* hidden,
+    device const uchar* W_sw,
+    device half* output,
+    constant uint& D_in,
+    constant uint& D_out,
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 24;
+    constexpr uint K_PER_BLK = 32;
+
+    uint n_block = tg.x;
+    uint lid_sg = lid.x % 32;
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+
+    uint nbc = D_in / K_PER_BLK;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
+
+    float accs[B_TILE];
+    for (uint b = 0; b < B_TILE; ++b) accs[b] = 0.0f;
+
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        float d = float(*(device const half*)(blk));
+        float m = float(*(device const half*)(blk + 2));
+        device const uchar* qh = blk + 4;
+        device const uchar* qs = blk + 8;
+        uint base_k = kb * K_PER_BLK;
+        for (uint p = 0; p < 16; ++p) {
+            uchar qsp = qs[p];
+            uint h_lo = (qh[p / 8]       >> (p       % 8)) & 1u;
+            uint h_hi = (qh[(p + 16) / 8] >> ((p + 16) % 8)) & 1u;
+            uint q_lo = (uint(qsp) & 0xFu)        | (h_lo << 4);
+            uint q_hi = ((uint(qsp) >> 4) & 0xFu) | (h_hi << 4);
+            float w_lo = d * float(q_lo) + m;
+            float w_hi = d * float(q_hi) + m;
+            for (uint b = 0; b < B_TILE; ++b) {
+                accs[b] += float(hidden[b * D_in + base_k + p])      * w_lo
+                         + float(hidden[b * D_in + base_k + p + 16]) * w_hi;
+            }
+        }
+    }
+
+    for (uint b = 0; b < B_TILE; ++b) {
+        partials[sg_id][lid_sg] = accs[b];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            output[b * D_out + n] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_q5_1_btile_b1")]]
+kernel void dense_gemv_q5_1_btile_b1(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q5_1_btile_impl<1>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q5_1_btile_b2")]]
+kernel void dense_gemv_q5_1_btile_b2(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q5_1_btile_impl<2>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q5_1_btile_b4")]]
+kernel void dense_gemv_q5_1_btile_b4(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q5_1_btile_impl<4>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q5_1_btile_b8")]]
+kernel void dense_gemv_q5_1_btile_b8(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q5_1_btile_impl<8>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+// =============================================================================
+// Q4_0 btile GEMV — block: 18 B / 32 elts. half d (offset 0), uchar qs[16].
+// Per element: w = d * (nib - 8). Simplest 4bpw on Apple Silicon — fewest
+// ALU ops per FMA in the dequant chain. Same outer skeleton as Q5_1.
+// =============================================================================
+
+template<uint B_TILE>
+inline void dense_gemv_q4_0_btile_impl(
+    device const half* hidden,
+    device const uchar* W_sw,
+    device half* output,
+    constant uint& D_in,
+    constant uint& D_out,
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 18;
+    constexpr uint K_PER_BLK = 32;
+
+    uint n_block = tg.x;
+    uint lid_sg = lid.x % 32;
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+
+    uint nbc = D_in / K_PER_BLK;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
+
+    float accs[B_TILE];
+    for (uint b = 0; b < B_TILE; ++b) accs[b] = 0.0f;
+
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        float d = float(*(device const half*)(blk));
+        device const uchar* qs = blk + 2;
+        uint base_k = kb * K_PER_BLK;
+        for (uint p = 0; p < 16; ++p) {
+            uchar byte = qs[p];
+            float w_lo = d * float(int(byte & 0xF) - 8);
+            float w_hi = d * float(int((byte >> 4) & 0xF) - 8);
+            for (uint b = 0; b < B_TILE; ++b) {
+                accs[b] += float(hidden[b * D_in + base_k + p])      * w_lo
+                         + float(hidden[b * D_in + base_k + p + 16]) * w_hi;
+            }
+        }
+    }
+
+    for (uint b = 0; b < B_TILE; ++b) {
+        partials[sg_id][lid_sg] = accs[b];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            output[b * D_out + n] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_q4_0_btile_b1")]]
+kernel void dense_gemv_q4_0_btile_b1(
+    device const half* hidden  [[buffer(0)]], device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]], constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q4_0_btile_impl<1>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q4_0_btile_b2")]]
+kernel void dense_gemv_q4_0_btile_b2(
+    device const half* hidden  [[buffer(0)]], device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]], constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q4_0_btile_impl<2>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q4_0_btile_b4")]]
+kernel void dense_gemv_q4_0_btile_b4(
+    device const half* hidden  [[buffer(0)]], device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]], constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q4_0_btile_impl<4>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q4_0_btile_b8")]]
+kernel void dense_gemv_q4_0_btile_b8(
+    device const half* hidden  [[buffer(0)]], device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]], constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q4_0_btile_impl<8>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+// =============================================================================
+// Q4_1 btile GEMV — block: 20 B / 32 elts. half d (offset 0), half m (offset 2),
+// uchar qs[16] (offset 4). Per element: w = d * nib + m (unsigned 4-bit nibble,
+// no -8 bias; m is the additive offset). Same outer skeleton as Q4_0 / Q5_1.
+// =============================================================================
+
+template<uint B_TILE>
+inline void dense_gemv_q4_1_btile_impl(
+    device const half* hidden,
+    device const uchar* W_sw,
+    device half* output,
+    constant uint& D_in,
+    constant uint& D_out,
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 20;
+    constexpr uint K_PER_BLK = 32;
+
+    uint n_block = tg.x;
+    uint lid_sg = lid.x % 32;
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+
+    uint nbc = D_in / K_PER_BLK;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
+
+    float accs[B_TILE];
+    for (uint b = 0; b < B_TILE; ++b) accs[b] = 0.0f;
+
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        float d = float(*(device const half*)(blk));
+        float m = float(*(device const half*)(blk + 2));
+        device const uchar* qs = blk + 4;
+        uint base_k = kb * K_PER_BLK;
+        for (uint p = 0; p < 16; ++p) {
+            uchar byte = qs[p];
+            float w_lo = d * float(byte & 0xF) + m;
+            float w_hi = d * float((byte >> 4) & 0xF) + m;
+            for (uint b = 0; b < B_TILE; ++b) {
+                accs[b] += float(hidden[b * D_in + base_k + p])      * w_lo
+                         + float(hidden[b * D_in + base_k + p + 16]) * w_hi;
+            }
+        }
+    }
+
+    for (uint b = 0; b < B_TILE; ++b) {
+        partials[sg_id][lid_sg] = accs[b];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            output[b * D_out + n] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_q4_1_btile_b1")]]
+kernel void dense_gemv_q4_1_btile_b1(
+    device const half* hidden  [[buffer(0)]], device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]], constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q4_1_btile_impl<1>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q4_1_btile_b2")]]
+kernel void dense_gemv_q4_1_btile_b2(
+    device const half* hidden  [[buffer(0)]], device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]], constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q4_1_btile_impl<2>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q4_1_btile_b4")]]
+kernel void dense_gemv_q4_1_btile_b4(
+    device const half* hidden  [[buffer(0)]], device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]], constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q4_1_btile_impl<4>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q4_1_btile_b8")]]
+kernel void dense_gemv_q4_1_btile_b8(
+    device const half* hidden  [[buffer(0)]], device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]], constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q4_1_btile_impl<8>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
 // Q8_0 v6 + fused RMSNorm. Same pattern as v5_rmsnorm but with swizzled W.
 kernel void dense_gemv_q8_0_v6_rmsnorm(
     device const half* x                [[buffer(0)]],
@@ -1517,7 +2493,7 @@ kernel void dense_gemv_q8_0_v6_rmsnorm(
     uint kb_end = kb_begin + kb_per_sg;
 
     float acc = 0.0f;
-    for (uint kb = kb_begin; kb < kb_end; ++kb) {
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
         device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
         float d = float(*(device const half*)(blk));
         device const char* qs = (device const char*)(blk + 2);
@@ -1619,13 +2595,107 @@ kernel void dense_gemv_q8_0_v6_rmsnorm_qkv(
     uint kb_end = kb_begin + kb_per_sg;
 
     float acc = 0.0f;
-    for (uint kb = kb_begin; kb < kb_end; ++kb) {
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
         device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
         float d = float(*(device const half*)(blk));
         device const char* qs = (device const char*)(blk + 2);
         uint base_k = kb * 32;
         for (uint p = 0; p < 32; ++p) {
             acc += float(h_norm[base_k + p]) * d * float(qs[p]);
+        }
+    }
+    threadgroup float partials[N_SPLITS][32];
+    partials[sg_id][lid_sg] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_id == 0) {
+        float total = partials[0][lid_sg] + partials[1][lid_sg] + partials[2][lid_sg] + partials[3][lid_sg];
+        out[b * D_out + n] = half(total);
+    }
+}
+
+// F16 mirror of dense_gemv_q8_0_v6_rmsnorm_qkv: same fused RMSNorm + QKV
+// dispatch but weights are plain row-major fp16 [D_out, D_in] (no swizzle,
+// no per-block scales). Inner loop drops the dequant mul and reads
+// weights directly. nbc = D_in / 32 K-tiling preserved verbatim.
+kernel void dense_gemv_f16_v6_rmsnorm_qkv(
+    device const half* x                [[buffer(0)]],
+    device const half* gamma            [[buffer(1)]],
+    device const half* Wq               [[buffer(2)]],
+    device const half* Wk               [[buffer(3)]],
+    device const half* Wv               [[buffer(4)]],
+    device half* out_q                  [[buffer(5)]],
+    device half* out_k                  [[buffer(6)]],
+    device half* out_v                  [[buffer(7)]],
+    constant uint& D_in                 [[buffer(8)]],
+    constant uint& Q_nb                 [[buffer(9)]],     // D_out_q / 32
+    constant uint& K_nb                 [[buffer(10)]],    // D_out_k / 32
+    constant uint& V_nb                 [[buffer(11)]],    // D_out_v / 32
+    constant uint& D_out_q              [[buffer(12)]],
+    constant uint& D_out_k              [[buffer(13)]],
+    constant uint& D_out_v              [[buffer(14)]],
+    constant float& eps                 [[buffer(15)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]],
+    uint sg_id                          [[simdgroup_index_in_threadgroup]])
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint MAX_D_IN = 2816;
+    constexpr uint THREADS = 128;
+    threadgroup half h_norm[MAX_D_IN];
+
+    uint slab = tg.x; uint b = tg.y; uint tid = lid.x; uint lid_sg = tid % 32;
+
+    // === RMS reduction + h_norm staging (shared by Q/K/V for this b) ===
+    device const half* xb = x + b * D_in;
+    float local_ss = 0.0f;
+    for (uint i = tid; i < D_in; i += THREADS) {
+        float v = float(xb[i]);
+        local_ss += v * v;
+    }
+    float sg_ss = simd_sum(local_ss);
+    threadgroup float ss_stage[N_SPLITS];
+    if (lid_sg == 0) ss_stage[sg_id] = sg_ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total_ss = ss_stage[0] + ss_stage[1] + ss_stage[2] + ss_stage[3];
+    float inv_rms = rsqrt(total_ss / float(D_in) + eps);
+    for (uint i = tid; i < D_in; i += THREADS) {
+        h_norm[i] = half(float(xb[i]) * inv_rms * float(gamma[i]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // === Dispatch slab to the right projection ===
+    uint n_block;
+    uint D_out;
+    device const half* W;
+    device half* out;
+    if (slab < Q_nb) {
+        n_block = slab;
+        D_out = D_out_q;
+        W = Wq;
+        out = out_q;
+    } else if (slab < Q_nb + K_nb) {
+        n_block = slab - Q_nb;
+        D_out = D_out_k;
+        W = Wk;
+        out = out_k;
+    } else {
+        n_block = slab - Q_nb - K_nb;
+        D_out = D_out_v;
+        W = Wv;
+        out = out_v;
+    }
+
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+    uint nbc = D_in / 32;
+    device const half* w_row = W + n * D_in;
+
+    float acc = 0.0f;
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        uint base_k = kb * 32;
+        device const half* w_blk = w_row + base_k;
+        for (uint p = 0; p < 32; ++p) {
+            acc += float(h_norm[base_k + p]) * float(w_blk[p]);
         }
     }
     threadgroup float partials[N_SPLITS][32];
@@ -1742,7 +2812,7 @@ inline void dense_gemv_q8_0_btile_qkv_impl(
     // Phase 3: register-amortized matmul. B_TILE accs in registers.
     float accs[B_TILE];
     for (uint v = 0; v < B_TILE; ++v) accs[v] = 0.0f;
-    for (uint kb = kb_begin; kb < kb_end; ++kb) {
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
         device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
         float d = float(*(device const half*)(blk));
         device const char* qs = (device const char*)(blk + 2);
@@ -1978,7 +3048,7 @@ inline void dense_gemv_q8_0_btile_qkv_otf_impl(
     // Phase 3: GEMV with on-the-fly RMSNorm. B_TILE register accs.
     float accs[B_TILE];
     for (uint v = 0; v < B_TILE; ++v) accs[v] = 0.0f;
-    for (uint kb = kb_begin; kb < kb_end; ++kb) {
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
         device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
         float d = float(*(device const half*)(blk));
         device const char* qs = (device const char*)(blk + 2);
@@ -2045,6 +3115,155 @@ kernel void dense_gemv_q8_0_btile_qkv_otf_b1(
                                            eps, numVecs,
                                            inv_rms, ss_stage, partials,
                                            tg, lid, sg_id);
+}
+
+// =============================================================================
+// F16 mirror of the Q8_0 RMSNorm + QKV otf zoo. Same per-batch inv_rms
+// staging and register-amortized matmul, but weights are plain row-major
+// fp16 [D_out, D_in] (no swizzle, no per-block scales). Inner loop drops
+// the d * qs[p] dequant and reads w_row[base_k + p] directly. Only B_TILE=1
+// is needed by this scope (b1 = the AR-decode path).
+template<uint B_TILE>
+inline void dense_gemv_f16_btile_qkv_otf_impl(
+    device const half* x,
+    device const half* gamma,
+    device const half* Wq,
+    device const half* Wk,
+    device const half* Wv,
+    device half* out_q,
+    device half* out_k,
+    device half* out_v,
+    constant uint& D_in,
+    constant uint& Q_nb,
+    constant uint& K_nb,
+    constant uint& V_nb,
+    constant uint& D_out_q,
+    constant uint& D_out_k,
+    constant uint& D_out_v,
+    constant float& eps,
+    constant uint& numVecs,
+    threadgroup float (&inv_rms)[B_TILE],
+    threadgroup float (&ss_stage)[4],
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint THREADS = 128;
+
+    uint slab = tg.x;
+    uint vec_block = tg.y;
+    uint v_base = vec_block * B_TILE;
+    if (v_base >= numVecs) return;
+    uint v_count = (numVecs - v_base < B_TILE) ? (numVecs - v_base) : B_TILE;
+
+    uint tid = lid.x;
+    uint lid_sg = tid % 32;
+
+    // Phase 1: per-batch RMS reduction (format-agnostic).
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        uint b = v_base + v;
+        device const half* xb = x + b * D_in;
+        float local_ss = 0.0f;
+        for (uint i = tid; i < D_in; i += THREADS) {
+            float val = float(xb[i]);
+            local_ss += val * val;
+        }
+        float sg_ss = simd_sum(local_ss);
+        if (lid_sg == 0) ss_stage[sg_id] = sg_ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total_ss = ss_stage[0] + ss_stage[1] + ss_stage[2] + ss_stage[3];
+        if (tid == 0) {
+            inv_rms[v] = rsqrt(total_ss / float(D_in) + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Phase 2: route slab to Q/K/V projection.
+    uint n_block;
+    uint D_out;
+    device const half* W;
+    device half* out;
+    if (slab < Q_nb) {
+        n_block = slab; D_out = D_out_q; W = Wq; out = out_q;
+    } else if (slab < Q_nb + K_nb) {
+        n_block = slab - Q_nb; D_out = D_out_k; W = Wk; out = out_k;
+    } else {
+        n_block = slab - Q_nb - K_nb; D_out = D_out_v; W = Wv; out = out_v;
+    }
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+    uint nbc = D_in / 32;
+    device const half* w_row = W + n * D_in;
+
+    // Phase 3: GEMV with on-the-fly RMSNorm. B_TILE register accs.
+    float accs[B_TILE];
+    for (uint v = 0; v < B_TILE; ++v) accs[v] = 0.0f;
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        uint base_k = kb * 32;
+        device const half* w_blk = w_row + base_k;
+        for (uint p = 0; p < 32; ++p) {
+            float w_p = float(w_blk[p]);
+            float gamma_p = float(gamma[base_k + p]);
+            for (uint v = 0; v < B_TILE; ++v) {
+                if (v < v_count) {
+                    uint b = v_base + v;
+                    float x_val = float(x[b * D_in + base_k + p]);
+                    // Normalize-on-the-fly: x · inv_rms · gamma · w
+                    accs[v] += x_val * inv_rms[v] * gamma_p * w_p;
+                }
+            }
+        }
+    }
+
+    // Phase 4: per-batch reduction across N_SPLITS SGs and write outputs.
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        partials[sg_id][lid_sg] = accs[v];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            uint b = v_base + v;
+            out[b * D_out + n] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_f16_btile_qkv_otf_b1")]]
+kernel void dense_gemv_f16_btile_qkv_otf_b1(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const half* Wq       [[buffer(2)]],
+    device const half* Wk       [[buffer(3)]],
+    device const half* Wv       [[buffer(4)]],
+    device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]],
+    device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]],
+    constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]],
+    constant uint& V_nb         [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]],
+    constant uint& D_out_k      [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]],
+    constant float& eps         [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[1];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_f16_btile_qkv_otf_impl<1>(x, gamma, Wq, Wk, Wv,
+                                          out_q, out_k, out_v,
+                                          D_in, Q_nb, K_nb, V_nb,
+                                          D_out_q, D_out_k, D_out_v,
+                                          eps, numVecs,
+                                          inv_rms, ss_stage, partials,
+                                          tg, lid, sg_id);
 }
 
 [[host_name("dense_gemv_q8_0_btile_qkv_otf_b2")]]
@@ -2150,6 +3369,1079 @@ kernel void dense_gemv_q8_0_btile_qkv_otf_b8(
                                            eps, numVecs,
                                            inv_rms, ss_stage, partials,
                                            tg, lid, sg_id);
+}
+
+// =============================================================================
+// Q5_K btile_qkv_otf — structural mirror of dense_gemv_q8_0_btile_qkv_otf.
+// Same 4-phase shape (RMS reduction → slab routing → otf-RMSNorm GEMV →
+// per-batch reduction); only Phase 3's per-element dequant differs.
+// Block size: 256 elts × 176 B for Q5_K vs 32 elts × 34 B for Q8_0.
+// =============================================================================
+
+template<uint B_TILE>
+inline void dense_gemv_q5_K_btile_qkv_otf_impl(
+    device const half* x,
+    device const half* gamma,
+    device const uchar* Wq_sw,
+    device const uchar* Wk_sw,
+    device const uchar* Wv_sw,
+    device half* out_q,
+    device half* out_k,
+    device half* out_v,
+    constant uint& D_in,
+    constant uint& Q_nb,
+    constant uint& K_nb,
+    constant uint& V_nb,
+    constant uint& D_out_q,
+    constant uint& D_out_k,
+    constant uint& D_out_v,
+    constant float& eps,
+    constant uint& numVecs,
+    threadgroup float (&inv_rms)[B_TILE],
+    threadgroup float (&ss_stage)[4],
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 176;
+    constexpr uint K_PER_BLK = 256;
+    constexpr uint THREADS = 128;
+
+    uint slab = tg.x;
+    uint vec_block = tg.y;
+    uint v_base = vec_block * B_TILE;
+    if (v_base >= numVecs) return;
+    uint v_count = (numVecs - v_base < B_TILE) ? (numVecs - v_base) : B_TILE;
+
+    uint tid = lid.x;
+    uint lid_sg = tid % 32;
+
+    // Phase 1: per-batch RMS reduction (format-agnostic, same as Q8_0).
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        uint b = v_base + v;
+        device const half* xb = x + b * D_in;
+        float local_ss = 0.0f;
+        for (uint i = tid; i < D_in; i += THREADS) {
+            float val = float(xb[i]);
+            local_ss += val * val;
+        }
+        float sg_ss = simd_sum(local_ss);
+        if (lid_sg == 0) ss_stage[sg_id] = sg_ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total_ss = ss_stage[0] + ss_stage[1] + ss_stage[2] + ss_stage[3];
+        if (tid == 0) {
+            inv_rms[v] = rsqrt(total_ss / float(D_in) + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Phase 2: slab routing — same as Q8_0 (not format-dependent).
+    uint n_block;
+    uint D_out;
+    device const uchar* W_sw;
+    device half* out;
+    if (slab < Q_nb) {
+        n_block = slab; D_out = D_out_q; W_sw = Wq_sw; out = out_q;
+    } else if (slab < Q_nb + K_nb) {
+        n_block = slab - Q_nb; D_out = D_out_k; W_sw = Wk_sw; out = out_k;
+    } else {
+        n_block = slab - Q_nb - K_nb; D_out = D_out_v; W_sw = Wv_sw; out = out_v;
+    }
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+    uint nbc = D_in / K_PER_BLK;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
+
+    // Phase 3: GEMV with on-the-fly RMSNorm. Q5_K dequant inside.
+    float accs[B_TILE];
+    for (uint v = 0; v < B_TILE; ++v) accs[v] = 0.0f;
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        float d_all = float(*(device const half*)(blk + 0));
+        float dmin  = float(*(device const half*)(blk + 2));
+        device const uchar* scales = blk + 4;
+        device const uchar* qh     = blk + 16;
+        device const uchar* qs     = blk + 48;
+        for (uint il_orig = 0; il_orig < 16; ++il_orig) {
+            uint q_off  = 32u * (il_orig / 4u) + 16u * (il_orig & 1u);
+            uint qh_off = 16u * (il_orig & 1u);
+            uchar ul    = uchar(1u << (il_orig / 2u));
+            uint is     = (il_orig / 4u) * 2u;
+            uint ph     = il_orig & 3u;
+            uchar2 sc   = get_scale_min_k4_just2(is, ph / 2u, scales);
+            float d_eff = (ph < 2u) ? d_all : (d_all / 16.0f);
+            float dl    = d_eff * float(sc[0]);
+            float ml    = dmin  * float(sc[1]);
+            uchar mask  = (ph < 2u) ? 0x0F : 0xF0;
+            float qhv   = (ph < 2u) ? 16.0f : 256.0f;
+            uint base_k = kb * K_PER_BLK + il_orig * 16u;
+            for (uint i = 0; i < 16; ++i) {
+                float v_q = float(qs[q_off + i] & mask)
+                          + (((qh[qh_off + i] & ul) != 0) ? qhv : 0.0f);
+                float w_p = dl * v_q - ml;
+                float gamma_p = float(gamma[base_k + i]);
+                for (uint v = 0; v < B_TILE; ++v) {
+                    if (v < v_count) {
+                        uint b = v_base + v;
+                        float x_val = float(x[b * D_in + base_k + i]);
+                        accs[v] += x_val * inv_rms[v] * gamma_p * w_p;
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 4: per-batch reduction across N_SPLITS SGs (same as Q8_0).
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        partials[sg_id][lid_sg] = accs[v];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            uint b = v_base + v;
+            out[b * D_out + n] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_q5_K_btile_qkv_otf_b1")]]
+kernel void dense_gemv_q5_K_btile_qkv_otf_b1(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]],
+    device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]],
+    device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]],
+    device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]],
+    constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]],
+    constant uint& V_nb         [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]],
+    constant uint& D_out_k      [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]],
+    constant float& eps         [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[1];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_q5_K_btile_qkv_otf_impl<1>(x, gamma, Wq_sw, Wk_sw, Wv_sw,
+                                           out_q, out_k, out_v,
+                                           D_in, Q_nb, K_nb, V_nb,
+                                           D_out_q, D_out_k, D_out_v,
+                                           eps, numVecs,
+                                           inv_rms, ss_stage, partials,
+                                           tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q5_K_btile_qkv_otf_b2")]]
+kernel void dense_gemv_q5_K_btile_qkv_otf_b2(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]],
+    device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]],
+    device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]],
+    device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]],
+    constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]],
+    constant uint& V_nb         [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]],
+    constant uint& D_out_k      [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]],
+    constant float& eps         [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[2];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_q5_K_btile_qkv_otf_impl<2>(x, gamma, Wq_sw, Wk_sw, Wv_sw,
+                                           out_q, out_k, out_v,
+                                           D_in, Q_nb, K_nb, V_nb,
+                                           D_out_q, D_out_k, D_out_v,
+                                           eps, numVecs,
+                                           inv_rms, ss_stage, partials,
+                                           tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q5_K_btile_qkv_otf_b4")]]
+kernel void dense_gemv_q5_K_btile_qkv_otf_b4(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]],
+    device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]],
+    device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]],
+    device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]],
+    constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]],
+    constant uint& V_nb         [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]],
+    constant uint& D_out_k      [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]],
+    constant float& eps         [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[4];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_q5_K_btile_qkv_otf_impl<4>(x, gamma, Wq_sw, Wk_sw, Wv_sw,
+                                           out_q, out_k, out_v,
+                                           D_in, Q_nb, K_nb, V_nb,
+                                           D_out_q, D_out_k, D_out_v,
+                                           eps, numVecs,
+                                           inv_rms, ss_stage, partials,
+                                           tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q5_K_btile_qkv_otf_b8")]]
+kernel void dense_gemv_q5_K_btile_qkv_otf_b8(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]],
+    device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]],
+    device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]],
+    device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]],
+    constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]],
+    constant uint& V_nb         [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]],
+    constant uint& D_out_k      [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]],
+    constant float& eps         [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[8];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_q5_K_btile_qkv_otf_impl<8>(x, gamma, Wq_sw, Wk_sw, Wv_sw,
+                                           out_q, out_k, out_v,
+                                           D_in, Q_nb, K_nb, V_nb,
+                                           D_out_q, D_out_k, D_out_v,
+                                           eps, numVecs,
+                                           inv_rms, ss_stage, partials,
+                                           tg, lid, sg_id);
+}
+
+// =============================================================================
+// Q6_K btile_qkv_otf — structural mirror with Q6_K dequant. Block: 210 B /
+// 256 elts. ql[128], qh[64], int8 scales[16], half d (offset 208).
+// Per il_orig ∈ [0,16): 16 weights via the kmask-shift-pack formula.
+// =============================================================================
+
+template<uint B_TILE>
+inline void dense_gemv_q6_K_btile_qkv_otf_impl(
+    device const half* x,
+    device const half* gamma,
+    device const uchar* Wq_sw,
+    device const uchar* Wk_sw,
+    device const uchar* Wv_sw,
+    device half* out_q,
+    device half* out_k,
+    device half* out_v,
+    constant uint& D_in,
+    constant uint& Q_nb,
+    constant uint& K_nb,
+    constant uint& V_nb,
+    constant uint& D_out_q,
+    constant uint& D_out_k,
+    constant uint& D_out_v,
+    constant float& eps,
+    constant uint& numVecs,
+    threadgroup float (&inv_rms)[B_TILE],
+    threadgroup float (&ss_stage)[4],
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 210;
+    constexpr uint K_PER_BLK = 256;
+    constexpr uint THREADS = 128;
+
+    uint slab = tg.x;
+    uint vec_block = tg.y;
+    uint v_base = vec_block * B_TILE;
+    if (v_base >= numVecs) return;
+    uint v_count = (numVecs - v_base < B_TILE) ? (numVecs - v_base) : B_TILE;
+
+    uint tid = lid.x;
+    uint lid_sg = tid % 32;
+
+    // Phase 1: per-batch RMS — same as Q5_K / Q8_0.
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        uint b = v_base + v;
+        device const half* xb = x + b * D_in;
+        float local_ss = 0.0f;
+        for (uint i = tid; i < D_in; i += THREADS) {
+            float val = float(xb[i]);
+            local_ss += val * val;
+        }
+        float sg_ss = simd_sum(local_ss);
+        if (lid_sg == 0) ss_stage[sg_id] = sg_ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total_ss = ss_stage[0] + ss_stage[1] + ss_stage[2] + ss_stage[3];
+        if (tid == 0) {
+            inv_rms[v] = rsqrt(total_ss / float(D_in) + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Phase 2: slab routing.
+    uint n_block;
+    uint D_out;
+    device const uchar* W_sw;
+    device half* out;
+    if (slab < Q_nb) {
+        n_block = slab; D_out = D_out_q; W_sw = Wq_sw; out = out_q;
+    } else if (slab < Q_nb + K_nb) {
+        n_block = slab - Q_nb; D_out = D_out_k; W_sw = Wk_sw; out = out_k;
+    } else {
+        n_block = slab - Q_nb - K_nb; D_out = D_out_v; W_sw = Wv_sw; out = out_v;
+    }
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+    uint nbc = D_in / K_PER_BLK;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
+
+    // Phase 3: GEMV with on-the-fly RMSNorm. Q6_K dequant inside.
+    float accs[B_TILE];
+    for (uint v = 0; v < B_TILE; ++v) accs[v] = 0.0f;
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        device const ushort* ql_u16    = (device const ushort*)(blk + 0);
+        device const ushort* qh_u16    = (device const ushort*)(blk + 128);
+        device const char*   scales_i8 = (device const char*)(blk + 192);
+        float d_all = float(*(device const half*)(blk + 208));
+        for (uint il = 0; il < 16; ++il) {
+            uint ql_base = 32u * (il / 8u) + 16u * ((il / 2u) & 1u) + 8u * (il & 1u);
+            uint qh_base = 16u * (il / 8u) + 8u * (il & 1u);
+            float sc = float(scales_i8[(il % 2u) + 2u * (il / 2u)]);
+            uint ph = (il / 2u) & 3u;
+            uint kmask1 = (ph > 1u) ? ((ph > 2u) ? 0xC0C0C0C0u : 0x30303030u)
+                                    : ((ph > 0u) ? 0x0C0C0C0Cu : 0x03030303u);
+            uint kmask2 = (ph > 1u) ? 0xF0F0F0F0u : 0x0F0F0F0Fu;
+            float ml  = d_all * sc * 32.0f;
+            float dl0 = d_all * sc;
+            float dl1 = dl0 / 256.0f;
+            float dl2 = dl1 / 256.0f;
+            float dl3 = dl2 / 256.0f;
+            uint shr_h = (ph > 2u) ? 2u : 0u;
+            uint shl_h = (ph > 1u) ? 0u : ((ph > 0u) ? 2u : 4u);
+            uint shr_l = (ph > 1u) ? 4u : 0u;
+            uint base_k = kb * K_PER_BLK + il * 16u;
+            for (uint i = 0; i < 4; ++i) {
+                uint low  = (uint(ql_u16[ql_base + 2u*i]) | (uint(ql_u16[ql_base + 2u*i + 1u]) << 16)) & kmask2;
+                uint high = (uint(qh_u16[qh_base + 2u*i]) | (uint(qh_u16[qh_base + 2u*i + 1u]) << 16)) & kmask1;
+                uint q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+                float w0 = dl0 * float(q & 0x000000FFu) - ml;
+                float w1 = dl1 * float(q & 0x0000FF00u) - ml;
+                float w2 = dl2 * float(q & 0x00FF0000u) - ml;
+                float w3 = dl3 * float(q & 0xFF000000u) - ml;
+                uint k0 = base_k + i * 4u;
+                float gamma0 = float(gamma[k0 + 0]);
+                float gamma1 = float(gamma[k0 + 1]);
+                float gamma2 = float(gamma[k0 + 2]);
+                float gamma3 = float(gamma[k0 + 3]);
+                for (uint v = 0; v < B_TILE; ++v) {
+                    if (v < v_count) {
+                        uint b = v_base + v;
+                        device const half* xb = x + b * D_in;
+                        float ir = inv_rms[v];
+                        accs[v] += float(xb[k0 + 0]) * ir * gamma0 * w0
+                                 + float(xb[k0 + 1]) * ir * gamma1 * w1
+                                 + float(xb[k0 + 2]) * ir * gamma2 * w2
+                                 + float(xb[k0 + 3]) * ir * gamma3 * w3;
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 4: per-batch reduction + write.
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        partials[sg_id][lid_sg] = accs[v];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            uint b = v_base + v;
+            out[b * D_out + n] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_q6_K_btile_qkv_otf_b1")]]
+kernel void dense_gemv_q6_K_btile_qkv_otf_b1(
+    device const half* x        [[buffer(0)]], device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]], device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]], device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]], device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]], constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]], constant uint& V_nb        [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]], constant uint& D_out_k     [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]], constant float& eps        [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[1]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q6_K_btile_qkv_otf_impl<1>(x, gamma, Wq_sw, Wk_sw, Wv_sw, out_q, out_k, out_v,
+        D_in, Q_nb, K_nb, V_nb, D_out_q, D_out_k, D_out_v, eps, numVecs,
+        inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q6_K_btile_qkv_otf_b2")]]
+kernel void dense_gemv_q6_K_btile_qkv_otf_b2(
+    device const half* x        [[buffer(0)]], device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]], device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]], device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]], device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]], constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]], constant uint& V_nb        [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]], constant uint& D_out_k     [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]], constant float& eps        [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[2]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q6_K_btile_qkv_otf_impl<2>(x, gamma, Wq_sw, Wk_sw, Wv_sw, out_q, out_k, out_v,
+        D_in, Q_nb, K_nb, V_nb, D_out_q, D_out_k, D_out_v, eps, numVecs,
+        inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q6_K_btile_qkv_otf_b4")]]
+kernel void dense_gemv_q6_K_btile_qkv_otf_b4(
+    device const half* x        [[buffer(0)]], device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]], device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]], device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]], device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]], constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]], constant uint& V_nb        [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]], constant uint& D_out_k     [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]], constant float& eps        [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[4]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q6_K_btile_qkv_otf_impl<4>(x, gamma, Wq_sw, Wk_sw, Wv_sw, out_q, out_k, out_v,
+        D_in, Q_nb, K_nb, V_nb, D_out_q, D_out_k, D_out_v, eps, numVecs,
+        inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q6_K_btile_qkv_otf_b8")]]
+kernel void dense_gemv_q6_K_btile_qkv_otf_b8(
+    device const half* x        [[buffer(0)]], device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]], device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]], device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]], device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]], constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]], constant uint& V_nb        [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]], constant uint& D_out_k     [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]], constant float& eps        [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[8]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q6_K_btile_qkv_otf_impl<8>(x, gamma, Wq_sw, Wk_sw, Wv_sw, out_q, out_k, out_v,
+        D_in, Q_nb, K_nb, V_nb, D_out_q, D_out_k, D_out_v, eps, numVecs,
+        inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+
+// =============================================================================
+// Q5_1 btile_qkv_otf — structural mirror with Q5_1 dequant. Block: 24 B /
+// 32 elts. half d, half m, uchar qh[4], uchar qs[16]. Same outer skeleton
+// as Q8_0 (32-elt blocks); inner dequant is the 5-bit unpack.
+// =============================================================================
+
+template<uint B_TILE>
+inline void dense_gemv_q5_1_btile_qkv_otf_impl(
+    device const half* x,
+    device const half* gamma,
+    device const uchar* Wq_sw,
+    device const uchar* Wk_sw,
+    device const uchar* Wv_sw,
+    device half* out_q,
+    device half* out_k,
+    device half* out_v,
+    constant uint& D_in,
+    constant uint& Q_nb,
+    constant uint& K_nb,
+    constant uint& V_nb,
+    constant uint& D_out_q,
+    constant uint& D_out_k,
+    constant uint& D_out_v,
+    constant float& eps,
+    constant uint& numVecs,
+    threadgroup float (&inv_rms)[B_TILE],
+    threadgroup float (&ss_stage)[4],
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 24;
+    constexpr uint K_PER_BLK = 32;
+    constexpr uint THREADS = 128;
+
+    uint slab = tg.x;
+    uint vec_block = tg.y;
+    uint v_base = vec_block * B_TILE;
+    if (v_base >= numVecs) return;
+    uint v_count = (numVecs - v_base < B_TILE) ? (numVecs - v_base) : B_TILE;
+
+    uint tid = lid.x;
+    uint lid_sg = tid % 32;
+
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        uint b = v_base + v;
+        device const half* xb = x + b * D_in;
+        float local_ss = 0.0f;
+        for (uint i = tid; i < D_in; i += THREADS) {
+            float val = float(xb[i]);
+            local_ss += val * val;
+        }
+        float sg_ss = simd_sum(local_ss);
+        if (lid_sg == 0) ss_stage[sg_id] = sg_ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total_ss = ss_stage[0] + ss_stage[1] + ss_stage[2] + ss_stage[3];
+        if (tid == 0) {
+            inv_rms[v] = rsqrt(total_ss / float(D_in) + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint n_block;
+    uint D_out;
+    device const uchar* W_sw;
+    device half* out;
+    if (slab < Q_nb) {
+        n_block = slab; D_out = D_out_q; W_sw = Wq_sw; out = out_q;
+    } else if (slab < Q_nb + K_nb) {
+        n_block = slab - Q_nb; D_out = D_out_k; W_sw = Wk_sw; out = out_k;
+    } else {
+        n_block = slab - Q_nb - K_nb; D_out = D_out_v; W_sw = Wv_sw; out = out_v;
+    }
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+    uint nbc = D_in / K_PER_BLK;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
+
+    float accs[B_TILE];
+    for (uint v = 0; v < B_TILE; ++v) accs[v] = 0.0f;
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        float d = float(*(device const half*)(blk));
+        float m = float(*(device const half*)(blk + 2));
+        device const uchar* qh = blk + 4;
+        device const uchar* qs = blk + 8;
+        uint base_k = kb * K_PER_BLK;
+        for (uint p = 0; p < 16; ++p) {
+            uchar qsp = qs[p];
+            uint h_lo = (qh[p / 8]       >> (p       % 8)) & 1u;
+            uint h_hi = (qh[(p + 16) / 8] >> ((p + 16) % 8)) & 1u;
+            uint q_lo = (uint(qsp) & 0xFu)        | (h_lo << 4);
+            uint q_hi = ((uint(qsp) >> 4) & 0xFu) | (h_hi << 4);
+            float w_lo = d * float(q_lo) + m;
+            float w_hi = d * float(q_hi) + m;
+            float gamma_lo = float(gamma[base_k + p]);
+            float gamma_hi = float(gamma[base_k + p + 16]);
+            for (uint v = 0; v < B_TILE; ++v) {
+                if (v < v_count) {
+                    uint b = v_base + v;
+                    float x_lo = float(x[b * D_in + base_k + p]);
+                    float x_hi = float(x[b * D_in + base_k + p + 16]);
+                    float ir = inv_rms[v];
+                    accs[v] += x_lo * ir * gamma_lo * w_lo
+                             + x_hi * ir * gamma_hi * w_hi;
+                }
+            }
+        }
+    }
+
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        partials[sg_id][lid_sg] = accs[v];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            uint b = v_base + v;
+            out[b * D_out + n] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_q5_1_btile_qkv_otf_b1")]]
+kernel void dense_gemv_q5_1_btile_qkv_otf_b1(
+    device const half* x        [[buffer(0)]], device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]], device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]], device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]], device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]], constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]], constant uint& V_nb        [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]], constant uint& D_out_k     [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]], constant float& eps        [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[1]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q5_1_btile_qkv_otf_impl<1>(x, gamma, Wq_sw, Wk_sw, Wv_sw, out_q, out_k, out_v,
+        D_in, Q_nb, K_nb, V_nb, D_out_q, D_out_k, D_out_v, eps, numVecs,
+        inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q5_1_btile_qkv_otf_b2")]]
+kernel void dense_gemv_q5_1_btile_qkv_otf_b2(
+    device const half* x        [[buffer(0)]], device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]], device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]], device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]], device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]], constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]], constant uint& V_nb        [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]], constant uint& D_out_k     [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]], constant float& eps        [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[2]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q5_1_btile_qkv_otf_impl<2>(x, gamma, Wq_sw, Wk_sw, Wv_sw, out_q, out_k, out_v,
+        D_in, Q_nb, K_nb, V_nb, D_out_q, D_out_k, D_out_v, eps, numVecs,
+        inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q5_1_btile_qkv_otf_b4")]]
+kernel void dense_gemv_q5_1_btile_qkv_otf_b4(
+    device const half* x        [[buffer(0)]], device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]], device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]], device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]], device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]], constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]], constant uint& V_nb        [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]], constant uint& D_out_k     [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]], constant float& eps        [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[4]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q5_1_btile_qkv_otf_impl<4>(x, gamma, Wq_sw, Wk_sw, Wv_sw, out_q, out_k, out_v,
+        D_in, Q_nb, K_nb, V_nb, D_out_q, D_out_k, D_out_v, eps, numVecs,
+        inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q5_1_btile_qkv_otf_b8")]]
+kernel void dense_gemv_q5_1_btile_qkv_otf_b8(
+    device const half* x        [[buffer(0)]], device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]], device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]], device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]], device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]], constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]], constant uint& V_nb        [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]], constant uint& D_out_k     [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]], constant float& eps        [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[8]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q5_1_btile_qkv_otf_impl<8>(x, gamma, Wq_sw, Wk_sw, Wv_sw, out_q, out_k, out_v,
+        D_in, Q_nb, K_nb, V_nb, D_out_q, D_out_k, D_out_v, eps, numVecs,
+        inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+
+// =============================================================================
+// Q4_0 btile_qkv_otf — structural mirror with Q4_0 dequant (simplest 4bpw).
+// =============================================================================
+
+template<uint B_TILE>
+inline void dense_gemv_q4_0_btile_qkv_otf_impl(
+    device const half* x, device const half* gamma,
+    device const uchar* Wq_sw, device const uchar* Wk_sw, device const uchar* Wv_sw,
+    device half* out_q, device half* out_k, device half* out_v,
+    constant uint& D_in,
+    constant uint& Q_nb, constant uint& K_nb, constant uint& V_nb,
+    constant uint& D_out_q, constant uint& D_out_k, constant uint& D_out_v,
+    constant float& eps, constant uint& numVecs,
+    threadgroup float (&inv_rms)[B_TILE], threadgroup float (&ss_stage)[4],
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 18;
+    constexpr uint K_PER_BLK = 32;
+    constexpr uint THREADS = 128;
+
+    uint slab = tg.x;
+    uint vec_block = tg.y;
+    uint v_base = vec_block * B_TILE;
+    if (v_base >= numVecs) return;
+    uint v_count = (numVecs - v_base < B_TILE) ? (numVecs - v_base) : B_TILE;
+
+    uint tid = lid.x;
+    uint lid_sg = tid % 32;
+
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        uint b = v_base + v;
+        device const half* xb = x + b * D_in;
+        float local_ss = 0.0f;
+        for (uint i = tid; i < D_in; i += THREADS) {
+            float val = float(xb[i]);
+            local_ss += val * val;
+        }
+        float sg_ss = simd_sum(local_ss);
+        if (lid_sg == 0) ss_stage[sg_id] = sg_ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total_ss = ss_stage[0] + ss_stage[1] + ss_stage[2] + ss_stage[3];
+        if (tid == 0) inv_rms[v] = rsqrt(total_ss / float(D_in) + eps);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint n_block;
+    uint D_out;
+    device const uchar* W_sw;
+    device half* out;
+    if (slab < Q_nb) {
+        n_block = slab; D_out = D_out_q; W_sw = Wq_sw; out = out_q;
+    } else if (slab < Q_nb + K_nb) {
+        n_block = slab - Q_nb; D_out = D_out_k; W_sw = Wk_sw; out = out_k;
+    } else {
+        n_block = slab - Q_nb - K_nb; D_out = D_out_v; W_sw = Wv_sw; out = out_v;
+    }
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+    uint nbc = D_in / K_PER_BLK;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
+
+    float accs[B_TILE];
+    for (uint v = 0; v < B_TILE; ++v) accs[v] = 0.0f;
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        float d = float(*(device const half*)(blk));
+        device const uchar* qs = blk + 2;
+        uint base_k = kb * K_PER_BLK;
+        for (uint p = 0; p < 16; ++p) {
+            uchar byte = qs[p];
+            float w_lo = d * float(int(byte & 0xF) - 8);
+            float w_hi = d * float(int((byte >> 4) & 0xF) - 8);
+            float gamma_lo = float(gamma[base_k + p]);
+            float gamma_hi = float(gamma[base_k + p + 16]);
+            for (uint v = 0; v < B_TILE; ++v) {
+                if (v < v_count) {
+                    uint b = v_base + v;
+                    float x_lo = float(x[b * D_in + base_k + p]);
+                    float x_hi = float(x[b * D_in + base_k + p + 16]);
+                    float ir = inv_rms[v];
+                    accs[v] += x_lo * ir * gamma_lo * w_lo
+                             + x_hi * ir * gamma_hi * w_hi;
+                }
+            }
+        }
+    }
+
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        partials[sg_id][lid_sg] = accs[v];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            uint b = v_base + v;
+            out[b * D_out + n] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_q4_0_btile_qkv_otf_b1")]]
+kernel void dense_gemv_q4_0_btile_qkv_otf_b1(
+    device const half* x        [[buffer(0)]], device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]], device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]], device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]], device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]], constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]], constant uint& V_nb        [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]], constant uint& D_out_k     [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]], constant float& eps        [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[1]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q4_0_btile_qkv_otf_impl<1>(x, gamma, Wq_sw, Wk_sw, Wv_sw, out_q, out_k, out_v,
+        D_in, Q_nb, K_nb, V_nb, D_out_q, D_out_k, D_out_v, eps, numVecs,
+        inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q4_0_btile_qkv_otf_b2")]]
+kernel void dense_gemv_q4_0_btile_qkv_otf_b2(
+    device const half* x        [[buffer(0)]], device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]], device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]], device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]], device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]], constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]], constant uint& V_nb        [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]], constant uint& D_out_k     [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]], constant float& eps        [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[2]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q4_0_btile_qkv_otf_impl<2>(x, gamma, Wq_sw, Wk_sw, Wv_sw, out_q, out_k, out_v,
+        D_in, Q_nb, K_nb, V_nb, D_out_q, D_out_k, D_out_v, eps, numVecs,
+        inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q4_0_btile_qkv_otf_b4")]]
+kernel void dense_gemv_q4_0_btile_qkv_otf_b4(
+    device const half* x        [[buffer(0)]], device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]], device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]], device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]], device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]], constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]], constant uint& V_nb        [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]], constant uint& D_out_k     [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]], constant float& eps        [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[4]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q4_0_btile_qkv_otf_impl<4>(x, gamma, Wq_sw, Wk_sw, Wv_sw, out_q, out_k, out_v,
+        D_in, Q_nb, K_nb, V_nb, D_out_q, D_out_k, D_out_v, eps, numVecs,
+        inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q4_0_btile_qkv_otf_b8")]]
+kernel void dense_gemv_q4_0_btile_qkv_otf_b8(
+    device const half* x        [[buffer(0)]], device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]], device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]], device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]], device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]], constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]], constant uint& V_nb        [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]], constant uint& D_out_k     [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]], constant float& eps        [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[8]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q4_0_btile_qkv_otf_impl<8>(x, gamma, Wq_sw, Wk_sw, Wv_sw, out_q, out_k, out_v,
+        D_in, Q_nb, K_nb, V_nb, D_out_q, D_out_k, D_out_v, eps, numVecs,
+        inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+
+// =============================================================================
+// Q4_1 btile_qkv_otf — structural mirror with Q4_1 dequant (w = d*nib + m).
+// =============================================================================
+
+template<uint B_TILE>
+inline void dense_gemv_q4_1_btile_qkv_otf_impl(
+    device const half* x, device const half* gamma,
+    device const uchar* Wq_sw, device const uchar* Wk_sw, device const uchar* Wv_sw,
+    device half* out_q, device half* out_k, device half* out_v,
+    constant uint& D_in,
+    constant uint& Q_nb, constant uint& K_nb, constant uint& V_nb,
+    constant uint& D_out_q, constant uint& D_out_k, constant uint& D_out_v,
+    constant float& eps, constant uint& numVecs,
+    threadgroup float (&inv_rms)[B_TILE], threadgroup float (&ss_stage)[4],
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 20;
+    constexpr uint K_PER_BLK = 32;
+    constexpr uint THREADS = 128;
+
+    uint slab = tg.x;
+    uint vec_block = tg.y;
+    uint v_base = vec_block * B_TILE;
+    if (v_base >= numVecs) return;
+    uint v_count = (numVecs - v_base < B_TILE) ? (numVecs - v_base) : B_TILE;
+
+    uint tid = lid.x;
+    uint lid_sg = tid % 32;
+
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        uint b = v_base + v;
+        device const half* xb = x + b * D_in;
+        float local_ss = 0.0f;
+        for (uint i = tid; i < D_in; i += THREADS) {
+            float val = float(xb[i]);
+            local_ss += val * val;
+        }
+        float sg_ss = simd_sum(local_ss);
+        if (lid_sg == 0) ss_stage[sg_id] = sg_ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total_ss = ss_stage[0] + ss_stage[1] + ss_stage[2] + ss_stage[3];
+        if (tid == 0) inv_rms[v] = rsqrt(total_ss / float(D_in) + eps);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint n_block;
+    uint D_out;
+    device const uchar* W_sw;
+    device half* out;
+    if (slab < Q_nb) {
+        n_block = slab; D_out = D_out_q; W_sw = Wq_sw; out = out_q;
+    } else if (slab < Q_nb + K_nb) {
+        n_block = slab - Q_nb; D_out = D_out_k; W_sw = Wk_sw; out = out_k;
+    } else {
+        n_block = slab - Q_nb - K_nb; D_out = D_out_v; W_sw = Wv_sw; out = out_v;
+    }
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+    uint nbc = D_in / K_PER_BLK;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
+
+    float accs[B_TILE];
+    for (uint v = 0; v < B_TILE; ++v) accs[v] = 0.0f;
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        float d = float(*(device const half*)(blk));
+        float m = float(*(device const half*)(blk + 2));
+        device const uchar* qs = blk + 4;
+        uint base_k = kb * K_PER_BLK;
+        for (uint p = 0; p < 16; ++p) {
+            uchar byte = qs[p];
+            float w_lo = d * float(byte & 0xF) + m;
+            float w_hi = d * float((byte >> 4) & 0xF) + m;
+            float gamma_lo = float(gamma[base_k + p]);
+            float gamma_hi = float(gamma[base_k + p + 16]);
+            for (uint v = 0; v < B_TILE; ++v) {
+                if (v < v_count) {
+                    uint b = v_base + v;
+                    float x_lo = float(x[b * D_in + base_k + p]);
+                    float x_hi = float(x[b * D_in + base_k + p + 16]);
+                    float ir = inv_rms[v];
+                    accs[v] += x_lo * ir * gamma_lo * w_lo
+                             + x_hi * ir * gamma_hi * w_hi;
+                }
+            }
+        }
+    }
+
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        partials[sg_id][lid_sg] = accs[v];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            uint b = v_base + v;
+            out[b * D_out + n] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_q4_1_btile_qkv_otf_b1")]]
+kernel void dense_gemv_q4_1_btile_qkv_otf_b1(
+    device const half* x        [[buffer(0)]], device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]], device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]], device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]], device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]], constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]], constant uint& V_nb        [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]], constant uint& D_out_k     [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]], constant float& eps        [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[1]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q4_1_btile_qkv_otf_impl<1>(x, gamma, Wq_sw, Wk_sw, Wv_sw, out_q, out_k, out_v,
+        D_in, Q_nb, K_nb, V_nb, D_out_q, D_out_k, D_out_v, eps, numVecs,
+        inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q4_1_btile_qkv_otf_b2")]]
+kernel void dense_gemv_q4_1_btile_qkv_otf_b2(
+    device const half* x        [[buffer(0)]], device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]], device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]], device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]], device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]], constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]], constant uint& V_nb        [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]], constant uint& D_out_k     [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]], constant float& eps        [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[2]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q4_1_btile_qkv_otf_impl<2>(x, gamma, Wq_sw, Wk_sw, Wv_sw, out_q, out_k, out_v,
+        D_in, Q_nb, K_nb, V_nb, D_out_q, D_out_k, D_out_v, eps, numVecs,
+        inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q4_1_btile_qkv_otf_b4")]]
+kernel void dense_gemv_q4_1_btile_qkv_otf_b4(
+    device const half* x        [[buffer(0)]], device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]], device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]], device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]], device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]], constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]], constant uint& V_nb        [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]], constant uint& D_out_k     [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]], constant float& eps        [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[4]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q4_1_btile_qkv_otf_impl<4>(x, gamma, Wq_sw, Wk_sw, Wv_sw, out_q, out_k, out_v,
+        D_in, Q_nb, K_nb, V_nb, D_out_q, D_out_k, D_out_v, eps, numVecs,
+        inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q4_1_btile_qkv_otf_b8")]]
+kernel void dense_gemv_q4_1_btile_qkv_otf_b8(
+    device const half* x        [[buffer(0)]], device const half* gamma    [[buffer(1)]],
+    device const uchar* Wq_sw   [[buffer(2)]], device const uchar* Wk_sw   [[buffer(3)]],
+    device const uchar* Wv_sw   [[buffer(4)]], device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]], device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]], constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]], constant uint& V_nb        [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]], constant uint& D_out_k     [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]], constant float& eps        [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[8]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q4_1_btile_qkv_otf_impl<8>(x, gamma, Wq_sw, Wk_sw, Wv_sw, out_q, out_k, out_v,
+        D_in, Q_nb, K_nb, V_nb, D_out_q, D_out_k, D_out_v, eps, numVecs,
+        inv_rms, ss_stage, partials, tg, lid, sg_id);
 }
 
 // Templated QKV with K-tile staging (Item C of the kernel zoo followup
@@ -2573,7 +4865,7 @@ kernel void dense_gemv_q8_0_v7_rmsnorm_qkv(
     float accs[VEC_TILE];
     for (uint v = 0; v < VEC_TILE; ++v) accs[v] = 0.0f;
 
-    for (uint kb = kb_begin; kb < kb_end; ++kb) {
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
         device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
         float d = float(*(device const half*)(blk));
         device const char* qs = (device const char*)(blk + 2);
@@ -2661,13 +4953,81 @@ kernel void dense_gemv_q8_0_v6_rmsnorm_gate_up(
     uint kb_end = kb_begin + kb_per_sg;
 
     float acc = 0.0f;
-    for (uint kb = kb_begin; kb < kb_end; ++kb) {
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
         device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
         float d = float(*(device const half*)(blk));
         device const char* qs = (device const char*)(blk + 2);
         uint base_k = kb * 32;
         for (uint p = 0; p < 32; ++p) {
             acc += float(h_norm[base_k + p]) * d * float(qs[p]);
+        }
+    }
+    threadgroup float partials[N_SPLITS][32];
+    partials[sg_id][lid_sg] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_id == 0) {
+        float total = partials[0][lid_sg] + partials[1][lid_sg] + partials[2][lid_sg] + partials[3][lid_sg];
+        uint col = is_up ? (D_out + n) : n;
+        fused_out[b * 2 * D_out + col] = half(total);
+    }
+}
+
+// F16 mirror of dense_gemv_q8_0_v6_rmsnorm_gate_up: same fused [gate|up]
+// dispatch with [slot, 2*D_out] output layout, but weights are plain
+// row-major fp16 [D_out, D_in] (no swizzle, no per-block scales). Inner
+// loop drops the dequant mul.
+kernel void dense_gemv_f16_v6_rmsnorm_gate_up(
+    device const half* x                [[buffer(0)]],
+    device const half* gamma            [[buffer(1)]],
+    device const half* Wg               [[buffer(2)]],
+    device const half* Wu               [[buffer(3)]],
+    device half* fused_out              [[buffer(4)]],
+    constant uint& D_in                 [[buffer(5)]],
+    constant uint& D_out                [[buffer(6)]],
+    constant float& eps                 [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]],
+    uint sg_id                          [[simdgroup_index_in_threadgroup]])
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint MAX_D_IN = 2816;
+    constexpr uint THREADS = 128;
+    threadgroup half h_norm[MAX_D_IN];
+
+    uint slab = tg.x; uint b = tg.y; uint tid = lid.x; uint lid_sg = tid % 32;
+    uint n_blocks_per_branch = D_out / 32;
+    bool is_up = slab >= n_blocks_per_branch;
+    uint n_block = is_up ? slab - n_blocks_per_branch : slab;
+
+    device const half* xb = x + b * D_in;
+    float local_ss = 0.0f;
+    for (uint i = tid; i < D_in; i += THREADS) {
+        float v = float(xb[i]);
+        local_ss += v * v;
+    }
+    float sg_ss = simd_sum(local_ss);
+    threadgroup float ss_stage[N_SPLITS];
+    if (lid_sg == 0) ss_stage[sg_id] = sg_ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total_ss = ss_stage[0] + ss_stage[1] + ss_stage[2] + ss_stage[3];
+    float inv_rms = rsqrt(total_ss / float(D_in) + eps);
+    for (uint i = tid; i < D_in; i += THREADS) {
+        h_norm[i] = half(float(xb[i]) * inv_rms * float(gamma[i]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+    uint nbc = D_in / 32;
+    device const half* W = is_up ? Wu : Wg;
+    device const half* w_row = W + n * D_in;
+
+    float acc = 0.0f;
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        uint base_k = kb * 32;
+        device const half* w_blk = w_row + base_k;
+        for (uint p = 0; p < 32; ++p) {
+            acc += float(h_norm[base_k + p]) * float(w_blk[p]);
         }
     }
     threadgroup float partials[N_SPLITS][32];
@@ -2752,7 +5112,7 @@ inline void dense_gemv_q8_0_btile_gate_up_otf_impl(
 
     float accs[B_TILE];
     for (uint v = 0; v < B_TILE; ++v) accs[v] = 0.0f;
-    for (uint kb = kb_begin; kb < kb_end; ++kb) {
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
         device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
         float d = float(*(device const half*)(blk));
         device const char* qs = (device const char*)(blk + 2);
@@ -2808,6 +5168,129 @@ kernel void dense_gemv_q8_0_btile_gate_up_otf_b1(
                                                 D_in, D_out, eps, numVecs,
                                                 inv_rms, ss_stage, partials,
                                                 tg, lid, sg_id);
+}
+
+// =============================================================================
+// F16 mirror of the Q8_0 RMSNorm + gate_up otf zoo. Same fused
+// [slot, 2*D_out] output and per-batch inv_rms staging, but weights are
+// plain row-major fp16 [D_out, D_in]. Only B_TILE=1 is needed by this
+// scope (b1 = the AR-decode path).
+template<uint B_TILE>
+inline void dense_gemv_f16_btile_gate_up_otf_impl(
+    device const half* x,
+    device const half* gamma,
+    device const half* Wg,
+    device const half* Wu,
+    device half* fused_out,
+    constant uint& D_in,
+    constant uint& D_out,             // = N_half (gate output dim = up output dim)
+    constant float& eps,
+    constant uint& numVecs,
+    threadgroup float (&inv_rms)[B_TILE],
+    threadgroup float (&ss_stage)[4],
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint THREADS = 128;
+
+    uint slab = tg.x;
+    uint vec_block = tg.y;
+    uint v_base = vec_block * B_TILE;
+    if (v_base >= numVecs) return;
+    uint v_count = (numVecs - v_base < B_TILE) ? (numVecs - v_base) : B_TILE;
+
+    uint tid = lid.x;
+    uint lid_sg = tid % 32;
+
+    // Slab routing: first D_out/32 slabs are gate, next D_out/32 are up.
+    uint n_blocks_per_branch = D_out / 32;
+    bool is_up = slab >= n_blocks_per_branch;
+    uint n_block = is_up ? slab - n_blocks_per_branch : slab;
+
+    // Phase 1: per-batch RMS — same as QKV otf.
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        uint b = v_base + v;
+        device const half* xb = x + b * D_in;
+        float local_ss = 0.0f;
+        for (uint i = tid; i < D_in; i += THREADS) {
+            float val = float(xb[i]);
+            local_ss += val * val;
+        }
+        float sg_ss = simd_sum(local_ss);
+        if (lid_sg == 0) ss_stage[sg_id] = sg_ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total_ss = ss_stage[0] + ss_stage[1] + ss_stage[2] + ss_stage[3];
+        if (tid == 0) {
+            inv_rms[v] = rsqrt(total_ss / float(D_in) + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Phase 2: GEMV with on-the-fly normalize. Read x and gamma directly.
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+    uint nbc = D_in / 32;
+    device const half* W = is_up ? Wu : Wg;
+    device const half* w_row = W + n * D_in;
+
+    float accs[B_TILE];
+    for (uint v = 0; v < B_TILE; ++v) accs[v] = 0.0f;
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        uint base_k = kb * 32;
+        device const half* w_blk = w_row + base_k;
+        for (uint p = 0; p < 32; ++p) {
+            float w_p = float(w_blk[p]);
+            float gamma_p = float(gamma[base_k + p]);
+            for (uint v = 0; v < B_TILE; ++v) {
+                if (v < v_count) {
+                    uint b = v_base + v;
+                    float x_val = float(x[b * D_in + base_k + p]);
+                    accs[v] += x_val * inv_rms[v] * gamma_p * w_p;
+                }
+            }
+        }
+    }
+
+    // Phase 3: per-batch reduction and write to fused [slot, 2*D_out] layout.
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        partials[sg_id][lid_sg] = accs[v];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            uint b = v_base + v;
+            uint col = is_up ? (D_out + n) : n;
+            fused_out[b * 2 * D_out + col] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_f16_btile_gate_up_otf_b1")]]
+kernel void dense_gemv_f16_btile_gate_up_otf_b1(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const half* Wg       [[buffer(2)]],
+    device const half* Wu       [[buffer(3)]],
+    device half* fused_out      [[buffer(4)]],
+    constant uint& D_in         [[buffer(5)]],
+    constant uint& D_out        [[buffer(6)]],
+    constant float& eps         [[buffer(7)]],
+    constant uint& numVecs      [[buffer(8)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[1];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_f16_btile_gate_up_otf_impl<1>(x, gamma, Wg, Wu, fused_out,
+                                              D_in, D_out, eps, numVecs,
+                                              inv_rms, ss_stage, partials,
+                                              tg, lid, sg_id);
 }
 
 [[host_name("dense_gemv_q8_0_btile_gate_up_otf_b2")]]
@@ -2882,6 +5365,880 @@ kernel void dense_gemv_q8_0_btile_gate_up_otf_b8(
                                                 tg, lid, sg_id);
 }
 
+// =============================================================================
+// Q5_K btile_gate_up_otf — structural mirror of the Q8_0 gate_up_otf zoo.
+// Same 3-phase shape (RMS reduction → slab-routed GEMV with OTF normalize
+// → per-batch reduction writing to fused [slot, 2*D_out] layout). Phase 2's
+// per-element dequant is Q5_K (256 elts × 176 B) instead of Q8_0 (32 × 34).
+// =============================================================================
+
+template<uint B_TILE>
+inline void dense_gemv_q5_K_btile_gate_up_otf_impl(
+    device const half* x,
+    device const half* gamma,
+    device const uchar* Wg_sw,
+    device const uchar* Wu_sw,
+    device half* fused_out,
+    constant uint& D_in,
+    constant uint& D_out,
+    constant float& eps,
+    constant uint& numVecs,
+    threadgroup float (&inv_rms)[B_TILE],
+    threadgroup float (&ss_stage)[4],
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 176;
+    constexpr uint K_PER_BLK = 256;
+    constexpr uint THREADS = 128;
+
+    uint slab = tg.x;
+    uint vec_block = tg.y;
+    uint v_base = vec_block * B_TILE;
+    if (v_base >= numVecs) return;
+    uint v_count = (numVecs - v_base < B_TILE) ? (numVecs - v_base) : B_TILE;
+
+    uint tid = lid.x;
+    uint lid_sg = tid % 32;
+
+    // Slab routing: gate then up (same as Q8_0).
+    uint n_blocks_per_branch = D_out / 32;
+    bool is_up = slab >= n_blocks_per_branch;
+    uint n_block = is_up ? slab - n_blocks_per_branch : slab;
+
+    // Phase 1: per-batch RMS reduction (format-agnostic).
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        uint b = v_base + v;
+        device const half* xb = x + b * D_in;
+        float local_ss = 0.0f;
+        for (uint i = tid; i < D_in; i += THREADS) {
+            float val = float(xb[i]);
+            local_ss += val * val;
+        }
+        float sg_ss = simd_sum(local_ss);
+        if (lid_sg == 0) ss_stage[sg_id] = sg_ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total_ss = ss_stage[0] + ss_stage[1] + ss_stage[2] + ss_stage[3];
+        if (tid == 0) {
+            inv_rms[v] = rsqrt(total_ss / float(D_in) + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Phase 2: GEMV with on-the-fly normalize, Q5_K dequant.
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+    uint nbc = D_in / K_PER_BLK;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_sw = is_up ? Wu_sw : Wg_sw;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
+
+    float accs[B_TILE];
+    for (uint v = 0; v < B_TILE; ++v) accs[v] = 0.0f;
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        float d_all = float(*(device const half*)(blk + 0));
+        float dmin  = float(*(device const half*)(blk + 2));
+        device const uchar* scales = blk + 4;
+        device const uchar* qh     = blk + 16;
+        device const uchar* qs     = blk + 48;
+        for (uint il_orig = 0; il_orig < 16; ++il_orig) {
+            uint q_off  = 32u * (il_orig / 4u) + 16u * (il_orig & 1u);
+            uint qh_off = 16u * (il_orig & 1u);
+            uchar ul    = uchar(1u << (il_orig / 2u));
+            uint is     = (il_orig / 4u) * 2u;
+            uint ph     = il_orig & 3u;
+            uchar2 sc   = get_scale_min_k4_just2(is, ph / 2u, scales);
+            float d_eff = (ph < 2u) ? d_all : (d_all / 16.0f);
+            float dl    = d_eff * float(sc[0]);
+            float ml    = dmin  * float(sc[1]);
+            uchar mask  = (ph < 2u) ? 0x0F : 0xF0;
+            float qhv   = (ph < 2u) ? 16.0f : 256.0f;
+            uint base_k = kb * K_PER_BLK + il_orig * 16u;
+            for (uint i = 0; i < 16; ++i) {
+                float v_q = float(qs[q_off + i] & mask)
+                          + (((qh[qh_off + i] & ul) != 0) ? qhv : 0.0f);
+                float w_p = dl * v_q - ml;
+                float gamma_p = float(gamma[base_k + i]);
+                for (uint v = 0; v < B_TILE; ++v) {
+                    if (v < v_count) {
+                        uint b = v_base + v;
+                        float x_val = float(x[b * D_in + base_k + i]);
+                        accs[v] += x_val * inv_rms[v] * gamma_p * w_p;
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 3: per-batch reduction + write to fused [slot, 2*D_out] layout.
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        partials[sg_id][lid_sg] = accs[v];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            uint b = v_base + v;
+            uint col = is_up ? (D_out + n) : n;
+            fused_out[b * 2 * D_out + col] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_q5_K_btile_gate_up_otf_b1")]]
+kernel void dense_gemv_q5_K_btile_gate_up_otf_b1(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const uchar* Wg_sw   [[buffer(2)]],
+    device const uchar* Wu_sw   [[buffer(3)]],
+    device half* fused_out      [[buffer(4)]],
+    constant uint& D_in         [[buffer(5)]],
+    constant uint& D_out        [[buffer(6)]],
+    constant float& eps         [[buffer(7)]],
+    constant uint& numVecs      [[buffer(8)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[1];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_q5_K_btile_gate_up_otf_impl<1>(x, gamma, Wg_sw, Wu_sw, fused_out,
+                                                D_in, D_out, eps, numVecs,
+                                                inv_rms, ss_stage, partials,
+                                                tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q5_K_btile_gate_up_otf_b2")]]
+kernel void dense_gemv_q5_K_btile_gate_up_otf_b2(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const uchar* Wg_sw   [[buffer(2)]],
+    device const uchar* Wu_sw   [[buffer(3)]],
+    device half* fused_out      [[buffer(4)]],
+    constant uint& D_in         [[buffer(5)]],
+    constant uint& D_out        [[buffer(6)]],
+    constant float& eps         [[buffer(7)]],
+    constant uint& numVecs      [[buffer(8)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[2];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_q5_K_btile_gate_up_otf_impl<2>(x, gamma, Wg_sw, Wu_sw, fused_out,
+                                                D_in, D_out, eps, numVecs,
+                                                inv_rms, ss_stage, partials,
+                                                tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q5_K_btile_gate_up_otf_b4")]]
+kernel void dense_gemv_q5_K_btile_gate_up_otf_b4(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const uchar* Wg_sw   [[buffer(2)]],
+    device const uchar* Wu_sw   [[buffer(3)]],
+    device half* fused_out      [[buffer(4)]],
+    constant uint& D_in         [[buffer(5)]],
+    constant uint& D_out        [[buffer(6)]],
+    constant float& eps         [[buffer(7)]],
+    constant uint& numVecs      [[buffer(8)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[4];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_q5_K_btile_gate_up_otf_impl<4>(x, gamma, Wg_sw, Wu_sw, fused_out,
+                                                D_in, D_out, eps, numVecs,
+                                                inv_rms, ss_stage, partials,
+                                                tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q5_K_btile_gate_up_otf_b8")]]
+kernel void dense_gemv_q5_K_btile_gate_up_otf_b8(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const uchar* Wg_sw   [[buffer(2)]],
+    device const uchar* Wu_sw   [[buffer(3)]],
+    device half* fused_out      [[buffer(4)]],
+    constant uint& D_in         [[buffer(5)]],
+    constant uint& D_out        [[buffer(6)]],
+    constant float& eps         [[buffer(7)]],
+    constant uint& numVecs      [[buffer(8)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[8];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_q5_K_btile_gate_up_otf_impl<8>(x, gamma, Wg_sw, Wu_sw, fused_out,
+                                                D_in, D_out, eps, numVecs,
+                                                inv_rms, ss_stage, partials,
+                                                tg, lid, sg_id);
+}
+
+// =============================================================================
+// Q6_K btile_gate_up_otf — structural mirror with Q6_K dequant.
+// =============================================================================
+
+template<uint B_TILE>
+inline void dense_gemv_q6_K_btile_gate_up_otf_impl(
+    device const half* x, device const half* gamma,
+    device const uchar* Wg_sw, device const uchar* Wu_sw,
+    device half* fused_out,
+    constant uint& D_in, constant uint& D_out, constant float& eps, constant uint& numVecs,
+    threadgroup float (&inv_rms)[B_TILE], threadgroup float (&ss_stage)[4],
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 210;
+    constexpr uint K_PER_BLK = 256;
+    constexpr uint THREADS = 128;
+
+    uint slab = tg.x;
+    uint vec_block = tg.y;
+    uint v_base = vec_block * B_TILE;
+    if (v_base >= numVecs) return;
+    uint v_count = (numVecs - v_base < B_TILE) ? (numVecs - v_base) : B_TILE;
+
+    uint tid = lid.x;
+    uint lid_sg = tid % 32;
+
+    uint n_blocks_per_branch = D_out / 32;
+    bool is_up = slab >= n_blocks_per_branch;
+    uint n_block = is_up ? slab - n_blocks_per_branch : slab;
+
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        uint b = v_base + v;
+        device const half* xb = x + b * D_in;
+        float local_ss = 0.0f;
+        for (uint i = tid; i < D_in; i += THREADS) {
+            float val = float(xb[i]);
+            local_ss += val * val;
+        }
+        float sg_ss = simd_sum(local_ss);
+        if (lid_sg == 0) ss_stage[sg_id] = sg_ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total_ss = ss_stage[0] + ss_stage[1] + ss_stage[2] + ss_stage[3];
+        if (tid == 0) {
+            inv_rms[v] = rsqrt(total_ss / float(D_in) + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+    uint nbc = D_in / K_PER_BLK;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_sw = is_up ? Wu_sw : Wg_sw;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
+
+    float accs[B_TILE];
+    for (uint v = 0; v < B_TILE; ++v) accs[v] = 0.0f;
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        device const ushort* ql_u16    = (device const ushort*)(blk + 0);
+        device const ushort* qh_u16    = (device const ushort*)(blk + 128);
+        device const char*   scales_i8 = (device const char*)(blk + 192);
+        float d_all = float(*(device const half*)(blk + 208));
+        for (uint il = 0; il < 16; ++il) {
+            uint ql_base = 32u * (il / 8u) + 16u * ((il / 2u) & 1u) + 8u * (il & 1u);
+            uint qh_base = 16u * (il / 8u) + 8u * (il & 1u);
+            float sc = float(scales_i8[(il % 2u) + 2u * (il / 2u)]);
+            uint ph = (il / 2u) & 3u;
+            uint kmask1 = (ph > 1u) ? ((ph > 2u) ? 0xC0C0C0C0u : 0x30303030u)
+                                    : ((ph > 0u) ? 0x0C0C0C0Cu : 0x03030303u);
+            uint kmask2 = (ph > 1u) ? 0xF0F0F0F0u : 0x0F0F0F0Fu;
+            float ml  = d_all * sc * 32.0f;
+            float dl0 = d_all * sc;
+            float dl1 = dl0 / 256.0f;
+            float dl2 = dl1 / 256.0f;
+            float dl3 = dl2 / 256.0f;
+            uint shr_h = (ph > 2u) ? 2u : 0u;
+            uint shl_h = (ph > 1u) ? 0u : ((ph > 0u) ? 2u : 4u);
+            uint shr_l = (ph > 1u) ? 4u : 0u;
+            uint base_k = kb * K_PER_BLK + il * 16u;
+            for (uint i = 0; i < 4; ++i) {
+                uint low  = (uint(ql_u16[ql_base + 2u*i]) | (uint(ql_u16[ql_base + 2u*i + 1u]) << 16)) & kmask2;
+                uint high = (uint(qh_u16[qh_base + 2u*i]) | (uint(qh_u16[qh_base + 2u*i + 1u]) << 16)) & kmask1;
+                uint q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+                float w0 = dl0 * float(q & 0x000000FFu) - ml;
+                float w1 = dl1 * float(q & 0x0000FF00u) - ml;
+                float w2 = dl2 * float(q & 0x00FF0000u) - ml;
+                float w3 = dl3 * float(q & 0xFF000000u) - ml;
+                uint k0 = base_k + i * 4u;
+                float gamma0 = float(gamma[k0 + 0]);
+                float gamma1 = float(gamma[k0 + 1]);
+                float gamma2 = float(gamma[k0 + 2]);
+                float gamma3 = float(gamma[k0 + 3]);
+                for (uint v = 0; v < B_TILE; ++v) {
+                    if (v < v_count) {
+                        uint b = v_base + v;
+                        device const half* xb = x + b * D_in;
+                        float ir = inv_rms[v];
+                        accs[v] += float(xb[k0 + 0]) * ir * gamma0 * w0
+                                 + float(xb[k0 + 1]) * ir * gamma1 * w1
+                                 + float(xb[k0 + 2]) * ir * gamma2 * w2
+                                 + float(xb[k0 + 3]) * ir * gamma3 * w3;
+                    }
+                }
+            }
+        }
+    }
+
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        partials[sg_id][lid_sg] = accs[v];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            uint b = v_base + v;
+            uint col = is_up ? (D_out + n) : n;
+            fused_out[b * 2 * D_out + col] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_q6_K_btile_gate_up_otf_b1")]]
+kernel void dense_gemv_q6_K_btile_gate_up_otf_b1(
+    device const half* x [[buffer(0)]], device const half* gamma [[buffer(1)]],
+    device const uchar* Wg_sw [[buffer(2)]], device const uchar* Wu_sw [[buffer(3)]],
+    device half* fused_out [[buffer(4)]],
+    constant uint& D_in [[buffer(5)]], constant uint& D_out [[buffer(6)]],
+    constant float& eps [[buffer(7)]], constant uint& numVecs [[buffer(8)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[1]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q6_K_btile_gate_up_otf_impl<1>(x, gamma, Wg_sw, Wu_sw, fused_out,
+        D_in, D_out, eps, numVecs, inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q6_K_btile_gate_up_otf_b2")]]
+kernel void dense_gemv_q6_K_btile_gate_up_otf_b2(
+    device const half* x [[buffer(0)]], device const half* gamma [[buffer(1)]],
+    device const uchar* Wg_sw [[buffer(2)]], device const uchar* Wu_sw [[buffer(3)]],
+    device half* fused_out [[buffer(4)]],
+    constant uint& D_in [[buffer(5)]], constant uint& D_out [[buffer(6)]],
+    constant float& eps [[buffer(7)]], constant uint& numVecs [[buffer(8)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[2]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q6_K_btile_gate_up_otf_impl<2>(x, gamma, Wg_sw, Wu_sw, fused_out,
+        D_in, D_out, eps, numVecs, inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q6_K_btile_gate_up_otf_b4")]]
+kernel void dense_gemv_q6_K_btile_gate_up_otf_b4(
+    device const half* x [[buffer(0)]], device const half* gamma [[buffer(1)]],
+    device const uchar* Wg_sw [[buffer(2)]], device const uchar* Wu_sw [[buffer(3)]],
+    device half* fused_out [[buffer(4)]],
+    constant uint& D_in [[buffer(5)]], constant uint& D_out [[buffer(6)]],
+    constant float& eps [[buffer(7)]], constant uint& numVecs [[buffer(8)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[4]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q6_K_btile_gate_up_otf_impl<4>(x, gamma, Wg_sw, Wu_sw, fused_out,
+        D_in, D_out, eps, numVecs, inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q6_K_btile_gate_up_otf_b8")]]
+kernel void dense_gemv_q6_K_btile_gate_up_otf_b8(
+    device const half* x [[buffer(0)]], device const half* gamma [[buffer(1)]],
+    device const uchar* Wg_sw [[buffer(2)]], device const uchar* Wu_sw [[buffer(3)]],
+    device half* fused_out [[buffer(4)]],
+    constant uint& D_in [[buffer(5)]], constant uint& D_out [[buffer(6)]],
+    constant float& eps [[buffer(7)]], constant uint& numVecs [[buffer(8)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[8]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q6_K_btile_gate_up_otf_impl<8>(x, gamma, Wg_sw, Wu_sw, fused_out,
+        D_in, D_out, eps, numVecs, inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+
+// =============================================================================
+// Q5_1 btile_gate_up_otf — structural mirror with Q5_1 dequant.
+// =============================================================================
+
+template<uint B_TILE>
+inline void dense_gemv_q5_1_btile_gate_up_otf_impl(
+    device const half* x, device const half* gamma,
+    device const uchar* Wg_sw, device const uchar* Wu_sw,
+    device half* fused_out,
+    constant uint& D_in, constant uint& D_out, constant float& eps, constant uint& numVecs,
+    threadgroup float (&inv_rms)[B_TILE], threadgroup float (&ss_stage)[4],
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 24;
+    constexpr uint K_PER_BLK = 32;
+    constexpr uint THREADS = 128;
+
+    uint slab = tg.x;
+    uint vec_block = tg.y;
+    uint v_base = vec_block * B_TILE;
+    if (v_base >= numVecs) return;
+    uint v_count = (numVecs - v_base < B_TILE) ? (numVecs - v_base) : B_TILE;
+
+    uint tid = lid.x;
+    uint lid_sg = tid % 32;
+
+    uint n_blocks_per_branch = D_out / 32;
+    bool is_up = slab >= n_blocks_per_branch;
+    uint n_block = is_up ? slab - n_blocks_per_branch : slab;
+
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        uint b = v_base + v;
+        device const half* xb = x + b * D_in;
+        float local_ss = 0.0f;
+        for (uint i = tid; i < D_in; i += THREADS) {
+            float val = float(xb[i]);
+            local_ss += val * val;
+        }
+        float sg_ss = simd_sum(local_ss);
+        if (lid_sg == 0) ss_stage[sg_id] = sg_ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total_ss = ss_stage[0] + ss_stage[1] + ss_stage[2] + ss_stage[3];
+        if (tid == 0) {
+            inv_rms[v] = rsqrt(total_ss / float(D_in) + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+    uint nbc = D_in / K_PER_BLK;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_sw = is_up ? Wu_sw : Wg_sw;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
+
+    float accs[B_TILE];
+    for (uint v = 0; v < B_TILE; ++v) accs[v] = 0.0f;
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        float d = float(*(device const half*)(blk));
+        float m = float(*(device const half*)(blk + 2));
+        device const uchar* qh = blk + 4;
+        device const uchar* qs = blk + 8;
+        uint base_k = kb * K_PER_BLK;
+        for (uint p = 0; p < 16; ++p) {
+            uchar qsp = qs[p];
+            uint h_lo = (qh[p / 8]       >> (p       % 8)) & 1u;
+            uint h_hi = (qh[(p + 16) / 8] >> ((p + 16) % 8)) & 1u;
+            uint q_lo = (uint(qsp) & 0xFu)        | (h_lo << 4);
+            uint q_hi = ((uint(qsp) >> 4) & 0xFu) | (h_hi << 4);
+            float w_lo = d * float(q_lo) + m;
+            float w_hi = d * float(q_hi) + m;
+            float gamma_lo = float(gamma[base_k + p]);
+            float gamma_hi = float(gamma[base_k + p + 16]);
+            for (uint v = 0; v < B_TILE; ++v) {
+                if (v < v_count) {
+                    uint b = v_base + v;
+                    float x_lo = float(x[b * D_in + base_k + p]);
+                    float x_hi = float(x[b * D_in + base_k + p + 16]);
+                    float ir = inv_rms[v];
+                    accs[v] += x_lo * ir * gamma_lo * w_lo
+                             + x_hi * ir * gamma_hi * w_hi;
+                }
+            }
+        }
+    }
+
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        partials[sg_id][lid_sg] = accs[v];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            uint b = v_base + v;
+            uint col = is_up ? (D_out + n) : n;
+            fused_out[b * 2 * D_out + col] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_q5_1_btile_gate_up_otf_b1")]]
+kernel void dense_gemv_q5_1_btile_gate_up_otf_b1(
+    device const half* x [[buffer(0)]], device const half* gamma [[buffer(1)]],
+    device const uchar* Wg_sw [[buffer(2)]], device const uchar* Wu_sw [[buffer(3)]],
+    device half* fused_out [[buffer(4)]],
+    constant uint& D_in [[buffer(5)]], constant uint& D_out [[buffer(6)]],
+    constant float& eps [[buffer(7)]], constant uint& numVecs [[buffer(8)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[1]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q5_1_btile_gate_up_otf_impl<1>(x, gamma, Wg_sw, Wu_sw, fused_out,
+        D_in, D_out, eps, numVecs, inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q5_1_btile_gate_up_otf_b2")]]
+kernel void dense_gemv_q5_1_btile_gate_up_otf_b2(
+    device const half* x [[buffer(0)]], device const half* gamma [[buffer(1)]],
+    device const uchar* Wg_sw [[buffer(2)]], device const uchar* Wu_sw [[buffer(3)]],
+    device half* fused_out [[buffer(4)]],
+    constant uint& D_in [[buffer(5)]], constant uint& D_out [[buffer(6)]],
+    constant float& eps [[buffer(7)]], constant uint& numVecs [[buffer(8)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[2]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q5_1_btile_gate_up_otf_impl<2>(x, gamma, Wg_sw, Wu_sw, fused_out,
+        D_in, D_out, eps, numVecs, inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q5_1_btile_gate_up_otf_b4")]]
+kernel void dense_gemv_q5_1_btile_gate_up_otf_b4(
+    device const half* x [[buffer(0)]], device const half* gamma [[buffer(1)]],
+    device const uchar* Wg_sw [[buffer(2)]], device const uchar* Wu_sw [[buffer(3)]],
+    device half* fused_out [[buffer(4)]],
+    constant uint& D_in [[buffer(5)]], constant uint& D_out [[buffer(6)]],
+    constant float& eps [[buffer(7)]], constant uint& numVecs [[buffer(8)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[4]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q5_1_btile_gate_up_otf_impl<4>(x, gamma, Wg_sw, Wu_sw, fused_out,
+        D_in, D_out, eps, numVecs, inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q5_1_btile_gate_up_otf_b8")]]
+kernel void dense_gemv_q5_1_btile_gate_up_otf_b8(
+    device const half* x [[buffer(0)]], device const half* gamma [[buffer(1)]],
+    device const uchar* Wg_sw [[buffer(2)]], device const uchar* Wu_sw [[buffer(3)]],
+    device half* fused_out [[buffer(4)]],
+    constant uint& D_in [[buffer(5)]], constant uint& D_out [[buffer(6)]],
+    constant float& eps [[buffer(7)]], constant uint& numVecs [[buffer(8)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[8]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q5_1_btile_gate_up_otf_impl<8>(x, gamma, Wg_sw, Wu_sw, fused_out,
+        D_in, D_out, eps, numVecs, inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+
+// =============================================================================
+// Q4_0 btile_gate_up_otf — structural mirror with Q4_0 dequant.
+// =============================================================================
+
+template<uint B_TILE>
+inline void dense_gemv_q4_0_btile_gate_up_otf_impl(
+    device const half* x, device const half* gamma,
+    device const uchar* Wg_sw, device const uchar* Wu_sw,
+    device half* fused_out,
+    constant uint& D_in, constant uint& D_out, constant float& eps, constant uint& numVecs,
+    threadgroup float (&inv_rms)[B_TILE], threadgroup float (&ss_stage)[4],
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 18;
+    constexpr uint K_PER_BLK = 32;
+    constexpr uint THREADS = 128;
+
+    uint slab = tg.x;
+    uint vec_block = tg.y;
+    uint v_base = vec_block * B_TILE;
+    if (v_base >= numVecs) return;
+    uint v_count = (numVecs - v_base < B_TILE) ? (numVecs - v_base) : B_TILE;
+
+    uint tid = lid.x;
+    uint lid_sg = tid % 32;
+
+    uint n_blocks_per_branch = D_out / 32;
+    bool is_up = slab >= n_blocks_per_branch;
+    uint n_block = is_up ? slab - n_blocks_per_branch : slab;
+
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        uint b = v_base + v;
+        device const half* xb = x + b * D_in;
+        float local_ss = 0.0f;
+        for (uint i = tid; i < D_in; i += THREADS) {
+            float val = float(xb[i]);
+            local_ss += val * val;
+        }
+        float sg_ss = simd_sum(local_ss);
+        if (lid_sg == 0) ss_stage[sg_id] = sg_ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total_ss = ss_stage[0] + ss_stage[1] + ss_stage[2] + ss_stage[3];
+        if (tid == 0) inv_rms[v] = rsqrt(total_ss / float(D_in) + eps);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+    uint nbc = D_in / K_PER_BLK;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_sw = is_up ? Wu_sw : Wg_sw;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
+
+    float accs[B_TILE];
+    for (uint v = 0; v < B_TILE; ++v) accs[v] = 0.0f;
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        float d = float(*(device const half*)(blk));
+        device const uchar* qs = blk + 2;
+        uint base_k = kb * K_PER_BLK;
+        for (uint p = 0; p < 16; ++p) {
+            uchar byte = qs[p];
+            float w_lo = d * float(int(byte & 0xF) - 8);
+            float w_hi = d * float(int((byte >> 4) & 0xF) - 8);
+            float gamma_lo = float(gamma[base_k + p]);
+            float gamma_hi = float(gamma[base_k + p + 16]);
+            for (uint v = 0; v < B_TILE; ++v) {
+                if (v < v_count) {
+                    uint b = v_base + v;
+                    float x_lo = float(x[b * D_in + base_k + p]);
+                    float x_hi = float(x[b * D_in + base_k + p + 16]);
+                    float ir = inv_rms[v];
+                    accs[v] += x_lo * ir * gamma_lo * w_lo
+                             + x_hi * ir * gamma_hi * w_hi;
+                }
+            }
+        }
+    }
+
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        partials[sg_id][lid_sg] = accs[v];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            uint b = v_base + v;
+            uint col = is_up ? (D_out + n) : n;
+            fused_out[b * 2 * D_out + col] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_q4_0_btile_gate_up_otf_b1")]]
+kernel void dense_gemv_q4_0_btile_gate_up_otf_b1(
+    device const half* x [[buffer(0)]], device const half* gamma [[buffer(1)]],
+    device const uchar* Wg_sw [[buffer(2)]], device const uchar* Wu_sw [[buffer(3)]],
+    device half* fused_out [[buffer(4)]],
+    constant uint& D_in [[buffer(5)]], constant uint& D_out [[buffer(6)]],
+    constant float& eps [[buffer(7)]], constant uint& numVecs [[buffer(8)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[1]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q4_0_btile_gate_up_otf_impl<1>(x, gamma, Wg_sw, Wu_sw, fused_out,
+        D_in, D_out, eps, numVecs, inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q4_0_btile_gate_up_otf_b2")]]
+kernel void dense_gemv_q4_0_btile_gate_up_otf_b2(
+    device const half* x [[buffer(0)]], device const half* gamma [[buffer(1)]],
+    device const uchar* Wg_sw [[buffer(2)]], device const uchar* Wu_sw [[buffer(3)]],
+    device half* fused_out [[buffer(4)]],
+    constant uint& D_in [[buffer(5)]], constant uint& D_out [[buffer(6)]],
+    constant float& eps [[buffer(7)]], constant uint& numVecs [[buffer(8)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[2]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q4_0_btile_gate_up_otf_impl<2>(x, gamma, Wg_sw, Wu_sw, fused_out,
+        D_in, D_out, eps, numVecs, inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q4_0_btile_gate_up_otf_b4")]]
+kernel void dense_gemv_q4_0_btile_gate_up_otf_b4(
+    device const half* x [[buffer(0)]], device const half* gamma [[buffer(1)]],
+    device const uchar* Wg_sw [[buffer(2)]], device const uchar* Wu_sw [[buffer(3)]],
+    device half* fused_out [[buffer(4)]],
+    constant uint& D_in [[buffer(5)]], constant uint& D_out [[buffer(6)]],
+    constant float& eps [[buffer(7)]], constant uint& numVecs [[buffer(8)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[4]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q4_0_btile_gate_up_otf_impl<4>(x, gamma, Wg_sw, Wu_sw, fused_out,
+        D_in, D_out, eps, numVecs, inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q4_0_btile_gate_up_otf_b8")]]
+kernel void dense_gemv_q4_0_btile_gate_up_otf_b8(
+    device const half* x [[buffer(0)]], device const half* gamma [[buffer(1)]],
+    device const uchar* Wg_sw [[buffer(2)]], device const uchar* Wu_sw [[buffer(3)]],
+    device half* fused_out [[buffer(4)]],
+    constant uint& D_in [[buffer(5)]], constant uint& D_out [[buffer(6)]],
+    constant float& eps [[buffer(7)]], constant uint& numVecs [[buffer(8)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[8]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q4_0_btile_gate_up_otf_impl<8>(x, gamma, Wg_sw, Wu_sw, fused_out,
+        D_in, D_out, eps, numVecs, inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+
+// =============================================================================
+// Q4_1 btile_gate_up_otf — structural mirror with Q4_1 dequant.
+// =============================================================================
+
+template<uint B_TILE>
+inline void dense_gemv_q4_1_btile_gate_up_otf_impl(
+    device const half* x, device const half* gamma,
+    device const uchar* Wg_sw, device const uchar* Wu_sw,
+    device half* fused_out,
+    constant uint& D_in, constant uint& D_out, constant float& eps, constant uint& numVecs,
+    threadgroup float (&inv_rms)[B_TILE], threadgroup float (&ss_stage)[4],
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
+{
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 20;
+    constexpr uint K_PER_BLK = 32;
+    constexpr uint THREADS = 128;
+
+    uint slab = tg.x;
+    uint vec_block = tg.y;
+    uint v_base = vec_block * B_TILE;
+    if (v_base >= numVecs) return;
+    uint v_count = (numVecs - v_base < B_TILE) ? (numVecs - v_base) : B_TILE;
+
+    uint tid = lid.x;
+    uint lid_sg = tid % 32;
+
+    uint n_blocks_per_branch = D_out / 32;
+    bool is_up = slab >= n_blocks_per_branch;
+    uint n_block = is_up ? slab - n_blocks_per_branch : slab;
+
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        uint b = v_base + v;
+        device const half* xb = x + b * D_in;
+        float local_ss = 0.0f;
+        for (uint i = tid; i < D_in; i += THREADS) {
+            float val = float(xb[i]);
+            local_ss += val * val;
+        }
+        float sg_ss = simd_sum(local_ss);
+        if (lid_sg == 0) ss_stage[sg_id] = sg_ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total_ss = ss_stage[0] + ss_stage[1] + ss_stage[2] + ss_stage[3];
+        if (tid == 0) inv_rms[v] = rsqrt(total_ss / float(D_in) + eps);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint n = n_block * 32 + lid_sg;
+    if (n >= D_out) return;
+    uint nbc = D_in / K_PER_BLK;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_sw = is_up ? Wu_sw : Wg_sw;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
+
+    float accs[B_TILE];
+    for (uint v = 0; v < B_TILE; ++v) accs[v] = 0.0f;
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        float d = float(*(device const half*)(blk));
+        float m = float(*(device const half*)(blk + 2));
+        device const uchar* qs = blk + 4;
+        uint base_k = kb * K_PER_BLK;
+        for (uint p = 0; p < 16; ++p) {
+            uchar byte = qs[p];
+            float w_lo = d * float(byte & 0xF) + m;
+            float w_hi = d * float((byte >> 4) & 0xF) + m;
+            float gamma_lo = float(gamma[base_k + p]);
+            float gamma_hi = float(gamma[base_k + p + 16]);
+            for (uint v = 0; v < B_TILE; ++v) {
+                if (v < v_count) {
+                    uint b = v_base + v;
+                    float x_lo = float(x[b * D_in + base_k + p]);
+                    float x_hi = float(x[b * D_in + base_k + p + 16]);
+                    float ir = inv_rms[v];
+                    accs[v] += x_lo * ir * gamma_lo * w_lo
+                             + x_hi * ir * gamma_hi * w_hi;
+                }
+            }
+        }
+    }
+
+    for (uint v = 0; v < B_TILE; ++v) {
+        if (v >= v_count) break;
+        partials[sg_id][lid_sg] = accs[v];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            uint b = v_base + v;
+            uint col = is_up ? (D_out + n) : n;
+            fused_out[b * 2 * D_out + col] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_q4_1_btile_gate_up_otf_b1")]]
+kernel void dense_gemv_q4_1_btile_gate_up_otf_b1(
+    device const half* x [[buffer(0)]], device const half* gamma [[buffer(1)]],
+    device const uchar* Wg_sw [[buffer(2)]], device const uchar* Wu_sw [[buffer(3)]],
+    device half* fused_out [[buffer(4)]],
+    constant uint& D_in [[buffer(5)]], constant uint& D_out [[buffer(6)]],
+    constant float& eps [[buffer(7)]], constant uint& numVecs [[buffer(8)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[1]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q4_1_btile_gate_up_otf_impl<1>(x, gamma, Wg_sw, Wu_sw, fused_out,
+        D_in, D_out, eps, numVecs, inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q4_1_btile_gate_up_otf_b2")]]
+kernel void dense_gemv_q4_1_btile_gate_up_otf_b2(
+    device const half* x [[buffer(0)]], device const half* gamma [[buffer(1)]],
+    device const uchar* Wg_sw [[buffer(2)]], device const uchar* Wu_sw [[buffer(3)]],
+    device half* fused_out [[buffer(4)]],
+    constant uint& D_in [[buffer(5)]], constant uint& D_out [[buffer(6)]],
+    constant float& eps [[buffer(7)]], constant uint& numVecs [[buffer(8)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[2]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q4_1_btile_gate_up_otf_impl<2>(x, gamma, Wg_sw, Wu_sw, fused_out,
+        D_in, D_out, eps, numVecs, inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q4_1_btile_gate_up_otf_b4")]]
+kernel void dense_gemv_q4_1_btile_gate_up_otf_b4(
+    device const half* x [[buffer(0)]], device const half* gamma [[buffer(1)]],
+    device const uchar* Wg_sw [[buffer(2)]], device const uchar* Wu_sw [[buffer(3)]],
+    device half* fused_out [[buffer(4)]],
+    constant uint& D_in [[buffer(5)]], constant uint& D_out [[buffer(6)]],
+    constant float& eps [[buffer(7)]], constant uint& numVecs [[buffer(8)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[4]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q4_1_btile_gate_up_otf_impl<4>(x, gamma, Wg_sw, Wu_sw, fused_out,
+        D_in, D_out, eps, numVecs, inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+[[host_name("dense_gemv_q4_1_btile_gate_up_otf_b8")]]
+kernel void dense_gemv_q4_1_btile_gate_up_otf_b8(
+    device const half* x [[buffer(0)]], device const half* gamma [[buffer(1)]],
+    device const uchar* Wg_sw [[buffer(2)]], device const uchar* Wu_sw [[buffer(3)]],
+    device half* fused_out [[buffer(4)]],
+    constant uint& D_in [[buffer(5)]], constant uint& D_out [[buffer(6)]],
+    constant float& eps [[buffer(7)]], constant uint& numVecs [[buffer(8)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[8]; threadgroup float ss_stage[4]; threadgroup float partials[4][32];
+    dense_gemv_q4_1_btile_gate_up_otf_impl<8>(x, gamma, Wg_sw, Wu_sw, fused_out,
+        D_in, D_out, eps, numVecs, inv_rms, ss_stage, partials, tg, lid, sg_id);
+}
+
 
 // Fused: RMSNorm(x, gamma) → Q8_0 dense GEMV v5. Reads x once from DRAM,
 // normalizes in-TG-memory, then projects. Eliminates the separate RMSNorm
@@ -2939,7 +6296,7 @@ kernel void dense_gemv_q8_0_v5_rmsnorm(
     uint kb_end = kb_begin + kb_per_sg;
 
     float acc = 0.0f;
-    for (uint kb = kb_begin; kb < kb_end; ++kb) {
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
         device const uchar* blk = W_col + kb * BLK;
         float d = float(*(device const half*)(blk));
         device const char* qs = (device const char*)(blk + 2);
@@ -3173,6 +6530,195 @@ kernel void moe_gemv_q5_1_v6(
                 float w_hi = d * float(q_hi) + m;
                 acc += float(hid[base_k + p])      * w_lo
                      + float(hid[base_k + p + 16]) * w_hi;
+            }
+        }
+        output[slot * D_out + n] = half(acc);
+    }
+}
+
+// MoE Q5_K GEMV v6: swizzled [expert, n_super=D_out/32, nbc=D_in/256, 32 cols, 176 bytes].
+// 32 threads of an SG read 5632 contiguous bytes per kb iter — cache-line coalesced.
+// Slot-flat: hidden indexed by slot_token[slot] (first MoE GEMV — fan-out from
+// hidden_norm[B, HIDDEN]). Mirror moe_gemv_q4k_v6 with Q5_K dequant.
+kernel void moe_gemv_q5_K_v6(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
+    if (expert >= 128u) return;       // sentinel: route_compact pads tail with E=128
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+    uint gb = group_start[expert]; uint ge = group_start[expert + 1];
+    if (ge == gb) return;
+
+    constexpr uint BLK = 176;
+    uint nbc = D_in / 256;
+    uint super_bytes = nbc * 32 * BLK;
+    uint expert_bytes = (D_out / 32) * super_bytes;
+    device const uchar* W_super = W_sw + expert * expert_bytes + n_block * super_bytes;
+
+    for (uint slot = gb; slot < ge; ++slot) {
+        uint tok = slot_token[slot];
+        device const half* hid = hidden + tok * D_in;
+        float acc = 0.0f;
+        for (uint kb = 0; kb < nbc; ++kb) {
+            device const uchar* blk = W_super + kb * 32 * BLK + t * BLK;
+            float d_all = float(*(device const half*)(blk + 0));
+            float dmin  = float(*(device const half*)(blk + 2));
+            device const uchar* scales = blk + 4;
+            device const uchar* qh     = blk + 16;
+            device const uchar* qs     = blk + 48;
+            for (uint il_orig = 0; il_orig < 16; ++il_orig) {
+                uint q_off  = 32u * (il_orig / 4u) + 16u * (il_orig & 1u);
+                uint qh_off = 16u * (il_orig & 1u);
+                uchar ul    = uchar(1u << (il_orig / 2u));
+                uint is     = (il_orig / 4u) * 2u;
+                uint ph     = il_orig & 3u;
+                uchar2 sc   = get_scale_min_k4_just2(is, ph / 2u, scales);
+                float d_eff = (ph < 2u) ? d_all : (d_all / 16.0f);
+                float dl    = d_eff * float(sc[0]);
+                float ml    = dmin  * float(sc[1]);
+                uchar mask  = (ph < 2u) ? 0x0F : 0xF0;
+                float qhv   = (ph < 2u) ? 16.0f : 256.0f;
+                uint base_k = kb * 256u + il_orig * 16u;
+                for (uint i = 0; i < 16; ++i) {
+                    float v = float(qs[q_off + i] & mask)
+                            + (((qh[qh_off + i] & ul) != 0) ? qhv : 0.0f);
+                    acc += float(hid[base_k + i]) * (dl * v - ml);
+                }
+            }
+        }
+        output[slot * D_out + n] = half(acc);
+    }
+}
+
+// MoE Q6_K GEMV v6: swizzled [expert, n_super=D_out/32, nbc=D_in/256, 32 cols, 210 bytes].
+// 32 threads of an SG read 6720 contiguous bytes per kb iter — cache-line coalesced.
+// Down-projection convention: hidden indexed by slot * D_in (per-slot layout).
+kernel void moe_gemv_q6_K_v6(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
+    if (expert >= 128u) return;
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+    uint gb = group_start[expert]; uint ge = group_start[expert + 1];
+    if (ge == gb) return;
+
+    constexpr uint BLK = 210;
+    uint nbc = D_in / 256;
+    uint super_bytes = nbc * 32 * BLK;
+    uint expert_bytes = (D_out / 32) * super_bytes;
+    device const uchar* W_super = W_sw + expert * expert_bytes + n_block * super_bytes;
+
+    for (uint slot = gb; slot < ge; ++slot) {
+        // Q6_K is the MoE DOWN projection per the V1 grid (Q6_K replacement
+        // for the high-precision down weights). Use slot * D_in layout —
+        // input is per-slot (already gate/up expanded), not per-batch-token.
+        device const half* hid = hidden + slot * D_in;
+        float acc = 0.0f;
+        for (uint kb = 0; kb < nbc; ++kb) {
+            device const uchar* blk = W_super + kb * 32 * BLK + t * BLK;
+            device const ushort* ql_u16    = (device const ushort*)(blk + 0);
+            device const ushort* qh_u16    = (device const ushort*)(blk + 128);
+            device const char*   scales_i8 = (device const char*)(blk + 192);
+            float d_all = float(*(device const half*)(blk + 208));
+            for (uint il = 0; il < 16; ++il) {
+                uint ql_base = 32u * (il / 8u) + 16u * ((il / 2u) & 1u) + 8u * (il & 1u);
+                uint qh_base = 16u * (il / 8u) + 8u * (il & 1u);
+                float sc = float(scales_i8[(il % 2u) + 2u * (il / 2u)]);
+                uint ph = (il / 2u) & 3u;
+
+                uint kmask1 = (ph > 1u) ? ((ph > 2u) ? 0xC0C0C0C0u : 0x30303030u)
+                                        : ((ph > 0u) ? 0x0C0C0C0Cu : 0x03030303u);
+                uint kmask2 = (ph > 1u) ? 0xF0F0F0F0u : 0x0F0F0F0Fu;
+                float ml  = d_all * sc * 32.0f;
+                float dl0 = d_all * sc;
+                float dl1 = dl0 / 256.0f;
+                float dl2 = dl1 / 256.0f;
+                float dl3 = dl2 / 256.0f;
+                uint shr_h = (ph > 2u) ? 2u : 0u;
+                uint shl_h = (ph > 1u) ? 0u : ((ph > 0u) ? 2u : 4u);
+                uint shr_l = (ph > 1u) ? 4u : 0u;
+
+                uint base_k = kb * 256u + il * 16u;
+                for (uint i = 0; i < 4; ++i) {
+                    uint low  = (uint(ql_u16[ql_base + 2u*i]) | (uint(ql_u16[ql_base + 2u*i + 1u]) << 16)) & kmask2;
+                    uint high = (uint(qh_u16[qh_base + 2u*i]) | (uint(qh_u16[qh_base + 2u*i + 1u]) << 16)) & kmask1;
+                    uint q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+                    float w0 = dl0 * float(q & 0x000000FFu) - ml;
+                    float w1 = dl1 * float(q & 0x0000FF00u) - ml;
+                    float w2 = dl2 * float(q & 0x00FF0000u) - ml;
+                    float w3 = dl3 * float(q & 0xFF000000u) - ml;
+                    uint k0 = base_k + i * 4u;
+                    acc += float(hid[k0 + 0]) * w0
+                         + float(hid[k0 + 1]) * w1
+                         + float(hid[k0 + 2]) * w2
+                         + float(hid[k0 + 3]) * w3;
+                }
+            }
+        }
+        output[slot * D_out + n] = half(acc);
+    }
+}
+
+// MoE Q8_0 GEMV v6: swizzled [expert, n_super=D_out/32, nbc=D_in/32, 32 cols, 34 bytes].
+// 32 threads of an SG read 1088 contiguous bytes per kb iter. Per-slot X
+// (down convention) — used for ffn_down_exps when llama-quantize keeps it
+// at Q8_0 (Q5_K_M default). Modeled on moe_gemv_q5_1_v6 with Q8_0 dequant.
+kernel void moe_gemv_q8_0_v6(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
+    if (expert >= 128u) return;
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+    uint gb = group_start[expert]; uint ge = group_start[expert + 1];
+    if (ge == gb) return;
+
+    constexpr uint BLK = 34;
+    uint nbc = D_in / 32;
+    uint super_bytes = nbc * 32 * BLK;
+    uint expert_bytes = (D_out / 32) * super_bytes;
+    device const uchar* W_super = W_sw + expert * expert_bytes + n_block * super_bytes;
+
+    for (uint slot = gb; slot < ge; ++slot) {
+        // Down-projection convention: hidden indexed by slot * D_in (per-slot).
+        device const half* hid = hidden + slot * D_in;
+        float acc = 0.0f;
+        for (uint kb = 0; kb < nbc; ++kb) {
+            device const uchar* blk = W_super + kb * 32 * BLK + t * BLK;
+            float d = float(*(device const half*)(blk));
+            device const char* qs = (device const char*)(blk + 2);
+            uint base_k = kb * 32;
+            for (uint p = 0; p < 32; ++p) {
+                acc += float(hid[base_k + p]) * d * float(qs[p]);
             }
         }
         output[slot * D_out + n] = half(acc);
@@ -4004,6 +7550,1192 @@ kernel void moe_gemv_q5_1_v11_b8_kern(
 {
     moe_gemv_q5_1_v11_impl<8>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid);
 }
+
+// =============================================================================
+// MoE Q4_0 v11 — structural mirror of moe_gemv_q4k_v11_impl (slot_token
+// broadcast convention). Q4_0 dequant: w = d * (nib - 8). Pre-dequant the
+// 32 weights of each block to register array W[32], then run the predicated
+// multi-slot FMA loop.
+// =============================================================================
+
+template<uint MAX_SLOTS>
+inline void moe_gemv_q4_0_v11_impl(
+    device const half* hidden,
+    device const uint* slot_token,
+    device const uchar* W_sw,
+    device const uint* active_experts,
+    device const uint* group_start,
+    device half* output,
+    constant uint& D_in,
+    constant uint& D_out,
+    uint2 tg,
+    uint2 lid)
+{
+    uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
+    if (expert >= 128u) return;
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+    uint gb = group_start[expert]; uint ge = group_start[expert + 1];
+    if (ge == gb) return;
+
+    constexpr uint BLK = 18;
+    uint nbc = D_in / 32;
+    uint super_bytes = nbc * 32 * BLK;
+    uint expert_bytes = (D_out / 32) * super_bytes;
+    device const uchar* W_super = W_sw + expert * expert_bytes + n_block * super_bytes;
+
+    uint slot_base = gb;
+    while (slot_base < ge) {
+        uint chunk = (ge - slot_base < MAX_SLOTS) ? (ge - slot_base) : MAX_SLOTS;
+        device const half* hid_slots[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            uint idx = (s < chunk) ? (slot_base + s) : slot_base;
+            hid_slots[s] = hidden + slot_token[idx] * D_in;
+        }
+        float accs[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) accs[s] = 0.0f;
+
+        for (uint kb = 0; kb < nbc; ++kb) {
+            device const uchar* blk = W_super + kb * 32 * BLK + t * BLK;
+            float d = float(*(device const half*)(blk));
+            device const uchar* qs = blk + 2;
+
+            half W_lo[16], W_hi[16];
+            for (uint p = 0; p < 16; ++p) {
+                uchar byte = qs[p];
+                W_lo[p] = half(d * float(int(byte & 0xF) - 8));
+                W_hi[p] = half(d * float(int((byte >> 4) & 0xF) - 8));
+            }
+            uint base_k = kb * 32;
+
+            for (uint s = 0; s < MAX_SLOTS; ++s) {
+                if (s < chunk) {
+                    device const half* hid = hid_slots[s];
+                    float a = accs[s];
+                    for (uint p = 0; p < 16; ++p) {
+                        a += float(hid[base_k + p])      * float(W_lo[p])
+                           + float(hid[base_k + p + 16]) * float(W_hi[p]);
+                    }
+                    accs[s] = a;
+                }
+            }
+        }
+
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            if (s < chunk) {
+                output[(slot_base + s) * D_out + n] = half(accs[s]);
+            }
+        }
+        slot_base += chunk;
+    }
+}
+
+[[host_name("moe_gemv_q4_0_v11_b1")]]
+kernel void moe_gemv_q4_0_v11_b1_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q4_0_v11_impl<1>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
+[[host_name("moe_gemv_q4_0_v11_b2")]]
+kernel void moe_gemv_q4_0_v11_b2_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q4_0_v11_impl<2>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
+[[host_name("moe_gemv_q4_0_v11_b4")]]
+kernel void moe_gemv_q4_0_v11_b4_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q4_0_v11_impl<4>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
+[[host_name("moe_gemv_q4_0_v11_b8")]]
+kernel void moe_gemv_q4_0_v11_b8_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q4_0_v11_impl<8>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
+
+// =============================================================================
+// MoE Q4_0 v11 (per-slot / down convention) — same kernel body as
+// moe_gemv_q4_0_v11_impl but reads `hidden + idx * D_in` instead of
+// `hidden + slot_token[idx] * D_in`. Used for ffn_down_exps in --pure Q4_0
+// configs, or anywhere ffn_down at a layer is Q4_0. The slot_token buffer
+// is kept in the binding signature for ABI parity but unused.
+// =============================================================================
+
+template<uint MAX_SLOTS>
+inline void moe_gemv_q4_0_v11_down_impl(
+    device const half* hidden,
+    device const uint* slot_token,    // unused — per-slot convention
+    device const uchar* W_sw,
+    device const uint* active_experts,
+    device const uint* group_start,
+    device half* output,
+    constant uint& D_in,
+    constant uint& D_out,
+    uint2 tg,
+    uint2 lid)
+{
+    (void)slot_token;
+    uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
+    if (expert >= 128u) return;
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+    uint gb = group_start[expert]; uint ge = group_start[expert + 1];
+    if (ge == gb) return;
+
+    constexpr uint BLK = 18;
+    uint nbc = D_in / 32;
+    uint super_bytes = nbc * 32 * BLK;
+    uint expert_bytes = (D_out / 32) * super_bytes;
+    device const uchar* W_super = W_sw + expert * expert_bytes + n_block * super_bytes;
+
+    uint slot_base = gb;
+    while (slot_base < ge) {
+        uint chunk = (ge - slot_base < MAX_SLOTS) ? (ge - slot_base) : MAX_SLOTS;
+        device const half* hid_slots[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            uint idx = (s < chunk) ? (slot_base + s) : slot_base;
+            hid_slots[s] = hidden + idx * D_in;
+        }
+        float accs[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) accs[s] = 0.0f;
+
+        for (uint kb = 0; kb < nbc; ++kb) {
+            device const uchar* blk = W_super + kb * 32 * BLK + t * BLK;
+            float d = float(*(device const half*)(blk));
+            device const uchar* qs = blk + 2;
+
+            half W_lo[16], W_hi[16];
+            for (uint p = 0; p < 16; ++p) {
+                uchar byte = qs[p];
+                W_lo[p] = half(d * float(int(byte & 0xF) - 8));
+                W_hi[p] = half(d * float(int((byte >> 4) & 0xF) - 8));
+            }
+            uint base_k = kb * 32;
+
+            for (uint s = 0; s < MAX_SLOTS; ++s) {
+                if (s < chunk) {
+                    device const half* hid = hid_slots[s];
+                    float a = accs[s];
+                    for (uint p = 0; p < 16; ++p) {
+                        a += float(hid[base_k + p])      * float(W_lo[p])
+                           + float(hid[base_k + p + 16]) * float(W_hi[p]);
+                    }
+                    accs[s] = a;
+                }
+            }
+        }
+
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            if (s < chunk) {
+                output[(slot_base + s) * D_out + n] = half(accs[s]);
+            }
+        }
+        slot_base += chunk;
+    }
+}
+
+[[host_name("moe_gemv_q4_0_v11_down_b1")]]
+kernel void moe_gemv_q4_0_v11_down_b1_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q4_0_v11_down_impl<1>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
+[[host_name("moe_gemv_q4_0_v11_down_b2")]]
+kernel void moe_gemv_q4_0_v11_down_b2_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q4_0_v11_down_impl<2>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
+[[host_name("moe_gemv_q4_0_v11_down_b4")]]
+kernel void moe_gemv_q4_0_v11_down_b4_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q4_0_v11_down_impl<4>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
+[[host_name("moe_gemv_q4_0_v11_down_b8")]]
+kernel void moe_gemv_q4_0_v11_down_b8_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q4_0_v11_down_impl<8>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
+
+// =============================================================================
+// MoE Q4_1 v11 (slot_token broadcast / up convention). Q4_1 dequant:
+// w = d * nib + m. Block: 20 B/32 elts (half d, half m, uchar qs[16]).
+// =============================================================================
+
+template<uint MAX_SLOTS>
+inline void moe_gemv_q4_1_v11_impl(
+    device const half* hidden,
+    device const uint* slot_token,
+    device const uchar* W_sw,
+    device const uint* active_experts,
+    device const uint* group_start,
+    device half* output,
+    constant uint& D_in,
+    constant uint& D_out,
+    uint2 tg,
+    uint2 lid)
+{
+    uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
+    if (expert >= 128u) return;
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+    uint gb = group_start[expert]; uint ge = group_start[expert + 1];
+    if (ge == gb) return;
+
+    constexpr uint BLK = 20;
+    uint nbc = D_in / 32;
+    uint super_bytes = nbc * 32 * BLK;
+    uint expert_bytes = (D_out / 32) * super_bytes;
+    device const uchar* W_super = W_sw + expert * expert_bytes + n_block * super_bytes;
+
+    uint slot_base = gb;
+    while (slot_base < ge) {
+        uint chunk = (ge - slot_base < MAX_SLOTS) ? (ge - slot_base) : MAX_SLOTS;
+        device const half* hid_slots[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            uint idx = (s < chunk) ? (slot_base + s) : slot_base;
+            hid_slots[s] = hidden + slot_token[idx] * D_in;
+        }
+        float accs[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) accs[s] = 0.0f;
+
+        for (uint kb = 0; kb < nbc; ++kb) {
+            device const uchar* blk = W_super + kb * 32 * BLK + t * BLK;
+            float d = float(*(device const half*)(blk));
+            float m = float(*(device const half*)(blk + 2));
+            device const uchar* qs = blk + 4;
+
+            half W_lo[16], W_hi[16];
+            for (uint p = 0; p < 16; ++p) {
+                uchar byte = qs[p];
+                W_lo[p] = half(d * float(byte & 0xF) + m);
+                W_hi[p] = half(d * float((byte >> 4) & 0xF) + m);
+            }
+            uint base_k = kb * 32;
+
+            for (uint s = 0; s < MAX_SLOTS; ++s) {
+                if (s < chunk) {
+                    device const half* hid = hid_slots[s];
+                    float a = accs[s];
+                    for (uint p = 0; p < 16; ++p) {
+                        a += float(hid[base_k + p])      * float(W_lo[p])
+                           + float(hid[base_k + p + 16]) * float(W_hi[p]);
+                    }
+                    accs[s] = a;
+                }
+            }
+        }
+
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            if (s < chunk) {
+                output[(slot_base + s) * D_out + n] = half(accs[s]);
+            }
+        }
+        slot_base += chunk;
+    }
+}
+
+[[host_name("moe_gemv_q4_1_v11_b1")]]
+kernel void moe_gemv_q4_1_v11_b1_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q4_1_v11_impl<1>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
+[[host_name("moe_gemv_q4_1_v11_b2")]]
+kernel void moe_gemv_q4_1_v11_b2_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q4_1_v11_impl<2>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
+[[host_name("moe_gemv_q4_1_v11_b4")]]
+kernel void moe_gemv_q4_1_v11_b4_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q4_1_v11_impl<4>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
+[[host_name("moe_gemv_q4_1_v11_b8")]]
+kernel void moe_gemv_q4_1_v11_b8_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q4_1_v11_impl<8>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
+
+// =============================================================================
+// MoE Q4_1 v11 (per-slot / down convention).
+// =============================================================================
+
+template<uint MAX_SLOTS>
+inline void moe_gemv_q4_1_v11_down_impl(
+    device const half* hidden,
+    device const uint* slot_token,    // unused — per-slot convention
+    device const uchar* W_sw,
+    device const uint* active_experts,
+    device const uint* group_start,
+    device half* output,
+    constant uint& D_in,
+    constant uint& D_out,
+    uint2 tg,
+    uint2 lid)
+{
+    (void)slot_token;
+    uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
+    if (expert >= 128u) return;
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+    uint gb = group_start[expert]; uint ge = group_start[expert + 1];
+    if (ge == gb) return;
+
+    constexpr uint BLK = 20;
+    uint nbc = D_in / 32;
+    uint super_bytes = nbc * 32 * BLK;
+    uint expert_bytes = (D_out / 32) * super_bytes;
+    device const uchar* W_super = W_sw + expert * expert_bytes + n_block * super_bytes;
+
+    uint slot_base = gb;
+    while (slot_base < ge) {
+        uint chunk = (ge - slot_base < MAX_SLOTS) ? (ge - slot_base) : MAX_SLOTS;
+        device const half* hid_slots[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            uint idx = (s < chunk) ? (slot_base + s) : slot_base;
+            hid_slots[s] = hidden + idx * D_in;
+        }
+        float accs[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) accs[s] = 0.0f;
+
+        for (uint kb = 0; kb < nbc; ++kb) {
+            device const uchar* blk = W_super + kb * 32 * BLK + t * BLK;
+            float d = float(*(device const half*)(blk));
+            float m = float(*(device const half*)(blk + 2));
+            device const uchar* qs = blk + 4;
+
+            half W_lo[16], W_hi[16];
+            for (uint p = 0; p < 16; ++p) {
+                uchar byte = qs[p];
+                W_lo[p] = half(d * float(byte & 0xF) + m);
+                W_hi[p] = half(d * float((byte >> 4) & 0xF) + m);
+            }
+            uint base_k = kb * 32;
+
+            for (uint s = 0; s < MAX_SLOTS; ++s) {
+                if (s < chunk) {
+                    device const half* hid = hid_slots[s];
+                    float a = accs[s];
+                    for (uint p = 0; p < 16; ++p) {
+                        a += float(hid[base_k + p])      * float(W_lo[p])
+                           + float(hid[base_k + p + 16]) * float(W_hi[p]);
+                    }
+                    accs[s] = a;
+                }
+            }
+        }
+
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            if (s < chunk) {
+                output[(slot_base + s) * D_out + n] = half(accs[s]);
+            }
+        }
+        slot_base += chunk;
+    }
+}
+
+[[host_name("moe_gemv_q4_1_v11_down_b1")]]
+kernel void moe_gemv_q4_1_v11_down_b1_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q4_1_v11_down_impl<1>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
+[[host_name("moe_gemv_q4_1_v11_down_b2")]]
+kernel void moe_gemv_q4_1_v11_down_b2_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q4_1_v11_down_impl<2>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
+[[host_name("moe_gemv_q4_1_v11_down_b4")]]
+kernel void moe_gemv_q4_1_v11_down_b4_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q4_1_v11_down_impl<4>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
+[[host_name("moe_gemv_q4_1_v11_down_b8")]]
+kernel void moe_gemv_q4_1_v11_down_b8_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q4_1_v11_down_impl<8>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
+
+// =============================================================================
+// MoE Q5_K v11 — structural mirror of moe_gemv_q4k_v11_impl (slot_token
+// broadcast convention, used for ffn_gate_up_exps in Q5_K_M). Same
+// MAX_SLOTS register-tile pattern; only the per-element dequant differs.
+// Q5_K block: 256 elts × 176 B (vs Q4_K's 256 × 144). 16 sub-tiles per
+// super-block, each producing 16 weights via the (q_off, qh_off, ul,
+// mask, qhv, dl, ml) chain.
+//
+// We pre-dequant 64 weights at a time (4 contiguous sub-tiles = K range
+// [group*64, group*64+64)) into register array W[64], then run the
+// predicated multi-slot FMA loop — same skeleton as Q4_K V11's pair loop
+// but each "group" is 4 sub-tiles of 16 weights instead of 1 pair of 32.
+// =============================================================================
+
+template<uint MAX_SLOTS>
+inline void moe_gemv_q5_K_v11_impl(
+    device const half* hidden,
+    device const uint* slot_token,
+    device const uchar* W_sw,
+    device const uint* active_experts,
+    device const uint* group_start,
+    device half* output,
+    constant uint& D_in,
+    constant uint& D_out,
+    uint2 tg,
+    uint2 lid)
+{
+    uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
+    if (expert >= 128u) return;
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+    uint gb = group_start[expert]; uint ge = group_start[expert + 1];
+    if (ge == gb) return;
+
+    constexpr uint BLK = 176;
+    uint nbc = D_in / 256;
+    uint super_bytes = nbc * 32 * BLK;
+    uint expert_bytes = (D_out / 32) * super_bytes;
+    device const uchar* W_super = W_sw + expert * expert_bytes + n_block * super_bytes;
+
+    uint slot_base = gb;
+    while (slot_base < ge) {
+        uint chunk = (ge - slot_base < MAX_SLOTS) ? (ge - slot_base) : MAX_SLOTS;
+        device const half* hid_slots[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            uint idx = (s < chunk) ? (slot_base + s) : slot_base;
+            hid_slots[s] = hidden + slot_token[idx] * D_in;
+        }
+        float accs[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) accs[s] = 0.0f;
+
+        for (uint kb = 0; kb < nbc; ++kb) {
+            device const uchar* blk = W_super + kb * 32 * BLK + t * BLK;
+            float d_all = float(*(device const half*)(blk + 0));
+            float dmin  = float(*(device const half*)(blk + 2));
+            device const uchar* scales = blk + 4;
+            device const uchar* qh     = blk + 16;
+            device const uchar* qs     = blk + 48;
+
+            // 4 groups of 4 contiguous sub-tiles, 64 weights per group.
+            for (uint group = 0; group < 4; ++group) {
+                half W[64];
+                for (uint il_in_grp = 0; il_in_grp < 4; ++il_in_grp) {
+                    uint il_orig = group * 4 + il_in_grp;
+                    uint q_off  = 32u * (il_orig / 4u) + 16u * (il_orig & 1u);
+                    uint qh_off = 16u * (il_orig & 1u);
+                    uchar ul    = uchar(1u << (il_orig / 2u));
+                    uint is     = (il_orig / 4u) * 2u;
+                    uint ph     = il_orig & 3u;
+                    uchar2 sc   = get_scale_min_k4_just2(is, ph / 2u, scales);
+                    float d_eff = (ph < 2u) ? d_all : (d_all / 16.0f);
+                    float dl    = d_eff * float(sc[0]);
+                    float ml    = dmin  * float(sc[1]);
+                    uchar mask  = (ph < 2u) ? 0x0F : 0xF0;
+                    float qhv   = (ph < 2u) ? 16.0f : 256.0f;
+                    for (uint i = 0; i < 16; ++i) {
+                        float v = float(qs[q_off + i] & mask)
+                                + (((qh[qh_off + i] & ul) != 0) ? qhv : 0.0f);
+                        W[il_in_grp * 16 + i] = half(dl * v - ml);
+                    }
+                }
+                uint base_k = kb * 256 + group * 64;
+
+                // Predicated multi-slot FMA. Mirrors Q4_K V11.
+                for (uint s = 0; s < MAX_SLOTS; ++s) {
+                    if (s < chunk) {
+                        device const half* hid = hid_slots[s];
+                        float a = accs[s];
+                        for (uint i = 0; i < 64; ++i) {
+                            a += float(hid[base_k + i]) * float(W[i]);
+                        }
+                        accs[s] = a;
+                    }
+                }
+            }
+        }
+
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            if (s < chunk) {
+                output[(slot_base + s) * D_out + n] = half(accs[s]);
+            }
+        }
+        slot_base += chunk;
+    }
+}
+
+[[host_name("moe_gemv_q5_K_v11_b1")]]
+kernel void moe_gemv_q5_K_v11_b1_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_q5_K_v11_impl<1>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+[[host_name("moe_gemv_q5_K_v11_b2")]]
+kernel void moe_gemv_q5_K_v11_b2_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_q5_K_v11_impl<2>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+[[host_name("moe_gemv_q5_K_v11_b4")]]
+kernel void moe_gemv_q5_K_v11_b4_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_q5_K_v11_impl<4>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+[[host_name("moe_gemv_q5_K_v11_b8")]]
+kernel void moe_gemv_q5_K_v11_b8_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_q5_K_v11_impl<8>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+// =============================================================================
+// MoE Q8_0 v11 — structural mirror of moe_gemv_q5_1_v11_impl (per-slot
+// convention, used for ffn_down_exps when format is Q8_0 in Q5_K_M).
+// Same MAX_SLOTS register-tile pattern; per-element dequant is Q8_0
+// (single int8 multiply by block scale d).
+// =============================================================================
+
+template<uint MAX_SLOTS>
+inline void moe_gemv_q8_0_v11_impl(
+    device const half* hidden,
+    device const uint* slot_token,    // unused — per-slot convention
+    device const uchar* W_sw,
+    device const uint* active_experts,
+    device const uint* group_start,
+    device half* output,
+    constant uint& D_in,
+    constant uint& D_out,
+    uint2 tg,
+    uint2 lid)
+{
+    (void)slot_token;
+    uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
+    if (expert >= 128u) return;
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+    uint gb = group_start[expert]; uint ge = group_start[expert + 1];
+    if (ge == gb) return;
+
+    constexpr uint BLK = 34;
+    uint nbc = D_in / 32;
+    uint super_bytes = nbc * 32 * BLK;
+    uint expert_bytes = (D_out / 32) * super_bytes;
+    device const uchar* W_super = W_sw + expert * expert_bytes + n_block * super_bytes;
+
+    uint slot_base = gb;
+    while (slot_base < ge) {
+        uint chunk = (ge - slot_base < MAX_SLOTS) ? (ge - slot_base) : MAX_SLOTS;
+        device const half* hid_slots[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            uint idx = (s < chunk) ? (slot_base + s) : slot_base;
+            hid_slots[s] = hidden + idx * D_in;
+        }
+        float accs[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) accs[s] = 0.0f;
+
+        for (uint kb = 0; kb < nbc; ++kb) {
+            device const uchar* blk = W_super + kb * 32 * BLK + t * BLK;
+            float d = float(*(device const half*)(blk + 0));
+            device const char* qs = (device const char*)(blk + 2);
+
+            // Pre-dequant 32 weights to register array W[32].
+            half W[32];
+            for (uint p = 0; p < 32; ++p) {
+                W[p] = half(d * float(qs[p]));
+            }
+            uint base_k = kb * 32;
+
+            // Predicated multi-slot FMA. Mirrors Q5_1 V11.
+            for (uint s = 0; s < MAX_SLOTS; ++s) {
+                if (s < chunk) {
+                    device const half* hid = hid_slots[s];
+                    float a = accs[s];
+                    for (uint p = 0; p < 32; ++p) {
+                        a += float(hid[base_k + p]) * float(W[p]);
+                    }
+                    accs[s] = a;
+                }
+            }
+        }
+
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            if (s < chunk) {
+                output[(slot_base + s) * D_out + n] = half(accs[s]);
+            }
+        }
+        slot_base += chunk;
+    }
+}
+
+[[host_name("moe_gemv_q8_0_v11_b1")]]
+kernel void moe_gemv_q8_0_v11_b1_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_q8_0_v11_impl<1>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+[[host_name("moe_gemv_q8_0_v11_b2")]]
+kernel void moe_gemv_q8_0_v11_b2_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_q8_0_v11_impl<2>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+[[host_name("moe_gemv_q8_0_v11_b4")]]
+kernel void moe_gemv_q8_0_v11_b4_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_q8_0_v11_impl<4>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+[[host_name("moe_gemv_q8_0_v11_b8")]]
+kernel void moe_gemv_q8_0_v11_b8_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_q8_0_v11_impl<8>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+// =============================================================================
+// MoE F16 v11 (per-slot convention) — fp16 weight-streaming mirror of
+// moe_gemv_q8_0_v11_impl with the dequant step removed. Buffer is per-expert
+// row-major fp16: [E][D_out, D_in], expert stride = D_out * D_in halves.
+// All slot routing arithmetic preserved verbatim.
+// =============================================================================
+
+template<uint MAX_SLOTS>
+inline void moe_gemv_f16_v11_impl(
+    device const half* hidden,
+    device const uint* slot_token,    // unused — per-slot convention
+    device const half* W,
+    device const uint* active_experts,
+    device const uint* group_start,
+    device half* output,
+    constant uint& D_in,
+    constant uint& D_out,
+    uint2 tg,
+    uint2 lid)
+{
+    (void)slot_token;
+    uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
+    if (expert >= 128u) return;
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+    uint gb = group_start[expert]; uint ge = group_start[expert + 1];
+    if (ge == gb) return;
+
+    uint nbc = D_in / 32;
+    device const half* W_row = W + (uint64_t)expert * (uint64_t)D_out * (uint64_t)D_in + (uint64_t)n * (uint64_t)D_in;
+
+    uint slot_base = gb;
+    while (slot_base < ge) {
+        uint chunk = (ge - slot_base < MAX_SLOTS) ? (ge - slot_base) : MAX_SLOTS;
+        device const half* hid_slots[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            uint idx = (s < chunk) ? (slot_base + s) : slot_base;
+            hid_slots[s] = hidden + idx * D_in;
+        }
+        float accs[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) accs[s] = 0.0f;
+
+        for (uint kb = 0; kb < nbc; ++kb) {
+            // Direct fp16 weight loads — no dequant.
+            half Wreg[32];
+            for (uint p = 0; p < 32; ++p) {
+                Wreg[p] = W_row[kb * 32 + p];
+            }
+            uint base_k = kb * 32;
+
+            // Predicated multi-slot FMA. Mirrors Q8_0 V11.
+            for (uint s = 0; s < MAX_SLOTS; ++s) {
+                if (s < chunk) {
+                    device const half* hid = hid_slots[s];
+                    float a = accs[s];
+                    for (uint p = 0; p < 32; ++p) {
+                        a += float(hid[base_k + p]) * float(Wreg[p]);
+                    }
+                    accs[s] = a;
+                }
+            }
+        }
+
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            if (s < chunk) {
+                output[(slot_base + s) * D_out + n] = half(accs[s]);
+            }
+        }
+        slot_base += chunk;
+    }
+}
+
+[[host_name("moe_gemv_f16_v11_b1")]]
+kernel void moe_gemv_f16_v11_b1_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const half* W                [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_f16_v11_impl<1>(hidden, slot_token, W, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+[[host_name("moe_gemv_f16_v11_b2")]]
+kernel void moe_gemv_f16_v11_b2_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const half* W                [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_f16_v11_impl<2>(hidden, slot_token, W, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+[[host_name("moe_gemv_f16_v11_b4")]]
+kernel void moe_gemv_f16_v11_b4_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const half* W                [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_f16_v11_impl<4>(hidden, slot_token, W, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+[[host_name("moe_gemv_f16_v11_b8")]]
+kernel void moe_gemv_f16_v11_b8_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const half* W                [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_f16_v11_impl<8>(hidden, slot_token, W, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+// =============================================================================
+// MoE F16 v11 UP (slot_token-broadcast convention) — for ffn_gate_up_exps
+// where multiple expert slots may share the same token's hidden vector.
+//
+// Differs from moe_gemv_f16_v11_impl above by exactly one line: the slot's
+// hidden pointer is `hidden + slot_token[idx] * D_in` instead of
+// `hidden + idx * D_in`. That is the standard moe_up indirection that the
+// Q4_K and Q5_K moe_up V11 kernels also do — when one source token is
+// routed to k experts, all k slots referring to that token must read the
+// SAME source row of `hidden`. Per-slot indexing here would silently read
+// neighbor slots' rows (which represent different tokens or different
+// experts of the same token), producing structurally-wrong-but-bounded
+// activations that propagate through the residual stream and degenerate
+// the output distribution.
+//
+// The down kernel (moe_gemv_f16_v11_impl above) stays per-slot — that
+// convention is correct for ffn_down_exps where each slot has its own
+// expert-output row from the prior MoE-up step.
+// =============================================================================
+
+template<uint MAX_SLOTS>
+inline void moe_gemv_f16_v11_up_impl(
+    device const half* hidden,
+    device const uint* slot_token,    // slot_token-broadcast convention
+    device const half* W,
+    device const uint* active_experts,
+    device const uint* group_start,
+    device half* output,
+    constant uint& D_in,
+    constant uint& D_out,
+    uint2 tg,
+    uint2 lid)
+{
+    uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
+    if (expert >= 128u) return;
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+    uint gb = group_start[expert]; uint ge = group_start[expert + 1];
+    if (ge == gb) return;
+
+    uint nbc = D_in / 32;
+    device const half* W_row = W + (uint64_t)expert * (uint64_t)D_out * (uint64_t)D_in + (uint64_t)n * (uint64_t)D_in;
+
+    uint slot_base = gb;
+    while (slot_base < ge) {
+        uint chunk = (ge - slot_base < MAX_SLOTS) ? (ge - slot_base) : MAX_SLOTS;
+        device const half* hid_slots[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            uint idx = (s < chunk) ? (slot_base + s) : slot_base;
+            // slot_token-broadcast: multiple slots may share a token, so
+            // indirect through slot_token[] to find this slot's source row.
+            hid_slots[s] = hidden + slot_token[idx] * D_in;
+        }
+        float accs[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) accs[s] = 0.0f;
+
+        for (uint kb = 0; kb < nbc; ++kb) {
+            // Direct fp16 weight loads — no dequant.
+            half Wreg[32];
+            for (uint p = 0; p < 32; ++p) {
+                Wreg[p] = W_row[kb * 32 + p];
+            }
+            uint base_k = kb * 32;
+
+            // Predicated multi-slot FMA. Mirrors the Q4_K up V11 pattern.
+            for (uint s = 0; s < MAX_SLOTS; ++s) {
+                if (s < chunk) {
+                    device const half* hid = hid_slots[s];
+                    float a = accs[s];
+                    for (uint p = 0; p < 32; ++p) {
+                        a += float(hid[base_k + p]) * float(Wreg[p]);
+                    }
+                    accs[s] = a;
+                }
+            }
+        }
+
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            if (s < chunk) {
+                output[(slot_base + s) * D_out + n] = half(accs[s]);
+            }
+        }
+        slot_base += chunk;
+    }
+}
+
+[[host_name("moe_gemv_f16_v11_up_b1")]]
+kernel void moe_gemv_f16_v11_up_b1_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const half* W                [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_f16_v11_up_impl<1>(hidden, slot_token, W, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+[[host_name("moe_gemv_f16_v11_up_b2")]]
+kernel void moe_gemv_f16_v11_up_b2_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const half* W                [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_f16_v11_up_impl<2>(hidden, slot_token, W, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+[[host_name("moe_gemv_f16_v11_up_b4")]]
+kernel void moe_gemv_f16_v11_up_b4_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const half* W                [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_f16_v11_up_impl<4>(hidden, slot_token, W, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+[[host_name("moe_gemv_f16_v11_up_b8")]]
+kernel void moe_gemv_f16_v11_up_b8_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const half* W                [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_f16_v11_up_impl<8>(hidden, slot_token, W, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+// =============================================================================
+// MoE Q6_K v11 (per-slot convention) — structural mirror of Q5_K V11 with
+// Q6_K dequant. Used for ffn_down_exps if a future GGUF puts Q6_K there.
+// 16 sub-tiles × 16 weights via the kmask/shift formula; we pre-dequant
+// 64 weights per group (4 sub-tiles) into register array W[64], then run
+// the predicated multi-slot FMA loop.
+// =============================================================================
+
+template<uint MAX_SLOTS>
+inline void moe_gemv_q6_K_v11_impl(
+    device const half* hidden,
+    device const uint* slot_token,    // unused — per-slot convention
+    device const uchar* W_sw,
+    device const uint* active_experts,
+    device const uint* group_start,
+    device half* output,
+    constant uint& D_in,
+    constant uint& D_out,
+    uint2 tg,
+    uint2 lid)
+{
+    (void)slot_token;
+    uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
+    if (expert >= 128u) return;
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+    uint gb = group_start[expert]; uint ge = group_start[expert + 1];
+    if (ge == gb) return;
+
+    constexpr uint BLK = 210;
+    uint nbc = D_in / 256;
+    uint super_bytes = nbc * 32 * BLK;
+    uint expert_bytes = (D_out / 32) * super_bytes;
+    device const uchar* W_super = W_sw + expert * expert_bytes + n_block * super_bytes;
+
+    uint slot_base = gb;
+    while (slot_base < ge) {
+        uint chunk = (ge - slot_base < MAX_SLOTS) ? (ge - slot_base) : MAX_SLOTS;
+        device const half* hid_slots[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            uint idx = (s < chunk) ? (slot_base + s) : slot_base;
+            hid_slots[s] = hidden + idx * D_in;
+        }
+        float accs[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) accs[s] = 0.0f;
+
+        for (uint kb = 0; kb < nbc; ++kb) {
+            device const uchar* blk = W_super + kb * 32 * BLK + t * BLK;
+            device const ushort* ql_u16    = (device const ushort*)(blk + 0);
+            device const ushort* qh_u16    = (device const ushort*)(blk + 128);
+            device const char*   scales_i8 = (device const char*)(blk + 192);
+            float d_all = float(*(device const half*)(blk + 208));
+
+            // 4 groups of 4 contiguous sub-tiles, 64 weights per group.
+            for (uint group = 0; group < 4; ++group) {
+                half W[64];
+                for (uint il_in_grp = 0; il_in_grp < 4; ++il_in_grp) {
+                    uint il = group * 4 + il_in_grp;
+                    uint ql_base = 32u * (il / 8u) + 16u * ((il / 2u) & 1u) + 8u * (il & 1u);
+                    uint qh_base = 16u * (il / 8u) + 8u * (il & 1u);
+                    float sc = float(scales_i8[(il % 2u) + 2u * (il / 2u)]);
+                    uint ph = (il / 2u) & 3u;
+                    uint kmask1 = (ph > 1u) ? ((ph > 2u) ? 0xC0C0C0C0u : 0x30303030u)
+                                            : ((ph > 0u) ? 0x0C0C0C0Cu : 0x03030303u);
+                    uint kmask2 = (ph > 1u) ? 0xF0F0F0F0u : 0x0F0F0F0Fu;
+                    float ml  = d_all * sc * 32.0f;
+                    float dl0 = d_all * sc;
+                    float dl1 = dl0 / 256.0f;
+                    float dl2 = dl1 / 256.0f;
+                    float dl3 = dl2 / 256.0f;
+                    uint shr_h = (ph > 2u) ? 2u : 0u;
+                    uint shl_h = (ph > 1u) ? 0u : ((ph > 0u) ? 2u : 4u);
+                    uint shr_l = (ph > 1u) ? 4u : 0u;
+                    for (uint i = 0; i < 4; ++i) {
+                        uint low  = (uint(ql_u16[ql_base + 2u*i]) | (uint(ql_u16[ql_base + 2u*i + 1u]) << 16)) & kmask2;
+                        uint high = (uint(qh_u16[qh_base + 2u*i]) | (uint(qh_u16[qh_base + 2u*i + 1u]) << 16)) & kmask1;
+                        uint q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+                        W[il_in_grp * 16 + i*4 + 0] = half(dl0 * float(q & 0x000000FFu) - ml);
+                        W[il_in_grp * 16 + i*4 + 1] = half(dl1 * float(q & 0x0000FF00u) - ml);
+                        W[il_in_grp * 16 + i*4 + 2] = half(dl2 * float(q & 0x00FF0000u) - ml);
+                        W[il_in_grp * 16 + i*4 + 3] = half(dl3 * float(q & 0xFF000000u) - ml);
+                    }
+                }
+                uint base_k = kb * 256 + group * 64;
+                for (uint s = 0; s < MAX_SLOTS; ++s) {
+                    if (s < chunk) {
+                        device const half* hid = hid_slots[s];
+                        float a = accs[s];
+                        for (uint i = 0; i < 64; ++i) {
+                            a += float(hid[base_k + i]) * float(W[i]);
+                        }
+                        accs[s] = a;
+                    }
+                }
+            }
+        }
+
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            if (s < chunk) {
+                output[(slot_base + s) * D_out + n] = half(accs[s]);
+            }
+        }
+        slot_base += chunk;
+    }
+}
+
+[[host_name("moe_gemv_q6_K_v11_b1")]]
+kernel void moe_gemv_q6_K_v11_b1_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q6_K_v11_impl<1>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
+[[host_name("moe_gemv_q6_K_v11_b2")]]
+kernel void moe_gemv_q6_K_v11_b2_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q6_K_v11_impl<2>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
+[[host_name("moe_gemv_q6_K_v11_b4")]]
+kernel void moe_gemv_q6_K_v11_b4_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q6_K_v11_impl<4>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
+[[host_name("moe_gemv_q6_K_v11_b8")]]
+kernel void moe_gemv_q6_K_v11_b8_kern(
+    device const half* hidden [[buffer(0)]], device const uint* slot_token [[buffer(1)]],
+    device const uchar* W_sw [[buffer(2)]], device const uint* active_experts [[buffer(3)]],
+    device const uint* group_start [[buffer(4)]], device half* output [[buffer(5)]],
+    constant uint& D_in [[buffer(6)]], constant uint& D_out [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{ moe_gemv_q6_K_v11_impl<8>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
 
 // MoE Q4_K v12 — V11 + per-kb tg-mem nibble lookup table (compute-bound
 // dequant rewrite). Targets the 32% gap between V11's measured MoE wall
@@ -5203,9 +9935,26 @@ kernel void flex_attn_v0(
 
 
 // Flex attention v1 — slide layer with Q_BLOCK=8 (prefill).
-// Each TG covers 8 consecutive Q positions × Q_PER_TG=2 Q-heads → 16 real Q rows.
-// MMA runs in 2 passes of 8 rows each. Per-Q-row softmax applies a per-row
-// causal+sliding mask using per-row q_positions. Partials laid out per (q_pos, q_head).
+//
+// 2026-05-06 refactor: switched from Q_PER_TG=2 (16 Q rows per TG) to
+// Q_PER_TG=1 (8 Q rows per TG, ONE q_head per TG). Matches the
+// flex_attn_full_prefill geometry. Reason: the Q_PER_TG=2 layout
+// declared 25,312 bytes of static threadgroup memory which Metal
+// counts as ~50 KB after compiler-side simdgroup-matrix double-
+// buffering — over the 32 KB hardware limit. Apple Silicon tolerated
+// the overflow at small KV-cache sizes (production worked at
+// pool=8192) but the threadgroup-mem assertion is real and fires
+// under MTL_DEBUG_LAYER. Single-q-head-per-TG drops static usage
+// to ~12.6 KB, well under 32 KB even with compiler doubling.
+//
+// Grid changes: x dim was B*H_KV (each TG handled Q_PER_TG q_heads
+// for one kv_head); now B*H_Q (each TG handles ONE q_head). H_KV is
+// derived inside the kernel via kv_head = (q_head * H_KV) / H_Q. The
+// dispatcher in encFlexAttnSlidePrefill must use the new grid.
+//
+// Each TG covers 8 consecutive Q positions × 1 Q-head → 8 real Q rows.
+// Per-Q-row softmax applies a per-row causal+sliding mask using
+// per-row q_positions. Partials laid out per (q_pos, q_head).
 kernel void flex_attn_slide_v1_q8(
     device const half* Q                    [[buffer(0)]],   // [B, Q_LEN, H_Q, D]
     device const half* K_cache              [[buffer(1)]],
@@ -5234,45 +9983,43 @@ kernel void flex_attn_slide_v1_q8(
     constexpr uint D = 256;
     constexpr uint PAGE = 16;
     constexpr uint THREADS = 32;
-    constexpr uint Q_PER_TG = 2;
     constexpr uint Q_BLOCK = 8;
-    constexpr uint Q_ROWS = Q_PER_TG * Q_BLOCK;   // 16
+    constexpr uint Q_ROWS = Q_BLOCK;          // 8 (was Q_PER_TG * Q_BLOCK = 16)
     constexpr uint D8 = D / 8;
 
-    const uint vs = tg_pos.x;
-    const uint q_block_idx = tg_pos.y;   // which Q tile
+    const uint vs = tg_pos.x;                 // ranges B * H_Q (was B * H_KV)
+    const uint q_block_idx = tg_pos.y;        // which Q tile
     const uint split = tg_pos.z;
-    const uint slot = vs / H_KV;
-    const uint kv_head = vs % H_KV;
-    const uint q_head_base = kv_head * Q_PER_TG;
+    const uint slot = vs / H_Q;               // (was vs / H_KV)
+    const uint q_head = vs % H_Q;             // (was kv_head, q_head_base = kv_head * Q_PER_TG)
+    const uint kv_head = (q_head * H_KV) / H_Q;
     const uint lid = lid3.x;
 
     const uint q_blocks_per_slot = (q_len + Q_BLOCK - 1) / Q_BLOCK;
     const uint csr_idx = slot * q_blocks_per_slot + q_block_idx;
     const uint q_local_base = q_block_idx * Q_BLOCK;
 
-    threadgroup half  Q_tile[Q_ROWS * D];
-    threadgroup half  scores_tile[Q_ROWS * PAGE];
-    threadgroup float O_acc[Q_ROWS * D];
-    threadgroup float m_state[Q_ROWS];
-    threadgroup float l_state[Q_ROWS];
-    threadgroup float scale_tile[Q_ROWS];
-    threadgroup uint  q_pos_tg[Q_BLOCK];
+    threadgroup half  Q_tile[Q_ROWS * D];           // 8 * 256 * 2 =  4096 B
+    threadgroup half  scores_tile[Q_ROWS * PAGE];   // 8 *  16 * 2 =   256 B
+    threadgroup float O_acc[Q_ROWS * D];            // 8 * 256 * 4 = 8192 B
+    threadgroup float m_state[Q_ROWS];              // 8 *       4 =   32 B
+    threadgroup float l_state[Q_ROWS];              //                  32 B
+    threadgroup float scale_tile[Q_ROWS];           //                  32 B
+    threadgroup uint  q_pos_tg[Q_BLOCK];            // 8 *       4 =   32 B
+                                                     // total: ~12,672 B static
 
     device const uint* bt_s = block_table + slot * max_pages;
 
-    // Load Q_tile with layout [row=q_local*Q_PER_TG+h_local, dim=d]. Pad
-    // rows where q_local_base+q_local >= q_len to zero so their MMA
-    // contributes zero.
+    // Load Q_tile with layout [row=q_local, dim=d]. Each row corresponds
+    // to one Q position for our single q_head. Padding rows zero out so
+    // their MMA contributes zero.
     for (uint i = lid; i < Q_ROWS * D; i += THREADS) {
         uint r = i / D;
-        uint q_local = r / Q_PER_TG;
-        uint h_local = r % Q_PER_TG;
-        uint q_pos_in_seq = q_local_base + q_local;
+        uint q_pos_in_seq = q_local_base + r;
         if (q_pos_in_seq >= q_len) {
             Q_tile[i] = half(0);
         } else {
-            uint q_flat = (slot * q_len + q_pos_in_seq) * H_Q + q_head_base + h_local;
+            uint q_flat = (slot * q_len + q_pos_in_seq) * H_Q + q_head;
             Q_tile[i] = Q[q_flat * D + (i % D)];
         }
     }
@@ -5314,20 +10061,19 @@ kernel void flex_attn_slide_v1_q8(
         device const half* Kbase = K_cache + (phys * PAGE * H_KV + kv_head) * D;
         device const half* Vbase = V_cache + (phys * PAGE * H_KV + kv_head) * D;
 
-        // QK via simdgroup_matrix. Q_ROWS=16 rows → 2 MMA passes per K col
-        // slab. PAGE=16 → 2 K col slabs (pb=0, 1).
+        // QK via simdgroup_matrix. Q_ROWS=8 rows → 1 MMA pass (was 2 at
+        // Q_ROWS=16). PAGE=16 → 2 K col slabs (pb=0, 1).
         for (uint pb = 0; pb < PAGE / 8; ++pb) {
             device const half* pk = Kbase + (pb * 8) * kv_row_stride;
-            for (uint qp = 0; qp < Q_ROWS / 8; ++qp) {
-                simdgroup_half8x8 mqk = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
-                for (uint dt = 0; dt < D8; ++dt) {
-                    simdgroup_half8x8 mq, mk;
-                    simdgroup_load(mq, Q_tile + (qp * 8) * D + dt * 8, D);
-                    simdgroup_load(mk, pk + dt * 8, kv_row_stride, ulong2(0, 0), true);
-                    simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
-                }
-                simdgroup_store(mqk, scores_tile + (qp * 8) * PAGE + pb * 8, PAGE);
+            // Q_ROWS / 8 = 1 — single qp pass.
+            simdgroup_half8x8 mqk = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+            for (uint dt = 0; dt < D8; ++dt) {
+                simdgroup_half8x8 mq, mk;
+                simdgroup_load(mq, Q_tile + dt * 8, D);
+                simdgroup_load(mk, pk + dt * 8, kv_row_stride, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
             }
+            simdgroup_store(mqk, scores_tile + pb * 8, PAGE);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -5335,17 +10081,18 @@ kernel void flex_attn_slide_v1_q8(
         // PARTIAL blocks we read a per-(q_local, block) bitmap produced by
         // the CPU mask-mod policy. Bit k of the per-row uint = 1 ⇒ keep, 0
         // ⇒ -∞. Rows past the real sequence end stay at -INF.
+        //
+        // With Q_PER_TG=1 (was =2), q_local = r directly. The mask layout
+        // is [total_partials, Q_BLOCK=8] which still indexes per (q_pos
+        // within tile = q_local), so partial_block_masks[partial_idx * 8 +
+        // q_local] is unchanged.
         if (lid < Q_ROWS) {
             const uint r = lid;
-            const uint q_local = r / Q_PER_TG;
+            const uint q_local = r;
             const uint q_pos_in_seq = q_local_base + q_local;
             if (q_pos_in_seq < q_len) {
                 uint mask_word = 0u;
                 if (is_partial) {
-                    // Partial blocks carry a Q_BLOCK-row bitmap. Within the
-                    // tile, q_local = r / Q_PER_TG already collapses the Q_PER_TG
-                    // head-grouping, so several rows share the same q_local
-                    // and the same mask row.
                     mask_word = partial_block_masks[partial_idx * 8u + q_local];
                 }
                 float row_max = -INFINITY;
@@ -5357,12 +10104,6 @@ kernel void flex_attn_slide_v1_q8(
                     s_loc[k] = sv;
                     row_max = max(row_max, sv);
                 }
-                // Skip the online-softmax update when this block contributes
-                // nothing for this Q row (all K masked). Otherwise we hit
-                // `exp(m_old - m_new)` with both = -INFINITY → exp(NaN) = NaN
-                // → poisons l_state → NaN in reduce. Happens for a Q row
-                // whose full causal horizon lies in earlier pages and the
-                // CSR split places a past-horizon partial page in this TG.
                 if (row_max == -INFINITY) {
                     scale_tile[r] = 1.0f;
                     for (uint k = 0; k < PAGE; ++k) scores_tile[r * PAGE + k] = half(0);
@@ -5381,7 +10122,6 @@ kernel void flex_attn_slide_v1_q8(
                     scale_tile[r] = scale;
                 }
             } else {
-                // zero out padding row's contribution this iteration
                 scale_tile[r] = 1.0f;
                 for (uint k = 0; k < PAGE; ++k) scores_tile[r * PAGE + k] = half(0);
             }
@@ -5403,14 +10143,12 @@ kernel void flex_attn_slide_v1_q8(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Write partials per real (q_pos, q_head). Padding rows skipped.
+    // Write partials per real (q_pos, q_head=this TG's q_head). One Q row
+    // per Q position now (was Q_PER_TG rows per position).
     const bool empty_split = (ix_begin >= ix_end);
     for (uint r = 0; r < Q_ROWS; ++r) {
-        const uint q_local = r / Q_PER_TG;
-        const uint h_local = r % Q_PER_TG;
-        const uint q_pos_in_seq = q_local_base + q_local;
+        const uint q_pos_in_seq = q_local_base + r;
         if (q_pos_in_seq >= q_len) continue;
-        const uint q_head = q_head_base + h_local;
         const uint pidx = ((slot * q_len + q_pos_in_seq) * H_Q + q_head) * N_SPLITS + split;
         if (lid == 0) {
             m_partials[pidx] = empty_split ? -INFINITY : m_state[r];
@@ -7183,6 +11921,147 @@ kernel void prefill_mm_q8_0_swiz(
 }
 
 // ────────────────────────────────────────────────────────────────────
+// F16 dense prefill — mirror of prefill_mm_q8_0_swiz with the in-flight
+// dequant replaced by a direct row-major fp16 read. Same NR0/NR1/NK
+// tile geometry, same threadgroup layout, same simdgroup mainloop.
+// W layout: plain row-major half [D_out, D_in]. No swizzle (fp16 has no
+// blocks to hide). Used for attn QKV/O and ffn_gate/up/down at prefill
+// when the tensor is already fp16 in the GGUF.
+// ────────────────────────────────────────────────────────────────────
+kernel void prefill_mm_f16_swiz(
+    device const half*   X            [[buffer(0)]],
+    device const half*   W            [[buffer(1)]],
+    device half*         Y            [[buffer(2)]],
+    constant uint& B_count            [[buffer(3)]],
+    constant uint& D_in               [[buffer(4)]],
+    constant uint& D_out              [[buffer(5)]],
+    threadgroup char*    shmem        [[threadgroup(0)]],
+    uint3 tgpig                       [[threadgroup_position_in_grid]],
+    ushort tiitg                      [[thread_index_in_threadgroup]],
+    ushort sgitg                      [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+    constexpr short nl = 2;
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y * NR0;
+    const int r1 = tgpig.x * NR1;
+
+    const int ne00 = (int)D_in;
+    const int ne0  = (int)D_out;
+    const int ne1  = (int)B_count;
+    const ulong nb10 = sizeof(half);
+    const ulong nb11 = (ulong)D_in * sizeof(half);
+
+    const short nr0 = (ne0 - r0 < NR0) ? short(ne0 - r0) : NR0;
+    const short nr1 = (ne1 - r1 < NR1) ? short(ne1 - r1) : NR1;
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : (nr0 - 1);
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : (nr1 - 1);
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+
+    // F16 has no per-block swizzle; W is plain row-major [ne0, ne00].
+    // Each thread owns row (r0+lr0) and reads 16 halves at K offset
+    // (loop_k + 16*il) — the same 16-elt sub-tile that dequantize_q8_0
+    // produced from the int8 block.
+    device const half * x = W + (int)(r0 + lr0) * ne00;
+
+    const short iy = 8 * (tiitg % NL1);
+    device const half * y = (device const half *) ((device const char *)X
+        + nb11*(r1 + lr1) + nb10*iy);
+
+    simdgroup_half8x8     ma[4];
+    simdgroup_half8x8     mb[2];
+    simdgroup_float8x8    mc[8];
+
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (int loop_k = 0; loop_k < ne00; loop_k += NK) {
+        {
+            // Direct row-major copy in place of dequantize_q8_0_llama.
+            half4x4 temp_a;
+            device const half * w_tile = x + loop_k + 16 * (int)il;
+            for (short i = 0; i < 16; i++) {
+                temp_a[i/4][i%4] = w_tile[i];
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = (tiitg/NL0)%8;
+                const short ly = i%8;
+                const short ib = 8*sx + sy;
+                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+            }
+        }
+
+        {
+            const short sx = (tiitg % NL1);
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4*sx + sy;
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = *((device half2x4 *) y);
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        // No swizzle pointer-walk for fp16: K advance comes from loop_k.
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float * temp_str = ((threadgroup float *) shmem)
+                                   + 32*(sgitg & 1)
+                                   + (16 * (sgitg >> 1)) * NR0;
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        for (int j = tiitg; j < nr1; j += NR1) {
+            device half * D = Y + r0 + (r1 + j) * ne0 + im * ne1 * ne0;
+            threadgroup float * C = ((threadgroup float *) shmem) + (j * NR0);
+            int i = 0;
+            for (; i < nr0; i++) {
+                D[i] = (half) C[i];
+            }
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
 // MoE matmul ports — simdgroup_float8x8 cooperative matmul for Q4_K
 // (gate+up) and Q5_1 (down), reading per-expert v6-swizzled weights and
 // using our existing routing convention (slot_token, group_start,
@@ -7250,6 +12129,82 @@ static inline void dequantize_q5_1_llama(device const block_q5_1_metal * xb, sho
         reg_f[i/2][2*(i%2) + 1] = d * x1 + m;
     }
     reg = (half4x4) reg_f;
+}
+
+// ── Q5_K block + simdgroup dequant (port of llama.cpp ggml-metal:699) ──
+// 176 bytes per 256 weights:
+//   half d, half dmin, uchar scales[12], uchar qh[32], uchar qs[128]
+struct block_q5K_metal {
+    half  d;
+    half  dmin;
+    uchar scales[12];
+    uchar qh[32];
+    uchar qs[128];
+};
+
+static inline void dequantize_q5_K_llama(device const block_q5K_metal * xb, short il, thread half4x4 & reg) {
+    device const uchar * q  = xb->qs;
+    device const uchar * qh = xb->qh;
+
+    short is = (il/4) * 2;
+    q  = q  + 32 * (il/4) + 16 * (il&1);
+    qh = qh + 16 * (il&1);
+    uchar ul = 1 << (il/2);
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const float d   = il < 2 ? float(xb->d) : float(xb->d) / 16.0f;
+    const float min_= float(xb->dmin);
+    const float dl  = d * sc[0];
+    const float ml  = min_ * sc[1];
+    const ushort mask  = il < 2 ? 0x0F : 0xF0;
+    const float qh_val = il < 2 ? 16.0f : 256.0f;
+    for (int i = 0; i < 16; ++i) {
+        const float v = (q[i] & mask) + (qh[i] & ul ? qh_val : 0.0f);
+        reg[i/4][i%4] = half(dl * v - ml);
+    }
+}
+
+// ── Q6_K block + simdgroup dequant (port of llama.cpp ggml-metal:722) ──
+// 210 bytes per 256 weights:
+//   uchar ql[128], uchar qh[64], int8 scales[16], half d
+struct block_q6K_metal {
+    uchar  ql[128];
+    uchar  qh[64];
+    int8_t scales[16];
+    half   d;
+};
+
+static inline void dequantize_q6_K_llama(device const block_q6K_metal * xb, short il, thread half4x4 & reg) {
+    const half d_all = xb->d;
+    device const uint16_t * ql = (device const uint16_t *)xb->ql;
+    device const uint16_t * qh = (device const uint16_t *)xb->qh;
+    device const int8_t   * scales = xb->scales;
+
+    ql = ql + 32*(il/8) + 16*((il/2)&1) + 8*(il&1);
+    qh = qh + 16*(il/8) + 8*(il&1);
+    float sc = scales[(il%2) + 2 * ((il/2))];
+    il = (il/2) & 3;
+
+    const uint32_t kmask1 = il>1 ? (il>2 ? 0xC0C0C0C0u : 0x30303030u)
+                                 : (il>0 ? 0x0C0C0C0Cu : 0x03030303u);
+    const uint32_t kmask2 = il>1 ? 0xF0F0F0F0u : 0x0F0F0F0Fu;
+    const float ml  = float(d_all) * sc * 32.0f;
+    const float dl0 = float(d_all) * sc;
+    const float dl1 = dl0 / 256.0f;
+    const float dl2 = dl0 / (256.0f * 256.0f);
+    const float dl3 = dl0 / (256.0f * 256.0f * 256.0f);
+    const uchar shr_h = il>2 ? 2 : 0;
+    const uchar shl_h = il>1 ? 0 : (il>0 ? 2 : 4);
+    const uchar shr_l = il>1 ? 4 : 0;
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t  low = (uint32_t(ql[2*i]) | (uint32_t(ql[2*i+1]) << 16)) & kmask2;
+        const uint32_t high = (uint32_t(qh[2*i]) | (uint32_t(qh[2*i+1]) << 16)) & kmask1;
+        const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+        reg[i][0] = half(dl0 * float(q & 0xFFu)         - ml);
+        reg[i][1] = half(dl1 * float(q & 0xFF00u)       - ml);
+        reg[i][2] = half(dl2 * float(q & 0xFF0000u)     - ml);
+        reg[i][3] = half(dl3 * float(q & 0xFF000000u)   - ml);
+    }
 }
 
 // ─── MoE Q4_K gate+up: simdgroup matmul, broadcast X via slot_token ─
@@ -7508,6 +12463,1150 @@ kernel void prefill_mm_id_q5_1_swiz(
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
         x  = (il < 2) ? x + 32 : x;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float * temp_str = ((threadgroup float *) shmem)
+                                   + 32*(sgitg & 1)
+                                   + (16 * (sgitg >> 1)) * NR0;
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short j = sgitg; j < nr1; j += 4) {
+        const uint s_out = gb + (uint)(r1 + j);
+        device half * D = Y + (int)s_out * ne0 + r0;
+        threadgroup float * C = ((threadgroup float *) shmem) + j * NR0;
+        for (int i = tiisg; i < nr0; i += 32) {
+            D[i] = (half) C[i];
+        }
+    }
+}
+
+// ─── Dense Q5_K prefill matmul: simdgroup matmul, swizzled W ───
+// Same skeleton as prefill_mm_q8_0_swiz; differs in block size (256/176B),
+// dequant call, and nl=16 (K-quant layout has 16 sub-tiles per super-block).
+
+kernel void prefill_mm_q5_K_swiz(
+    device const half*   X            [[buffer(0)]],
+    device const uchar*  W_q5k        [[buffer(1)]],
+    device half*         Y            [[buffer(2)]],
+    constant uint& B_count            [[buffer(3)]],
+    constant uint& D_in               [[buffer(4)]],
+    constant uint& D_out              [[buffer(5)]],
+    threadgroup char*    shmem        [[threadgroup(0)]],
+    uint3 tgpig                       [[threadgroup_position_in_grid]],
+    ushort tiitg                      [[thread_index_in_threadgroup]],
+    ushort sgitg                      [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+    constexpr short nl = 16;
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y * NR0;
+    const int r1 = tgpig.x * NR1;
+
+    const int ne00 = (int)D_in;
+    const int ne0  = (int)D_out;
+    const int ne1  = (int)B_count;
+    const ulong nb10 = sizeof(half);
+    const ulong nb11 = (ulong)D_in * sizeof(half);
+
+    const short nr0 = (ne0 - r0 < NR0) ? short(ne0 - r0) : NR0;
+    const short nr1 = (ne1 - r1 < NR1) ? short(ne1 - r1) : NR1;
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : (nr0 - 1);
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : (nr1 - 1);
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+    const short offset1 = il0/nl;
+
+    const int   nbc    = ne00 / 256;
+    const short row_g  = (short)(r0 + lr0);
+    const short ns     = row_g >> 5;
+    const short col    = row_g & 31;
+    device const block_q5K_metal * x = (device const block_q5K_metal *)W_q5k
+        + (int)ns * nbc * 32
+        + (int)offset1 * 32
+        + col;
+
+    const short iy = 8 * (tiitg % NL1);
+    device const half * y = (device const half *) ((device const char *)X
+        + nb11*(r1 + lr1) + nb10*iy);
+
+    simdgroup_half8x8     ma[4];
+    simdgroup_half8x8     mb[2];
+    simdgroup_float8x8    mc[8];
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (int loop_k = 0; loop_k < ne00; loop_k += NK) {
+        {
+            half4x4 temp_a;
+            dequantize_q5_K_llama(x, il, temp_a);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = (tiitg/NL0)%8;
+                const short ly = i%8;
+                const short ib = 8*sx + sy;
+                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+            }
+        }
+
+        {
+            const short sx = (tiitg % NL1);
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4*sx + sy;
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = *((device half2x4 *) y);
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + 32 : x;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float * temp_str = ((threadgroup float *) shmem)
+                                   + 32*(sgitg & 1)
+                                   + (16 * (sgitg >> 1)) * NR0;
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        for (int j = tiitg; j < nr1; j += NR1) {
+            device half * D = Y + r0 + (r1 + j) * ne0 + im * ne1 * ne0;
+            threadgroup float * C = ((threadgroup float *) shmem) + (j * NR0);
+            int i = 0;
+            for (; i < nr0; i++) {
+                D[i] = (half) C[i];
+            }
+        }
+    }
+}
+
+// ─── Dense Q6_K prefill matmul ───
+
+kernel void prefill_mm_q6_K_swiz(
+    device const half*   X            [[buffer(0)]],
+    device const uchar*  W_q6k        [[buffer(1)]],
+    device half*         Y            [[buffer(2)]],
+    constant uint& B_count            [[buffer(3)]],
+    constant uint& D_in               [[buffer(4)]],
+    constant uint& D_out              [[buffer(5)]],
+    threadgroup char*    shmem        [[threadgroup(0)]],
+    uint3 tgpig                       [[threadgroup_position_in_grid]],
+    ushort tiitg                      [[thread_index_in_threadgroup]],
+    ushort sgitg                      [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+    constexpr short nl = 16;
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y * NR0;
+    const int r1 = tgpig.x * NR1;
+
+    const int ne00 = (int)D_in;
+    const int ne0  = (int)D_out;
+    const int ne1  = (int)B_count;
+    const ulong nb10 = sizeof(half);
+    const ulong nb11 = (ulong)D_in * sizeof(half);
+
+    const short nr0 = (ne0 - r0 < NR0) ? short(ne0 - r0) : NR0;
+    const short nr1 = (ne1 - r1 < NR1) ? short(ne1 - r1) : NR1;
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : (nr0 - 1);
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : (nr1 - 1);
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+    const short offset1 = il0/nl;
+
+    const int   nbc    = ne00 / 256;
+    const short row_g  = (short)(r0 + lr0);
+    const short ns     = row_g >> 5;
+    const short col    = row_g & 31;
+    device const block_q6K_metal * x = (device const block_q6K_metal *)W_q6k
+        + (int)ns * nbc * 32
+        + (int)offset1 * 32
+        + col;
+
+    const short iy = 8 * (tiitg % NL1);
+    device const half * y = (device const half *) ((device const char *)X
+        + nb11*(r1 + lr1) + nb10*iy);
+
+    simdgroup_half8x8     ma[4];
+    simdgroup_half8x8     mb[2];
+    simdgroup_float8x8    mc[8];
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (int loop_k = 0; loop_k < ne00; loop_k += NK) {
+        {
+            half4x4 temp_a;
+            dequantize_q6_K_llama(x, il, temp_a);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = (tiitg/NL0)%8;
+                const short ly = i%8;
+                const short ib = 8*sx + sy;
+                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+            }
+        }
+
+        {
+            const short sx = (tiitg % NL1);
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4*sx + sy;
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = *((device half2x4 *) y);
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + 32 : x;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float * temp_str = ((threadgroup float *) shmem)
+                                   + 32*(sgitg & 1)
+                                   + (16 * (sgitg >> 1)) * NR0;
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        for (int j = tiitg; j < nr1; j += NR1) {
+            device half * D = Y + r0 + (r1 + j) * ne0 + im * ne1 * ne0;
+            threadgroup float * C = ((threadgroup float *) shmem) + (j * NR0);
+            int i = 0;
+            for (; i < nr0; i++) {
+                D[i] = (half) C[i];
+            }
+        }
+    }
+}
+
+// ─── Dense Q5_1 prefill matmul ───
+// Used for ffn_down at layers where llama-quantize emits Q5_1 instead of
+// Q8_0 in Q5_K_M output. Same skeleton as prefill_mm_q8_0_swiz; differs in
+// block size (32-elt/24B), nl=2, and dequantize_q5_1_llama call.
+
+kernel void prefill_mm_q5_1_swiz(
+    device const half*   X            [[buffer(0)]],
+    device const uchar*  W_q51        [[buffer(1)]],
+    device half*         Y            [[buffer(2)]],
+    constant uint& B_count            [[buffer(3)]],
+    constant uint& D_in               [[buffer(4)]],
+    constant uint& D_out              [[buffer(5)]],
+    threadgroup char*    shmem        [[threadgroup(0)]],
+    uint3 tgpig                       [[threadgroup_position_in_grid]],
+    ushort tiitg                      [[thread_index_in_threadgroup]],
+    ushort sgitg                      [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+    constexpr short nl = 2;
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y * NR0;
+    const int r1 = tgpig.x * NR1;
+
+    const int ne00 = (int)D_in;
+    const int ne0  = (int)D_out;
+    const int ne1  = (int)B_count;
+    const ulong nb10 = sizeof(half);
+    const ulong nb11 = (ulong)D_in * sizeof(half);
+
+    const short nr0 = (ne0 - r0 < NR0) ? short(ne0 - r0) : NR0;
+    const short nr1 = (ne1 - r1 < NR1) ? short(ne1 - r1) : NR1;
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : (nr0 - 1);
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : (nr1 - 1);
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+    const short offset1 = il0/nl;
+
+    const int   nbc    = ne00 / 32;        // 32-elt blocks for Q5_1
+    const short row_g  = (short)(r0 + lr0);
+    const short ns     = row_g >> 5;
+    const short col    = row_g & 31;
+    device const block_q5_1_metal * x = (device const block_q5_1_metal *)W_q51
+        + (int)ns * nbc * 32
+        + (int)offset1 * 32
+        + col;
+
+    const short iy = 8 * (tiitg % NL1);
+    device const half * y = (device const half *) ((device const char *)X
+        + nb11*(r1 + lr1) + nb10*iy);
+
+    simdgroup_half8x8     ma[4];
+    simdgroup_half8x8     mb[2];
+    simdgroup_float8x8    mc[8];
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (int loop_k = 0; loop_k < ne00; loop_k += NK) {
+        {
+            half4x4 temp_a;
+            dequantize_q5_1_llama(x, il, temp_a);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = (tiitg/NL0)%8;
+                const short ly = i%8;
+                const short ib = 8*sx + sy;
+                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+            }
+        }
+
+        {
+            const short sx = (tiitg % NL1);
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4*sx + sy;
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = *((device half2x4 *) y);
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + 32 : x;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float * temp_str = ((threadgroup float *) shmem)
+                                   + 32*(sgitg & 1)
+                                   + (16 * (sgitg >> 1)) * NR0;
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        for (int j = tiitg; j < nr1; j += NR1) {
+            device half * D = Y + r0 + (r1 + j) * ne0 + im * ne1 * ne0;
+            threadgroup float * C = ((threadgroup float *) shmem) + (j * NR0);
+            int i = 0;
+            for (; i < nr0; i++) {
+                D[i] = (half) C[i];
+            }
+        }
+    }
+}
+
+// ─── MoE Q5_K gate+up: simdgroup matmul, broadcast X via slot_token ─
+// Slot-flat adaptation of bench's kernel_mul_mm_id_q5_K_swiz (which used
+// llama.cpp tpe/ids). Mirrors prefill_mm_id_q4K_swiz with Q5_K dequant.
+
+kernel void prefill_mm_id_q5_K_swiz(
+    device const half*    X            [[buffer(0)]],
+    device const uint*    slot_token   [[buffer(1)]],
+    device const uchar*   W_q5k        [[buffer(2)]],
+    device const uint*    active_exp   [[buffer(3)]],
+    device const uint*    group_start  [[buffer(4)]],
+    device half*          Y            [[buffer(5)]],
+    constant uint& D_in                [[buffer(6)]],
+    constant uint& D_out               [[buffer(7)]],
+    threadgroup char*  shmem           [[threadgroup(0)]],
+    uint3 tgpig                        [[threadgroup_position_in_grid]],
+    ushort tiitg                       [[thread_index_in_threadgroup]],
+    ushort tiisg                       [[thread_index_in_simdgroup]],
+    ushort sgitg                       [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+    constexpr short nl = 16;
+
+    const uint ai = tgpig.z;
+    const uint expert = active_exp[ai];
+    if (expert >= 128u) return;
+
+    const int r0 = tgpig.y * NR0;
+    const int r1 = tgpig.x * NR1;
+
+    const uint gb = group_start[expert];
+    const uint ge = group_start[expert + 1];
+    const int neh1 = (int)(ge - gb);
+    if (r1 >= neh1) return;
+
+    const int ne00 = (int)D_in;
+    const int ne0  = (int)D_out;
+    const int nbc  = ne00 / 256;
+    const int blocks_per_expert = ne0 * nbc;
+
+    const ulong nb12 = (ulong)D_in * sizeof(half);
+
+    const short nr0 = (ne0 - r0 < NR0) ? short(ne0 - r0) : NR0;
+    const short nr1 = (neh1 - r1 < NR1) ? short(neh1 - r1) : NR1;
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : (nr0 - 1);
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : (nr1 - 1);
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+
+    const uint s_flat = gb + (uint)(r1 + lr1);
+    const uint t_idx  = slot_token[s_flat];
+
+    const short offset1 = il0 / nl;
+
+    const short row_g = (short)(r0 + lr0);
+    const short ns    = row_g >> 5;
+    const short col   = row_g & 31;
+    device const block_q5K_metal * x = ((device const block_q5K_metal *)W_q5k)
+        + (int)expert * blocks_per_expert
+        + (int)ns * nbc * 32
+        + (int)offset1 * 32
+        + col;
+
+    const short iy = 8 * (tiitg % NL1);
+    device const half * y = (device const half *) ((device const char *)X
+        + nb12 * (ulong)t_idx + sizeof(half) * (ulong)iy);
+
+    simdgroup_half8x8     ma[4];
+    simdgroup_half8x8     mb[2];
+    simdgroup_float8x8    mc[8];
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (int loop_k = 0; loop_k < ne00; loop_k += NK) {
+        {
+            half4x4 temp_a;
+            dequantize_q5_K_llama(x, il, temp_a);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = (tiitg/NL0)%8;
+                const short ly = i%8;
+                const short ib = 8*sx + sy;
+                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+            }
+        }
+
+        {
+            const short sx = (tiitg % NL1);
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4*sx + sy;
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = *((device half2x4 *) y);
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + 32 : x;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float * temp_str = ((threadgroup float *) shmem)
+                                   + 32*(sgitg & 1)
+                                   + (16 * (sgitg >> 1)) * NR0;
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short j = sgitg; j < nr1; j += 4) {
+        const uint s_out = gb + (uint)(r1 + j);
+        device half * D = Y + (int)s_out * ne0 + r0;
+        threadgroup float * C = ((threadgroup float *) shmem) + j * NR0;
+        for (int i = tiisg; i < nr0; i += 32) {
+            D[i] = (half) C[i];
+        }
+    }
+}
+
+// ─── MoE Q6_K down: simdgroup matmul, per-slot X (no slot_token broadcast) ─
+// Slot-flat adaptation; Q6_K serves as the down-projection format in V1.
+
+kernel void prefill_mm_id_q6_K_swiz(
+    device const half*    X            [[buffer(0)]],
+    device const uchar*   W_q6k        [[buffer(1)]],
+    device const uint*    active_exp   [[buffer(2)]],
+    device const uint*    group_start  [[buffer(3)]],
+    device half*          Y            [[buffer(4)]],
+    constant uint& D_in                [[buffer(5)]],
+    constant uint& D_out               [[buffer(6)]],
+    threadgroup char*  shmem           [[threadgroup(0)]],
+    uint3 tgpig                        [[threadgroup_position_in_grid]],
+    ushort tiitg                       [[thread_index_in_threadgroup]],
+    ushort tiisg                       [[thread_index_in_simdgroup]],
+    ushort sgitg                       [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+    constexpr short nl = 16;
+
+    const uint ai = tgpig.z;
+    const uint expert = active_exp[ai];
+    if (expert >= 128u) return;
+
+    const int r0 = tgpig.y * NR0;
+    const int r1 = tgpig.x * NR1;
+
+    const uint gb = group_start[expert];
+    const uint ge = group_start[expert + 1];
+    const int neh1 = (int)(ge - gb);
+    if (r1 >= neh1) return;
+
+    const int ne00 = (int)D_in;
+    const int ne0  = (int)D_out;
+    const int nbc  = ne00 / 256;
+    const int blocks_per_expert = ne0 * nbc;
+
+    const ulong nb12 = (ulong)D_in * sizeof(half);
+
+    const short nr0 = (ne0 - r0 < NR0) ? short(ne0 - r0) : NR0;
+    const short nr1 = (neh1 - r1 < NR1) ? short(neh1 - r1) : NR1;
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : (nr0 - 1);
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : (nr1 - 1);
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+
+    const uint s_flat = gb + (uint)(r1 + lr1);
+
+    const short offset1 = il0 / nl;
+
+    const short row_g = (short)(r0 + lr0);
+    const short ns    = row_g >> 5;
+    const short col   = row_g & 31;
+    device const block_q6K_metal * x = ((device const block_q6K_metal *)W_q6k)
+        + (int)expert * blocks_per_expert
+        + (int)ns * nbc * 32
+        + (int)offset1 * 32
+        + col;
+
+    const short iy = 8 * (tiitg % NL1);
+    device const half * y = (device const half *) ((device const char *)X
+        + nb12 * (ulong)s_flat + sizeof(half) * (ulong)iy);
+
+    simdgroup_half8x8     ma[4];
+    simdgroup_half8x8     mb[2];
+    simdgroup_float8x8    mc[8];
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (int loop_k = 0; loop_k < ne00; loop_k += NK) {
+        {
+            half4x4 temp_a;
+            dequantize_q6_K_llama(x, il, temp_a);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = (tiitg/NL0)%8;
+                const short ly = i%8;
+                const short ib = 8*sx + sy;
+                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+            }
+        }
+
+        {
+            const short sx = (tiitg % NL1);
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4*sx + sy;
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = *((device half2x4 *) y);
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + 32 : x;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float * temp_str = ((threadgroup float *) shmem)
+                                   + 32*(sgitg & 1)
+                                   + (16 * (sgitg >> 1)) * NR0;
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short j = sgitg; j < nr1; j += 4) {
+        const uint s_out = gb + (uint)(r1 + j);
+        device half * D = Y + (int)s_out * ne0 + r0;
+        threadgroup float * C = ((threadgroup float *) shmem) + j * NR0;
+        for (int i = tiisg; i < nr0; i += 32) {
+            D[i] = (half) C[i];
+        }
+    }
+}
+
+// ─── MoE Q8_0 down: simdgroup matmul, per-slot X (no slot_token broadcast) ─
+// Slot-flat adaptation of bench's kernel_mul_mm_id_q8_0_swiz. Used for
+// ffn_down_exps when llama-quantize emits Q8_0 (Q5_K_M default).
+
+kernel void prefill_mm_id_q8_0_swiz(
+    device const half*    X            [[buffer(0)]],
+    device const uchar*   W_q80        [[buffer(1)]],
+    device const uint*    active_exp   [[buffer(2)]],
+    device const uint*    group_start  [[buffer(3)]],
+    device half*          Y            [[buffer(4)]],
+    constant uint& D_in                [[buffer(5)]],
+    constant uint& D_out               [[buffer(6)]],
+    threadgroup char*  shmem           [[threadgroup(0)]],
+    uint3 tgpig                        [[threadgroup_position_in_grid]],
+    ushort tiitg                       [[thread_index_in_threadgroup]],
+    ushort tiisg                       [[thread_index_in_simdgroup]],
+    ushort sgitg                       [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+    constexpr short nl = 2;       // Q8_0 has 2 sub-tiles per 32-elt block
+
+    const uint ai = tgpig.z;
+    const uint expert = active_exp[ai];
+    if (expert >= 128u) return;
+
+    const int r0 = tgpig.y * NR0;
+    const int r1 = tgpig.x * NR1;
+
+    const uint gb = group_start[expert];
+    const uint ge = group_start[expert + 1];
+    const int neh1 = (int)(ge - gb);
+    if (r1 >= neh1) return;
+
+    const int ne00 = (int)D_in;
+    const int ne0  = (int)D_out;
+    const int nbc  = ne00 / 32;       // 32-elt super-blocks for Q8_0
+    const int blocks_per_expert = ne0 * nbc;
+
+    const ulong nb12 = (ulong)D_in * sizeof(half);
+
+    const short nr0 = (ne0 - r0 < NR0) ? short(ne0 - r0) : NR0;
+    const short nr1 = (neh1 - r1 < NR1) ? short(neh1 - r1) : NR1;
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : (nr0 - 1);
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : (nr1 - 1);
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+
+    const uint s_flat = gb + (uint)(r1 + lr1);
+
+    const short offset1 = il0 / nl;
+
+    const short row_g = (short)(r0 + lr0);
+    const short ns    = row_g >> 5;
+    const short col   = row_g & 31;
+    device const block_q8_0_metal * x = ((device const block_q8_0_metal *)W_q80)
+        + (int)expert * blocks_per_expert
+        + (int)ns * nbc * 32
+        + (int)offset1 * 32
+        + col;
+
+    const short iy = 8 * (tiitg % NL1);
+    device const half * y = (device const half *) ((device const char *)X
+        + nb12 * (ulong)s_flat + sizeof(half) * (ulong)iy);
+
+    simdgroup_half8x8     ma[4];
+    simdgroup_half8x8     mb[2];
+    simdgroup_float8x8    mc[8];
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (int loop_k = 0; loop_k < ne00; loop_k += NK) {
+        {
+            half4x4 temp_a;
+            dequantize_q8_0_llama(x, il, temp_a);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = (tiitg/NL0)%8;
+                const short ly = i%8;
+                const short ib = 8*sx + sy;
+                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+            }
+        }
+
+        {
+            const short sx = (tiitg % NL1);
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4*sx + sy;
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = *((device half2x4 *) y);
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + 32 : x;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float * temp_str = ((threadgroup float *) shmem)
+                                   + 32*(sgitg & 1)
+                                   + (16 * (sgitg >> 1)) * NR0;
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short j = sgitg; j < nr1; j += 4) {
+        const uint s_out = gb + (uint)(r1 + j);
+        device half * D = Y + (int)s_out * ne0 + r0;
+        threadgroup float * C = ((threadgroup float *) shmem) + j * NR0;
+        for (int i = tiisg; i < nr0; i += 32) {
+            D[i] = (half) C[i];
+        }
+    }
+}
+
+// ─── MoE F16: simdgroup matmul, per-slot X, plain row-major fp16 W ──────
+// Mirror of prefill_mm_id_q8_0_swiz with the in-flight dequant replaced by
+// a direct fp16 read. Single kernel covers both call sites
+// (ffn_gate_up_exps and ffn_down_exps) because the I/O shape is identical
+// once the routing is provided via active_exp / group_start.
+//
+// W layout: row-major half [E, D_out, D_in]. Per-expert base pointer is
+// just expert * D_out * D_in (no swizzled-block math).
+kernel void prefill_mm_id_f16_swiz(
+    device const half*    X            [[buffer(0)]],
+    device const half*    W            [[buffer(1)]],
+    device const uint*    active_exp   [[buffer(2)]],
+    device const uint*    group_start  [[buffer(3)]],
+    device half*          Y            [[buffer(4)]],
+    constant uint& D_in                [[buffer(5)]],
+    constant uint& D_out               [[buffer(6)]],
+    threadgroup char*  shmem           [[threadgroup(0)]],
+    uint3 tgpig                        [[threadgroup_position_in_grid]],
+    ushort tiitg                       [[thread_index_in_threadgroup]],
+    ushort tiisg                       [[thread_index_in_simdgroup]],
+    ushort sgitg                       [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+    constexpr short nl = 2;
+
+    const uint ai = tgpig.z;
+    const uint expert = active_exp[ai];
+    if (expert >= 128u) return;
+
+    const int r0 = tgpig.y * NR0;
+    const int r1 = tgpig.x * NR1;
+
+    const uint gb = group_start[expert];
+    const uint ge = group_start[expert + 1];
+    const int neh1 = (int)(ge - gb);
+    if (r1 >= neh1) return;
+
+    const int ne00 = (int)D_in;
+    const int ne0  = (int)D_out;
+
+    const ulong nb12 = (ulong)D_in * sizeof(half);
+
+    const short nr0 = (ne0 - r0 < NR0) ? short(ne0 - r0) : NR0;
+    const short nr1 = (neh1 - r1 < NR1) ? short(neh1 - r1) : NR1;
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : (nr0 - 1);
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : (nr1 - 1);
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+
+    const uint s_flat = gb + (uint)(r1 + lr1);
+
+    // F16 per-expert base: simple row-major stride product, no block math.
+    // Each thread owns row (r0+lr0) of expert `expert`.
+    device const half * x = W
+        + (ulong)expert * (ulong)ne0 * (ulong)ne00
+        + (ulong)(r0 + lr0) * (ulong)ne00;
+
+    const short iy = 8 * (tiitg % NL1);
+    device const half * y = (device const half *) ((device const char *)X
+        + nb12 * (ulong)s_flat + sizeof(half) * (ulong)iy);
+
+    simdgroup_half8x8     ma[4];
+    simdgroup_half8x8     mb[2];
+    simdgroup_float8x8    mc[8];
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (int loop_k = 0; loop_k < ne00; loop_k += NK) {
+        {
+            // Direct row-major copy in place of dequantize_q8_0_llama.
+            half4x4 temp_a;
+            device const half * w_tile = x + loop_k + 16 * (int)il;
+            for (short i = 0; i < 16; i++) {
+                temp_a[i/4][i%4] = w_tile[i];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = (tiitg/NL0)%8;
+                const short ly = i%8;
+                const short ib = 8*sx + sy;
+                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+            }
+        }
+
+        {
+            const short sx = (tiitg % NL1);
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4*sx + sy;
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = *((device half2x4 *) y);
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        // No swizzle pointer-walk for fp16: K advance comes from loop_k.
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float * temp_str = ((threadgroup float *) shmem)
+                                   + 32*(sgitg & 1)
+                                   + (16 * (sgitg >> 1)) * NR0;
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short j = sgitg; j < nr1; j += 4) {
+        const uint s_out = gb + (uint)(r1 + j);
+        device half * D = Y + (int)s_out * ne0 + r0;
+        threadgroup float * C = ((threadgroup float *) shmem) + j * NR0;
+        for (int i = tiisg; i < nr0; i += 32) {
+            D[i] = (half) C[i];
+        }
+    }
+}
+
+// ─── MoE F16 UP prefill: slot_token-broadcast convention ────────────────
+// Mirror of prefill_mm_id_q4K_swiz (Q4_K is moe_up only, so its kernel
+// uses slot_token-broadcast for X). The F16 down kernel above is wrong
+// to call from moe_up — its buffer signature lacks slot_token, so the
+// dispatcher's index-1 binding (slot_token) gets read as the weight
+// matrix pointer and produces structurally-wrong output.
+//
+// Buffer layout matches Q4_K moe_up exactly:
+//   (0) X, (1) slot_token, (2) W, (3) active_exp, (4) group_start,
+//   (5) Y, (6) D_in, (7) D_out.
+// X is indexed via t_idx = slot_token[s_flat] (broadcast: multiple slots
+// referring to the same source token read the same X row).
+// ─────────────────────────────────────────────────────────────────────────
+kernel void prefill_mm_id_f16_up_swiz(
+    device const half*    X            [[buffer(0)]],
+    device const uint*    slot_token   [[buffer(1)]],
+    device const half*    W            [[buffer(2)]],
+    device const uint*    active_exp   [[buffer(3)]],
+    device const uint*    group_start  [[buffer(4)]],
+    device half*          Y            [[buffer(5)]],
+    constant uint& D_in                [[buffer(6)]],
+    constant uint& D_out               [[buffer(7)]],
+    threadgroup char*  shmem           [[threadgroup(0)]],
+    uint3 tgpig                        [[threadgroup_position_in_grid]],
+    ushort tiitg                       [[thread_index_in_threadgroup]],
+    ushort tiisg                       [[thread_index_in_simdgroup]],
+    ushort sgitg                       [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+    constexpr short nl = 2;
+
+    const uint ai = tgpig.z;
+    const uint expert = active_exp[ai];
+    if (expert >= 128u) return;
+
+    const int r0 = tgpig.y * NR0;
+    const int r1 = tgpig.x * NR1;
+
+    const uint gb = group_start[expert];
+    const uint ge = group_start[expert + 1];
+    const int neh1 = (int)(ge - gb);
+    if (r1 >= neh1) return;
+
+    const int ne00 = (int)D_in;
+    const int ne0  = (int)D_out;
+
+    const ulong nb12 = (ulong)D_in * sizeof(half);
+
+    const short nr0 = (ne0 - r0 < NR0) ? short(ne0 - r0) : NR0;
+    const short nr1 = (neh1 - r1 < NR1) ? short(neh1 - r1) : NR1;
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : (nr0 - 1);
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : (nr1 - 1);
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+
+    // slot_token-broadcast: lookup the source token for this slot.
+    const uint s_flat = gb + (uint)(r1 + lr1);
+    const uint t_idx  = slot_token[s_flat];
+
+    // F16 per-expert base: simple row-major stride product, no block math.
+    device const half * x = W
+        + (ulong)expert * (ulong)ne0 * (ulong)ne00
+        + (ulong)(r0 + lr0) * (ulong)ne00;
+
+    const short iy = 8 * (tiitg % NL1);
+    // Index X by t_idx, not s_flat (multiple slots may share a token).
+    device const half * y = (device const half *) ((device const char *)X
+        + nb12 * (ulong)t_idx + sizeof(half) * (ulong)iy);
+
+    simdgroup_half8x8     ma[4];
+    simdgroup_half8x8     mb[2];
+    simdgroup_float8x8    mc[8];
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (int loop_k = 0; loop_k < ne00; loop_k += NK) {
+        {
+            half4x4 temp_a;
+            device const half * w_tile = x + loop_k + 16 * (int)il;
+            for (short i = 0; i < 16; i++) {
+                temp_a[i/4][i%4] = w_tile[i];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = (tiitg/NL0)%8;
+                const short ly = i%8;
+                const short ib = 8*sx + sy;
+                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+            }
+        }
+
+        {
+            const short sx = (tiitg % NL1);
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4*sx + sy;
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = *((device half2x4 *) y);
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
         y += NK;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);

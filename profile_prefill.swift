@@ -111,12 +111,13 @@ func runLmPrefillProfile(ggufPath: String) {
                 let Wv = lw.attnV ?? lw.attnK
                 encRMSNormG(cb, x: pre_hidden, gammaBuf: lw.attnNorm, out: pre_hidden_norm,
                              D: HIDDEN, numVecs: N)
-                encMatMulQ80SwizPrefill(cb, x: pre_hidden_norm, W: lw.attnQ, Y: q_out,
-                                         Din: HIDDEN, Dout: H * HD, numVecs: N)
-                encMatMulQ80SwizPrefill(cb, x: pre_hidden_norm, W: lw.attnK, Y: k_out,
-                                         Din: HIDDEN, Dout: KV_H * HD, numVecs: N)
-                encMatMulQ80SwizPrefill(cb, x: pre_hidden_norm, W: Wv, Y: v_out,
-                                         Din: HIDDEN, Dout: KV_H * HD, numVecs: N)
+                let WvFmt = (lw.attnV != nil) ? lw.attnVFormat : lw.attnKFormat
+                encDenseMmPrefill(cb, x: pre_hidden_norm, W: lw.attnQ, format: lw.attnQFormat, Y: q_out,
+                                   Din: HIDDEN, Dout: H * HD, numVecs: N)
+                encDenseMmPrefill(cb, x: pre_hidden_norm, W: lw.attnK, format: lw.attnKFormat, Y: k_out,
+                                   Din: HIDDEN, Dout: KV_H * HD, numVecs: N)
+                encDenseMmPrefill(cb, x: pre_hidden_norm, W: Wv, format: WvFmt, Y: v_out,
+                                   Din: HIDDEN, Dout: KV_H * HD, numVecs: N)
             })
 
             stages.append(runStage("qkn_rope", layer: L) { cb in
@@ -146,10 +147,10 @@ func runLmPrefillProfile(ggufPath: String) {
                 }
             })
 
-            // o_proj (simdgroup matmul, v6-swizzled Q8_0) + post-attn RMSNormAdd.
+            // o_proj (simdgroup matmul, format-aware) + post-attn RMSNormAdd.
             stages.append(runStage("oproj_norm", layer: L) { cb in
-                encMatMulQ80SwizPrefill(cb, x: pre_attn_out, W: lw.attnOut, Y: pre_mlp_out,
-                                         Din: H * HD, Dout: HIDDEN, numVecs: N)
+                encDenseMmPrefill(cb, x: pre_attn_out, W: lw.attnOut, format: lw.attnOutFormat,
+                                   Y: pre_mlp_out, Din: H * HD, Dout: HIDDEN, numVecs: N)
                 encRmsNormAdd(cb, x: pre_mlp_out, gammaBuf: lw.postAttnNorm,
                               residual: pre_hidden, out: pre_hidden, N: HIDDEN, numVecs: N)
             })
@@ -158,14 +159,14 @@ func runLmPrefillProfile(ggufPath: String) {
             stages.append(runStage("shrd_ffn", layer: L) { cb in
                 encRMSNormG(cb, x: pre_hidden, gammaBuf: lw.ffnNorm, out: pre_hidden_norm,
                              D: HIDDEN, numVecs: N)
-                encMatMulQ80SwizPrefill(cb, x: pre_hidden_norm, W: lw.ffnGate, Y: pre_shrd_gate,
-                                         Din: HIDDEN, Dout: SHARED_INT, numVecs: N)
-                encMatMulQ80SwizPrefill(cb, x: pre_hidden_norm, W: lw.ffnUp, Y: pre_shrd_gate_up_fused,
-                                         Din: HIDDEN, Dout: SHARED_INT, numVecs: N)
+                encDenseMmPrefill(cb, x: pre_hidden_norm, W: lw.ffnGate, format: lw.ffnGateFormat,
+                                   Y: pre_shrd_gate, Din: HIDDEN, Dout: SHARED_INT, numVecs: N)
+                encDenseMmPrefill(cb, x: pre_hidden_norm, W: lw.ffnUp, format: lw.ffnUpFormat,
+                                   Y: pre_shrd_gate_up_fused, Din: HIDDEN, Dout: SHARED_INT, numVecs: N)
                 encGeluMulInplace(cb, gate: pre_shrd_gate, up: pre_shrd_gate_up_fused,
                                    N_half: SHARED_INT, numSlots: N)
-                encMatMulQ80SwizPrefill(cb, x: pre_shrd_gate, W: lw.ffnDown, Y: pre_mlp_out,
-                                         Din: SHARED_INT, Dout: HIDDEN, numVecs: N)
+                encDenseMmPrefill(cb, x: pre_shrd_gate, W: lw.ffnDown, format: lw.ffnDownFormat,
+                                   Y: pre_mlp_out, Din: SHARED_INT, Dout: HIDDEN, numVecs: N)
                 encRMSNormG(cb, x: pre_mlp_out, gammaBuf: lw.postFfn1Norm, out: pre_mlp_out,
                             D: HIDDEN, numVecs: N)
             })
@@ -183,24 +184,26 @@ func runLmPrefillProfile(ggufPath: String) {
                                      numVecs: N)
             })
 
-            // MoE: pre-FFN2 RMSNorm + Q4_K gate_up matmul (slot-flat, broadcast X).
-            stages.append(runStage("moe_q4k", layer: L) { cb in
+            // MoE: pre-FFN2 RMSNorm + format-aware gate_up matmul (slot-flat, broadcast X).
+            stages.append(runStage("moe_up", layer: L) { cb in
                 encRMSNormG(cb, x: pre_hidden, gammaBuf: lw.preFfn2Norm, out: pre_hidden_norm,
                             D: HIDDEN, numVecs: N)
-                encMmIdQ4KSwizPrefill(cb, x: pre_hidden_norm, W: lw.moeGateUp, Y: pre_gate_up_fused,
-                                       slotTokenBuf: pre_slot_token, activeExpBuf: active_exp,
-                                       groupStartBuf: pre_group_start,
-                                       Din: HIDDEN, Dout: MOE_FUSED_DOUT, numSlots: NS, E: E_EXP)
+                encMoeUpMmPrefill(cb, x: pre_hidden_norm, W: lw.moeGateUp, format: lw.moeGateUpFormat,
+                                   Y: pre_gate_up_fused,
+                                   slotTokenBuf: pre_slot_token, activeExpBuf: active_exp,
+                                   groupStartBuf: pre_group_start,
+                                   Din: HIDDEN, Dout: MOE_FUSED_DOUT, numSlots: NS, E: E_EXP)
             })
             stages.append(runStage("moe_gelu", layer: L) { cb in
                 encMoeGeluMulFused(cb, fused: pre_gate_up_fused, out: pre_gate_proj,
                                     N_half: MOE_INT, numSlots: NS)
             })
-            // MoE Q5_1 down matmul (slot-flat, per-slot X).
-            stages.append(runStage("moe_q51", layer: L) { cb in
-                encMmIdQ51SwizPrefill(cb, x: pre_gate_proj, W: lw.moeDown, Y: pre_moe_down_out,
-                                       activeExpBuf: active_exp, groupStartBuf: pre_group_start,
-                                       Din: MOE_INT, Dout: HIDDEN, numSlots: NS, E: E_EXP)
+            // Format-aware MoE down matmul (slot-flat, per-slot X).
+            stages.append(runStage("moe_down", layer: L) { cb in
+                encMoeDownMmPrefill(cb, x: pre_gate_proj, W: lw.moeDown, format: lw.moeDownFormat,
+                                     Y: pre_moe_down_out,
+                                     activeExpBuf: active_exp, groupStartBuf: pre_group_start,
+                                     Din: MOE_INT, Dout: HIDDEN, numSlots: NS, E: E_EXP)
             })
             stages.append(runStage("moe_tail", layer: L) { cb in
                 encMoeCombineWriteInto(cb, moeOut: pre_moe_down_out, batchSlots: pre_batch_slots,

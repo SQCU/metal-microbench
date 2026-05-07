@@ -33,7 +33,6 @@ import json
 import os
 import time
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -44,10 +43,22 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import gemma_ffi as g
 
 from chat_template import (
-    TextChunk, ImageChunk, SoftsChunk, render_chat,
-    tokenize_with_specials,
+    TextChunk, ImageChunk, render_chat,
+    render_turn_delta, tokenize_with_specials,
 )
-from tool_call_parser import extract_tool_calls
+from conversation_state import ConversationCache, StoredSegment, hash_messages
+# NOTE on tool calls: the bridge does NOT parse tool-call markers out
+# of model output. The model emits whatever bytes it emits (including
+# `<|tool_call>...<tool_call|>` markers when tools are present in the
+# request); the response content carries those bytes verbatim. Clients
+# that want OAI-shape `tool_calls` parse them themselves — that work
+# is application-level interpretation, not tensor service work, and
+# putting it on the bridge's response-latency path means every chat
+# completion paid synchronous CPU for parsing the model's text against
+# a regex even when no tool was ever requested. The toolcards runner
+# already has its own dispatch logic; if a chat client wants OAI tool
+# shape it should run a tiny proxy that does the regex extraction
+# client-side.
 
 
 # ----------------------------------------------------------------------
@@ -63,7 +74,7 @@ VISION_SAFETENSORS = (
     or os.environ.get("VISION_ST")
     or ""
 )
-MODEL_NAME = os.environ.get("GEMMA_MODEL_NAME", "gemma-4-a4b-q4km")
+MODEL_NAME = os.environ.get("GEMMA_MODEL_NAME", "gemma-4-a4b")
 
 
 # ----------------------------------------------------------------------
@@ -78,8 +89,15 @@ _submit_q: "asyncio.Queue[g.StreamSpec]" = None  # type: ignore[assignment]
 _response_qs: dict[int, "asyncio.Queue[g.StreamUpdate]"] = {}
 _next_stream_id_lock: "asyncio.Lock | None" = None
 _next_stream_id = 1
-_coord_task: "asyncio.Task | None" = None
+_submit_pump_task: "asyncio.Task | None" = None
+_poll_pump_task: "asyncio.Task | None" = None
 _TOOL_CALL_CLOSE_TOKENS: list[int] = []  # set at startup
+_TURN_END_TOKENS: list[int] = []         # set at startup; chat-template end-of-turn
+
+# Per-conversation prefix-token cache. Keyed by hash(messages, tools);
+# value is the exact token sequence in the engine's KV after that
+# turn's stream completed. See conversation_state.py for the contract.
+_conv_cache = ConversationCache(max_entries=128)
 
 
 async def _next_stream_id_alloc() -> int:
@@ -90,40 +108,60 @@ async def _next_stream_id_alloc() -> int:
         return sid
 
 
-async def _coordinator() -> None:
-    """Single coroutine that owns all FFI calls.
+async def _submit_pump() -> None:
+    """Block on the submit queue; batch-drain on each wake; push to FFI.
 
-    Drain the submission queue (non-blocking burst), submit anything
-    pending as ONE batch (so backend in-batch shared-prefix detection
-    can fire), then poll for updates. When idle, sleep briefly.
+    Distinct from the poll pump so submit and poll can run on
+    independent threadpool workers. The engine's gemma_submit is
+    non-driving (just enqueues to an intake queue + signals a cond);
+    gemma_poll's drive loop drains the intake at the top of each
+    iteration. So a submit landing mid-prefill is picked up
+    microseconds later, no roundtrip cap.
     """
     while True:
         try:
-            new_specs: list[g.StreamSpec] = []
+            # Block on the first item, then drain everything else
+            # already in the queue so we batch when possible (engine's
+            # in-batch shared-prefix leader/follower detection lives
+            # inside gemma_submit's intake encoding).
+            first = await _submit_q.get()
+            specs = [first]
             try:
                 while True:
-                    new_specs.append(_submit_q.get_nowait())
+                    specs.append(_submit_q.get_nowait())
             except asyncio.QueueEmpty:
                 pass
+            rc = await asyncio.to_thread(g.submit, specs)
+            if rc != 0:
+                print(f"[submit_pump] submit returned {rc}", flush=True)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print(f"[submit_pump] error: {e}", flush=True)
+            await asyncio.sleep(0.05)
 
-            if new_specs:
-                rc = await asyncio.to_thread(g.submit, new_specs)
-                if rc != 0:
-                    print(f"[coord] submit returned {rc}", flush=True)
 
-            updates = await asyncio.to_thread(g.poll, 50)
+async def _poll_pump() -> None:
+    """Drive the engine via gemma_poll; fan updates to per-stream queues.
+
+    The Swift-side gemma_poll is now work-conserving: it runs prefill
+    chunks back-to-back at engine speed, breaks ONLY on update emission
+    or true idle. The timeout we pass (100ms) gates how long it
+    cond_waits for new intake when truly idle — never how long it
+    drives existing work.
+    """
+    while True:
+        try:
+            updates = await asyncio.to_thread(g.poll, 100)
             for u in updates:
                 rq = _response_qs.get(u.stream_id)
                 if rq is not None:
                     await rq.put(u)
-
-            if not new_specs and not updates:
-                await asyncio.sleep(0.001)
         except asyncio.CancelledError:
             return
         except Exception as e:
-            print(f"[coord] error: {e}", flush=True)
-            await asyncio.sleep(0.1)
+            print(f"[poll_pump] error: {e}", flush=True)
+            await asyncio.sleep(0.05)
 
 
 # ----------------------------------------------------------------------
@@ -142,8 +180,12 @@ def _parse_sampling(body: dict, max_tokens: int) -> g.SamplingParams:
     stop_tokens: list[int] = []
     if isinstance(stop, list):
         # OpenAI's `stop` is text strings; we'd need to tokenize each
-        # to convert. For now, leave empty if any are non-empty strings;
-        # bridge does post-detokenize string matching client-side.
+        # to convert. For now, leave empty; the engine's actual stop
+        # signal for chat-completions is configured via
+        # `sampling.stop_sequences` in the chat_completions handler
+        # below (the engine consumes stop_sequences but ignores
+        # stop_tokens — see ffi_batch.swift:277 vs lm_engine.swift's
+        # AR loop).
         pass
     capture_logits = bool(body.get("logprobs", False))
     top_logprobs = int(body.get("top_logprobs", 0))
@@ -168,22 +210,92 @@ def _build_stream_spec(stream_id: int,
                        messages: list[dict],
                        sampling: g.SamplingParams,
                        capture_logits: bool,
-                       tools: list | None = None) -> g.StreamSpec:
-    """OpenAI messages → StreamSpec via the model's own chat template.
+                       tools: list | None = None) -> tuple[g.StreamSpec, list[StoredSegment]]:
+    """OpenAI messages → (StreamSpec, submitted_text_tokens).
 
-    `tools` (OpenAI function-calling tool schemas) is forwarded to the
-    template, which emits Gemma-4's native <|tool>declaration:...<tool|>
-    blocks in the system turn so the model knows what's available.
+    Two paths:
+      * Warm-conversation: messages[:-1] hashes to a known prior turn's
+        prefix tokens. Build submission as
+        `prior_prefix_tokens + tokenize(render_user_turn_delta(messages[-1]))`,
+        bypassing canonical re-render of historical content.
+      * Cold: canonical `render_chat()` + `tokenize_with_specials()`,
+        same as before.
+
+    The returned `submitted_text_tokens` is the flat sequence of token
+    IDs across all `kind=0` (text) segments — image / softs segments
+    contribute their own tokens at the engine level, which we don't
+    attempt to track here. Conversation-state recording therefore runs
+    only for purely text turns; mixed-modality turns fall through to
+    canonical for now (`record_state=False`).
     """
-    chunks = render_chat(messages, add_generation_prompt=True, tools=tools)
-    segments: list[g.Segment] = []
+    # Two paths share a common chunks-to-segments converter:
+    # * Warm: messages[:-1] hashes to a stored ConversationState. We
+    #   submit prior.segments + chunks_to_segments(render_turn_delta(
+    #   messages[-1])), letting the engine's content-hash cache adopt
+    #   every page of prior.segments verbatim.
+    # * Cold: render_chat(messages, ...) produces all chunks; the same
+    #   converter turns them into segments.
+    prior_segments: list[StoredSegment] = []
+    delta_chunks = None
+
+    if _warm_path_eligible(messages):
+        prior_state = _conv_cache.lookup(hash_messages(messages[:-1], tools))
+        if prior_state is not None:
+            prev_was_tool_call = bool(
+                len(messages) >= 2 and messages[-2].get("tool_calls"))
+            try:
+                delta_chunks = render_turn_delta(
+                    messages[-1], prev_was_tool_call=prev_was_tool_call)
+                prior_segments = list(prior_state.segments)
+            except ValueError as e:
+                # Two cases of ValueError here:
+                # (a) render_turn_delta refused this message shape — fall
+                #     through to the canonical render.
+                # (b) the chat-template's image-URL decoder rejected a
+                #     non-data: URL — that's a client error, surface it
+                #     as 400 instead of 500.
+                if "image_url" in str(e):
+                    raise HTTPException(400, str(e)) from None
+                delta_chunks = None
+
+    if delta_chunks is None:
+        try:
+            delta_chunks = render_chat(
+                messages, add_generation_prompt=True, tools=tools)
+        except ValueError as e:
+            # Same as above: image_url that isn't a data: URI is a
+            # client-shape error, not a server fault.
+            if "image_url" in str(e):
+                raise HTTPException(400, str(e)) from None
+            raise
+
+    delta_segments = _chunks_to_segments(
+        delta_chunks, add_bos=not prior_segments)
+    submitted_segments = list(prior_segments) + delta_segments
+    spec_segments = [
+        g.Segment(kind=s.kind, tokens=list(s.tokens), image_bytes=s.image_bytes)
+        for s in submitted_segments
+    ]
+    return g.StreamSpec(
+        stream_id=stream_id, action=0,
+        flags=0x01 if capture_logits else 0,
+        segments=spec_segments, sampling=sampling,
+    ), submitted_segments
+
+
+def _chunks_to_segments(chunks, *, add_bos: bool) -> list[StoredSegment]:
+    """Convert TextChunk/ImageChunk list into StoredSegments.
+    Consecutive TextChunks coalesce so the engine sees a stable
+    boundary structure independent of how the chunk source split text.
+    """
+    segments: list[StoredSegment] = []
     pending: list[int] = []
-    did_bos = False
+    did_bos = not add_bos
 
     def flush() -> None:
         nonlocal did_bos
         if pending:
-            segments.append(g.Segment(kind=0, tokens=list(pending)))
+            segments.append(StoredSegment(kind=0, tokens=list(pending)))
             pending.clear()
             did_bos = True
 
@@ -196,19 +308,23 @@ def _build_stream_spec(stream_id: int,
                 did_bos = True
         elif isinstance(ch, ImageChunk):
             flush()
-            segments.append(g.Segment(kind=1, image_bytes=ch.data))
-        elif isinstance(ch, SoftsChunk):
-            raise HTTPException(
-                400, "client-replayed soft tokens not yet supported on /v1/chat/completions")
+            segments.append(StoredSegment(kind=1, image_bytes=ch.data))
     flush()
+    return segments
 
-    return g.StreamSpec(
-        stream_id=stream_id,
-        action=0,
-        flags=0x01 if capture_logits else 0,
-        segments=segments,
-        sampling=sampling,
-    )
+
+def _warm_path_eligible(messages: list[dict]) -> bool:
+    """The conversation can be replayed via stored segments iff:
+      - len(messages) >= 2 (a prior turn exists to inherit)
+      - messages[-1].role is one render_turn_delta supports
+        ({user, tool, function}). Assistant-as-final isn't an OAI
+        shape we expect to serve.
+    Tools / role:tool / tool_calls in HISTORICAL messages are fine —
+    they're replayed as stored token bytes, not re-rendered.
+    """
+    if len(messages) < 2:
+        return False
+    return messages[-1].get("role") in ("user", "tool", "function")
 
 
 # ----------------------------------------------------------------------
@@ -258,18 +374,51 @@ async def _startup() -> None:
     _TOOL_CALL_CLOSE_TOKENS = list(g.tokenize("<tool_call|>", add_bos=False))
     print(f"[bridge] tool_call close tokens: {_TOOL_CALL_CLOSE_TOKENS}", flush=True)
 
+    # Gemma-4's chat-template end-of-turn special token. The chat
+    # template emits `<end_of_turn>` (special-token id 106 in the
+    # Gemma vocabulary, which renders as the literal text `<turn|>`
+    # when decoded) to delimit every turn. The bridge MUST treat 106
+    # as a stop signal — without it, the model continues past its
+    # natural turn boundary and emits auxiliary scaffolding (a
+    # `thought` channel, secondary turns, `<channel|>` blocks) that
+    # leaks into the response content.
+    #
+    # GGUF metadata's `eos_token_id` field is unreliable for this:
+    # the Q4_K_M GGUF reports eos=106 (correct, == <end_of_turn>),
+    # but the fp16 GGUF reports eos=1 (bare <eos>, NOT the chat-
+    # template end-of-turn). Hardcoding token 106 here makes the
+    # bridge respect the chat template's actual turn boundary
+    # regardless of which token the GGUF metadata happens to claim
+    # as "EOS". Token id is stable across all Gemma 1/2/3/4 vocabs.
+    #
+    # Note: tokenizing the literal STRING "<turn|>" via g.tokenize
+    # does NOT yield 106 — it yields the BPE breakdown of those 8
+    # ASCII chars as ordinary tokens. We want the special token id
+    # the model actually emits, which is 106.
+    global _TURN_END_TOKENS
+    _TURN_END_TOKENS = [106]
+    print(f"[bridge] chat-template end-of-turn tokens: {_TURN_END_TOKENS} "
+          f"(<end_of_turn>)", flush=True)
+
     _submit_q = asyncio.Queue()
+    global _submit_pump_task, _poll_pump_task
     _next_stream_id_lock = asyncio.Lock()
-    _coord_task = asyncio.create_task(_coordinator())
+    _submit_pump_task = asyncio.create_task(_submit_pump())
+    _poll_pump_task = asyncio.create_task(_poll_pump())
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    global _coord_task
-    if _coord_task is not None:
-        _coord_task.cancel()
+    global _submit_pump_task, _poll_pump_task
+    for name, task in [
+        ("submit_pump", _submit_pump_task),
+        ("poll_pump", _poll_pump_task),
+    ]:
+        if task is None:
+            continue
+        task.cancel()
         try:
-            await _coord_task
+            await task
         except asyncio.CancelledError:
             pass
     g.shutdown()
@@ -292,7 +441,28 @@ def health() -> JSONResponse:
         "vision_cache_hits": s.vision_cache_hits,
         "total_steps": s.total_steps,
         "total_tokens_emitted": s.total_tokens_emitted,
+        "capabilities": {
+            "max_q_len": g.max_q_len(),
+        },
     })
+
+
+@app.post("/v1/tokenize")
+async def tokenize_endpoint(req: Request) -> JSONResponse:
+    """Stateless tokenizer call. Returns token IDs for `input` text plus
+    optional BOS prepend.
+
+    `g.tokenize` is synchronous CPU work calling into the Swift FFI; we
+    run it in a thread so high-volume callers (perplexity-stride scans,
+    HellaSwag pre-tokenization, etc.) don't pin the asyncio event loop
+    and starve concurrent chat-completion / teacher-forced traffic.
+    """
+    body = await req.json()
+    text = body.get("input", "")
+    add_bos = bool(body.get("add_bos", False))
+    tokens = await asyncio.to_thread(
+        lambda: list(g.tokenize(str(text), add_bos=add_bos)))
+    return JSONResponse({"tokens": tokens, "n_tokens": len(tokens)})
 
 
 def _models_payload() -> dict:
@@ -365,21 +535,34 @@ async def chat_completions(req: Request) -> Any:
     # advisory; the model decides. (Forced tool selection / "required" /
     # named-function modes are not yet wired through.)
     tools = body.get("tools") if isinstance(body.get("tools"), list) else None
-    # When tools are present, ask the engine to self-terminate on the
-    # tool-call close marker so we don't burn 4096 tokens of
-    # <|tool_response> waiting for an injected response. Engine-side
-    # stop_sequences match against the recently-emitted tail; once the
-    # 5-token <tool_call|> sequence appears, done_reason=1 fires.
+    # Engine-side stop_sequences are matched against the recently-
+    # emitted token tail; when any sequence matches, done_reason=1
+    # fires and the AR loop terminates. We always include the
+    # chat-template end-of-turn ([106] = <end_of_turn>) so the model
+    # stops at its natural turn boundary instead of bleeding into
+    # auxiliary scaffolding (thought channel, secondary turns)
+    # that the bridge would otherwise expose as response content.
+    # When tools are present we also include the tool_call_close
+    # multi-token sequence so the engine self-terminates on
+    # <tool_call|> rather than burning 4096 tokens waiting for an
+    # injected <|tool_response>.
+    sampling.stop_sequences = [list(_TURN_END_TOKENS)]
     if tools and _TOOL_CALL_CLOSE_TOKENS:
-        sampling.stop_sequences = [list(_TOOL_CALL_CLOSE_TOKENS)]
+        sampling.stop_sequences.append(list(_TOOL_CALL_CLOSE_TOKENS))
     print(f"[bridge] chat_completions: tools={len(tools) if tools else 0}, "
           f"tool_choice={body.get('tool_choice')!r}, "
           f"messages={len(messages)}, stream={stream}, "
           f"stop_seqs={len(sampling.stop_sequences)}", flush=True)
     stream_id = await _next_stream_id_alloc()
-    spec = _build_stream_spec(stream_id, messages, sampling, capture_logits, tools=tools)
+    spec, submitted_segments = _build_stream_spec(
+        stream_id, messages, sampling, capture_logits, tools=tools)
     response_q: asyncio.Queue = asyncio.Queue()
     _response_qs[stream_id] = response_q
+
+    # Conversation-state recording is enabled whenever we have segments
+    # to remember. The cache key includes the assistant message we'll
+    # return, so the next turn finds it under hash(messages + [resp]).
+    record_state = bool(submitted_segments)
 
     await _submit_q.put(spec)
 
@@ -421,21 +604,20 @@ async def chat_completions(req: Request) -> Any:
                   f"done_reason={done_reason}", flush=True)
             finish = "stop" if done_reason == 1 else (
                 "length" if done_reason == 2 else "stop")
-            # Detect Gemma's native tool-call output. If found, lift
-            # them into the OAI-shape `tool_calls` field on the message
-            # and strip from `content`. finish_reason becomes
-            # "tool_calls" per the OpenAI spec so the client knows to
-            # invoke the tool rather than treat the response as final.
-            tool_calls, residual = extract_tool_calls(text)
-            if tool_calls:
-                message: dict[str, Any] = {
-                    "role": "assistant",
-                    "content": residual or None,
-                    "tool_calls": tool_calls,
-                }
-                finish = "tool_calls"
-            else:
-                message = {"role": "assistant", "content": text}
+            # Tool-call extraction is NOT a bridge concern. The model
+            # may have emitted `<|tool_call>...<tool_call|>` bytes if
+            # tools were in the request; those bytes are part of the
+            # response text verbatim. Clients parse them client-side.
+            message: dict[str, Any] = {"role": "assistant", "content": text}
+            if record_state:
+                final_segments = list(submitted_segments)
+                if all_tokens:
+                    final_segments.append(
+                        StoredSegment(kind=0, tokens=list(all_tokens)))
+                _conv_cache.record(
+                    hash_messages(messages + [message], tools),
+                    final_segments,
+                )
             choice: dict[str, Any] = {
                 "index": 0,
                 "message": message,
@@ -472,84 +654,47 @@ async def chat_completions(req: Request) -> Any:
     async def gen():
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
         created = int(time.time())
-        # Buffer all tokens; once we see Gemma's tool-call open marker
-        # we suppress further content chunks until done, then emit the
-        # parsed tool_calls in one final delta. Until the marker shows
-        # up we stream content normally so plain replies have low TTFT.
+        # Stream content deltas as they arrive. Tool-call markers in
+        # the model's output are NOT extracted or reshaped here — they
+        # ride through as part of the content text. Clients that want
+        # OAI tool-call shape parse them themselves. The bridge does
+        # not pay synchronous CPU on the response-streaming hot path
+        # for application-level interpretation.
         all_tokens: list[int] = []
-        suppress_content = False
-        # Rolling text window for tool-call open-marker detection. The
-        # marker can span delta-token boundaries, so we keep a small tail
-        # window and search there. O(1) per token vs the previous
-        # O(n) detokenize-history-per-token cost (which dominated SSE
-        # latency on long generations).
-        _open_window = ""
-        _OPEN_MARKER = '<|tool_call>'
-        _OPEN_WINDOW_LEN = len(_OPEN_MARKER) * 2 + 32
+        last_update: g.StreamUpdate | None = None
+        clean_close = False
         try:
             while True:
                 u: g.StreamUpdate = await response_q.get()
+                last_update = u
                 if u.new_tokens:
                     all_tokens.extend(u.new_tokens)
                     delta_text = g.detokenize(u.new_tokens)
-                    if not suppress_content:
-                        # Slide the window with the new delta and search
-                        # for the open marker. O(window_len) per token.
-                        _open_window = (_open_window + delta_text)[-_OPEN_WINDOW_LEN:]
-                        if _OPEN_MARKER in _open_window:
-                            suppress_content = True
-                        else:
-                            yield ("data: " + json.dumps({
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": MODEL_NAME,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": delta_text},
-                                    "finish_reason": None,
-                                }],
-                            }) + "\n\n")
-                    # No bridge-side cancel needed — when tools are
-                    # present we passed the <tool_call|> token sequence
-                    # in SamplingParams.stop_sequences, so the engine
-                    # self-terminates with state==2 / done_reason=1 as
-                    # soon as it emits the close marker.
+                    yield ("data: " + json.dumps({
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": MODEL_NAME,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": delta_text},
+                            "finish_reason": None,
+                        }],
+                    }) + "\n\n")
                 if u.state == 2:
                     finish = "stop" if u.done_reason == 1 else (
                         "length" if u.done_reason == 2 else "stop")
-                    full_text = g.detokenize(all_tokens)
-                    tool_calls, residual = extract_tool_calls(full_text)
-                    if tool_calls:
-                        finish = "tool_calls"
-                        # Emit one chunk with the full tool_calls array.
-                        # Each entry carries `index`, the streaming-shape
-                        # ST/OAI-clients accumulate by.
-                        delta_tc = []
-                        for i, tc in enumerate(tool_calls):
-                            delta_tc.append({
-                                "index": i,
-                                "id": tc["id"],
-                                "type": "function",
-                                "function": {
-                                    "name": tc["function"]["name"],
-                                    "arguments": tc["function"]["arguments"],
-                                },
-                            })
-                        delta = {"tool_calls": delta_tc}
-                        if residual:
-                            delta["content"] = residual
-                        yield ("data: " + json.dumps({
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": MODEL_NAME,
-                            "choices": [{
-                                "index": 0,
-                                "delta": delta,
-                                "finish_reason": None,
-                            }],
-                        }) + "\n\n")
+                    if record_state:
+                        full_text = g.detokenize(all_tokens)
+                        done_msg = {"role": "assistant", "content": full_text}
+                        final_segments = list(submitted_segments)
+                        if all_tokens:
+                            final_segments.append(
+                                StoredSegment(kind=0, tokens=list(all_tokens)))
+                        _conv_cache.record(
+                            hash_messages(messages + [done_msg], tools),
+                            final_segments,
+                        )
                     yield ("data: " + json.dumps({
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -570,8 +715,32 @@ async def chat_completions(req: Request) -> Any:
                         },
                     }) + "\n\n")
                     yield "data: [DONE]\n\n"
+                    print(f"[bridge] usage (SSE): "
+                          f"prompt_tokens={u.prompt_tokens_seen}, "
+                          f"completion_tokens={u.completion_tokens_emitted}, "
+                          f"cache_hits={u.cache_hits}, "
+                          f"cache_misses={u.cache_misses}, "
+                          f"vision_cache_hits={u.vision_cache_hits}, "
+                          f"done_reason={u.done_reason}", flush=True)
+                    clean_close = True
                     break
         finally:
+            # Log usage regardless of how we exited the loop. Clean
+            # close (state==2) reaches the dedicated print earlier;
+            # disconnect / cancellation lands here with `last_update`
+            # holding the most recent StreamUpdate. This prevents the
+            # silent-cache-hits-on-cancel observability gap that bit
+            # us when Zed cancels SSE on tool-mode prose.
+            if not clean_close and last_update is not None:
+                u = last_update
+                print(f"[bridge] usage (DISCONNECT): "
+                      f"prompt_tokens={u.prompt_tokens_seen}, "
+                      f"completion_tokens={u.completion_tokens_emitted}, "
+                      f"cache_hits={u.cache_hits}, "
+                      f"cache_misses={u.cache_misses}, "
+                      f"vision_cache_hits={u.vision_cache_hits}, "
+                      f"state={u.state}, "
+                      f"done_reason={u.done_reason}", flush=True)
             _response_qs.pop(stream_id, None)
     return StreamingResponse(gen(), media_type="text/event-stream")
 
