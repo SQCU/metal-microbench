@@ -44,9 +44,14 @@ import gemma_ffi as g
 
 from chat_template import (
     TextChunk, ImageChunk, render_chat,
-    render_turn_delta, tokenize_with_specials,
+    tokenize_with_specials,
 )
-from conversation_state import ConversationCache, StoredSegment, hash_messages
+# 2026-05-07: stripped ConversationCache + warm-path adoption per the
+# 'NO REMOTE LOCKS / chat completions stateless' principle. The bridge
+# no longer remembers any state across requests — every chat-completion
+# render runs canonically from the supplied `messages` list.
+# Previous module: conversation_state.py (kept for now; dead code).
+from conversation_state import StoredSegment
 # NOTE on tool calls: the bridge does NOT parse tool-call markers out
 # of model output. The model emits whatever bytes it emits (including
 # `<|tool_call>...<tool_call|>` markers when tools are present in the
@@ -94,10 +99,13 @@ _poll_pump_task: "asyncio.Task | None" = None
 _TOOL_CALL_CLOSE_TOKENS: list[int] = []  # set at startup
 _TURN_END_TOKENS: list[int] = []         # set at startup; chat-template end-of-turn
 
-# Per-conversation prefix-token cache. Keyed by hash(messages, tools);
-# value is the exact token sequence in the engine's KV after that
-# turn's stream completed. See conversation_state.py for the contract.
-_conv_cache = ConversationCache(max_entries=128)
+# 2026-05-07: deleted _conv_cache. The bridge is now stateless across
+# chat-completion requests — no warm-path adoption, no
+# message-hash-keyed memory, no LRU. Engine-side content-hash KV page
+# adoption (page_manager.contentIndex) still benefits multi-turn chat
+# at the engine layer where it's a passive accelerator (no client-side
+# entanglement); the bridge no longer constructs request-shape state
+# across requests.
 
 
 async def _next_stream_id_alloc() -> int:
@@ -228,59 +236,33 @@ def _build_stream_spec(stream_id: int,
     only for purely text turns; mixed-modality turns fall through to
     canonical for now (`record_state=False`).
     """
-    # Two paths share a common chunks-to-segments converter:
-    # * Warm: messages[:-1] hashes to a stored ConversationState. We
-    #   submit prior.segments + chunks_to_segments(render_turn_delta(
-    #   messages[-1])), letting the engine's content-hash cache adopt
-    #   every page of prior.segments verbatim.
-    # * Cold: render_chat(messages, ...) produces all chunks; the same
-    #   converter turns them into segments.
-    prior_segments: list[StoredSegment] = []
-    delta_chunks = None
+    # 2026-05-07: bridge is stateless across chat completions per the
+    # 'NO REMOTE LOCKS / no entanglement' principle. Each request renders
+    # canonically from `messages` — no warm-path adoption from a stored
+    # prior conversation-state. The engine's content-hash KV page cache
+    # at the page_manager layer still produces multi-turn KV reuse for
+    # bit-identical prefix bytes (passive accelerator, no client-side
+    # state); but the bridge itself constructs no cross-request state.
+    try:
+        delta_chunks = render_chat(
+            messages, add_generation_prompt=True, tools=tools)
+    except ValueError as e:
+        # image_url that isn't a data: URI is a client-shape error,
+        # not a server fault.
+        if "image_url" in str(e):
+            raise HTTPException(400, str(e)) from None
+        raise
 
-    if _warm_path_eligible(messages):
-        prior_state = _conv_cache.lookup(hash_messages(messages[:-1], tools))
-        if prior_state is not None:
-            prev_was_tool_call = bool(
-                len(messages) >= 2 and messages[-2].get("tool_calls"))
-            try:
-                delta_chunks = render_turn_delta(
-                    messages[-1], prev_was_tool_call=prev_was_tool_call)
-                prior_segments = list(prior_state.segments)
-            except ValueError as e:
-                # Two cases of ValueError here:
-                # (a) render_turn_delta refused this message shape — fall
-                #     through to the canonical render.
-                # (b) the chat-template's image-URL decoder rejected a
-                #     non-data: URL — that's a client error, surface it
-                #     as 400 instead of 500.
-                if "image_url" in str(e):
-                    raise HTTPException(400, str(e)) from None
-                delta_chunks = None
-
-    if delta_chunks is None:
-        try:
-            delta_chunks = render_chat(
-                messages, add_generation_prompt=True, tools=tools)
-        except ValueError as e:
-            # Same as above: image_url that isn't a data: URI is a
-            # client-shape error, not a server fault.
-            if "image_url" in str(e):
-                raise HTTPException(400, str(e)) from None
-            raise
-
-    delta_segments = _chunks_to_segments(
-        delta_chunks, add_bos=not prior_segments)
-    submitted_segments = list(prior_segments) + delta_segments
+    delta_segments = _chunks_to_segments(delta_chunks, add_bos=True)
     spec_segments = [
         g.Segment(kind=s.kind, tokens=list(s.tokens), image_bytes=s.image_bytes)
-        for s in submitted_segments
+        for s in delta_segments
     ]
     return g.StreamSpec(
         stream_id=stream_id, action=0,
         flags=0x01 if capture_logits else 0,
         segments=spec_segments, sampling=sampling,
-    ), submitted_segments
+    ), delta_segments
 
 
 def _chunks_to_segments(chunks, *, add_bos: bool) -> list[StoredSegment]:
@@ -313,18 +295,8 @@ def _chunks_to_segments(chunks, *, add_bos: bool) -> list[StoredSegment]:
     return segments
 
 
-def _warm_path_eligible(messages: list[dict]) -> bool:
-    """The conversation can be replayed via stored segments iff:
-      - len(messages) >= 2 (a prior turn exists to inherit)
-      - messages[-1].role is one render_turn_delta supports
-        ({user, tool, function}). Assistant-as-final isn't an OAI
-        shape we expect to serve.
-    Tools / role:tool / tool_calls in HISTORICAL messages are fine —
-    they're replayed as stored token bytes, not re-rendered.
-    """
-    if len(messages) < 2:
-        return False
-    return messages[-1].get("role") in ("user", "tool", "function")
+# 2026-05-07: deleted _warm_path_eligible. Bridge no longer carries
+# any cross-request conversation state to inherit from.
 
 
 # ----------------------------------------------------------------------
@@ -554,21 +526,21 @@ async def chat_completions(req: Request) -> Any:
           f"messages={len(messages)}, stream={stream}, "
           f"stop_seqs={len(sampling.stop_sequences)}", flush=True)
     stream_id = await _next_stream_id_alloc()
-    spec, submitted_segments = _build_stream_spec(
+    spec, _ = _build_stream_spec(
         stream_id, messages, sampling, capture_logits, tools=tools)
     response_q: asyncio.Queue = asyncio.Queue()
     _response_qs[stream_id] = response_q
 
-    # Conversation-state recording is enabled whenever we have segments
-    # to remember. The cache key includes the assistant message we'll
-    # return, so the next turn finds it under hash(messages + [resp]).
-    record_state = bool(submitted_segments)
+    # 2026-05-07: removed conversation-state recording. Bridge is
+    # stateless across requests; the engine's page-cache is the only
+    # cross-request memory and operates without client-side coupling.
 
     await _submit_q.put(spec)
 
     if not stream:
         # Aggregate path: handler awaits the entire response, so handler-
         # level finally is correct.
+        clean_close_aggregate = False
         try:
             all_tokens: list[int] = []
             usage: dict[str, int] = {}
@@ -609,15 +581,8 @@ async def chat_completions(req: Request) -> Any:
             # tools were in the request; those bytes are part of the
             # response text verbatim. Clients parse them client-side.
             message: dict[str, Any] = {"role": "assistant", "content": text}
-            if record_state:
-                final_segments = list(submitted_segments)
-                if all_tokens:
-                    final_segments.append(
-                        StoredSegment(kind=0, tokens=list(all_tokens)))
-                _conv_cache.record(
-                    hash_messages(messages + [message], tools),
-                    final_segments,
-                )
+            # 2026-05-07: no conversation-state recording. Stateless
+            # bridge per the NO REMOTE LOCKS principle.
             choice: dict[str, Any] = {
                 "index": 0,
                 "message": message,
@@ -634,7 +599,7 @@ async def chat_completions(req: Request) -> Any:
                         ],
                     } for lp in collected_logprobs]
                 }
-            return JSONResponse({
+            response = JSONResponse({
                 "id": f"chatcmpl-{uuid.uuid4().hex[:16]}",
                 "object": "chat.completion",
                 "created": int(time.time()),
@@ -642,7 +607,22 @@ async def chat_completions(req: Request) -> Any:
                 "choices": [choice],
                 "usage": usage,
             })
+            clean_close_aggregate = True
+            return response
         finally:
+            # 2026-05-07: cancel-on-disconnect. If we did not reach
+            # state==2 (done_reason set), the client almost certainly
+            # gave up on the request — TCP reset / asyncio cancel /
+            # exception. Without enqueueing a cancel here, the engine
+            # would keep running this stream's prefill+AR until natural
+            # EOS, holding a slot away from other clients. The principle
+            # is 'a dead client must NOT delay work for live ones'.
+            if not clean_close_aggregate:
+                cancel_spec = g.StreamSpec(stream_id=stream_id, action=2)
+                try:
+                    await _submit_q.put(cancel_spec)
+                except Exception:
+                    pass
             _response_qs.pop(stream_id, None)
 
     # SSE streaming. Cleanup MUST be inside the generator's own finally;
@@ -684,17 +664,7 @@ async def chat_completions(req: Request) -> Any:
                 if u.state == 2:
                     finish = "stop" if u.done_reason == 1 else (
                         "length" if u.done_reason == 2 else "stop")
-                    if record_state:
-                        full_text = g.detokenize(all_tokens)
-                        done_msg = {"role": "assistant", "content": full_text}
-                        final_segments = list(submitted_segments)
-                        if all_tokens:
-                            final_segments.append(
-                                StoredSegment(kind=0, tokens=list(all_tokens)))
-                        _conv_cache.record(
-                            hash_messages(messages + [done_msg], tools),
-                            final_segments,
-                        )
+                    # 2026-05-07: no conversation-state recording.
                     yield ("data: " + json.dumps({
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -741,6 +711,15 @@ async def chat_completions(req: Request) -> Any:
                       f"vision_cache_hits={u.vision_cache_hits}, "
                       f"state={u.state}, "
                       f"done_reason={u.done_reason}", flush=True)
+            # 2026-05-07: cancel-on-disconnect (SSE path). If the
+            # client gave up before we hit state==2, free the engine
+            # slot now rather than leaving it pinned until natural EOS.
+            if not clean_close:
+                cancel_spec = g.StreamSpec(stream_id=stream_id, action=2)
+                try:
+                    await _submit_q.put(cancel_spec)
+                except Exception:
+                    pass
             _response_qs.pop(stream_id, None)
     return StreamingResponse(gen(), media_type="text/event-stream")
 

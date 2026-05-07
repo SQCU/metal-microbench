@@ -94,6 +94,29 @@ struct GemmaBpe {
 
     // Encode a prompt into token IDs. When `addBos` is nil, the default from
     // the GGUF metadata applies (Gemma-4 defaults to true).
+    //
+    // 2026-05-07: heap-based BPE merger replaces the old O(N²)
+    // greedy scan + remove-at:. The previous algorithm did:
+    //   - O(N) scan over all adjacent pairs to find lowest-rank merge
+    //   - O(N) `symbols.remove(at:)` shift after each merge
+    //   - O(K) String concat per merge
+    // → O(N²) scans + O(N²) shifts + O(N × avg_token_len) concat
+    //
+    // For a 64K-token prefill (Gemma-4 supports up to 256K context),
+    // that's 4 BILLION ops — a minutes-long encode call that violates
+    // the model's basic spec.
+    //
+    // Replacement is the standard heap-based SentencePiece BPE:
+    //   - doubly-linked list over symbol slots (next/prev) → O(1) merge
+    //   - min-heap of pending (rank, leftIdx, rightIdx, gens) entries
+    //   - generation counter per slot invalidates stale heap entries
+    //     instead of needing eager-removal from the heap
+    //   - per-merge: 1 heap pop + (up to) 2 heap pushes for new pairs
+    //     created at the merge boundary; O(log N) work per merge
+    // → O(N log N) total, with a one-time O(N) String concat budget
+    // bounded by total text length.
+    //
+    // For 64K tokens: ~64K × 17 = ~1M ops. Sub-second.
     func encode(_ text: String, addBos: Bool? = nil) -> [UInt32] {
         var out: [UInt32] = []
         if addBos ?? self.addBos { out.append(bosId) }
@@ -105,7 +128,7 @@ struct GemmaBpe {
         // Step 2 — initial atomization. Walk Unicode scalars; if the scalar
         // is a vocab token, use it; otherwise fall back to UTF-8 bytes via
         // <0xHH> tokens (every byte value is in the vocab as a type-6 token).
-        var symbols: [String] = []
+        var symbols: [String?] = []
         symbols.reserveCapacity(pre.count * 2)
         for scalar in pre.unicodeScalars {
             let s = String(scalar)
@@ -118,28 +141,136 @@ struct GemmaBpe {
             }
         }
         if symbols.isEmpty { return out }
-
-        // Step 3 — greedy merge. Scan for the best (lowest-rank) adjacent
-        // pair, merge, repeat. Early-exit when no pair has a rank.
-        while symbols.count >= 2 {
-            var bestRank = Int.max
-            var bestI = -1
-            for i in 0..<(symbols.count - 1) {
-                guard let inner = mergeRankByFirst[symbols[i]],
-                      let r = inner[symbols[i + 1]] else { continue }
-                if r < bestRank { bestRank = r; bestI = i }
+        if symbols.count == 1 {
+            // Trivial: no merges possible.
+            if let s = symbols[0] {
+                out.append(tokenToId[s] ?? unkId)
             }
-            if bestI < 0 { break }
-            symbols[bestI] = symbols[bestI] + symbols[bestI + 1]
-            symbols.remove(at: bestI + 1)
+            return out
         }
 
-        // Step 4 — map to IDs. Any symbol that somehow didn't resolve falls
-        // back to UNK, but after a successful merge pass every symbol should
-        // be in vocab (single chars + byte tokens are all type-1/type-6).
-        for s in symbols {
-            if let id = tokenToId[s] { out.append(id) }
-            else { out.append(unkId) }
+        // Step 3 — heap-based BPE merge.
+        let n = symbols.count
+        // Doubly-linked list over the symbol-slot array.
+        // prevIdx[i] = index of previous live slot (or -1 at head).
+        // nextIdx[i] = index of next live slot (or -1 at tail).
+        // gen[i] = monotonically incrementing generation number; used
+        //   to invalidate stale heap entries without eager-removal.
+        var prevIdx = [Int](repeating: -1, count: n)
+        var nextIdx = [Int](repeating: -1, count: n)
+        var gen = [UInt32](repeating: 0, count: n)
+        for i in 0..<n {
+            prevIdx[i] = (i == 0) ? -1 : (i - 1)
+            nextIdx[i] = (i == n - 1) ? -1 : (i + 1)
+        }
+
+        // Min-heap entries. Sorted by (rank ASC, leftIdx ASC) for
+        // deterministic tiebreak. genL/genR record the generation
+        // each slot had when this entry was created; if either has
+        // since advanced, this entry is stale (its pair was already
+        // merged on a different side).
+        struct HeapEntry {
+            let rank: Int
+            let leftIdx: Int
+            let rightIdx: Int
+            let genL: UInt32
+            let genR: UInt32
+        }
+        // Manual binary min-heap on Array<HeapEntry>. ~30 lines, no
+        // external dependency. Tiebreak: lower leftIdx wins (matches
+        // greedy left-to-right scan order of the previous algorithm
+        // when all pairs have equal rank).
+        var heap: [HeapEntry] = []
+        heap.reserveCapacity(n)
+        @inline(__always)
+        func heapBetter(_ a: HeapEntry, _ b: HeapEntry) -> Bool {
+            if a.rank != b.rank { return a.rank < b.rank }
+            return a.leftIdx < b.leftIdx
+        }
+        @inline(__always)
+        func heapPush(_ e: HeapEntry) {
+            heap.append(e)
+            var i = heap.count - 1
+            while i > 0 {
+                let p = (i - 1) >> 1
+                if heapBetter(heap[i], heap[p]) {
+                    heap.swapAt(i, p); i = p
+                } else { break }
+            }
+        }
+        @inline(__always)
+        func heapPop() -> HeapEntry? {
+            guard !heap.isEmpty else { return nil }
+            let top = heap[0]
+            let last = heap.removeLast()
+            if !heap.isEmpty {
+                heap[0] = last
+                var i = 0
+                let n = heap.count
+                while true {
+                    let l = 2*i + 1, r = 2*i + 2
+                    var best = i
+                    if l < n && heapBetter(heap[l], heap[best]) { best = l }
+                    if r < n && heapBetter(heap[r], heap[best]) { best = r }
+                    if best == i { break }
+                    heap.swapAt(i, best); i = best
+                }
+            }
+            return top
+        }
+        @inline(__always)
+        func tryPushPair(_ leftIdx: Int, _ rightIdx: Int) {
+            guard leftIdx >= 0, rightIdx >= 0,
+                  let leftSym = symbols[leftIdx],
+                  let rightSym = symbols[rightIdx],
+                  let inner = mergeRankByFirst[leftSym],
+                  let rank = inner[rightSym] else { return }
+            heapPush(HeapEntry(rank: rank,
+                                leftIdx: leftIdx, rightIdx: rightIdx,
+                                genL: gen[leftIdx], genR: gen[rightIdx]))
+        }
+
+        // Initial heap: all adjacent live pairs.
+        for i in 0..<(n - 1) {
+            tryPushPair(i, i + 1)
+        }
+
+        // Process merges in rank order.
+        while let entry = heapPop() {
+            let l = entry.leftIdx, r = entry.rightIdx
+            // Stale checks: either symbol consumed, or its generation
+            // has advanced since this entry was created.
+            guard symbols[l] != nil, symbols[r] != nil,
+                  gen[l] == entry.genL, gen[r] == entry.genR,
+                  nextIdx[l] == r else { continue }
+            // Merge r into l.
+            symbols[l] = symbols[l]! + symbols[r]!
+            symbols[r] = nil
+            gen[l] &+= 1
+            // Splice r out of the linked list.
+            let rNext = nextIdx[r]
+            nextIdx[l] = rNext
+            if rNext >= 0 { prevIdx[rNext] = l }
+            // (prevIdx[r] / nextIdx[r] are now ignored.)
+            // Push new pairs at the merge boundary.
+            let lPrev = prevIdx[l]
+            tryPushPair(lPrev, l)
+            tryPushPair(l, rNext)
+        }
+
+        // Step 4 — walk the linked list from head (the lowest live
+        // index) and emit token IDs. A symbol that somehow didn't
+        // resolve falls back to UNK; after a successful merge pass
+        // every symbol should be in vocab (singletons + byte tokens
+        // are all in vocab).
+        var head = 0
+        while head < n && symbols[head] == nil { head += 1 }
+        var i = head
+        while i >= 0 {
+            if let s = symbols[i] {
+                out.append(tokenToId[s] ?? unkId)
+            }
+            i = nextIdx[i]
         }
         return out
     }
