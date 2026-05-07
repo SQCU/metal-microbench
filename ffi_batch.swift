@@ -387,48 +387,35 @@ private struct LogprobRecord {
 }
 private var gLogprobsQ: [UInt64: [LogprobRecord]] = [:]
 
-// In-batch shared-prefix deferral — see notes/specs/bandwidth_triage.md §2.
-// When gemma_submit_batch arrives with N streams whose first PAGE_SLIDE
-// tokens hash to the same value, only one (the leader) actually opens
-// a session and prefills. Followers are stashed here, indexed by the
-// shared first-page hash they're waiting on. On every poll_batch tick,
-// we re-check the cache: once the leader has promoted its first page,
-// followers apply with the standard adoptSharedPrefixPages path picking
-// up the prefix automatically. This is what makes 4 simultaneous
-// rollouts of the same prompt cost 1× prefill instead of 4×.
-private struct DeferredStart {
-    let spec: DecodedStream
-    let firstPageHash: UInt64
-    let leaderStreamId: UInt64   // who we're waiting on
-}
-private var gDeferred: [UInt64: DeferredStart] = [:]   // stream_id → deferred
-// Leader assignment per first-page-hash within a batch. Used by deferred
-// followers to know which session's prefill to wait for before applying.
-private var gBatchLeaders: [UInt64: UInt64] = [:]      // hash → leader sid
+// 2026-05-07: deleted in-batch shared-prefix follower deferral.
+// Per the NO REMOTE LOCKS principle, gating stream B's submission on
+// stream A's prefill progress is a cross-stream coupling — even though
+// hash-keyed, it makes one client's work order depend on another's
+// timing. The engine-side content-hash KV page cache (page_manager
+// contentIndex) already accelerates B's prefill mid-stream when A's
+// pages are present, with no waiting and no client coupling: B's
+// prefill kernel runs to completion either way; engine just hands B
+// cached pages where it can. Follower deferral was a pre-cache-aware
+// optimization that became redundant once the page cache landed, and
+// was strict-violation territory under the principle.
+//
+// Empirical sched_sim_token D2 sweep + production probe agreed: the
+// follower-deferral path only won at p_shared >= 50% with prompt
+// length >= 512 — i.e., the agent-clique sampling regime. Even then
+// only modestly (3-11%) and only after paying a 1-CB silencing cost
+// for the leader's single-slot prefill. For typical eval/serving
+// workloads (independent prompts), it lost 0-2%.
+//
+// Removed: DeferredStart struct, gDeferred dict, gBatchLeaders dict,
+// firstPageHashOf helper, and the LM_BATCH_SHARED_PREFIX_DEFERRAL
+// gate logic. The gemma_poll deferred-retry loop is also stripped
+// (was unused with gDeferred always empty).
 
 // Streams whose state=2 (.done) update has already been appended to the
 // current poll's updates buffer. Prevents duplicate done-emissions when
 // the poll loop drives multiple CBs and re-iterates gStreamToSession on
 // each. Reset at the top of every gemma_poll call.
 private var gDoneEmittedThisPoll: Set<UInt64> = []
-
-// ----------------------------------------------------------------------
-// Compute the first-page hash for a stream's start segments. Returns 0
-// (= "no hash") if the stream doesn't have ≥ PAGE_SLIDE leading text
-// tokens. For first-cut, image-leading streams skip the deferral path
-// — the multimodal curriculum's per-rollout system-text prefix is the
-// case we care about, and that's always text-leading.
-// ----------------------------------------------------------------------
-private func firstPageHashOf(_ stream: DecodedStream) -> UInt64 {
-    var leading: [UInt32] = []
-    for seg in stream.segments {
-        guard seg.kind == 0 else { break }   // image_bytes — stop accumulating
-        leading.append(contentsOf: seg.tokens)
-        if leading.count >= PAGE_SLIDE { break }
-    }
-    guard leading.count >= PAGE_SLIDE else { return 0 }
-    return PageManager.hashPage(leading[0..<PAGE_SLIDE], cvecDigest: 0)
-}
 
 // ----------------------------------------------------------------------
 // Apply a single decoded stream action to the engine.
@@ -507,9 +494,6 @@ private func applyStreamAction(_ stream: DecodedStream, engine: LmEngine) {
         s.stopSequences = stream.sampling.stopSequences
         applyControlVectors(s, cvs: stream.controlVectors)
     case 2: // cancel
-        // A cancel might arrive for a deferred (not-yet-applied) stream
-        // too. Drop it from gDeferred either way.
-        gDeferred.removeValue(forKey: sid)
         guard let s = gStreamToSession[sid] else { return }
         engine.closeSession(s)
         gStreamToSession.removeValue(forKey: sid)
@@ -939,36 +923,13 @@ private func drainIntakeIntoEngine(_ engine: LmEngine) {
     gIntakeCond.unlock()
     if items.isEmpty { return }
 
-    let dbg = ProcessInfo.processInfo.environment["LM_BATCH_DEBUG"] != nil
-    // 2026-05-07: shared-prefix follower deferral is now opt-in via
-    // LM_BATCH_SHARED_PREFIX_DEFERRAL=1. The sched_sim_token simulation
-    // (D2 break-even surface) showed it only wins for prompt_len>=512
-    // with p_shared>=50% (agent-clique sampling). For typical live
-    // serving (independent prompts, p_shared≈0), it costs 0-2% by
-    // serializing followers behind leaders that could have prefilled
-    // in parallel. Default OFF — every stream admits as its own
-    // session and prefills its own KV pages.
-    let useFollowerDeferral = (ProcessInfo.processInfo.environment["LM_BATCH_SHARED_PREFIX_DEFERRAL"] == "1")
+    // 2026-05-07: every submitted stream is applied directly. No
+    // shared-prefix follower deferral. Cross-stream coupling at the
+    // bridge layer is forbidden under the NO REMOTE LOCKS principle;
+    // the engine-side content-hash KV page cache delivers the same
+    // benefit (cached prefix adoption) as a passive accelerator
+    // without making B's submission wait on A's prefill progress.
     for stream in items {
-        if useFollowerDeferral && stream.action == 0 { // start
-            let h = firstPageHashOf(stream)
-            if h != 0 && engine.pageManager.findByHash(h) == nil {
-                if let leaderSid = gBatchLeaders[h],
-                   gStreamToSession[leaderSid] != nil {
-                    gDeferred[stream.streamId] = DeferredStart(
-                        spec: stream, firstPageHash: h,
-                        leaderStreamId: leaderSid)
-                    if dbg {
-                        print("  [batch] stream \(stream.streamId) deferred behind leader \(leaderSid) (hash=\(String(h, radix: 16)))")
-                    }
-                    continue
-                }
-                gBatchLeaders[h] = stream.streamId
-                if dbg {
-                    print("  [batch] stream \(stream.streamId) leader (hash=\(String(h, radix: 16)))")
-                }
-            }
-        }
         applyStreamAction(stream, engine: engine)
     }
 }
@@ -982,9 +943,12 @@ public func gemma_poll(_ timeoutMs: Int32,
 
     // Drive contract (work-conserving):
     //   1. drain intake into engine state (each iteration)
-    //   2. retry deferred starts (each iteration; only matters when
-    //      LM_BATCH_SHARED_PREFIX_DEFERRAL=1 is set — otherwise gDeferred
-    //      stays empty)
+    //   2. (no deferred-retry step; deleted 2026-05-07 — the
+    //      LM_BATCH_SHARED_PREFIX_DEFERRAL feature created a
+    //      cross-stream coupling that the NO REMOTE LOCKS principle
+    //      forbids; KV-page-cache adoption at the page_manager layer
+    //      gives the same prefix-reuse benefit passively, with no
+    //      submission gating.)
     //   3. if engine has work: syncTickStep() — runs one prefill chunk
     //      OR one AR step
     //   4. collect updates from streams that emitted tokens; APPEND to
@@ -1017,40 +981,10 @@ public func gemma_poll(_ timeoutMs: Int32,
         // 1. Drain new submissions into engine state.
         drainIntakeIntoEngine(engine)
 
-        // 2. Retry deferred starts (in-batch shared-prefix follower
-        //    rule: a follower waits until its leader's session is past
-        //    prefill, then applies). gDeferred is empty in default
-        //    operation (the LM_BATCH_SHARED_PREFIX_DEFERRAL gate is
-        //    off by default per the 2026-05-07 D2 falsification).
-        //    2026-05-07: snapshot the keys once into a stack-local
-        //    array only when gDeferred has entries; the previous
-        //    `Array(gDeferred.keys)` allocation ran every poll
-        //    iteration regardless of whether the dict had entries.
-        if !gDeferred.isEmpty {
-            let dbg = ProcessInfo.processInfo.environment["LM_BATCH_DEBUG"] != nil
-            // Collect keys to apply in this pass; can't iterate the
-            // dict while mutating it (removeValue), so snapshot only
-            // the ready-to-apply keys instead of the full key set.
-            var readyKeys: [UInt64] = []
-            readyKeys.reserveCapacity(gDeferred.count)
-            for (sid, pending) in gDeferred {
-                let leaderReady: Bool
-                if let leader = gStreamToSession[pending.leaderStreamId] {
-                    leaderReady = (leader.state == .generating || leader.state == .done)
-                } else {
-                    leaderReady = true
-                }
-                if leaderReady { readyKeys.append(sid) }
-            }
-            for sid in readyKeys {
-                guard let pending = gDeferred[sid] else { continue }
-                if dbg {
-                    print("  [batch] stream \(sid) follower applying — leader \(pending.leaderStreamId) ready")
-                }
-                applyStreamAction(pending.spec, engine: engine)
-                gDeferred.removeValue(forKey: sid)
-            }
-        }
+        // 2. (Removed 2026-05-07): deferred-start retry. Shared-prefix
+        //    follower deferral was a cross-stream coupling that the
+        //    NO REMOTE LOCKS principle forbids; engine-side page-cache
+        //    handles prefix reuse passively at the page_manager layer.
 
         // 3. Drive one chunk if there's work.
         let hadWork = engine.hasWork
