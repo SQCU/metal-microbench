@@ -92,23 +92,27 @@ MODEL_NAME = os.environ.get("GEMMA_MODEL_NAME", "gemma-4-a4b")
 # Updates fan from the driver thread to per-stream asyncio.Queues via
 # loop.call_soon_threadsafe(rq.put_nowait, u).
 #
-# Why this replaces the old "two asyncio tasks each call to_thread" pattern:
-#   - The old pattern paid an asyncio→threadpool→cgo round-trip per
-#     submit AND per poll cycle (~5-10 ms each). At ~12 AR ticks/sec
-#     that was ~120-240 ms/sec of pure host-side overhead between
-#     productive CBs.
-#   - The old pattern used TWO threadpool workers concurrently calling
-#     into the FFI (submit + poll). Even with internal Swift-side
-#     locking that was correct, it doubled cgo entry overhead.
-#   - sched_sim_bridge's P8 sensitivity sweep showed the dominant
-#     unmodeled cost in the 57-vs-77-tok/s gap is exactly threadpool
-#     dispatch + per-update asyncio scheduling. Native owner thread
-#     predicted 80+ tok/s.
+# WHAT THIS ACTUALLY GIVES (measured, not predicted):
+#   - Single FFI owner. The old two-asyncio-tasks pattern violated the
+#     "single coroutine/thread calls into the dylib at a time" contract
+#     documented in gemma_ffi.py: submit_pump and poll_pump could each
+#     get a different threadpool worker and concurrently enter the FFI.
+#     Even with Swift-side locking correctness, that doubled cgo entry
+#     overhead. Native single owner is architecturally clean.
+#   - Direct g.submit from handler. Cold-start submission latency is
+#     gIntakeCond signal speed (microseconds) instead of waiting for
+#     the next poll deadline. No measurable latency win in the bench
+#     (cold start is rare), but real for low-arrival-rate workloads.
 #
-# Wakeup story: when the engine is idle, gemma_poll cond_waits on
-# gIntakeCond inside Swift. HTTP handlers calling gemma_submit signal
-# that cond, waking the driver thread within microseconds — so cold-
-# start latency is signal latency, not the driver's poll deadline.
+# WHAT THIS DID NOT GIVE (an honestly disclaimed past prediction):
+# An earlier sched_sim_bridge sensitivity sweep predicted +30-40%
+# aggregate throughput from this refactor. The actual measured AR-tick
+# rate was 10.60 ticks/sec — identical to the prior asyncio.to_thread +
+# 100ms-deadline-with-work-conserving-poll pattern. The sim's modeling
+# of asyncio.to_thread overhead was off; the work-conserving poll fix
+# from earlier in the session had already amortized that cost inside
+# one poll call. The architectural cleanup matters for correctness;
+# the throughput needle stays put at ~91% kernel saturation per CB.
 # ----------------------------------------------------------------------
 import threading
 

@@ -2388,27 +2388,23 @@ final class LmEngine {
     }
 
     // Unified scheduler tick. Picks between fast prefill and AR batch each
-    // call:
+    // call. Path priority (rewritten 2026-05-07 — the prior "max wins"
+    // rule was sched_sim_token-falsified, see pickChainPath body):
     //
-    //   1. Any session has a .softTokens head chunk  →  single-slot fast
-    //      prefill for that session (image tokens can't go through AR).
-    //   2. ALL busy sessions are .priming with .tokens chunks of ≥2 remaining
-    //      → multi-slot fast prefill in ONE CB, all slots active. This is
-    //      the simultaneous-submission case: 4 users POST-ing at once should
-    //      settle into peak throughput, not 16 AR-steps of zero emits.
-    //   3. Exactly one session busy AND its head is tokens-chunk ≥ 2  →
-    //      single-slot fast prefill.
-    //   4. Otherwise  →  AR step across all busy sessions. Handles mixed
-    //      prime+gen naturally: priming slots consume priming tokens, gen
-    //      slots emit — so staggered submissions pipeline automatically.
+    //   1. Any session has a .softTokens head chunk  →  soft prefill
+    //      (image tokens can't go through AR; multi if ≥ 2 priming).
+    //   2. Any session has a .tokens chunk of ≥2 remaining  →  text
+    //      prefill (multi if ≥ 2 priming, else single). ALWAYS
+    //      preferred over AR: a single-slot prefill costs 1 CB of
+    //      all-8-silenced, but saves prompt_len-1 silenced-slot-ticks
+    //      from AR-priming the would-be priming session through AR.
+    //      For any prompt_len > 1 it wins; sched_sim D1 confirms.
+    //   3. Otherwise  →  AR step across all busy sessions.
     //
     // Returns tokens emitted this tick (usually 0 during prefill unless the
     // chunk drained and we sampled the first generated token).
     // Scheduler path enum. Mutually-exclusive categories that map to one
     // of the three kernel shapes (soft-prefill / text-prefill / AR).
-    // pickChainPath returns the highest-slot-count path so each CB runs
-    // the most efficient kernel given current work — see the slot-count-
-    // driven priority section in notes/engine_debloat.md.
     enum ChainPath {
         case idle
         case softMultiPrefill([Session])
