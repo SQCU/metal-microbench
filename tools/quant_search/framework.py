@@ -644,8 +644,15 @@ async def run_benchmarks_pooled(
     file_handles = {name: out_paths[name].open("w")
                     for name in benchmarks}
 
+    # 2026-05-07: enable HTTP keep-alive. The previous
+    # max_keepalive_connections=0 forced TCP+TLS handshake on every
+    # bridge call — unnecessary churn under load when both sides
+    # are localhost talking to the same uvicorn worker. With
+    # keep-alive at the concurrency limit, hot connections are
+    # reused across requests; cold-start handshake cost is paid
+    # once per concurrent slot rather than per request.
     limits = httpx.Limits(max_connections=config.concurrency * 4,
-                          max_keepalive_connections=0)
+                          max_keepalive_connections=config.concurrency)
     completed_by_bench: dict[str, int] = {n: 0 for n in benchmarks}
     wall_t0 = time.time()
     last_progress_t = wall_t0

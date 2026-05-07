@@ -548,10 +548,13 @@ async def chat_completions(req: Request) -> Any:
     sampling.stop_sequences = [list(_TURN_END_TOKENS)]
     if tools and _TOOL_CALL_CLOSE_TOKENS:
         sampling.stop_sequences.append(list(_TOOL_CALL_CLOSE_TOKENS))
+    # PYTHONUNBUFFERED=1 (set by the lifecycle launcher) means every
+    # write hits stdout immediately; the explicit `flush=True` is
+    # gratuitous lock acquisition on each per-request print.
     print(f"[bridge] chat_completions: tools={len(tools) if tools else 0}, "
           f"tool_choice={body.get('tool_choice')!r}, "
           f"messages={len(messages)}, stream={stream}, "
-          f"stop_seqs={len(sampling.stop_sequences)}", flush=True)
+          f"stop_seqs={len(sampling.stop_sequences)}")
     stream_id = await _next_stream_id_alloc()
     spec, _ = _build_stream_spec(
         stream_id, messages, sampling, capture_logits, tools=tools)
@@ -609,7 +612,7 @@ async def chat_completions(req: Request) -> Any:
                   f"cache_hits={usage.get('cache_hits')}, "
                   f"cache_misses={usage.get('cache_misses')}, "
                   f"vision_cache_hits={usage.get('vision_cache_hits')}, "
-                  f"done_reason={done_reason}", flush=True)
+                  f"done_reason={done_reason}")
             finish = "stop" if done_reason == 1 else (
                 "length" if done_reason == 2 else "stop")
             # Tool-call extraction is NOT a bridge concern. The model
@@ -727,7 +730,7 @@ async def chat_completions(req: Request) -> Any:
                           f"cache_hits={u.cache_hits}, "
                           f"cache_misses={u.cache_misses}, "
                           f"vision_cache_hits={u.vision_cache_hits}, "
-                          f"done_reason={u.done_reason}", flush=True)
+                          f"done_reason={u.done_reason}")
                     clean_close = True
                     break
         finally:
@@ -746,7 +749,7 @@ async def chat_completions(req: Request) -> Any:
                       f"cache_misses={u.cache_misses}, "
                       f"vision_cache_hits={u.vision_cache_hits}, "
                       f"state={u.state}, "
-                      f"done_reason={u.done_reason}", flush=True)
+                      f"done_reason={u.done_reason}")
             # 2026-05-07: cancel-on-disconnect (SSE path). If the
             # client gave up before we hit state==2, free the engine
             # slot now rather than leaving it pinned until natural EOS.

@@ -1532,16 +1532,13 @@ final class LmEngine {
     // grammar to the next literal phase.
     private var freeLineMask: [Float] = []
 
-    // Per-CotState computed mask cache. Recomputed on the fly when a
-    // session's cot state advances into a new literal phase or moves
-    // its literal cursor. Free-line phases reuse `freeLineMask`. The
-    // cache is invalidated when the session's cot is enabled, advances
-    // a phase, or finishes (cot = nil).
-    private var cotLiteralMaskCache: [Int: [Float]] = [:]
-    // ^ keyed by "phase epoch" — each session's CotState gets a unique
-    // epoch we mint on enable. We use Session.id as the epoch for now;
-    // collisions can't happen since at any time only one CotState
-    // exists per session id.
+    // 2026-05-07: removed cotLiteralMaskCache. The field was declared
+    // but never populated or read — pure dead code. The cotMask
+    // function (now writing directly to the GPU buffer) recomputes
+    // each call; if literal-phase mask compute ever shows up in
+    // profiles, a real cache should be added with eviction tied to
+    // CoT-state-mutation events (enable/advance/disable) rather than
+    // session id (which doesn't capture phase advancement).
 
     // Write the mask for a CotState's CURRENT phase + cursor directly
     // to `dst` (a [VOCAB] Float pointer in the GPU sampling-bias buffer).
