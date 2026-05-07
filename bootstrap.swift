@@ -169,7 +169,13 @@ let denseF16BtileB2PSO          = pso("dense_gemv_f16_btile_b2")
 let denseF16BtileB4PSO          = pso("dense_gemv_f16_btile_b4")
 let denseF16BtileB8PSO          = pso("dense_gemv_f16_btile_b8")
 let denseF16BtileQkvOtfB1PSO    = pso("dense_gemv_f16_btile_qkv_otf_b1")
+let denseF16BtileQkvOtfB2PSO    = pso("dense_gemv_f16_btile_qkv_otf_b2")
+let denseF16BtileQkvOtfB4PSO    = pso("dense_gemv_f16_btile_qkv_otf_b4")
+let denseF16BtileQkvOtfB8PSO    = pso("dense_gemv_f16_btile_qkv_otf_b8")
 let denseF16BtileGateUpOtfB1PSO = pso("dense_gemv_f16_btile_gate_up_otf_b1")
+let denseF16BtileGateUpOtfB2PSO = pso("dense_gemv_f16_btile_gate_up_otf_b2")
+let denseF16BtileGateUpOtfB4PSO = pso("dense_gemv_f16_btile_gate_up_otf_b4")
+let denseF16BtileGateUpOtfB8PSO = pso("dense_gemv_f16_btile_gate_up_otf_b8")
 let denseF16V6RmsQkvPSO         = pso("dense_gemv_f16_v6_rmsnorm_qkv")
 let denseF16V6RmsGateUpPSO      = pso("dense_gemv_f16_v6_rmsnorm_gate_up")
 let moeGemvF16V11B1PSO          = pso("moe_gemv_f16_v11_b1")
@@ -1851,11 +1857,25 @@ func encGemvQ5KBtileQKVOtf(_ cb: MTLCommandBuffer, x: MTLBuffer, gammaBuf: MTLBu
     enc.endEncoding()
 }
 
-// F16 fused-RMSNorm QKV dispatcher — structural mirror of
-// encGemvQ80BtileQKVOtf. Three-tier policy: activeB==1 picks the
-// btile_qkv_otf_b1 PSO; activeB ≥ 2 falls back to V6 grid-shrink (only
-// b1 was added in the F16 zoo, mirroring the Q8_0 OTF policy where only
-// b1 actually beat V6).
+// F16 fused-RMSNorm QKV dispatcher.
+//
+// History: only b1 OTF was originally shipped, mirroring Q8_0's policy
+// (V6 fallback at activeB > 1).
+//
+// 2026-05-07 falsification probe: shipped F16 OTF b{2,4,8} kernels and
+// routed them at activeB > 1, hypothesizing that without the per-FMA
+// dequant cost Q8_0 carries, F16's OTF would beat V6 by amortizing RMS
+// across B_TILE batches per TG. Result: production AR-tick wall went
+// from ~85 ms to ~96 ms (-13% throughput). The hypothesis was wrong.
+// The likely cause is GPU saturation: V6 dispatches `slabs × activeB`
+// TGs (~500-770 for full QKV at activeB=8) while OTF b8 dispatches
+// only `slabs` TGs (~64-96), starving the M5 Max's 40 GPU cores of
+// parallel work. The 8× weight-bandwidth amortization OTF gains is
+// outweighed by the saturation loss.
+//
+// Current policy: keep the b{2,4,8} kernels available (zero cost to
+// ship), but route via V6 fallback at activeB > 1. activeB=1 still
+// uses OTF b1 since V6 has nothing to amortize at single-stream.
 func encGemvF16BtileQKVOtf(_ cb: MTLCommandBuffer, x: MTLBuffer, gammaBuf: MTLBuffer,
                             Wq: MTLBuffer, Wk: MTLBuffer, Wv: MTLBuffer,
                             outQ: MTLBuffer, outK: MTLBuffer, outV: MTLBuffer,
@@ -2064,9 +2084,11 @@ func encGemvQ5KBtileGateUpOtf(_ cb: MTLCommandBuffer, x: MTLBuffer, gammaBuf: MT
     enc.endEncoding()
 }
 
-// F16 fused-RMSNorm gate+up dispatcher — structural mirror of
-// encGemvQ80BtileGateUpOtf. Same activeB policy: b1 picks the templated
-// gate_up_otf_b1 PSO; activeB > 1 falls back to V6 grid-shrink.
+// F16 fused-RMSNorm gate+up dispatcher. Same falsification story as
+// encGemvF16BtileQKVOtf above (b{2,4,8} routing measured slower than
+// V6 fallback at activeB > 1, ~13% AR-tick wall regression). Kernels
+// are shipped for future use but production routes via V6 fallback
+// at activeB > 1; only activeB=1 uses OTF b1.
 func encGemvF16BtileGateUpOtf(_ cb: MTLCommandBuffer, x: MTLBuffer, gammaBuf: MTLBuffer,
                                 Wg: MTLBuffer, Wu: MTLBuffer, fusedOut: MTLBuffer,
                                 Din: Int, Dout: Int, activeB: Int) {

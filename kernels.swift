@@ -3266,6 +3266,119 @@ kernel void dense_gemv_f16_btile_qkv_otf_b1(
                                           tg, lid, sg_id);
 }
 
+// F16 OTF QKV — B_TILE ∈ {2, 4, 8}. Mechanical mirrors of the b1 wrapper
+// using the same templated impl with different specializations. Reason
+// for shipping these (the Q8_0 zoo had b{2,4,8} but production V6
+// fallback skipped them at activeB > 1): F16 has no per-FMA dequant
+// cost, so the OTF inner loop is much tighter than Q8_0's. The V6
+// fallback redoes the RMS reduction in every (slab, batch) TG, which
+// is a significant redundant-work cost at activeB=8 — OTF amortizes
+// that across the B_TILE batches sharing a TG.
+[[host_name("dense_gemv_f16_btile_qkv_otf_b2")]]
+kernel void dense_gemv_f16_btile_qkv_otf_b2(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const half* Wq       [[buffer(2)]],
+    device const half* Wk       [[buffer(3)]],
+    device const half* Wv       [[buffer(4)]],
+    device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]],
+    device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]],
+    constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]],
+    constant uint& V_nb         [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]],
+    constant uint& D_out_k      [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]],
+    constant float& eps         [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[2];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_f16_btile_qkv_otf_impl<2>(x, gamma, Wq, Wk, Wv,
+                                          out_q, out_k, out_v,
+                                          D_in, Q_nb, K_nb, V_nb,
+                                          D_out_q, D_out_k, D_out_v,
+                                          eps, numVecs,
+                                          inv_rms, ss_stage, partials,
+                                          tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_f16_btile_qkv_otf_b4")]]
+kernel void dense_gemv_f16_btile_qkv_otf_b4(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const half* Wq       [[buffer(2)]],
+    device const half* Wk       [[buffer(3)]],
+    device const half* Wv       [[buffer(4)]],
+    device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]],
+    device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]],
+    constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]],
+    constant uint& V_nb         [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]],
+    constant uint& D_out_k      [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]],
+    constant float& eps         [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[4];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_f16_btile_qkv_otf_impl<4>(x, gamma, Wq, Wk, Wv,
+                                          out_q, out_k, out_v,
+                                          D_in, Q_nb, K_nb, V_nb,
+                                          D_out_q, D_out_k, D_out_v,
+                                          eps, numVecs,
+                                          inv_rms, ss_stage, partials,
+                                          tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_f16_btile_qkv_otf_b8")]]
+kernel void dense_gemv_f16_btile_qkv_otf_b8(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const half* Wq       [[buffer(2)]],
+    device const half* Wk       [[buffer(3)]],
+    device const half* Wv       [[buffer(4)]],
+    device half* out_q          [[buffer(5)]],
+    device half* out_k          [[buffer(6)]],
+    device half* out_v          [[buffer(7)]],
+    constant uint& D_in         [[buffer(8)]],
+    constant uint& Q_nb         [[buffer(9)]],
+    constant uint& K_nb         [[buffer(10)]],
+    constant uint& V_nb         [[buffer(11)]],
+    constant uint& D_out_q      [[buffer(12)]],
+    constant uint& D_out_k      [[buffer(13)]],
+    constant uint& D_out_v      [[buffer(14)]],
+    constant float& eps         [[buffer(15)]],
+    constant uint& numVecs      [[buffer(16)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[8];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_f16_btile_qkv_otf_impl<8>(x, gamma, Wq, Wk, Wv,
+                                          out_q, out_k, out_v,
+                                          D_in, Q_nb, K_nb, V_nb,
+                                          D_out_q, D_out_k, D_out_v,
+                                          eps, numVecs,
+                                          inv_rms, ss_stage, partials,
+                                          tg, lid, sg_id);
+}
+
 [[host_name("dense_gemv_q8_0_btile_qkv_otf_b2")]]
 kernel void dense_gemv_q8_0_btile_qkv_otf_b2(
     device const half* x        [[buffer(0)]],
@@ -5288,6 +5401,83 @@ kernel void dense_gemv_f16_btile_gate_up_otf_b1(
     threadgroup float ss_stage[4];
     threadgroup float partials[4][32];
     dense_gemv_f16_btile_gate_up_otf_impl<1>(x, gamma, Wg, Wu, fused_out,
+                                              D_in, D_out, eps, numVecs,
+                                              inv_rms, ss_stage, partials,
+                                              tg, lid, sg_id);
+}
+
+// F16 OTF gate+up — B_TILE ∈ {2, 4, 8}. Same rationale as the QKV
+// b{2,4,8} additions above: F16 has no per-FMA dequant cost, so the
+// OTF inner loop is tighter than Q8_0's, and amortizing RMS across
+// B_TILE batches per TG (avoiding V6's per-(slab,batch) RMS redo)
+// is a clear win at activeB > 1.
+[[host_name("dense_gemv_f16_btile_gate_up_otf_b2")]]
+kernel void dense_gemv_f16_btile_gate_up_otf_b2(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const half* Wg       [[buffer(2)]],
+    device const half* Wu       [[buffer(3)]],
+    device half* fused_out      [[buffer(4)]],
+    constant uint& D_in         [[buffer(5)]],
+    constant uint& D_out        [[buffer(6)]],
+    constant float& eps         [[buffer(7)]],
+    constant uint& numVecs      [[buffer(8)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[2];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_f16_btile_gate_up_otf_impl<2>(x, gamma, Wg, Wu, fused_out,
+                                              D_in, D_out, eps, numVecs,
+                                              inv_rms, ss_stage, partials,
+                                              tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_f16_btile_gate_up_otf_b4")]]
+kernel void dense_gemv_f16_btile_gate_up_otf_b4(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const half* Wg       [[buffer(2)]],
+    device const half* Wu       [[buffer(3)]],
+    device half* fused_out      [[buffer(4)]],
+    constant uint& D_in         [[buffer(5)]],
+    constant uint& D_out        [[buffer(6)]],
+    constant float& eps         [[buffer(7)]],
+    constant uint& numVecs      [[buffer(8)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[4];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_f16_btile_gate_up_otf_impl<4>(x, gamma, Wg, Wu, fused_out,
+                                              D_in, D_out, eps, numVecs,
+                                              inv_rms, ss_stage, partials,
+                                              tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_f16_btile_gate_up_otf_b8")]]
+kernel void dense_gemv_f16_btile_gate_up_otf_b8(
+    device const half* x        [[buffer(0)]],
+    device const half* gamma    [[buffer(1)]],
+    device const half* Wg       [[buffer(2)]],
+    device const half* Wu       [[buffer(3)]],
+    device half* fused_out      [[buffer(4)]],
+    constant uint& D_in         [[buffer(5)]],
+    constant uint& D_out        [[buffer(6)]],
+    constant float& eps         [[buffer(7)]],
+    constant uint& numVecs      [[buffer(8)]],
+    uint2 tg                    [[threadgroup_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint sg_id                  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float inv_rms[8];
+    threadgroup float ss_stage[4];
+    threadgroup float partials[4][32];
+    dense_gemv_f16_btile_gate_up_otf_impl<8>(x, gamma, Wg, Wu, fused_out,
                                               D_in, D_out, eps, numVecs,
                                               inv_rms, ss_stage, partials,
                                               tg, lid, sg_id);
