@@ -313,6 +313,78 @@ def _strip_response_scaffolding(text: str) -> str:
     return text
 
 
+# Match ANY `<|channel>BODY<channel|>` block, body up to ~200 chars.
+# More permissive than _LEADING_CHANNEL_RE because we're cleaning
+# arbitrary historical contamination — could be anywhere in the message,
+# not just at the start.
+_ANY_CHANNEL_BLOCK_RE = re.compile(
+    r'<\|channel>[^<]{0,200}<channel\|>',
+    re.DOTALL,
+)
+
+
+def _clean_history_message(msg: dict) -> dict:
+    """Normalize a historical message before rendering through the chat
+    template. Two fixes applied:
+
+    1. CHANNEL-MARKER CONTAMINATION (assistant content):
+       Strip `<|channel>...<channel|>` blocks from assistant content
+       that a previous turn's response leaked into client-saved history.
+
+    2. TOOL-CALL ARGUMENTS DOUBLE-BRACKETING (assistant tool_calls):
+       OpenAI's standard tool_calls shape has `arguments` as a JSON-
+       encoded STRING (e.g., `'{"query":"..."}'`). The chat template
+       (chat_template.jinja:244-255) emits its OWN `{` and `}` brackets
+       around this — producing `{{"query":"..."}}` when concatenated
+       with the string's existing brackets. The model is trained on
+       this doubled-bracket format and reproduces it in NEW tool_call
+       output. The bridge's server-side tool-call extractor then fails
+       to parse the doubled braces as JSON.
+
+       Fix: parse the JSON string into a dict so the template takes
+       the `is mapping` branch (lines 245-251) which formats correctly
+       without doubled brackets. As a side effect, the model sees
+       single-bracket format in input AND emits single-bracket format
+       in output — consistency restored.
+
+    Tool messages and user messages pass through (channel markers in
+    user content are likely intentional examples, not bleed).
+    """
+    role = msg.get("role")
+    if role == "assistant":
+        out = dict(msg)
+        # 1. Channel-marker strip on string content.
+        content = msg.get("content")
+        if isinstance(content, str):
+            cleaned = _ANY_CHANNEL_BLOCK_RE.sub('', content)
+            cleaned = _TRAILING_TURN_RE.sub('', cleaned)
+            if cleaned != content:
+                out["content"] = cleaned.strip()
+        # 2. tool_calls arguments string → dict.
+        tcs = msg.get("tool_calls")
+        if isinstance(tcs, list) and tcs:
+            new_tcs = []
+            for tc in tcs:
+                if isinstance(tc, dict):
+                    fn = tc.get("function") or {}
+                    args = fn.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            parsed = json.loads(args)
+                            new_fn = dict(fn)
+                            new_fn["arguments"] = parsed
+                            new_tc = dict(tc)
+                            new_tc["function"] = new_fn
+                            new_tcs.append(new_tc)
+                            continue
+                        except (TypeError, json.JSONDecodeError):
+                            pass
+                new_tcs.append(tc)
+            out["tool_calls"] = new_tcs
+        return out
+    return msg
+
+
 _TOOL_CALL_BLOCK_RE = re.compile(
     r'<\|tool_call>(.*?)<tool_call\|>',
     re.DOTALL,
@@ -433,6 +505,19 @@ def _build_stream_spec(stream_id: int,
     # at the page_manager layer still produces multi-turn KV reuse for
     # bit-identical prefix bytes (passive accelerator, no client-side
     # state); but the bridge itself constructs no cross-request state.
+
+    # Clean prior assistant `content` before rendering: strip any
+    # `<|channel>...<channel|>` blocks that a previous turn's response
+    # may have leaked into the saved history. This was a real failure
+    # mode — the model's first-tokens-per-turn echo of the no-thinking
+    # epilogue would land in client conversation state, then on the
+    # NEXT turn that literal text gets atomic-id-emitted on the input
+    # path (per chat_template.py:SPECIAL_TOKENS) and the model sees a
+    # mid-message empty thought-channel block in its own past output.
+    # Stripping on input is belt to the suspenders of stripping on
+    # output (_strip_response_scaffolding), since old contaminated
+    # history persists even after the output-side fix.
+    messages = [_clean_history_message(m) for m in messages]
     try:
         delta_chunks = render_chat(
             messages, add_generation_prompt=True, tools=tools)
@@ -498,6 +583,32 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
+
+
+# Opt-in request-body capture for "what is this client actually sending?"
+# debugging. Set BRIDGE_LOG_REQUESTS=/path/to/file.jsonl to append each
+# /v1/chat/completions request body as one JSON line. Off by default;
+# on path adds ~50µs per captured request (one decode + one fwrite).
+# Pair with scripts/replay_bridge_request.py to curl-replay any captured
+# request. Implemented inside the chat_completions handler (NOT a
+# middleware) — middleware-based body interception is fragile because
+# Starlette's receive-or-disconnect wrapper rejects re-injected
+# `http.request` messages with "Unexpected message received".
+_LOG_REQUESTS_PATH = os.environ.get("BRIDGE_LOG_REQUESTS")
+
+
+def _maybe_log_chat_request(body: dict) -> None:
+    if not _LOG_REQUESTS_PATH:
+        return
+    try:
+        with open(_LOG_REQUESTS_PATH, "a") as f:
+            f.write(json.dumps({
+                "ts": time.time(),
+                "path": "/v1/chat/completions",
+                "body": body,
+            }) + "\n")
+    except Exception as e:
+        print(f"[bridge] BRIDGE_LOG_REQUESTS write failed: {e}", flush=True)
 
 
 @app.on_event("startup")
@@ -688,6 +799,7 @@ def list_models_compat() -> JSONResponse:
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request) -> Any:
     body = await req.json()
+    _maybe_log_chat_request(body)
     messages = body.get("messages", [])
     if not messages:
         raise HTTPException(400, "messages is required")
