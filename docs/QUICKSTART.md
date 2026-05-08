@@ -12,11 +12,11 @@ cd server && uv sync
 # 3. Fetch the Gemma-4 weights (GGUF + bf16 safetensors) into ./models/
 uv run python scripts/fetch-weights.py
 
-# 4. Launch — reads server/config.toml, runs uvicorn on port 8000
+# 4. Launch — reads server/config.toml, runs uvicorn on port 8001 by default
 uv run python serve.py
 ```
 
-Open <http://localhost:8000> for the client index; pick one of the five demo clients or drive the REST API directly.
+Open <http://localhost:8001> for the client index; pick one of the five demo clients or drive the REST API directly.
 
 ## Configuration
 
@@ -29,7 +29,7 @@ safetensors_path = "models/gemma-4-bf16/model-00001-of-00002.safetensors"
 
 [server]
 host = "0.0.0.0"
-port = 8000
+port = 8001
 log_level = "warning"
 
 [fetch]
@@ -65,7 +65,6 @@ OpenAI-compatible for the chat/completion endpoints; the extras (`/v1/images/pre
 | --- | --- | --- |
 | `GET` | `/health` | engine readiness, model name, cache stats |
 | `POST` | `/v1/chat/completions` | OpenAI-compat chat; accepts `image_url` and `softs` content items |
-| `POST` | `/v1/completions` | raw-text continuation (no chat template) |
 | `POST` | `/v1/images/prewarm` | run vision tower + cache softs ahead of time |
 | `POST` | `/v1/media/extract` | run vision, return softs as base64 for client-side persistence |
 | `GET` | `/v1/kv/snapshot` | per-session page ownership + refcount |

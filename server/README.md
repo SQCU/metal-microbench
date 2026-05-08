@@ -8,7 +8,7 @@ endpoint — curl-testable in isolation.
 
 ```
   browser (fetch + SSE)  ─┐
-                          ├──► FastAPI bridge (port 8000) ──► libgemma_metal.dylib ──► Metal GPU
+                          ├──► FastAPI bridge (port 8001) ──► libgemma_metal.dylib ──► Metal GPU
   curl / HTTPie          ─┘       (1 pump thread, asyncio handlers)
 ```
 
@@ -25,7 +25,15 @@ make libgemma_metal.dylib
 # Sync the Python venv + run the bridge.
 cd server
 uv sync
-GGUF_PATH=/path/to/model.gguf uv run uvicorn bridge:app --port 8000
+
+# Canonical, config-driven launch (reads server/config.toml; default port 8001):
+uv run python serve.py
+
+# Or the env-override path:
+GEMMA_PORT=8002 uv run python serve.py
+
+# Direct uvicorn (legacy form; bypasses config-toml resolution):
+GGUF_PATH=/path/to/model.gguf uv run uvicorn bridge:app --port 8001
 ```
 
 First call takes ~10 s (weight load + first-CB compile). Subsequent requests
@@ -40,8 +48,8 @@ Every web-app call maps to one of these. Each has a curl recipe.
 Liveness + runtime stats.
 
 ```bash
-curl http://localhost:8000/health
-# {"status":"ready","model":"gemma-4-a4b-q4km","active_sessions":0,"pump_running":true}
+curl http://localhost:8001/health
+# {"status":"ready","model":"gemma-4-a4b","active_sessions":0,"pump_running":true}
 ```
 
 ### `GET /v1/models`
@@ -49,7 +57,7 @@ curl http://localhost:8000/health
 OpenAI-shaped model list.
 
 ```bash
-curl http://localhost:8000/v1/models
+curl http://localhost:8001/v1/models
 ```
 
 ### `POST /v1/chat/completions`
@@ -57,10 +65,10 @@ curl http://localhost:8000/v1/models
 Non-streaming:
 
 ```bash
-curl -X POST http://localhost:8000/v1/chat/completions \
+curl -X POST http://localhost:8001/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "gemma-4-a4b-q4km",
+    "model": "gemma-4-a4b",
     "messages": [{"role":"user","content":"What is the capital of France?"}],
     "max_tokens": 24
   }'
@@ -69,7 +77,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 Streaming (SSE):
 
 ```bash
-curl -N -X POST http://localhost:8000/v1/chat/completions \
+curl -N -X POST http://localhost:8001/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Write a haiku."}],"max_tokens":30,"stream":true}'
 # data: {"id":"chatcmpl-…","object":"chat.completion.chunk",...}
@@ -80,23 +88,13 @@ curl -N -X POST http://localhost:8000/v1/chat/completions \
 Two concurrent requests ride the B=4 batched scheduler:
 
 ```bash
-(curl -sS -X POST http://localhost:8000/v1/chat/completions \
+(curl -sS -X POST http://localhost:8001/v1/chat/completions \
    -H 'Content-Type: application/json' \
    -d '{"messages":[{"role":"user","content":"Count to 5."}],"max_tokens":30}' &
- curl -sS -X POST http://localhost:8000/v1/chat/completions \
+ curl -sS -X POST http://localhost:8001/v1/chat/completions \
    -H 'Content-Type: application/json' \
    -d '{"messages":[{"role":"user","content":"List colors."}],"max_tokens":30}' &
  wait)
-```
-
-### `POST /v1/completions`
-
-Raw-prompt legacy endpoint (skips the chat template render).
-
-```bash
-curl -X POST http://localhost:8000/v1/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"<|turn>user\nHi<turn|>\n<|turn>model\n","max_tokens":16}'
 ```
 
 ### multimodal (image_url)
@@ -117,13 +115,14 @@ print(json.dumps({
   }],
   'max_tokens': 32
 }))" > /tmp/body.json
-curl -sS -X POST http://localhost:8000/v1/chat/completions \
+curl -sS -X POST http://localhost:8001/v1/chat/completions \
   -H 'Content-Type: application/json' \
   --data-binary @/tmp/body.json
 ```
 
-The bridge decodes the data URI, writes a tempfile, runs the vision tower
-via `gemma_submit_image_path`, brackets the soft tokens with BOI/EOI
+The bridge decodes the data URI and runs the vision tower via
+`gemma_submit_image_bytes` (image bytes pass straight through — no
+filesystem round-trip), brackets the soft tokens with BOI/EOI
 (255999/258882) markers, and the session generates as usual. Vision adds
 ~7 s TTFT on M5 (one-time per request; no caching yet).
 
@@ -143,14 +142,14 @@ the already-padded (280-row fp32) soft-tokens MTLBuffer; LRU-evicts at
 Inspect:
 
 ```bash
-curl http://localhost:8000/v1/cache/stats
+curl http://localhost:8001/v1/cache/stats
 # {"entries":1,"hits":7,"misses":1,"bytes":3153920,"hit_rate":0.875}
 ```
 
 Flush:
 
 ```bash
-curl -X POST http://localhost:8000/v1/cache/clear
+curl -X POST http://localhost:8001/v1/cache/clear
 # {"evicted":1}
 ```
 
@@ -158,7 +157,7 @@ Pre-populate (skip the first-request TTFT hit for an image you know
 you'll reference soon):
 
 ```bash
-curl -X POST http://localhost:8000/v1/images/prewarm \
+curl -X POST http://localhost:8001/v1/images/prewarm \
   -H 'Content-Type: application/json' \
   -d '{"image_url": {"url": "data:image/png;base64,..."}}'
 # {"soft_tokens":280,"cache_key":"<sha256>","elapsed_ms":7073,"stats":{...}}
@@ -224,7 +223,7 @@ kv tenancy strip polls `GET /v1/kv/snapshot` every 300 ms. The bandwidth chart i
 pure client-side (counts SSE delta arrivals over a 500 ms sliding window).
 
 ```bash
-open http://localhost:8000/    # macOS
+open http://localhost:8001/    # macOS
 ```
 
 ## python FFI directly (no HTTP)
@@ -244,7 +243,34 @@ prints both responses. Useful for testing the dylib without HTTP involvement.
 |---|---|---|
 | `GEMMA_DYLIB` | auto-discover | path to `libgemma_metal.dylib` |
 | `GGUF_PATH` | hard-coded | path to the GGUF weights file |
-| `GEMMA_MODEL_NAME` | `gemma-4-a4b-q4km` | model id returned by `/v1/models` |
-| `GEMMA_BRIDGE_HOST` | `0.0.0.0` | bind address |
-| `GEMMA_BRIDGE_PORT` | `8000` | listen port |
-| `GEMMA_BRIDGE_LOG` | `info` | uvicorn log level |
+| `GEMMA_MODEL_NAME` | `gemma-4-a4b` | model id returned by `/v1/models` |
+| `GEMMA_HOST` | `0.0.0.0` (config.toml [server].host) | bind address |
+| `GEMMA_PORT` | `8001` (config.toml [server].port) | listen port |
+| `GEMMA_LOG_LEVEL` | `warning` | uvicorn log level |
+| `BRIDGE_URL` | (resolved from config) | client-side override (clients only) |
+| `QUANT_BRIDGE_URL` | (legacy alias) | quant_search harnesses |
+| `GEMMA_BRIDGE` | (legacy alias) | scringlo / older harnesses |
+
+**Config-driven defaults** live in `server/config.toml`. Env vars
+override; client-side scripts read the resolved URL via
+`server/bridge_config.py` so changing one line in config.toml flips
+every harness in lockstep.
+
+## driving the engine without the HTTP bridge
+
+The Swift dylib also speaks a direct ctypes ABI (`gemma_ffi.py`) — no
+FastAPI / asyncio involvement. The probe scripts and offline tests
+use this path:
+
+```bash
+# stdlib-only probes (no third-party deps; either python form works,
+# but uv-managed is canonical for consistency with the rest of the project):
+cd server
+uv run python test_batch_ffi.py             # smoke test
+uv run python probe_oversubscription.py     # M:K throughput sweep
+uv run python probe_sustained_eval.py       # 5-min sustained eval shape
+
+# The probes import gemma_ffi (a thin ctypes wrapper around the dylib),
+# which expects libgemma_metal.dylib to be discoverable — built once via
+# `make libgemma_metal.dylib` from the repo root.
+```
