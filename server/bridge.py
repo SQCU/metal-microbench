@@ -23,8 +23,16 @@ will surface them through /v1/chat/completions body fields once their
 backend support lands. See notes/specs/batch_ffi_abi.md "Open
 questions" for the schema.
 
-Run:
-  uv run uvicorn bridge:app --host 0.0.0.0 --port 8000 --log-level info
+Run (canonical, config-driven):
+  ./server/serve.py
+  # (reads server/config.toml; default port 8001)
+
+Or via the env-override path (priority: BRIDGE_URL > GEMMA_PORT > config):
+  GEMMA_PORT=8002 ./server/serve.py
+
+Clients should import bridge_config (server/bridge_config.py) rather
+than hardcoding 127.0.0.1:8001 — that module reads the same config
+file and exposes BRIDGE_URL / chat_completions_url() / etc.
 """
 from __future__ import annotations
 
@@ -537,6 +545,57 @@ async def chat_completions(req: Request) -> Any:
         sampling.cot_labels = ["GOAL", "APPROACH", "EDGE"]
     elif isinstance(sc, list) and sc:
         sampling.cot_labels = [str(x).strip() for x in sc if str(x).strip()]
+
+    # OpenAI `response_format` (JSON mode). Two forms supported:
+    #   {"type": "json_object"}            — generic "JSON only"
+    #   {"type": "json_schema",
+    #    "json_schema": {"schema": {...},
+    #                     "name": "...",
+    #                     "strict": bool}}  — schema-described JSON
+    #
+    # Implementation: prompt-based (prepend a strong instruction to
+    # the messages list). The engine doesn't have grammar-constrained
+    # decoding for general JSON yet; structured_cot's grammar is
+    # think-block-only. For Gemma-4 26B-A4B the prompt-based approach
+    # produces well-formed JSON in practice, but it is NOT a hard
+    # guarantee — clients that need bit-strict output should validate
+    # post-hoc and retry on parse failures.
+    #
+    # The rider is added as the first message so it persists across
+    # multi-turn rendering. We don't merge into an existing system
+    # message because that would silently rewrite caller-supplied
+    # system text, and chat-template renderers handle multi-system-
+    # message lists fine.
+    rf = body.get("response_format")
+    if isinstance(rf, dict):
+        rf_type = rf.get("type")
+        rider: str | None = None
+        if rf_type == "json_object":
+            rider = (
+                "You MUST respond with a single valid JSON object. "
+                "Output ONLY the JSON — no prose, no markdown fences, "
+                "no preamble or postamble. Begin with `{` and end with `}`."
+            )
+        elif rf_type == "json_schema":
+            schema_obj = rf.get("json_schema") or {}
+            schema = schema_obj.get("schema", {})
+            name = schema_obj.get("name") or "response"
+            try:
+                schema_text = json.dumps(schema, indent=2, ensure_ascii=False)
+            except (TypeError, ValueError):
+                schema_text = "(schema not JSON-serializable)"
+            rider = (
+                f"You MUST respond with a single valid JSON object "
+                f"named '{name}' matching this schema:\n\n{schema_text}\n\n"
+                f"Output ONLY the JSON — no prose, no markdown fences. "
+                f"Every required field must be present."
+            )
+        if rider:
+            # Prepend as a system message; preserve any caller-supplied
+            # system messages by stacking after the rider.
+            messages = [{"role": "system", "content": rider}] + list(messages)
+            print(f"[bridge] response_format={rf_type!r}: rider injected "
+                  f"({len(rider)} chars); messages now {len(messages)}")
     # OpenAI tool calling: tools[] → injected via chat template's native
     # <|tool>declaration:...<tool|> blocks. tool_choice is currently
     # advisory; the model decides. (Forced tool selection / "required" /
