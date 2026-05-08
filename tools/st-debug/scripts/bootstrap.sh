@@ -97,6 +97,30 @@ print(f"  oai_settings.function_calling       = {existing['function_calling']}")
 print(f"  firstRun                            = False (welcome popup suppressed)")
 PY
 
+# Symlink toolcards from main ST install. Plugin reads them from
+# $DATA_ROOT/toolcards/{cards,installed}/. Keeping them as symlinks
+# means the debug instance picks up changes the user makes to their
+# main install's cards (e.g., editing a service.py to reproduce a
+# bug). If isolation matters in a future scenario, switch to `cp -r`.
+TOOLCARDS_SRC="$ST_SRC/data/toolcards"
+TOOLCARDS_DST="$DATA_ROOT/toolcards"
+mkdir -p "$TOOLCARDS_DST"
+if [[ -d "$TOOLCARDS_SRC/cards" ]]; then
+    rm -rf "$TOOLCARDS_DST/cards"
+    ln -sf "$TOOLCARDS_SRC/cards" "$TOOLCARDS_DST/cards"
+    echo "[bootstrap] toolcards/cards → $TOOLCARDS_SRC/cards (symlinked)"
+fi
+if [[ -d "$TOOLCARDS_SRC/installed" ]]; then
+    rm -rf "$TOOLCARDS_DST/installed"
+    ln -sf "$TOOLCARDS_SRC/installed" "$TOOLCARDS_DST/installed"
+    echo "[bootstrap] toolcards/installed → $TOOLCARDS_SRC/installed (symlinked)"
+fi
+if [[ -d "$TOOLCARDS_SRC/sources" ]]; then
+    # Sources directory is referenced by some toolcards too.
+    rm -rf "$TOOLCARDS_DST/sources"
+    ln -sf "$TOOLCARDS_SRC/sources" "$TOOLCARDS_DST/sources"
+fi
+
 # Drop a minimal default character so the chat UI is usable.
 CHARS_DIR="$DATA_ROOT/default-user/characters"
 mkdir -p "$CHARS_DIR"
