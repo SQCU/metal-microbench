@@ -145,6 +145,113 @@ Pair the refined tool with a single-shot variant (no refinement loop).
 Authentic choice between quick + refined is a modest lift but legitimately
 useful for cases where a 30-second wait is wrong (icons, simple shapes).
 
+## Round 2: dual-example design + calibration (2026-05-08, evening)
+
+Per the user's followup point: a single example combines two distinct
+teachings ("when does this fit" + "how to shape the query"). Splitting
+them with NON-OVERLAPPING topical content avoids transitive cargo-
+culting. Plus we now measure both TPR (positive prompt) AND FPR
+(negative prompt) to catch over-elicitation.
+
+New variants:
+  K: dual-example single tool — qualitative trigger + syntax form, on
+     unrelated topics ("scenes/diagrams" trigger + 'art-nouveau door
+     frame' syntax)
+  L: dual-example pair — quick + refined, both with dual examples on
+     non-overlapping topics across the pair
+  M: qualitative-only — situation→tool example with NO syntax form.
+     Isolates which half of the dual-example pattern carries the lift.
+
+Negative prompt added: "what time do you usually go to bed??" — clearly
+non-visual, model should NOT fire.
+
+### Headline finding from round 2: pure-qualitative variant M
+**OVER-ELICITS dramatically**.
+
+K=25 cell, scringlo persona:
+
+```
+M_qualitative_only:
+  positive ("see a fractal"):    1/25 ( 4%)   ← under-fires
+  negative ("go to bed"):       24/25 (96%)   ← over-fires
+  calib margin:                  -92pp        ← inverted
+```
+
+The model takes M's qualitative trigger ("a user describing wanting to
+see something, mentioning a visual idea, asking for a diagram, or
+describing a scene they're trying to picture") and creatively generates
+visualizations even when the user wasn't asking for one. The
+description's language is broad enough that the model finds visual
+relevance everywhere.
+
+This directly validates the user's instinct that **non-overlapping
+qualitative + syntax examples** matter: the syntax example anchors the
+model in WHAT IS BEING ASKED. Without it, the qualitative trigger fires
+indiscriminately.
+
+### Replication caveats
+
+K=10 and K=25 runs disagreed on the absolute rates of A, I, K, L
+(variance 0-45% across runs). Two plausible mechanisms:
+
+1. **Trial correlation through the bridge's content-hash KV cache.**
+   Repeated identical prompts hit the same cached prefix pages,
+   making the per-trial outcomes correlated rather than independent.
+   K=N bumps don't shrink error bars as expected when trials aren't
+   IID. To fix: vary `seed` parameter per call OR perturb prompts.
+
+2. **Cumulative bridge state.** Between the K=20 run (early afternoon)
+   and the K=25 run (evening), the bridge accumulated ~129k AR steps.
+   The page pool and content-index entries are different. Behavior
+   under load may not match cold-start behavior.
+
+The robust signal is **directional**, not absolute:
+- Verbose-4-param descriptions (B, F) reliably never fire
+- Pure-qualitative descriptions (M) reliably over-fire on negative
+- Show-don't-tell variants with syntax grounding (I, K, L) sit
+  somewhere in 0-40% on positive with FPR ≈ 0%
+
+A more rigorous future-session sweep would:
+- Use independent random seeds per trial (`seed=` param to bridge)
+- K ≥ 50 per cell
+- Multiple positive AND multiple negative prompts (3+ each)
+- Possibly run cells in randomized order (so cumulative bridge state
+  doesn't bias adjacent variants)
+
+### Updated action items
+
+The recommendations from round 1 stand, with one refinement:
+
+**Add a syntax example, NOT just a qualitative trigger.** A "this is
+when to call" line alone (variant M) over-elicits. Pair it with a
+concrete syntax-form example on a DIFFERENT topic (variant K) so the
+model anchors on "what does the call look like" alongside "when to
+choose this tool." Topically-distinct examples prevent the model from
+pattern-matching narrowly on the example's topic.
+
+For the canonical query-to-svg__generate redesign:
+
+```
+description: "Renders a description as an SVG inline in the
+              conversation.  Both you and the user see the result.
+
+              When to call: a user describing wanting to see
+              something, mentioning a visual idea, asking for a
+              diagram, or describing a scene they're trying to picture.
+
+              How to call: the `query` parameter is a natural-language
+              description of the image. Example call:
+              query='an ornate art-nouveau door frame in deep green
+              and gold'."
+
+parameters:   { query: str }    # drop max_iters/width/height
+```
+
+This shape combines (a) drop user-facing-defaults parameters
+[round 1], (b) qualitative trigger [round 2], (c) syntax-form example
+on non-overlapping topic [round 2]. Testing under controlled-variance
+conditions (fresh bridge + per-trial seeds + K≥50) is future work.
+
 ## What we did NOT do (out of scope)
 
 - Bridge-side `tool_choice: required` honouring — this would be a real

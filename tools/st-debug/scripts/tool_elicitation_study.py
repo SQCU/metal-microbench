@@ -333,6 +333,117 @@ def variant_J_canonical_framing() -> list:
     }]
 
 
+# ── Dual-example variants: qualitative situation→tool + syntax query→form ─
+#
+# Per the user (2026-05-08): the show-don't-tell finding is correct, but
+# a SINGLE example combines two distinct teachings — "when does the
+# situation merit calling this tool" AND "how should the query string
+# be shaped". Splitting them, with NON-OVERLAPPING TOPICAL CONTENT,
+# avoids transitive cargo-culting (model learning "only fire on the
+# specific topic shown" rather than the general principle).
+
+def variant_K_dual_examples_single() -> list:
+    """One tool. Description has TWO distinct examples, deliberately
+    on unrelated topics:
+      - qualitative situation→tool example: "when a user describes a
+        scene they want to see"
+      - syntax query→form example: a fully-shaped query for a
+        completely different topic
+    Different topics = the model has to generalize, not pattern-match."""
+    return [{
+        "type": "function",
+        "function": {
+            "name": "draw_svg",
+            "description": (
+                "Renders a description as an SVG inline in the conversation. "
+                "Both you and the user see the result.\n"
+                "\n"
+                "When to call: examples of situations where this tool fits — "
+                "a user describing wanting to see something, mentioning a "
+                "visual idea, asking for a diagram, or describing a scene "
+                "they're trying to picture.\n"
+                "\n"
+                "How to call: the `query` parameter is a natural-language "
+                "description of the image. Example call: "
+                "query='an ornate art-nouveau door frame in deep green and gold'."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string",
+                              "description": "Natural-language description of the image to render."},
+                },
+                "required": ["query"],
+            },
+        },
+    }]
+
+
+def variant_L_dual_examples_pair() -> list:
+    """Paired tools (quick / refined), each with the dual-example
+    pattern: qualitative situation example + syntax example, on
+    non-overlapping topics across the pair."""
+    return [
+        {"type": "function", "function": {
+            "name": "draw_svg_quick",
+            "description": (
+                "Single-attempt SVG rendering, returns in about 5 seconds. "
+                "Suited for icons, small diagrams, sketches.\n"
+                "\n"
+                "When to call: a user wanting a quick visual sketch, an "
+                "icon for a label, or a simple shape — situations where "
+                "polish matters less than turnaround.\n"
+                "\n"
+                "How to call: example query='a flat-style coffee cup icon, "
+                "outlined in black'."),
+            "parameters": {"type": "object",
+                "properties": {"query": {"type": "string", "description": "What to draw."}},
+                "required": ["query"]}}},
+        {"type": "function", "function": {
+            "name": "draw_svg_refined",
+            "description": (
+                "SVG rendering with three iterative refinement passes against "
+                "vision feedback. Takes about 30 seconds.\n"
+                "\n"
+                "When to call: a user describing a detailed scene, asking for "
+                "something they'd want to share or use as a reference, or "
+                "describing imagery where accuracy to the description matters.\n"
+                "\n"
+                "How to call: example query='a stained-glass window depicting "
+                "phases of the moon, deep cobalt and silver palette'."),
+            "parameters": {"type": "object",
+                "properties": {"query": {"type": "string", "description": "What to draw."}},
+                "required": ["query"]}}},
+    ]
+
+
+def variant_M_qualitative_only() -> list:
+    """Single tool with ONLY the qualitative situation example, no
+    syntax example. Isolates: does the situation→tool example carry
+    most of the lift, or does the syntax→form example also contribute?"""
+    return [{
+        "type": "function",
+        "function": {
+            "name": "draw_svg",
+            "description": (
+                "Renders a description as an SVG inline in the conversation. "
+                "Both you and the user see the result.\n"
+                "\n"
+                "When to call: examples of situations where this tool fits — "
+                "a user describing wanting to see something, mentioning a "
+                "visual idea, asking for a diagram, or describing a scene "
+                "they're trying to picture."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string",
+                              "description": "Natural-language description of the image to render."},
+                },
+                "required": ["query"],
+            },
+        },
+    }]
+
+
 VARIANTS = {
     "A_single_terse":     variant_A_single_terse,
     "B_single_verbose":   variant_B_single_verbose,
@@ -345,38 +456,51 @@ VARIANTS = {
     "H_polite_pair":      variant_H_polite_contextual_pair,
     "I_few_shot":         variant_I_few_shot_example,
     "J_canonical_framing": variant_J_canonical_framing,
+    # Dual-example (qualitative + syntax) variants:
+    "K_dual_examples":    variant_K_dual_examples_single,
+    "L_dual_examples_pair": variant_L_dual_examples_pair,
+    "M_qualitative_only": variant_M_qualitative_only,
 }
 
 
 # ── Prompts ────────────────────────────────────────────────────────────
 #
-# The "stem query" — ambiguous enough that the model's choice isn't
-# forced by directive language. The user explicitly asked us to test
-# improvisational dialogue, not directive prompts.
+# The user (2026-05-08) made the calibration point: a useful tool is one
+# that's elicited far more often when relevant WITHOUT erroneous
+# elicitation. So we need TWO prompts:
+#   - POSITIVE: a clearly visual ask. We want HIGH tool-use rate.
+#   - NEGATIVE: a clearly non-visual ask. We want LOW tool-use rate.
+# A variant whose lift is symmetric across positive and negative is
+# CALIBRATED (e.g., 40%/40% means it fires equally regardless of context
+# — bad). The aspirational shape is high TPR + low FPR.
 
-# We use the scringlo persona because:
-#   1. The user reported the regression specifically in scringlo-shape chats
-#   2. The persona is silly/improv, which makes "should I use a tool?"
-#      genuinely ambiguous — a tool-savvy persona would always tool, a
-#      no-tools persona never would
-SCRINGLO_DISCOURSE = [
-    {"role": "system",
-     "content": "Write scringlo scramble's next reply in a fictional chat between scringlo scramble and lusier."},
-    {"role": "system",
-     "content": "scringlo scramble is basically just a silly little guy. (they/her). they have access to drawing tools and like to use them when asked to visualize something."},
-    {"role": "system", "content": "[Start a new Chat]"},
-    {"role": "assistant", "content": "uhmmmm... hlello?"},
-    {"role": "user", "content": "i wanna see a fractal!! ✨"},
-]
+# Persona scaffolding — same scringlo improv across both prompts so the
+# only thing changing is the user turn.
+def make_discourse(user_text: str) -> list:
+    return [
+        {"role": "system",
+         "content": "Write scringlo scramble's next reply in a fictional chat between scringlo scramble and lusier."},
+        {"role": "system",
+         "content": "scringlo scramble is basically just a silly little guy. (they/her). they have access to drawing tools and like to use them when asked to visualize something."},
+        {"role": "system", "content": "[Start a new Chat]"},
+        {"role": "assistant", "content": "uhmmmm... hlello?"},
+        {"role": "user", "content": user_text},
+    ]
+
+
+PROMPTS = {
+    "positive": "i wanna see a fractal!! ✨",   # genuinely visual ambiguous ask
+    "negative": "what time do you usually go to bed??",   # not visual at all
+}
 
 
 # ── Runner ─────────────────────────────────────────────────────────────
 
-def fire_one(*, tools: list, semaphore_handle=None) -> dict:
+def fire_one(*, tools: list, prompt_text: str) -> dict:
     """One bridge call. Returns observation dict."""
     body = json.dumps({
         "model": "gemma-4-a4b",
-        "messages": SCRINGLO_DISCOURSE,
+        "messages": make_discourse(prompt_text),
         "tools": tools,
         "tool_choice": "auto",
         "temperature": TEMPERATURE,
@@ -404,15 +528,16 @@ def fire_one(*, tools: list, semaphore_handle=None) -> dict:
     }
 
 
-def run_variant(name: str, builder, k: int) -> list[dict]:
-    """K replicates of a variant. Returns list of observation dicts."""
+def run_cell(name: str, builder, prompt_label: str, prompt_text: str,
+             k: int) -> list[dict]:
+    """K replicates of a (variant, prompt) cell."""
     tools = builder()
     obs = []
     for i in range(k):
-        sys.stderr.write(f"\r  [{name}] {i+1}/{k}")
+        sys.stderr.write(f"\r  [{name} / {prompt_label}] {i+1}/{k}")
         sys.stderr.flush()
         try:
-            obs.append(fire_one(tools=tools))
+            obs.append(fire_one(tools=tools, prompt_text=prompt_text))
         except Exception as e:
             obs.append({"elapsed": 0, "tool_called": False, "tool_names": [],
                         "error": str(e), "completion_tokens": 0,
@@ -421,61 +546,78 @@ def run_variant(name: str, builder, k: int) -> list[dict]:
     return obs
 
 
-def summarize(name: str, obs: list[dict]) -> dict:
-    """Per-variant summary stats."""
+def cell_rate(obs: list[dict]) -> tuple[int, int, float]:
+    """(n_called, n_total, rate)."""
     n = len(obs)
     n_called = sum(1 for o in obs if o["tool_called"])
-    rate = n_called / n if n else 0.0
-    # Histogram of tool names called (for multi-tool variants)
-    name_counts = {}
-    for o in obs:
-        for tn in o["tool_names"]:
-            name_counts[tn] = name_counts.get(tn, 0) + 1
-    elapsed_when_called = [o["elapsed"] for o in obs if o["tool_called"]]
-    elapsed_when_prose = [o["elapsed"] for o in obs if not o["tool_called"]]
-    return {
-        "name": name,
-        "n_replicates": n,
-        "n_called": n_called,
-        "tool_use_rate": rate,
-        "tool_name_counts": name_counts,
-        "p50_call_s": statistics.median(elapsed_when_called) if elapsed_when_called else None,
-        "p50_prose_s": statistics.median(elapsed_when_prose) if elapsed_when_prose else None,
-        "errors": sum(1 for o in obs if o.get("error")),
-    }
+    return n_called, n, (n_called / n if n else 0.0)
 
 
 def main() -> int:
     print(f"=== tool-description elicitation A/B study ===")
-    print(f"  K replicates per variant: {K_REPLICATES}")
-    print(f"  temperature:              {TEMPERATURE}")
-    print(f"  prompt: scringlo improv, ambiguous 'i wanna see a fractal!! ✨'")
+    print(f"  K replicates per (variant, prompt): {K_REPLICATES}")
+    print(f"  temperature: {TEMPERATURE}")
+    print(f"  prompts:")
+    for label, text in PROMPTS.items():
+        print(f"    [{label}] {text!r}")
+    print(f"  variants: {len(VARIANTS)} ({', '.join(VARIANTS.keys())})")
     print()
 
-    summaries = []
+    # rows[variant][prompt_label] = list of observation dicts
+    rows: dict[str, dict[str, list[dict]]] = {}
     for name, builder in VARIANTS.items():
-        obs = run_variant(name, builder, K_REPLICATES)
-        s = summarize(name, obs)
-        summaries.append(s)
+        rows[name] = {}
+        for prompt_label, prompt_text in PROMPTS.items():
+            rows[name][prompt_label] = run_cell(
+                name, builder, prompt_label, prompt_text, K_REPLICATES)
 
-    # Final report.
+    # Calibration report. The aspirational shape is HIGH on positive,
+    # LOW on negative — a calibrated tool fires when relevant and
+    # skips when not. Quote both raw rates plus a "calibration
+    # margin" = TPR - FPR. Positive margin is good; near-zero margin
+    # means the tool fires regardless of relevance.
     print()
-    print(f"  {'variant':<22} | {'tool-use rate':<13} | {'p50 call/s':<11} | tools called (count)")
-    print(f"  {'-'*22}-+-{'-'*13}-+-{'-'*11}-+-{'-'*40}")
-    for s in summaries:
-        rate_str = f"{s['n_called']:>2}/{s['n_replicates']}  ({s['tool_use_rate']*100:>4.0f}%)"
-        p50 = s["p50_call_s"]
-        p50_str = f"{p50:.1f}" if p50 is not None else "—"
-        names_str = ", ".join(f"{n}={c}" for n, c in s["tool_name_counts"].items()) or "(none)"
-        print(f"  {s['name']:<22} | {rate_str:<13} | {p50_str:<11} | {names_str}")
+    print(f"  {'variant':<22} | {'TPR (positive)':<15} | "
+          f"{'FPR (negative)':<15} | {'calib margin':<12} | tools (positive)")
+    print(f"  {'-'*22}-+-{'-'*15}-+-{'-'*15}-+-{'-'*12}-+-{'-'*30}")
+    for name in VARIANTS.keys():
+        pos_obs = rows[name]["positive"]
+        neg_obs = rows[name]["negative"]
+        pos_called, pos_n, pos_rate = cell_rate(pos_obs)
+        neg_called, neg_n, neg_rate = cell_rate(neg_obs)
+        margin = pos_rate - neg_rate
+        pos_str = f"{pos_called:>2}/{pos_n}  ({pos_rate*100:>4.0f}%)"
+        neg_str = f"{neg_called:>2}/{neg_n}  ({neg_rate*100:>4.0f}%)"
+        margin_str = f"{margin*100:+>5.0f}pp"
+        # Tool-name histogram on positive prompt
+        name_counts = {}
+        for o in pos_obs:
+            for tn in o["tool_names"]:
+                name_counts[tn] = name_counts.get(tn, 0) + 1
+        names_str = ", ".join(f"{n}={c}" for n, c in name_counts.items()) or "(none)"
+        print(f"  {name:<22} | {pos_str:<15} | {neg_str:<15} | "
+              f"{margin_str:<12} | {names_str}")
 
-    # Save raw observations alongside summary.
+    # Save raw observations + per-cell summaries.
     out = pathlib.Path("/tmp/tool_elicitation_study.json")
+    summaries = {}
+    for name, by_prompt in rows.items():
+        summaries[name] = {}
+        for prompt_label, obs in by_prompt.items():
+            n_called, n, rate = cell_rate(obs)
+            summaries[name][prompt_label] = {
+                "n_called": n_called, "n_total": n, "rate": rate,
+                "tool_name_counts": {
+                    tn: sum(1 for o in obs if tn in o["tool_names"])
+                    for tn in {n_ for o in obs for n_ in o["tool_names"]}
+                },
+            }
     payload = {
         "config": {
             "k_replicates": K_REPLICATES,
             "temperature": TEMPERATURE,
             "max_tokens": MAX_TOKENS,
+            "prompts": PROMPTS,
         },
         "summaries": summaries,
     }
