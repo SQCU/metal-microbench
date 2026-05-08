@@ -549,7 +549,18 @@ let logits      = emptyHalf(B * VOCAB)
 // runAdmissionPass is removed (lm_engine.swift:1436), so 8192 is now
 // sized for actual concurrent demand: 8 streams × ~140 pages typical
 // = ~1100 pages active, with ~7× headroom.
-let MAX_RESIDENT_SESSIONS = 16                    // logical users held in KV
+// 2026-05-07: bumped from 16 to 64 for the M:K permutation refactor.
+// M=64 logical sessions decoupled from K=B=8 kernel-batch positions.
+// Each AR CB picks K of M sessions in .generating state; sessions
+// that are priming/idle wait their turn without silencing kernel
+// positions. Bench CONCURRENCY can go up to MAX_RESIDENT_SESSIONS
+// without bench-side queueing — engine queues them all in
+// residentSessions and rotates them through kernel positions.
+//
+// Memory impact: KV-page footprint is per-session × pages-per-session
+// = M × ~100 pages = ~6400 pages. Within current 8192-page pool.
+// If long-context workloads need more headroom, bump SCRATCH_PAGE_BASE.
+let MAX_RESIDENT_SESSIONS = 64                    // logical users held in KV
 let SCRATCH_STRIP = 256                           // silenced-slot scratch (shared)
 let SCRATCH_PAGE_BASE = 8192                     // DEBUG: pool=12288 to capture all Metal validation messages
 let REAL_PAGE_BASE = 0

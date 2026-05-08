@@ -518,11 +518,27 @@ struct SessionTrigger {
 
 final class Session {
     let id: Int
-    // Which active-batch slot this session is currently occupying, or nil
-    // when the session is *resident* (KV pages retained, block_table not
-    // populated) but not in the active batch. The scheduler moves sessions
-    // between resident-without-slot and resident-with-slot each tick.
+    // 2026-05-07 (M:K permutation): `slot` is now per-CB scratch.
+    //   - Set by the engine's per-CB picker (pickKernelMappingForAR /
+    //     pickKernelMappingForPrefill) BEFORE each CB runs, to the
+    //     kernel-batch position [0..B) the session is currently
+    //     occupying for THIS CB.
+    //   - Cleared/repicked at the start of the NEXT CB.
+    //   - Read by existing prepare/finalize code that uses s.slot to
+    //     index kernel buffers (input_tokens, sampling, block_table).
+    //
+    // The previous semantics (persistent slot ownership for the life
+    // of the session, set by runAdmissionPass) is gone — sessions
+    // live in residentSessions[Int: Session] indefinitely (M >> B
+    // logical sessions allowed) and rotate through kernel positions.
     var slot: Int?
+    // 2026-05-07: client-controlled flags moved onto Session so the
+    // engine doesn't depend on bridge-side dictionaries. Set by
+    // applyStreamAction at start; engine reads them per CB to
+    // populate gpu_capture_active / gpu_capture_topk for the
+    // chosen kpos.
+    var captureLogits: Bool = false
+    var topLogprobs: UInt32 = 0
     let eosId: UInt32
     var maxNewTokens: Int
     // Sampling temperature. 0 (default) = greedy argmax, preserving
@@ -1158,15 +1174,17 @@ final class LmEngine {
     // batch slot. Limited to MAX_RESIDENT_SESSIONS — beyond that, callers
     // queue externally (a separate admission layer handles that).
     private(set) var residentSessions: [Int: Session] = [:]
-    // Active-batch slot table: slotAssignment[s] is a session id or nil.
+    // 2026-05-07 (M:K): slotAssignment removed. With the per-CB picker
+    // model, kernel positions are assigned dynamically via Session.slot.
+    // Keeping the field declarations as @unused stubs would be misleading;
+    // they're gone. Code that searches sid → kpos can iterate residents
+    // with `where $0.slot == kpos`.
     // Decoupled from residentSessions — sessions move in and out of slots
     // each tick based on `wantsSlot` state.
-    private var slotAssignment: [Int?]
     private var nextId: Int = 1
 
-    // Round-robin cursor for slot admission — avoids sticky-bias toward
-    // low-id sessions when more ready sessions exist than free slots.
-    private var admissionCursor: Int = 0
+    // 2026-05-07 (M:K): admissionCursor + slotAssignment retired. Picker
+    // owns its own cursor (pickerCursor); admission is now slot-free.
 
     // Page manager owns the KV cache's physical page pool.
     let pageManager: PageManager
@@ -1207,7 +1225,7 @@ final class LmEngine {
     init(weights: LmWeights) {
         self.weights = weights
         self.tokenizer = GemmaBpe(weights: weights)
-        self.slotAssignment = Array(repeating: nil, count: B)
+        // 2026-05-07 (M:K): slotAssignment removed. Picker assigns kpos per CB.
         self.pageManager = PageManager(numPhysPages: SCRATCH_PAGE_BASE,
                                         pageSize: PAGE_SLIDE)
         self._savedBTScratchByteCount = B * MAX_PAGES_PER_SLOT * MemoryLayout<UInt32>.stride
@@ -1355,10 +1373,9 @@ final class LmEngine {
     // Close: release slot (if any), return pages, drop from residency.
     func closeSession(_ s: Session) {
         s.state = .done
-        if let slot = s.slot {
-            slotAssignment[slot] = nil
-            s.slot = nil
-        }
+        // 2026-05-07 (M:K): no persistent slotAssignment to clear; slot
+        // is per-CB scratch. Just nil out the per-CB field for cleanliness.
+        s.slot = nil
         pageManager.releaseAllForSession(s.id)
         s.ownedPages.removeAll()
         s.consumedTokens.removeAll()
@@ -1410,9 +1427,11 @@ final class LmEngine {
 
     func poolStats() -> PageManager.Stats { return pageManager.stats() }
 
-    // Sessions currently occupying active batch slots (length ≤ B).
+    // 2026-05-07 (M:K): "active" sessions are now all residents in a
+    // busy state (.priming or .generating). Length can be > B; the
+    // per-CB picker selects up to B of them for kernel positions.
     var activeSessions: [Session] {
-        return slotAssignment.compactMap { $0.flatMap { residentSessions[$0] } }
+        return residentSessions.values.filter { $0.state.isBusy }
     }
     // Resident sessions that want a slot (priming or generating).
     var readyResidents: [Session] {
@@ -1431,52 +1450,87 @@ final class LmEngine {
     func runAdmissionPassPublic() { runAdmissionPass() }
 
     private func runAdmissionPass() {
-        for slot in 0..<B {
-            if let sid = slotAssignment[slot],
-               let s = residentSessions[sid],
-               !s.state.wantsSlot {
-                s.slot = nil
-                slotAssignment[slot] = nil
-            }
+        // 2026-05-07 (M:K permutation): admission is now a no-op.
+        // Sessions are added to residentSessions by openSession();
+        // page allocation happens lazily in prepare* paths (per CB)
+        // via ensurePages with the exact kLen the CB needs. Pre-
+        // reserving a 1024-token floor at admission worked when M=B=8
+        // (8 × 128 pages = 1024 pages, headroom in 8192-page pool),
+        // but at M=64 it reserves 8192 pages = the entire pool, and
+        // each session is over-allocated 4× what it actually uses.
+        //
+        // Per-CB ensurePages provides correct block_table coverage
+        // for the kernel positions chosen this CB; non-chosen
+        // sessions don't need any pages until their next CB.
+    }
+
+    // 2026-05-07: per-CB kernel-batch position picker.
+    //
+    // Picks up to B of the M=residentSessions.count sessions to occupy
+    // kernel-batch positions [0..B). Returns a [Session?] of length B
+    // indexed by kpos; nil entries are silenced (the kernel still runs
+    // those positions but with scratch-strip block_table + sampling_active=0).
+    //
+    // Selection: round-robin by session id. The cursor advances by 1 per
+    // CB, so over many CBs each session gets equal kernel-batch share.
+    // For workloads with M >> B (e.g., M=64 sessions, B=8), each session
+    // gets ~B/M ≈ 12.5% of the kernel-batch share. Per-session decode
+    // rate drops; aggregate throughput stays at the kernel ceiling.
+    //
+    // Side effects: sets `Session.slot = kpos` on each chosen session
+    // for use by existing prepare/finalize code that indexes kernel
+    // buffers via s.slot. Non-chosen sessions get s.slot = nil.
+    //
+    // `state` filter selects which sessions are eligible: .generating
+    // for AR, .priming for prefill paths.
+    private func pickKernelMappingForState(
+        _ acceptable: (Session) -> Bool
+    ) -> [Session?] {
+        // Clear all residents' slots — only chosen ones get a kpos.
+        for s in residentSessions.values { s.slot = nil }
+        let eligible = residentSessions.values
+            .filter(acceptable)
+            .sorted { $0.id < $1.id }
+        var mapping: [Session?] = Array(repeating: nil, count: B)
+        if eligible.isEmpty { return mapping }
+        let pickStart = pickerCursor % eligible.count
+        for i in 0..<min(B, eligible.count) {
+            let s = eligible[(pickStart + i) % eligible.count]
+            s.slot = i
+            mapping[i] = s
         }
-        let ready = readyResidents.filter { $0.slot == nil }.sorted { $0.id < $1.id }
-        if ready.isEmpty { return }
-        var cursor = admissionCursor % ready.count
-        for slot in 0..<B where slotAssignment[slot] == nil {
-            let pick = ready[cursor % ready.count]
-            if pick.slot != nil { cursor += 1; continue }
-            pick.slot = slot
-            slotAssignment[slot] = pick.id
-            // Reserve enough for the chat-turn-typical context (1024
-            // tokens = 128 pages) + currently-pending prefill, NOT
-            // the entire `maxNewTokens` budget. The 1024 floor is
-            // load-bearing: block_table entries beyond `ownedPages`
-            // are stale pointers, and AR/prefill kernels read
-            // block_table at logical-page positions up to the
-            // session's max-context — under-reserving makes those
-            // reads target wrong physical pages and silently corrupt
-            // KV cache.
-            //
-            // Growth past the 1024 floor happens lazily on AR ticks
-            // via `ensurePages(s, forKLen: s.position + 2)` in
-            // finalizeARStep — that's the page allocator's own future
-            // work and does not need to be preempted here.
-            //
-            // The previous version added `pick.maxNewTokens + 8` to
-            // the lookahead. With maxNewTokens=8192 (a normal client
-            // setting for long-form responses), that meant ~1025
-            // pages per session × 8 admitted streams = 8200 pages
-            // required at admission burst — guaranteed pool exhaustion
-            // on any admission burst with realistic max_tokens. That
-            // pattern is removed; only the 1024-token typical-context
-            // floor remains.
-            let pendingPrime = pick.pendingPrimingCount
-            let lookahead = max(pick.position + pendingPrime + 8, 1024)
-            _ = ensurePages(pick, forKLen: lookahead)
-            installBlockTable(pick, slot: slot)
-            cursor += 1
+        pickerCursor &+= 1
+        return mapping
+    }
+
+    private var pickerCursor: Int = 0
+
+    private func pickKernelMappingForAR() -> [Session?] {
+        // AR can serve both .generating sessions (real decode) AND
+        // .priming sessions with a 1-token tail (popArPrimingToken
+        // consumes them one token at a time). The pickChainPath
+        // already routed multi-token-priming sessions to a prefill
+        // path; whatever lands here is decoder-eligible.
+        return pickKernelMappingForState { $0.state.isBusy }
+    }
+
+    // For prefill paths, the caller supplies a list of sessions in priming
+    // state (already filtered by chunk type — text vs soft). The picker
+    // assigns up to B of them to kernel positions and silences the rest.
+    private func pickKernelMappingForPrefill(_ sessions: [Session]) -> [Session?] {
+        for s in residentSessions.values { s.slot = nil }
+        let eligible = sessions.filter { residentSessions[$0.id] != nil }
+            .sorted { $0.id < $1.id }
+        var mapping: [Session?] = Array(repeating: nil, count: B)
+        if eligible.isEmpty { return mapping }
+        let pickStart = pickerCursor % eligible.count
+        for i in 0..<min(B, eligible.count) {
+            let s = eligible[(pickStart + i) % eligible.count]
+            s.slot = i
+            mapping[i] = s
         }
-        admissionCursor = (admissionCursor + 1) % max(ready.count, 1)
+        pickerCursor &+= 1
+        return mapping
     }
 
     // Take one token off the head chunk if it's a .tokens chunk. Returns
@@ -1720,12 +1774,20 @@ final class LmEngine {
         let npsP = num_pages_slide.contents().bindMemory(to: UInt32.self, capacity: B)
         let npfP = num_pages_full.contents().bindMemory(to: UInt32.self, capacity: B)
 
+        // 2026-05-07 (M:K permutation): pick up to B sessions in
+        // .generating state from residentSessions to occupy the kernel
+        // batch positions. The picker assigns Session.slot = kpos for
+        // each chosen session; the existing per-kpos populate code
+        // below uses s.slot as the kernel index. Non-chosen kernel
+        // positions are silenced (block_table[kpos][0] → scratch,
+        // sampling_active=0 implicit via realSlot=false).
+        let arMapping = pickKernelMappingForAR()
+
         // Track which slots run REAL work this step.
         var realSlot = [Bool](repeating: false, count: B)
 
         for slot in 0..<B {
-            if let sid = slotAssignment[slot],
-               let s = residentSessions[sid], s.state.isBusy {
+            if let s = arMapping[slot], s.state.isBusy {
                 // Grow pages if needed for the step that's about to run.
                 _ = ensurePages(s, forKLen: s.position + 2)
                 installBlockTable(s, slot: slot)
@@ -1747,17 +1809,14 @@ final class LmEngine {
                     continue
                 }
             }
-            // Park: BOS at position 0, k_len=1, 1 page. The park slot writes
-            // to whatever phys page is installed in block_table[slot][0] —
-            // which for an unassigned slot is the scratch strip via the
-            // guard-page fallback in installBlockTable. Safe no-op.
+            // Park: BOS at position 0, k_len=1, 1 page. Non-chosen kernel
+            // positions get scratch-strip block_table to keep KV writes
+            // from this park step from corrupting other sessions' pages.
             tokP[slot] = weights.bosTokenId
             posP[slot] = 0
             klsP[slot] = 1; klfP[slot] = 1
             npsP[slot] = 1; npfP[slot] = 1
-            if slotAssignment[slot] == nil {
-                // No session here; redirect block_table[slot][0] to scratch
-                // so this park step's KV write can't corrupt someone else.
+            if arMapping[slot] == nil {
                 let btP = block_table.contents().bindMemory(to: UInt32.self,
                             capacity: B * MAX_PAGES_PER_SLOT)
                 btP[slot * MAX_PAGES_PER_SLOT + 0] = UInt32(SCRATCH_PAGE_BASE)
@@ -1769,12 +1828,11 @@ final class LmEngine {
 
         // Sampling params for the GPU sample_token dispatch that
         // encodes at the end of buildStepCB. See populateSamplingParams.
+        // 2026-05-07 (M:K): use arMapping (from picker) instead of the
+        // deleted slotAssignment.
         var arSlotSession: [Session?] = Array(repeating: nil, count: B)
         for slot in 0..<B where realSlot[slot] {
-            if let sid = slotAssignment[slot],
-               let s = residentSessions[sid] {
-                arSlotSession[slot] = s
-            }
+            arSlotSession[slot] = arMapping[slot]
         }
         populateSamplingParams(arSlotSession)
 
@@ -1790,8 +1848,7 @@ final class LmEngine {
         // can write back pre-write projections for telemetry.
         for slot in 0..<B { gSlotControls[slot].removeAll(keepingCapacity: true) }
         for slot in 0..<B where realSlot[slot] {
-            guard let sid = slotAssignment[slot],
-                  let s = residentSessions[sid] else { continue }
+            guard let s = arMapping[slot] else { continue }
             let measBase = slot * MAX_PROJECT_CONTROLS_PER_SLOT
             var measIdx = 0
             for c in s.activeControls {
@@ -1853,8 +1910,7 @@ final class LmEngine {
         // scalar output. Max MAX_DETECTORS_PER_SLOT detectors per slot.
         for slot in 0..<B { gSlotDetectors[slot].removeAll(keepingCapacity: true) }
         for slot in 0..<B where realSlot[slot] {
-            guard let sid = slotAssignment[slot],
-                  let s = residentSessions[sid] else { continue }
+            guard let s = arMapping[slot] else { continue }
             let base = slot * MAX_DETECTORS_PER_SLOT
             for (i, d) in s.detectors.prefix(MAX_DETECTORS_PER_SLOT).enumerated() {
                 gSlotDetectors[slot].append(SlotDetector(
@@ -2156,9 +2212,14 @@ final class LmEngine {
 
     func prepareSinglePrefill(_ s: Session) -> PreparedSinglePrefill? {
         guard s.state == .priming, let head = s.chunkQueue.first else { return nil }
-        // Ensure the session owns an active slot. If not, run admission first.
-        if s.slot == nil { runAdmissionPass() }
-        guard let sslot = s.slot else { return nil }
+        // 2026-05-07 (M:K): single-slot prefill puts THIS session at
+        // kpos 0, silences the rest. The picker isn't involved (only
+        // one session in the prefill); we just stamp s.slot=0 so
+        // existing code that uses s.slot reads kpos=0.
+        runAdmissionPass()    // ensure pages allocated
+        for other in residentSessions.values where other.id != s.id { other.slot = nil }
+        s.slot = 0
+        let sslot = 0
         let qLen = head.count
         precondition(qLen >= 1)
         let thisTile = min(qLen, MAX_Q_LEN)
@@ -2647,18 +2708,16 @@ final class LmEngine {
 
     func prepareMultiSlotPrefill(_ sessions: [Session]) -> PreparedMultiPrefill? {
         runAdmissionPass()
-        // Gather each busy slot's priming session + chunk. Per-CB
-        // [Session?]/[[UInt32]] arrays are 8 elements each (~tens of
-        // bytes) — kept as fresh allocs because Swift's Copy-on-Write
-        // would copy them anyway on `return PreparedMultiPrefill(...,
-        // slotSession: ...)` capture.
+        // 2026-05-07 (M:K): pick up to B priming sessions and assign
+        // them kpos 0..K-1. Non-chosen kernel positions silenced.
+        let mapping = pickKernelMappingForPrefill(sessions)
         var slotSession: [Session?] = Array(repeating: nil, count: B)
         var slotTokens: [[UInt32]] = Array(repeating: [], count: B)
-        for s in sessions {
-            guard let sslot = s.slot else { continue }
+        for kpos in 0..<B {
+            guard let s = mapping[kpos] else { continue }
             guard case .tokens(let ts) = s.chunkQueue.first, !ts.isEmpty else { continue }
-            slotSession[sslot] = s
-            slotTokens[sslot] = ts
+            slotSession[kpos] = s
+            slotTokens[kpos] = ts
         }
         // min remaining across active slots; cap at MAX_Q_LEN.
         var qLen = MAX_Q_LEN
@@ -2881,13 +2940,14 @@ final class LmEngine {
 
     func prepareMultiSlotSoftPrefill(_ sessions: [Session]) -> PreparedSoftPrefill? {
         runAdmissionPass()
-        // Gather each busy slot's current soft-tokens chunk.
+        // 2026-05-07 (M:K): same picker pattern as text prefill.
+        let mapping = pickKernelMappingForPrefill(sessions)
         var slotSoft: [Int: SoftRef] = [:]
-        for s in sessions {
-            guard let sslot = s.slot else { continue }
+        for kpos in 0..<B {
+            guard let s = mapping[kpos] else { continue }
             guard case let .softTokens(buf, count, isFp32, byteOffset, eventTicket) = s.chunkQueue.first
             else { continue }
-            slotSoft[sslot] = SoftRef(session: s, buffer: buf, remainingCount: count,
+            slotSoft[kpos] = SoftRef(session: s, buffer: buf, remainingCount: count,
                                        isFp32: isFp32, byteOffset: byteOffset,
                                        eventTicket: eventTicket)
         }
