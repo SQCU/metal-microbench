@@ -503,7 +503,11 @@ async def chat_completions(req: Request) -> Any:
     messages = body.get("messages", [])
     if not messages:
         raise HTTPException(400, "messages is required")
-    max_tokens = int(body.get("max_tokens", body.get("max_completion_tokens", 256)))
+    # Default bumped 256 → 4096 on 2026-05-07. The 256 default came from
+    # before the engine could sustain long contexts; Gemma-4 rates 128k and
+    # the engine kernel-side handles 64k+ full-cache cleanly. Clients that
+    # want shorter responses pass max_tokens explicitly.
+    max_tokens = int(body.get("max_tokens", body.get("max_completion_tokens", 4096)))
     stream = bool(body.get("stream", False))
 
     # Research-feature body fields that don't yet have unified-FFI

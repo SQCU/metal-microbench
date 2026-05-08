@@ -106,7 +106,7 @@ class SamplingParams:
     top_p: float = 1.0
     top_k: int = 0
     repetition_penalty: float = 1.0
-    max_new_tokens: int = 64
+    max_new_tokens: int = 4096   # bumped from 64 (2026-05-07): Gemma-4 rates 128k context; engine kernel-side handles 64k full-cache / 128k slide. 64 was a stale default from before the engine could sustain long contexts.
     seed: int = 0
     eos_token_id: int = -1            # -1 = use model default
     stop_tokens: list[int] = field(default_factory=list)

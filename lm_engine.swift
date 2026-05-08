@@ -1325,7 +1325,10 @@ final class LmEngine {
     // streamId, applies sampling/control state, and submits initial
     // segments all under the same lock acquisition. There is no
     // pre-first-submit window where a Session exists with no work.
-    fileprivate func openSession(eosId: UInt32? = nil, maxNewTokens: Int = 128) -> Session? {
+    fileprivate func openSession(eosId: UInt32? = nil, maxNewTokens: Int = 4096) -> Session? {
+        // 2026-05-07: default bumped 128 → 4096. Gemma-4 rates 128k context
+        // and the engine handles 64k+ full-cache positions per slot. The
+        // 128 default was from before long-context support landed.
         guard residentSessions.count < MAX_RESIDENT_SESSIONS else {
             print("  openSession: residency cap \(MAX_RESIDENT_SESSIONS) reached")
             return nil
@@ -1362,7 +1365,7 @@ final class LmEngine {
     // ────────────────────────────────────────────────────────────────────
     struct RequestInit {
         var eosId: UInt32? = nil
-        var maxNewTokens: Int = 128
+        var maxNewTokens: Int = 4096   // bumped 128 → 4096 (2026-05-07): see openSession default note
         var samplingTemperature: Float = 0.0
         var captureLogits: Bool = false
         var topLogprobs: UInt32 = 0
