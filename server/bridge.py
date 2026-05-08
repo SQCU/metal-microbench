@@ -272,6 +272,47 @@ def _parse_sampling(body: dict, max_tokens: int) -> g.SamplingParams:
 # the request and no markers are found (model declined to call),
 # tool_calls_list is None and content is unchanged.
 # ────────────────────────────────────────────────────────────────────────
+# Per-turn scaffolding bytes the model emits but clients shouldn't see.
+# 2026-05-07: surfaced after a SillyTavern-fork user reported
+# `<|channel|>thought\n` appearing at the start of responses.
+#
+# The chat template's `add_generation_prompt=True, enable_thinking=False`
+# epilogue is `<|turn>model\n<|channel>thought\n<channel|>` (the empty-
+# thought no-thinking marker). The model is supposed to start its
+# response AFTER `<channel|>` closes — and does — but in some contexts
+# (notably multi-turn flows after a prior tool_call) it ECHOES the
+# `<|channel>thought\n<channel|>` structure as the first tokens of its
+# output, presumably as a learned formatting habit. The bytes ride
+# through detokenize verbatim and bleed into client UIs.
+#
+# Likewise, `<turn|>` (id 106) is the engine's natural-stop marker
+# (`_TURN_END_TOKENS`). It's an EOS signal, not response content;
+# clients don't need it.
+#
+# Conservative strip rules:
+#   - Leading `<|channel>BODY<channel|>` ONLY when BODY is short (<= 40
+#     chars between markers) — i.e., the empty/short echo. Real
+#     thinking content (longer body) is preserved so callers using
+#     enable_thinking can still surface it.
+#   - Trailing `<turn|>` regardless.
+_LEADING_CHANNEL_RE = re.compile(
+    r'^\s*<\|channel>[^<]{0,40}<channel\|>\s*',
+    re.DOTALL,
+)
+_TRAILING_TURN_RE = re.compile(r'\s*<turn\|>\s*$', re.DOTALL)
+
+
+def _strip_response_scaffolding(text: str) -> str:
+    """Drop per-turn scaffolding bytes the client shouldn't see.
+
+    See _LEADING_CHANNEL_RE / _TRAILING_TURN_RE comments for what's
+    stripped and why. Body content between markers is preserved.
+    """
+    text = _LEADING_CHANNEL_RE.sub('', text)
+    text = _TRAILING_TURN_RE.sub('', text)
+    return text
+
+
 _TOOL_CALL_BLOCK_RE = re.compile(
     r'<\|tool_call>(.*?)<tool_call\|>',
     re.DOTALL,
@@ -832,6 +873,7 @@ async def chat_completions(req: Request) -> Any:
             # affordant.
             cleaned_text, extracted_tool_calls = _extract_tool_calls(
                 text, had_tools=tools is not None)
+            cleaned_text = _strip_response_scaffolding(cleaned_text)
             message: dict[str, Any] = {"role": "assistant",
                                         "content": cleaned_text}
             if extracted_tool_calls:
@@ -937,6 +979,7 @@ async def chat_completions(req: Request) -> Any:
                         full_text = g.detokenize(all_tokens)
                         cleaned_text, extracted = _extract_tool_calls(
                             full_text, had_tools=True)
+                        cleaned_text = _strip_response_scaffolding(cleaned_text)
                         if extracted:
                             finish = "tool_calls"
                             print(f"[bridge] (SSE) extracted "
