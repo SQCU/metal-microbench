@@ -367,14 +367,34 @@ async def _startup() -> None:
     else:
         print(f"[bridge] vision disabled (no safetensors path)", flush=True)
 
-    # Pre-tokenize Gemma-4's tool-call close marker. Used as a stop
-    # sequence on every chat-completion that ships tools[]: as soon as
-    # the model emits <tool_call|> the engine self-terminates with
-    # done_reason=1 (eos-equivalent), no wasted decode of the
-    # downstream <|tool_response> spam.
+    # Gemma-4's tool-call close marker. Used as a stop sequence on every
+    # chat-completion that ships tools[]: as soon as the model emits
+    # <tool_call|> the engine self-terminates with done_reason=1
+    # (eos-equivalent), no wasted decode of the downstream
+    # <|tool_response> hallucinations.
+    #
+    # 2026-05-07 (regression fix): MUST be hardcoded to the atomic vocab
+    # ID 49, not produced via g.tokenize("<tool_call|>"). Same pitfall as
+    # _TURN_END_TOKENS=[106] documented below: `g.tokenize` BPE-splits
+    # the literal angle-bracket string into multiple tokens, but the
+    # *model* emits a single atomic token id 49 (the special-token entry
+    # in tokenizer.json). A multi-token BPE stop-sequence never matches
+    # the model's single-token emission, so the engine NEVER STOPS at the
+    # marker — generation continues past the close marker into hallucinated
+    # post-call content (often more tool calls, or a fake <|tool_response>
+    # block). When max_tokens was 256 this was masked because truncation
+    # cut the trailing garbage early enough; the 256→4096 default bump on
+    # 2026-05-07 unmasked it and broke client-side tool-call parsers.
+    #
+    # Atomic vocab IDs (from /Users/mdot/models/gemma-4-a4b-bf16/tokenizer.json
+    # added_tokens, all special=true):
+    #     <|tool>          : 46     <tool|>          : 47
+    #     <|tool_call>     : 48     <tool_call|>     : 49
+    #     <|tool_response> : 50     <tool_response|> : 51
     global _TOOL_CALL_CLOSE_TOKENS
-    _TOOL_CALL_CLOSE_TOKENS = list(g.tokenize("<tool_call|>", add_bos=False))
-    print(f"[bridge] tool_call close tokens: {_TOOL_CALL_CLOSE_TOKENS}", flush=True)
+    _TOOL_CALL_CLOSE_TOKENS = [49]
+    print(f"[bridge] tool_call close tokens: {_TOOL_CALL_CLOSE_TOKENS} "
+          f"(<tool_call|> atomic vocab id)", flush=True)
 
     # Gemma-4's chat-template end-of-turn special token. The chat
     # template emits `<end_of_turn>` (special-token id 106 in the
