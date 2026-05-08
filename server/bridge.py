@@ -585,32 +585,6 @@ app.add_middleware(
 )
 
 
-# Opt-in request-body capture for "what is this client actually sending?"
-# debugging. Set BRIDGE_LOG_REQUESTS=/path/to/file.jsonl to append each
-# /v1/chat/completions request body as one JSON line. Off by default;
-# on path adds ~50µs per captured request (one decode + one fwrite).
-# Pair with scripts/replay_bridge_request.py to curl-replay any captured
-# request. Implemented inside the chat_completions handler (NOT a
-# middleware) — middleware-based body interception is fragile because
-# Starlette's receive-or-disconnect wrapper rejects re-injected
-# `http.request` messages with "Unexpected message received".
-_LOG_REQUESTS_PATH = os.environ.get("BRIDGE_LOG_REQUESTS")
-
-
-def _maybe_log_chat_request(body: dict) -> None:
-    if not _LOG_REQUESTS_PATH:
-        return
-    try:
-        with open(_LOG_REQUESTS_PATH, "a") as f:
-            f.write(json.dumps({
-                "ts": time.time(),
-                "path": "/v1/chat/completions",
-                "body": body,
-            }) + "\n")
-    except Exception as e:
-        print(f"[bridge] BRIDGE_LOG_REQUESTS write failed: {e}", flush=True)
-
-
 @app.on_event("startup")
 async def _startup() -> None:
     global _next_stream_id_lock
@@ -799,7 +773,6 @@ def list_models_compat() -> JSONResponse:
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request) -> Any:
     body = await req.json()
-    _maybe_log_chat_request(body)
     messages = body.get("messages", [])
     if not messages:
         raise HTTPException(400, "messages is required")
