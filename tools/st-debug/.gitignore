@@ -1,0 +1,8 @@
+# the ST dataRoot is regenerable — do not commit it
+_data/
+
+# playwright artifacts
+tests/node_modules/
+tests/playwright-report/
+tests/test-results/
+tests/.playwright/
