@@ -21,8 +21,10 @@ and the FFI stays free of role/template semantics.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Union
@@ -213,28 +215,114 @@ def render_chat(messages: list[dict], *,
 # assigns to single vocab slots. BPE'ing these markers splits them into
 # character pieces and pushes the model off-manifold; we emit the atomic
 # ID instead. Extended via _register_atomic_id() when more get wired.
-SPECIAL_TOKENS: dict[str, int] = {
-    # Turn / channel scaffolding (chat structure)
+# Tokens we deliberately DON'T atomic-ize when they appear in prose:
+#   bos / eos / pad / unk / mask:
+#       Added by the tokenizer's `add_bos` parameter when needed; emitting
+#       them as atomic IDs mid-string would break user prompts that
+#       happen to contain the literal substring "<bos>" (etc.) — like a
+#       documentation request about the tokenizer itself.
+#   <|image|>:
+#       The image placeholder. Already split out BEFORE tokenize_with_specials
+#       runs (see render_chat / _IMAGE_PLACEHOLDER), so atomic-izing it here
+#       would never match. Left out for clarity.
+_EXCLUDE_FROM_ATOMIC: frozenset[str] = frozenset({
+    "<bos>", "<eos>", "<pad>", "<unk>", "<mask>",
+    "<|image|>",
+})
+
+# Hand-coded fallback list, used only when tokenizer.json can't be
+# located at module-import time. Kept minimal: the auto-loader from
+# tokenizer.json is the canonical path and pulls everything the model
+# actually ships. Any entry here is just to keep the bridge from
+# crashing on a misconfigured deployment.
+_FALLBACK_SPECIAL_TOKENS: dict[str, int] = {
     "<|turn>":          105,
     "<turn|>":          106,
     "<|channel>":       100,
     "<channel|>":       101,
-    # Tool-call scaffolding. 2026-05-07: added after a regression where
-    # multi-turn flows with prior tool_calls were BPE-splitting these
-    # markers on the input path while the model was trained to emit them
-    # as single atomic tokens. Mismatched input bytes shifted the KV
-    # cache off-manifold for tool-aware prompts. IDs verified against
-    # tokenizer.json added_tokens (all special=true). See bridge.py's
-    # _TOOL_CALL_CLOSE_TOKENS comment for the matching output-side fix.
     "<|tool>":          46,
     "<tool|>":          47,
     "<|tool_call>":     48,
     "<tool_call|>":     49,
     "<|tool_response>": 50,
     "<tool_response|>": 51,
+    "<|\"|>":           52,
+    "<|think|>":        98,
 }
 
-_SPECIAL_RE = re.compile("|".join(re.escape(k) for k in SPECIAL_TOKENS))
+
+def _load_special_tokens_from_tokenizer_json() -> dict[str, int] | None:
+    """Walk likely tokenizer.json locations; return the model's full
+    set of special added_tokens (id, content) — atomic-IDs the chat
+    template can emit and the model was trained to consume directly.
+    Returns None if no tokenizer.json is reachable; caller falls back
+    to the hand-coded mini-dict.
+
+    Why auto-load: hand-coded SPECIAL_TOKENS tables historically grew
+    one regression at a time. Whenever the chat template introduced a
+    new atomic marker (`<|tool_call>`, `<|"|>`, `<|think|>`, ...) the
+    Python tokenize_with_specials would silently BPE-split it,
+    feeding the model off-manifold input bytes. Pulling the full
+    set from tokenizer.json eliminates that class of bug entirely:
+    every special-true atomic ID the model knows about becomes
+    eligible for atomic-emission on the input path.
+    """
+    paths_to_try: list[Path] = []
+    chat_tpl_env = os.environ.get("GEMMA_CHAT_TEMPLATE")
+    if chat_tpl_env:
+        paths_to_try.append(Path(chat_tpl_env).parent / "tokenizer.json")
+    st_env = os.environ.get("GEMMA_SAFETENSORS")
+    if st_env:
+        paths_to_try.append(Path(st_env).parent / "tokenizer.json")
+    # Last-ditch: known canonical bf16 mirror location.
+    paths_to_try.append(
+        Path("/Users/mdot/models/gemma-4-a4b-bf16/tokenizer.json"))
+
+    for p in paths_to_try:
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text())
+        except Exception as e:
+            print(f"[chat_template] failed to parse {p}: {e}", file=sys.stderr)
+            continue
+        out: dict[str, int] = {}
+        for entry in data.get("added_tokens", []):
+            if not isinstance(entry, dict):
+                continue
+            content = entry.get("content")
+            tid = entry.get("id")
+            if not content or tid is None:
+                continue
+            if not entry.get("special", False):
+                continue
+            if content in _EXCLUDE_FROM_ATOMIC:
+                continue
+            out[content] = int(tid)
+        if out:
+            print(f"[chat_template] loaded {len(out)} special tokens from {p}",
+                  file=sys.stderr)
+            return out
+    return None
+
+
+_loaded = _load_special_tokens_from_tokenizer_json()
+if _loaded is not None:
+    SPECIAL_TOKENS: dict[str, int] = _loaded
+else:
+    print("[chat_template] tokenizer.json unreachable; using hand-coded "
+          "fallback SPECIAL_TOKENS (may miss model-specific atomic IDs)",
+          file=sys.stderr)
+    SPECIAL_TOKENS = dict(_FALLBACK_SPECIAL_TOKENS)
+
+# Sort by length DESC so longer markers are matched ahead of any prefix
+# that overlaps with a shorter one. (The current Gemma-4 set has no
+# such overlaps, but it's a cheap invariant to maintain — if a future
+# model adds e.g. `<|tool>` and `<|tool_extended>` we want the longer
+# one to win.)
+_SPECIAL_RE = re.compile(
+    "|".join(re.escape(k)
+              for k in sorted(SPECIAL_TOKENS.keys(), key=len, reverse=True)))
 
 
 # Boundary text fragments the canonical jinja template emits at turn
