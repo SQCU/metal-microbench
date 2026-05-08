@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import os
 import time
 import uuid
@@ -242,6 +243,124 @@ def _parse_sampling(body: dict, max_tokens: int) -> g.SamplingParams:
         top_logprobs=top_logprobs,
         logit_bias=logit_bias,
     ), capture_logits
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Tool-call extraction (2026-05-07).
+#
+# Gemma-4's chat template (format_argument macro) emits string arguments
+# as `<|"|>STRING<|"|>` (the atomic id-52 token wrapping the content),
+# but in practice the model improvises a SECOND format when the string
+# contains literal `"` characters (e.g., the SVG markup `width="100"`):
+# it switches to a raw-string form `<|<DELIM>STRING<DELIM>|>` where
+# <DELIM> is typically a backtick. Both forms are observed in the wild;
+# the bridge accepts either.
+#
+# A tool call from the model looks like:
+#
+#     <|tool_call>call:NAME{key1:value1,key2:value2,...}<tool_call|>
+#
+# This extractor:
+#   1. finds every `<|tool_call>...<tool_call|>` block in the response,
+#   2. parses the function name + argument body,
+#   3. converts it to OpenAI tool_calls[] shape:
+#         {"id": "call_<uuid>", "type": "function",
+#          "function": {"name": "<name>", "arguments": "<json-string>"}}
+#   4. returns (cleaned_content_with_markers_stripped, tool_calls_list).
+#
+# When tools are NOT in the request, this is a no-op. When tools ARE in
+# the request and no markers are found (model declined to call),
+# tool_calls_list is None and content is unchanged.
+# ────────────────────────────────────────────────────────────────────────
+_TOOL_CALL_BLOCK_RE = re.compile(
+    r'<\|tool_call>(.*?)<tool_call\|>',
+    re.DOTALL,
+)
+# <|"|>STRING<|"|> — training format for atomic-quoted strings
+_ATOMIC_QUOTE_RE = re.compile(r'<\|"\|>(.*?)<\|"\|>', re.DOTALL)
+# <|D...D|> — model's improvised raw-string form. D is any single char
+# that isn't itself `>` or `<` (the surrounding angle brackets) or `|`
+# (which would re-enter the marker syntax). Backtick is what we've
+# observed; the regex accepts any single non-restricted char.
+_RAW_QUOTE_RE = re.compile(r'<\|([^<>|])(.*?)\1\|>', re.DOTALL)
+# Unquoted bareword keys in pseudo-JSON: `{key:` or `,key:`.
+_BAREWORD_KEY_RE = re.compile(r'([\{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:')
+
+
+def _parse_tool_call_args(arg_block: str) -> dict | None:
+    """Convert the model's argument-DSL inside `{...}` to a Python dict.
+
+    Strategy: rewrite the DSL to standard JSON, then json.loads. Returns
+    None if the result isn't parseable as JSON — caller decides whether
+    to fall back (e.g., return raw bytes as the argument value).
+    """
+    # 1. <|"|>X<|"|>  →  "X" (with proper JSON-escape of X)
+    rewritten = _ATOMIC_QUOTE_RE.sub(
+        lambda m: json.dumps(m.group(1)), arg_block)
+    # 2. <|D...D|>  →  "..." (raw-string form, content can have anything)
+    rewritten = _RAW_QUOTE_RE.sub(
+        lambda m: json.dumps(m.group(2)), rewritten)
+    # 3. Bareword keys → quoted keys
+    rewritten = _BAREWORD_KEY_RE.sub(r'\1"\2":', rewritten)
+    # 4. Try to parse as JSON
+    try:
+        return json.loads(rewritten)
+    except json.JSONDecodeError:
+        return None
+
+
+def _extract_tool_calls(content: str,
+                         had_tools: bool) -> tuple[str, list[dict] | None]:
+    """Extract tool calls from a model response into OpenAI shape.
+
+    Returns (cleaned_content, tool_calls_or_None). When a parse fails
+    on a particular block, the block stays in cleaned_content as-is
+    so the client at least sees the bytes (debugging affordance).
+    """
+    if not had_tools or '<|tool_call>' not in content:
+        return content, None
+
+    tool_calls: list[dict] = []
+    cleaned_parts: list[str] = []
+    last_end = 0
+    for m in _TOOL_CALL_BLOCK_RE.finditer(content):
+        cleaned_parts.append(content[last_end:m.start()])
+        body = m.group(1).strip()
+        # Body shape: `call:NAME{ARGS}` (NAME is plain identifier;
+        # ARGS may contain nested braces, so split at the FIRST `{`).
+        prefix, _, rest = body.partition('{')
+        prefix = prefix.strip()
+        if not (prefix.startswith('call:') and rest):
+            # Malformed: leave the block unmodified.
+            cleaned_parts.append(m.group(0))
+            last_end = m.end()
+            continue
+        name = prefix[len('call:'):].strip()
+        # rest is "...args...}" — strip the trailing `}` to get the args body.
+        if not rest.endswith('}'):
+            cleaned_parts.append(m.group(0))
+            last_end = m.end()
+            continue
+        args_body = '{' + rest  # restore opening brace; close already there
+        parsed = _parse_tool_call_args(args_body)
+        if parsed is None:
+            # Couldn't convert to JSON — keep raw block visible to
+            # the client and skip the tool_calls[] entry.
+            cleaned_parts.append(m.group(0))
+            last_end = m.end()
+            continue
+        tool_calls.append({
+            "id": f"call_{uuid.uuid4().hex[:16]}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(parsed, ensure_ascii=False),
+            },
+        })
+        last_end = m.end()
+    cleaned_parts.append(content[last_end:])
+    cleaned = ''.join(cleaned_parts).strip()
+    return cleaned, (tool_calls if tool_calls else None)
 
 
 def _build_stream_spec(stream_id: int,
@@ -702,11 +821,25 @@ async def chat_completions(req: Request) -> Any:
                   f"done_reason={done_reason}")
             finish = "stop" if done_reason == 1 else (
                 "length" if done_reason == 2 else "stop")
-            # Tool-call extraction is NOT a bridge concern. The model
-            # may have emitted `<|tool_call>...<tool_call|>` bytes if
-            # tools were in the request; those bytes are part of the
-            # response text verbatim. Clients parse them client-side.
-            message: dict[str, Any] = {"role": "assistant", "content": text}
+            # 2026-05-07: server-side tool-call extraction. When tools
+            # were in the request and the model emitted
+            # `<|tool_call>...<tool_call|>` markers, parse them out of
+            # `text` and surface as OpenAI-shape `message.tool_calls[]`.
+            # Markers are stripped from `content` so clients see a clean
+            # response; finish_reason flips to "tool_calls" per OAI spec.
+            # Models that emit malformed blocks have their bytes left
+            # verbatim (parse-failure fallback) so debugging stays
+            # affordant.
+            cleaned_text, extracted_tool_calls = _extract_tool_calls(
+                text, had_tools=tools is not None)
+            message: dict[str, Any] = {"role": "assistant",
+                                        "content": cleaned_text}
+            if extracted_tool_calls:
+                message["tool_calls"] = extracted_tool_calls
+                finish = "tool_calls"
+                print(f"[bridge] extracted {len(extracted_tool_calls)} "
+                      f"tool_call(s); names="
+                      f"{[tc['function']['name'] for tc in extracted_tool_calls]}")
             # 2026-05-07: no conversation-state recording. Stateless
             # bridge per the NO REMOTE LOCKS principle.
             choice: dict[str, Any] = {
@@ -760,12 +893,16 @@ async def chat_completions(req: Request) -> Any:
     async def gen():
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
         created = int(time.time())
-        # Stream content deltas as they arrive. Tool-call markers in
-        # the model's output are NOT extracted or reshaped here — they
-        # ride through as part of the content text. Clients that want
-        # OAI tool-call shape parse them themselves. The bridge does
-        # not pay synchronous CPU on the response-streaming hot path
-        # for application-level interpretation.
+        # 2026-05-07: when tools are present in the request we BUFFER
+        # the response content rather than streaming it tokenwise. This
+        # is so we can parse `<|tool_call>...<tool_call|>` blocks out of
+        # the complete response and emit OpenAI-shape `tool_calls[]`
+        # deltas at the end (matching how every other OAI-compat server
+        # streams tool calls). Tool-call responses are typically short
+        # (engine stops at <tool_call|>), so the latency cost of
+        # buffering is bounded and the shape correctness is worth it.
+        # Non-tool requests stream tokenwise as before.
+        had_tools = tools is not None
         all_tokens: list[int] = []
         last_update: g.StreamUpdate | None = None
         clean_close = False
@@ -775,22 +912,85 @@ async def chat_completions(req: Request) -> Any:
                 last_update = u
                 if u.new_tokens:
                     all_tokens.extend(u.new_tokens)
-                    delta_text = g.detokenize(u.new_tokens)
-                    yield ("data: " + json.dumps({
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": MODEL_NAME,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": delta_text},
-                            "finish_reason": None,
-                        }],
-                    }) + "\n\n")
+                    if not had_tools:
+                        # Tokenwise content streaming (the common path).
+                        delta_text = g.detokenize(u.new_tokens)
+                        yield ("data: " + json.dumps({
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": MODEL_NAME,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": delta_text},
+                                "finish_reason": None,
+                            }],
+                        }) + "\n\n")
                 if u.state == 2:
                     finish = "stop" if u.done_reason == 1 else (
                         "length" if u.done_reason == 2 else "stop")
-                    # 2026-05-07: no conversation-state recording.
+                    # When tools were present, drain accumulated content
+                    # through the tool-call extractor and emit the right
+                    # shape: either a final content delta (no tool calls
+                    # found) or a tool_calls delta + finish_reason=tool_calls.
+                    if had_tools:
+                        full_text = g.detokenize(all_tokens)
+                        cleaned_text, extracted = _extract_tool_calls(
+                            full_text, had_tools=True)
+                        if extracted:
+                            finish = "tool_calls"
+                            print(f"[bridge] (SSE) extracted "
+                                  f"{len(extracted)} tool_call(s); names="
+                                  f"{[tc['function']['name'] for tc in extracted]}")
+                            # Surface any non-tool prose first (rare, but
+                            # the model occasionally adds prose before/
+                            # after the tool call).
+                            if cleaned_text:
+                                yield ("data: " + json.dumps({
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": MODEL_NAME,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"content": cleaned_text},
+                                        "finish_reason": None,
+                                    }],
+                                }) + "\n\n")
+                            # Tool-calls delta. OpenAI's streaming shape
+                            # uses `index` per tool call within the choice.
+                            tc_deltas = [{
+                                "index": i,
+                                "id": tc["id"],
+                                "type": tc["type"],
+                                "function": tc["function"],
+                            } for i, tc in enumerate(extracted)]
+                            yield ("data: " + json.dumps({
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": MODEL_NAME,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"tool_calls": tc_deltas},
+                                    "finish_reason": None,
+                                }],
+                            }) + "\n\n")
+                        else:
+                            # No tool calls extracted — emit the full
+                            # buffered content as one delta so the
+                            # client at least gets the bytes.
+                            yield ("data: " + json.dumps({
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": MODEL_NAME,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": cleaned_text},
+                                    "finish_reason": None,
+                                }],
+                            }) + "\n\n")
                     yield ("data: " + json.dumps({
                         "id": completion_id,
                         "object": "chat.completion.chunk",
