@@ -1041,18 +1041,27 @@ async def chat_completions(req: Request) -> Any:
                     all_tokens.extend(u.new_tokens)
                     if not had_tools:
                         # Tokenwise content streaming (the common path).
-                        delta_text = g.detokenize(u.new_tokens)
-                        yield ("data: " + json.dumps({
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": MODEL_NAME,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"content": delta_text},
-                                "finish_reason": None,
-                            }],
-                        }) + "\n\n")
+                        # Strip per-turn scaffolding (trailing <turn|>,
+                        # leading channel echoes) per-delta. Found by
+                        # tools/st-debug api_probe: pre-fix, the final
+                        # delta contained "<turn|>" because token id 106
+                        # detokenizes to the literal string. Most deltas
+                        # are unaffected; the strip is a no-op when no
+                        # marker is present.
+                        delta_text = _strip_response_scaffolding(
+                            g.detokenize(u.new_tokens))
+                        if delta_text:
+                            yield ("data: " + json.dumps({
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": MODEL_NAME,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": delta_text},
+                                    "finish_reason": None,
+                                }],
+                            }) + "\n\n")
                 if u.state == 2:
                     finish = "stop" if u.done_reason == 1 else (
                         "length" if u.done_reason == 2 else "stop")
