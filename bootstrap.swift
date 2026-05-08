@@ -6317,25 +6317,15 @@ if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"], isDumpRun,
 if let ggufPath = ProcessInfo.processInfo.environment["GGUF_VALIDATE"] {
     runGgufValidateHarness(ggufPath: ggufPath)
 }
-// CVEC correctness harness. LM_TEST_CVEC_DIGEST=1 runs the pure-logic
-// digest unit tests (fast, no weights). LM_TEST_CVEC_CACHE=1 runs the
-// full integration test (requires GGUF_PATH).
-if ProcessInfo.processInfo.environment["LM_TEST_CVEC_DIGEST"] != nil {
-    runCvecDigestUnitTests()
-}
-if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
-   ProcessInfo.processInfo.environment["LM_TEST_CVEC_CACHE"] != nil {
-    runCvecDigestUnitTests()
-    runCvecCacheIntegrationTest(ggufPath: ggufPath)
-}
-if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
-   ProcessInfo.processInfo.environment["LM_TEST_CACHE_DIVERGENCE"] != nil {
-    runPrefillCacheDivergenceDump(ggufPath: ggufPath)
-}
-if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
-   ProcessInfo.processInfo.environment["LM_TEST_PREFIX_CACHE"] != nil {
-    runPrefixCacheSmoke(ggufPath: ggufPath)
-}
+// 2026-05-07: CVEC + prefix-cache test harnesses deleted. Their Swift
+// test files (test_cvec_cache.swift, test_prefix_cache.swift) reached
+// past the FFI to drive the engine's openSession/submit/closeSession
+// internal lifecycle, freezing the bad two-phase API. Both were
+// deleted under the user mandate "test files which freeze bad api
+// contracts are bad tests." Equivalent coverage is now exercised
+// through the batch FFI (server/test_batch_ffi*.py): cache reuse is
+// verified end-to-end via cache_hits/cache_misses counters returned
+// in the StreamUpdate wire format.
 } // end runEnvDrivenDemos
 
 // Run all the one-time top-level side effects (banners + active_exp fill)

@@ -23,8 +23,13 @@ import CryptoKit
 // gemma_init, cleared at teardown).
 private var gVisionResidency: VisionResidency?
 private var gPressureSource: DispatchSourceMemoryPressure?
-private var gSessions: [Int32: Session] = [:]
-private var gNextHandle: Int32 = 1
+// 2026-05-07: gSessions / gNextHandle deleted. The per-session FFI surface
+// (gemma_session_open / submit / poll / close) was retired earlier in
+// favour of the batch FFI; this dict was only ever READ by the two
+// diagnostic snapshot FFIs (gemma_scheduler_snapshot,
+// gemma_kv_snapshot_summary) that always returned 0 entries because
+// nothing populated it. Both snapshots have been deleted along with
+// the dict.
 
 // Vision soft-tokens cache — keyed by SHA-256 of the raw PNG/JPEG bytes.
 // On a cache hit we skip preprocessing + vision tower entirely (saves ~7 s
@@ -299,18 +304,10 @@ public func gemma_page_refcount(_ phys: Int32) -> Int32 {
     return Int32(engine.pageManager.pageRefcount(Int(phys)))
 }
 
-// Which session IDs currently own a given phys page. Fill outSids, return count.
-@_cdecl("gemma_page_owners")
-public func gemma_page_owners(_ phys: Int32,
-                               _ outSids: UnsafeMutablePointer<Int32>?,
-                               _ maxN: Int32) -> Int32 {
-    guard let engine = gEngine else { return 0 }
-    let owners = engine.pageManager.ownersOfPage(Int(phys))
-    if outSids == nil { return Int32(owners.count) }
-    let n = min(owners.count, Int(maxN))
-    for i in 0..<n { outSids![i] = Int32(owners[i]) }
-    return Int32(n)
-}
+// gemma_page_owners deleted 2026-05-07: per-page session ownership is no
+// longer a meaningful concept. Under the anonymous-pool refactor pages
+// have a refcount only — no per-page list of holding sessions exists.
+// Use gemma_page_refcount for "is this page shared" (refcount > 1).
 
 // gemma_session_counts deleted 2026-04-26: per-session page counts are
 // now per-stream, surfaced via StreamUpdate.cache_hits / cache_misses
@@ -395,76 +392,12 @@ public func gemma_engine_scheduler_stats(
     return 0
 }
 
-// Per-session scheduler rows: [sid, state, slot, position, chunk_queue_depth]
-// packed Int32 per row. `slot == -1` means resident but not currently
-// bound to an active-batch slot (the "starving" case this endpoint is
-// designed to make visible). Bulk single-lock call — same design as
-// gemma_kv_snapshot_summary to avoid starving AR throughput under
-// polling load.
-@_cdecl("gemma_scheduler_snapshot")
-public func gemma_scheduler_snapshot(_ outBuf: UnsafeMutablePointer<Int32>?,
-                                      _ maxSessions: Int32) -> Int32 {
-    guard let engine = gEngine else { return 0 }
-    let sids = Array(gSessions.keys).sorted()
-    if outBuf == nil { return Int32(sids.count) }
-    let stride = 5
-    var written = 0
-    for sid in sids {
-        if written >= Int(maxSessions) { break }
-        guard let s = gSessions[sid] else { continue }
-        let stateCode: Int32
-        switch s.state {
-        case .idle:       stateCode = 0
-        case .priming:    stateCode = 1
-        case .generating: stateCode = 2
-        case .paused:     stateCode = 3
-        case .done:       stateCode = 4
-        }
-        let base = written * stride
-        outBuf![base + 0] = sid
-        outBuf![base + 1] = stateCode
-        outBuf![base + 2] = Int32(s.slot ?? -1)
-        outBuf![base + 3] = Int32(s.positionForDebug)
-        outBuf![base + 4] = Int32(s.chunkQueueDepthForDebug)
-        _ = engine  // quiet unused-capture when no page lookups needed
-        written += 1
-    }
-    return Int32(written)
-}
-
-@_cdecl("gemma_kv_snapshot_summary")
-public func gemma_kv_snapshot_summary(_ outBuf: UnsafeMutablePointer<Int32>?,
-                                       _ maxSessions: Int32) -> Int32 {
-    guard let engine = gEngine, let out = outBuf else { return 0 }
-    let sids = Array(gSessions.keys).sorted()
-    let stride = 5
-    var written = 0
-    for sid in sids {
-        if written >= Int(maxSessions) { break }
-        guard let s = gSessions[sid] else { continue }
-        let stateCode: Int32
-        switch s.state {
-        case .idle:       stateCode = 0
-        case .priming:    stateCode = 1
-        case .generating: stateCode = 2
-        case .paused:     stateCode = 3
-        case .done:       stateCode = 4
-        }
-        let owned = s.ownedPagesForDebug
-        var shared = 0
-        for phys in owned {
-            if engine.pageManager.pageRefcount(phys) > 1 { shared += 1 }
-        }
-        let base = written * stride
-        out[base + 0] = sid
-        out[base + 1] = Int32(s.positionForDebug)
-        out[base + 2] = stateCode
-        out[base + 3] = Int32(owned.count)
-        out[base + 4] = Int32(shared)
-        written += 1
-    }
-    return Int32(written)
-}
+// gemma_scheduler_snapshot + gemma_kv_snapshot_summary deleted 2026-05-07:
+// both iterated `gSessions` which was never written to, so they always
+// returned 0 entries. Zero callers in Python or Swift confirmed via grep.
+// Replacements (if anything ever wants this telemetry again): iterate
+// engine.requestForStream.values directly — that's the canonical live-
+// request set under the anonymous-pool refactor.
 
 // --- Vision / multimodal ---
 

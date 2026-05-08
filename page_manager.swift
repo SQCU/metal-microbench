@@ -47,7 +47,8 @@ import Foundation
 enum PageManagerError: Error {
     case outOfPages(needed: Int, available: Int)
     case doubleFree(physPage: Int)
-    case notOwned(physPage: Int, sessionId: Int)
+    // 2026-05-07: removed `notOwned` — no per-session owner concept.
+    // decref() is a refcount op; double-decref is silently ignored.
 }
 
 // A logical page: which session owns it, at which logical index, plus the
@@ -66,7 +67,14 @@ enum PageManagerError: Error {
 // of this content-hash pair (nil when this page isn't part of a promoted
 // pair).
 private struct PageInfo {
-    var owners: Set<Int>        // session IDs currently holding this page
+    // 2026-05-07 (anonymous-pool refactor): pages are no longer tagged
+    // with the set of session IDs that own them. The pool is a uniform
+    // anonymous resource; callers (engine, vision tower, etc.) hold
+    // their own [Int] lists of phys pages they're currently using and
+    // call decref() to release. The single number `refcount` replaces
+    // the `owners: Set<Int>` ledger — same information (refcount ==
+    // owners.count) but no per-session bookkeeping inside PageManager.
+    var refcount: Int           // number of live page references
     var contentHash: UInt64?    // nil = page isn't content-indexed (fresh/dirty)
     var pairMate: Int?          // other phys page sharing this hash (see header)
     var lastAccessTick: UInt64
@@ -116,8 +124,10 @@ final class PageManager {
     // 16-token slide-page's data in both cache layouts. See the
     // PageInfo header for why sharing has to be a pair.
     private var contentIndex: [UInt64: SharedPagePair] = [:]
-    // Per-session ordered list of phys pages owned (for release + block-table build).
-    private var sessionPages: [Int: [Int]] = [:]
+    // 2026-05-07: deleted `sessionPages: [Int: [Int]]`. Callers now hold
+    // their own list of phys pages they reference and call decref()
+    // when done. No per-session ledger lives in the page manager —
+    // pages are anonymous, identified only by content hash + refcount.
     private var clockTick: UInt64 = 0
 
     init(numPhysPages: Int, pageSize: Int, basePage: Int = 0,
@@ -136,7 +146,7 @@ final class PageManager {
         self.numPoolPages = poolCount
         self.pageSize = pageSize
         self.pages = (0..<numPhysPages).map { _ in
-            PageInfo(owners: [], contentHash: nil, pairMate: nil, lastAccessTick: 0)
+            PageInfo(refcount: 0, contentHash: nil, pairMate: nil, lastAccessTick: 0)
         }
         // Free list spans only the pool range. Push in reverse so the
         // lowest-indexed pool page pops first (cache-warm-friendly).
@@ -226,7 +236,11 @@ final class PageManager {
     // them from free list), and only then allocFresh runs for the
     // genuine tail — by which point the free list contains uncached
     // pages.
-    func allocFresh(sessionId: Int) throws -> Int {
+    // 2026-05-07: anonymous-pool refactor — callers track their own
+    // page references; PageManager only knows refcounts and content
+    // hashes. Returns a phys page with refcount=1; caller MUST call
+    // decref(physPage:) when done with it.
+    func allocFresh() throws -> Int {
         guard !freeList.isEmpty else {
             throw PageManagerError.outOfPages(needed: 1, available: 0)
         }
@@ -273,35 +287,30 @@ final class PageManager {
         }
         clockTick += 1
         var p = pages[phys]
-        p.owners = [sessionId]
+        p.refcount = 1
         p.lastAccessTick = clockTick
         pages[phys] = p
-        sessionPages[sessionId, default: []].append(phys)
         return phys
     }
 
-    // Adopt an existing cached page for `sessionId`. If the page was
-    // released-but-not-yet-overwritten (owners.isEmpty, still on free
-    // list), resurrect it: remove from the free list, set sessionId as
-    // the sole owner. Otherwise just add sessionId to the owner set.
-    // Either way, content hash is preserved (read-only sharing).
-    func shareExisting(physPage: Int, sessionId: Int) {
+    // Increment refcount on an existing page (used to be `shareExisting`).
+    // If the page was previously refcount=0 and on the free list, it's
+    // pulled out (resurrection of a cached page). Content hash is
+    // preserved (read-only sharing across whichever callers hold the
+    // refcount). Caller is responsible for matching decref().
+    func incref(physPage: Int) {
         clockTick += 1
         var p = pages[physPage]
-        if p.owners.isEmpty {
+        if p.refcount == 0 {
             // Page is in free list but still has valid content. Pull it
-            // back out before handing out to this session.
-            // 2026-05-07: O(1) lookup via freeListPos parallel map +
-            // swap-with-last-and-pop, replacing the previous
-            // O(|freeList|) `freeList.firstIndex(of: physPage)` scan.
+            // back out before handing out the new reference.
             if let idx = freeListPos[physPage] {
                 _ = freeListPop(at: idx)
             }
         }
-        p.owners.insert(sessionId)
+        p.refcount += 1
         p.lastAccessTick = clockTick
         pages[physPage] = p
-        sessionPages[sessionId, default: []].append(physPage)
     }
 
     // After a fresh-allocated pair of pages has been written to (full
@@ -332,50 +341,32 @@ final class PageManager {
             slidePrimary: slidePrimary, fullSibling: fullSibling)
     }
 
-    // Release this session's claim on the page. If refcount drops to zero
-    // the page goes on the free list BUT its content-index entry stays —
-    // the KV data is still valid until something actually overwrites it
-    // (which only happens at allocFresh time). This enables cache hits
-    // across session lifetimes: close session A, open session B with the
-    // same prefix, B's probe finds A's cached pages and resurrects them
-    // via shareExisting without any prefill work.
-    func releasePage(physPage: Int, sessionId: Int) throws {
+    // Decrement refcount. If it drops to 0, the page goes on the free
+    // list BUT its content-index entry stays — KV data is still valid
+    // until something overwrites it (only at allocFresh time). This
+    // enables cache hits across request lifetimes: request A finishes
+    // and decrefs its pages; request B with the same prefix probes
+    // contentIndex, hits the (now-refcount=0-but-still-cached) pages,
+    // calls incref() to resurrect them. No prefill work needed.
+    //
+    // No sessionId arg, no `notOwned` error — pages are anonymous.
+    // Caller is responsible for not double-decref'ing or decref'ing
+    // pages they didn't incref.
+    func decref(physPage: Int) {
         var p = pages[physPage]
-        guard p.owners.contains(sessionId) else {
-            throw PageManagerError.notOwned(physPage: physPage, sessionId: sessionId)
+        if p.refcount > 0 {
+            p.refcount -= 1
+            if p.refcount == 0 {
+                freeListPush(physPage)
+                // contentHash preserved for potential cache hit later.
+            }
+            pages[physPage] = p
         }
-        p.owners.remove(sessionId)
-        if p.owners.isEmpty {
-            freeListPush(physPage)
-            // Do NOT drop contentHash here — leave it for potential reuse.
-        }
-        pages[physPage] = p
-    }
-
-    // Release all of a session's pages in one call — used by closeSession.
-    func releaseAllForSession(_ sessionId: Int) {
-        guard let owned = sessionPages.removeValue(forKey: sessionId) else { return }
-        for phys in owned {
-            // Ignore failures — we're tearing down the session anyway.
-            try? releasePage(physPage: phys, sessionId: sessionId)
-        }
-    }
-
-    // Peek at a session's owned pages (for block-table assembly).
-    func pagesForSession(_ sessionId: Int) -> [Int] {
-        return sessionPages[sessionId] ?? []
-    }
-
-    // Owners of a physical page. Used by the KV-snapshot FFI to surface
-    // which sessions are citing a given page (refcount > 1 ⇒ shared).
-    func ownersOfPage(_ phys: Int) -> [Int] {
-        guard phys >= 0 && phys < pages.count else { return [] }
-        return Array(pages[phys].owners).sorted()
     }
 
     func pageRefcount(_ phys: Int) -> Int {
         guard phys >= 0 && phys < pages.count else { return 0 }
-        return pages[phys].owners.count
+        return pages[phys].refcount
     }
 
     // Diagnostic snapshot.
@@ -383,12 +374,14 @@ final class PageManager {
         let totalPages: Int
         let freePages: Int
         let cachedHashes: Int
-        let activeSessions: Int
+        // 2026-05-07: pages-in-use count replaces "active sessions".
+        // Pages are anonymous; "in-use" means refcount > 0.
+        let pagesInUse: Int
     }
     func stats() -> Stats {
         return Stats(totalPages: numPhysPages,
                      freePages: freeList.count,
                      cachedHashes: contentIndex.count,
-                     activeSessions: sessionPages.count)
+                     pagesInUse: numPoolPages - freeList.count)
     }
 }

@@ -34,18 +34,24 @@
 import Foundation
 import Metal
 
+// 2026-05-07 (anonymous-pool refactor): collapsed from a 5-state FSM
+// (.idle/.priming/.generating/.paused/.done) to the three phases a
+// stateless chat-completions request goes through. The deleted .idle
+// and .paused cases existed only because the old API was two-phase
+// (openSession then submit then setters then maybe more submits). Under
+// atomic construction (LmEngine.submitRequest) a Session is born with
+// chunks already queued, so .priming covers "has prefill work" and
+// there's no half-state where a Session exists with no work.
 enum SessionState: Equatable {
-    case idle           // no pending work — e.g. session just opened, nothing submitted
-    case priming        // chunkQueue non-empty — teacher-forcing prompt/tool tokens
+    case priming        // chunkQueue non-empty (or just-finished prefill on transition to generating)
     case generating     // sampling; pushing to outputQueue
-    case paused         // explicit pause (caller is waiting for tool result); KV retained
-    case done           // EOS / maxTokens / caller closed
+    case done           // EOS / maxTokens
 
     // Does this session want a slot on the next scheduler tick?
     var wantsSlot: Bool {
         switch self {
         case .priming, .generating: return true
-        default: return false
+        case .done: return false
         }
     }
     // Legacy alias — some code paths still read .isBusy.
@@ -581,7 +587,10 @@ final class Session {
     @inline(__always)
     fileprivate weak var engine: LmEngine?
 
-    fileprivate(set) var state: SessionState = .idle
+    // Default .priming: under atomic construction (LmEngine.submitRequest)
+    // a Session is created with its first segment already queued. The
+    // pre-submit window where state was .idle is gone.
+    fileprivate(set) var state: SessionState = .priming
     // Phys-page IDs owned by this session, in logical-page order:
     //   ownedPages[p] = phys page number for this session's page p
     //   ownedPages.count * PAGE_SLIDE bounds the max k_len this session
@@ -621,47 +630,21 @@ final class Session {
     // When state == .generating, the last-sampled token becomes the next
     // step's input; kept separate from the chunk queue for state clarity.
     fileprivate var nextGeneratedInput: UInt32 = 0
-    // Teacher-forcing: override the token that will be fed to the next
-    // AR tick instead of the sampled one. Originally driven by the
-    // (now-removed) /v1/perplexity endpoint to walk a session through
-    // a known completion while reading logits at each position. Caller
-    // is responsible for ensuring the session is in .generating state
-    // when this is set.
-    // TODO: no live callers as of 2026-05-05 — candidate for deletion
-    // once we confirm no out-of-tree consumers depend on it.
-    func forceNextInput(_ token: UInt32) { nextGeneratedInput = token }
+    // forceNextInput / pauseForExternal / resumeFromExternalPause /
+    // pausedStateCache deleted 2026-05-07: under stateless chat-
+    // completions the bridge never reaches past the API to pause or
+    // teacher-force a live request. Each new conversation turn is a
+    // fresh request submitted with the full token history; content-hash
+    // KV-page sharing is the *only* mechanism for skipping prefix work
+    // (no private cross-request reach-arounds).
 
-    // Pause/resume the session for external orchestration. While
-    // paused, wantsSlot returns false so the scheduler's pump skips
-    // this session during tick(); caller drives progress via submit
-    // + wait_position with no risk of an unwanted interleaved AR tick
-    // overwriting logits between a read and the next submit.
-    //
-    // We remember the state we were in before pausing so resume
-    // restores it exactly. Otherwise: a .generating session with no
-    // chunk queue that we "resume to .priming" would cause AR step
-    // to call popArPrimingToken on an empty queue, get nil, and park
-    // the slot — no position advance, Python's wait_position hangs.
-    fileprivate var pausedStateCache: SessionState? = nil
-    func pauseForExternal() {
-        if state == .generating || state == .priming {
-            pausedStateCache = state
-            state = .paused
-        }
-    }
-    func resumeFromExternalPause() {
-        if state == .paused {
-            state = pausedStateCache ?? .generating
-            pausedStateCache = nil
-        }
-    }
     // Next KV-cache write position. k_len after a step == position + 1.
     fileprivate var position: Int = 0
     fileprivate var numGenerated: Int = 0
 
     // Control-vector state (Phase B). activeControls is evaluated once
-    // per tick inside step(); turnIndex advances at each model-response
-    // boundary (submit() flips .done→.paused increments it).
+    // per tick inside step(); turnIndex is set at construction (always
+    // 0 under stateless chat-completions — one turn per request).
     fileprivate(set) var activeControls: [ActiveControl] = []
     fileprivate(set) var turnIndex: Int = 0
 
@@ -800,6 +783,29 @@ final class Session {
     // Tokens the caller can consume.
     fileprivate var outputQueue: [UInt32] = []
 
+    // ────────────────────────────────────────────────────────────────────
+    // Bridge-side per-request state, pulled inside the request 2026-05-07
+    // ────────────────────────────────────────────────────────────────────
+    // Previously these lived in `private var gFoo: [UInt64: ...]`
+    // dictionaries inside ffi_batch.swift, indexed by stream_id with a
+    // companion gStreamToSession[UInt64: Session] to resolve them. That
+    // was the long-range client-server coupling the user objected to:
+    // bridge-side state survives across requests, indexed by an external
+    // ID. Now each request owns its own state and the bridge is a thin
+    // marshaling layer over `engine.requestForStream[sid]`.
+    //
+    // streamId: the bridge's external request identity. Set by the
+    // bridge immediately after openSession returns. 0 = no bridge.
+    var streamId: UInt64 = 0
+    // Token-accounting that gets surfaced via StreamUpdate (billing).
+    var usage = StreamUsage()
+    // Logprob capture: previously `gCaptureLogits: Set<UInt64>` and
+    // `gTopLogprobs: [UInt64: UInt32]`. captureLogits and topLogprobs
+    // already live on Session above; this is the per-request emit queue
+    // and the high-water mark of "outputs we've already reported."
+    var logprobsQueue: [LogprobRecord] = []
+    var lastReportedOutputCount: Int = 0
+
     fileprivate init(id: Int, eosId: UInt32, maxNewTokens: Int, engine: LmEngine) {
         self.id = id; self.slot = nil
         self.eosId = eosId; self.maxNewTokens = maxNewTokens
@@ -807,7 +813,8 @@ final class Session {
     }
 
     // Queue more input tokens to be teacher-forced. Valid in any state:
-    // calling while .generating/.paused/.idle flips back to .priming.
+    // calling while .generating flips back to .priming. .done is
+    // terminal — submit on a .done session is a no-op.
     //
     // At the *first* submit (session still at position=0, no owned pages),
     // we probe the PageManager's content index for cache hits on the
@@ -868,8 +875,8 @@ final class Session {
                 // ownedPages (slide primary + full sibling); unadopt both.
                 let lastFull = ownedPages.removeLast()
                 let lastSlide = ownedPages.removeLast()
-                try? eng.pageManager.releasePage(physPage: lastFull, sessionId: id)
-                try? eng.pageManager.releasePage(physPage: lastSlide, sessionId: id)
+                eng.pageManager.decref(physPage: lastFull)
+                eng.pageManager.decref(physPage: lastSlide)
                 skipPrefix -= 1
                 promotedPageCount = skipPrefix
             }
@@ -904,59 +911,13 @@ final class Session {
         submit(eng.tokenizer.encode(text, addBos: addBos))
     }
 
-    // Explicit KV-page sharing: borrow this session's first `pageCount`
-    // pages from `source` and install them as our own read-only prefix.
-    // Unlike content-hash auto-sharing (which needs token-level hashable
-    // prefixes), adoptKvFrom operates on phys pages directly — so it
-    // works for ANY kind of prefix, including image soft tokens that
-    // aren't easily fingerprinted from their fp16 content.
-    //
-    // Usage (the "same image, multiple suffixes" pattern):
-    //   let base = engine.openSession(); base.submit(prefix + image)
-    //   while base.state == .priming { engine.tick() }
-    //   let pagesToShare = base.position / PAGE_SLIDE       // full pages only
-    //   for query in queries {
-    //       let s = engine.openSession()
-    //       s.adoptKvFrom(base, pageCount: pagesToShare)
-    //       s.submit(query)
-    //   }
-    //   while engine.hasWork { engine.tick() }              // all concurrent
-    //
-    // Preconditions: this session must be fresh (position=0, no owned
-    // pages yet) and `pageCount` must not exceed source's current owned
-    // page count. Fails silently (returns false) otherwise.
-    @discardableResult
-    func adoptKvFrom(_ source: Session, pageCount: Int) -> Bool {
-        guard position == 0 && ownedPages.isEmpty else { return false }
-        guard pageCount >= 0, pageCount <= source.ownedPages.count else { return false }
-        guard let eng = engine else { return false }
-        // Share each of source's leading phys pages. shareExisting handles
-        // the release-from-freelist path if source has since closed but
-        // the page's content hasn't been overwritten yet.
-        for p in 0..<pageCount {
-            let phys = source.ownedPages[p]
-            eng.pageManager.shareExisting(physPage: phys, sessionId: id)
-            ownedPages.append(phys)
-        }
-        // Advance our position past the shared range. The next submit's
-        // tokens will prefill starting at this position.
-        position = pageCount * PAGE_SLIDE
-        // Copy source's consumedTokens over the shared range so that
-        // post-prefill promotion for our future pages uses a prefix hash
-        // that stays consistent with source's (i.e. a THIRD session
-        // sharing BOTH of us gets a consistent cache hit).
-        let tokensToCopy = min(source.consumedTokens.count, pageCount * PAGE_SLIDE)
-        if tokensToCopy > 0 {
-            consumedTokens.append(contentsOf: source.consumedTokens[0..<tokensToCopy])
-        }
-        // Adopted pages were already content-indexed by source's post-
-        // prefill promotion; skip re-promoting them.
-        promotedPageCount = pageCount
-        // A session that adopted pages is priming-ready: it has KV for
-        // positions [0, pageCount*PAGE_SLIDE) but no queued chunks yet.
-        // The first submit() will queue the divergent suffix.
-        return true
-    }
+    // adoptKvFrom deleted 2026-05-07: explicit cross-request KV-page
+    // sharing was a private reach-around the bridge layer used for
+    // "same image, multiple suffixes." Under the anonymous-pool /
+    // content-hash design, the only way one request shares another's
+    // pages is via PageManager.contentIndex — content-addressed, no
+    // identity coupling. Callers that need image-prefix sharing should
+    // arrange for the soft-token fp16 buffer to hash deterministically.
 
     // Walk the PageManager's content index for leading pages of
     // consumedTokens. Returns the number of SLIDE pages successfully
@@ -991,8 +952,8 @@ final class Session {
                 }
                 break
             }
-            engine.pageManager.shareExisting(physPage: pair.slidePrimary, sessionId: id)
-            engine.pageManager.shareExisting(physPage: pair.fullSibling, sessionId: id)
+            engine.pageManager.incref(physPage: pair.slidePrimary)
+            engine.pageManager.incref(physPage: pair.fullSibling)
             ownedPages.append(pair.slidePrimary)
             ownedPages.append(pair.fullSibling)
             adopted += 1
@@ -1030,8 +991,8 @@ final class Session {
             // Unadopt the trailing slide page so prefill has ≥ 1 token.
             let trailingFull = ownedPages.removeLast()
             let trailingSlide = ownedPages.removeLast()
-            try? engine.pageManager.releasePage(physPage: trailingFull, sessionId: id)
-            try? engine.pageManager.releasePage(physPage: trailingSlide, sessionId: id)
+            engine.pageManager.decref(physPage: trailingFull)
+            engine.pageManager.decref(physPage: trailingSlide)
             promotedPageCount -= 1
             advance -= PAGE_SLIDE
         }
@@ -1106,41 +1067,13 @@ final class Session {
         }
     }
 
-    // Explicit pause — retain KV, release the active slot. Caller uses this
-    // while waiting for a tool call to complete from an external API; the
-    // subsequent submit() of the tool-result tokens flips back to .priming
-    // and re-admits the session on the next scheduler tick.
-    func pause() { if state != .done { state = .paused } }
-
-    // Mid-generation append: extend a session that already has KV history
-    // (generated some tokens, hit a turn boundary, got paused by the caller)
-    // with new tokens/softs. The next tick prefills them against the existing
-    // block_table starting at the current `position`, then AR resumes.
-    //
-    // Differs from submit() in two ways:
-    //   - reopens a .done session (submit() preserves .done as terminal)
-    //   - resets numGenerated so maxNewTokens governs the next turn, not the
-    //     running total (opt out via resetBudget: false for cumulative cap)
-    //
-    // Appropriate for multiturn chat, tool-call responses, injecting a
-    // rendered-SVG image result back to the agent that requested it, etc.
-    func append(_ tokens: [UInt32], resetBudget: Bool = true) {
-        guard !tokens.isEmpty else { return }
-        if state == .done { state = .paused }
-        if resetBudget { numGenerated = 0 }
-        submit(tokens)
-    }
-    func append(text: String, resetBudget: Bool = true) {
-        guard let eng = engine else { return }
-        append(eng.tokenizer.encode(text, addBos: false), resetBudget: resetBudget)
-    }
-    func append(softTokens: MTLBuffer, count: Int, isFp32: Bool,
-                  eventTicket: UInt64 = 0, resetBudget: Bool = true) {
-        guard count > 0 else { return }
-        if state == .done { state = .paused }
-        if resetBudget { numGenerated = 0 }
-        submit(softTokens: softTokens, count: count, isFp32: isFp32, eventTicket: eventTicket)
-    }
+    // pause() / append() deleted 2026-05-07: multi-turn-with-retained-
+    // KV ("inject tool result back into a paused session") was the
+    // motivating use case. Under stateless chat-completions every new
+    // turn is a fresh request submitted with the full history — content-
+    // hash KV-page adoption recovers the prefix work without any
+    // bridge-side notion of "this stream is the continuation of that
+    // one." See applyStreamAction in ffi_batch.swift.
 
     // Pull the next generated token, or nil if none ready.
     func nextToken() -> UInt32? {
@@ -1166,6 +1099,25 @@ final class Session {
     func finish() { state = .done }
 }
 
+// ============================================================================
+// Per-request bridge state (moved out of ffi_batch.swift's gFoo dictionaries
+// 2026-05-07; see Session.streamId / Session.usage / Session.logprobsQueue
+// for the field definitions that hold these). These are simple value types
+// with no engine-private semantics — they're "what the bridge needs to
+// remember about a request between submit() and poll()."
+// ============================================================================
+struct StreamUsage {
+    var promptTokensSeen: UInt32 = 0
+    var completionTokensEmitted: UInt32 = 0
+    var visionCacheHits: UInt32 = 0
+}
+
+struct LogprobRecord {
+    let token: UInt32
+    let sampledLogprob: Float
+    let topKPairs: [(UInt32, Float)]
+}
+
 final class LmEngine {
     let weights: LmWeights
     let tokenizer: GemmaBpe
@@ -1174,6 +1126,21 @@ final class LmEngine {
     // batch slot. Limited to MAX_RESIDENT_SESSIONS — beyond that, callers
     // queue externally (a separate admission layer handles that).
     private(set) var residentSessions: [Int: Session] = [:]
+    // 2026-05-07: streamId-keyed lookup. Replaces the bridge's
+    // gStreamToSession dictionary. The bridge calls openSession (returns
+    // a Session with engine-internal id) then bindStream(s, sid) so the
+    // engine can resolve incoming bridge calls by stream_id.
+    private(set) var requestForStream: [UInt64: Session] = [:]
+    func bindStream(_ s: Session, streamId sid: UInt64) {
+        s.streamId = sid
+        requestForStream[sid] = s
+    }
+    func unbindStream(_ s: Session) {
+        if s.streamId != 0 {
+            requestForStream.removeValue(forKey: s.streamId)
+            s.streamId = 0
+        }
+    }
     // 2026-05-07 (M:K): slotAssignment removed. With the per-CB picker
     // model, kernel positions are assigned dynamically via Session.slot.
     // Keeping the field declarations as @unused stubs would be misleading;
@@ -1250,7 +1217,7 @@ final class LmEngine {
         let needed = (kLen + PAGE_FULL - 1) / PAGE_FULL
         while s.ownedPages.count < needed {
             do {
-                let p = try pageManager.allocFresh(sessionId: s.id)
+                let p = try pageManager.allocFresh()
                 zeroPhysPageKV(p)
                 s.ownedPages.append(p)
             } catch {
@@ -1289,7 +1256,7 @@ final class LmEngine {
               s.position == 0 else { return }
         if s.ownedPages.isEmpty {
             do {
-                let p = try pageManager.allocFresh(sessionId: s.id)
+                let p = try pageManager.allocFresh()
                 zeroPhysPageKV(p)
                 s.ownedPages.append(p)
             } catch {
@@ -1352,12 +1319,13 @@ final class LmEngine {
 
     // Open a new session on the first free slot. Returns nil if the engine
     // is at capacity (B active sessions) OR the page pool is exhausted.
-    // Caller owns the Session and must call `closeSession` to free both
-    // the slot and the allocated pages.
-    // Open a new resident session. Pages are claimed on-demand as the
-    // session accumulates KV; no up-front allocation. Slot is assigned by
-    // the scheduler on the next tick() call when the session is ready.
-    func openSession(eosId: UInt32? = nil, maxNewTokens: Int = 128) -> Session? {
+    // 2026-05-07: openSession went private. Sessions are no longer
+    // creatable from outside the engine — the only public path is
+    // `submitRequest(...)` below, which creates the Session, binds its
+    // streamId, applies sampling/control state, and submits initial
+    // segments all under the same lock acquisition. There is no
+    // pre-first-submit window where a Session exists with no work.
+    fileprivate func openSession(eosId: UInt32? = nil, maxNewTokens: Int = 128) -> Session? {
         guard residentSessions.count < MAX_RESIDENT_SESSIONS else {
             print("  openSession: residency cap \(MAX_RESIDENT_SESSIONS) reached")
             return nil
@@ -1370,17 +1338,100 @@ final class LmEngine {
         return s
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    // Atomic request creation (2026-05-07).
+    //
+    // RequestInit bundles per-request configuration that's set once at
+    // birth — no setter dance from the bridge, no observable half-state.
+    // Initial segments are submitted at construction; the Session is born
+    // in .priming with chunkQueue populated.
+    //
+    // The body of submitRequest does what applyStreamAction's old "start"
+    // case used to do, but inside the engine: open the session, bind the
+    // streamId, write all the per-request fields, queue every initial
+    // segment, and return the live Session. The bridge holds nothing
+    // about the request afterward — `engine.requestForStream[sid]` is
+    // the only handle.
+    //
+    // Image segments need vision-tower work the bridge knows about (the
+    // softs cache lives in ffi_batch.swift). For those, the caller passes
+    // a closure `submitImageSegment` that produces the soft-token blit
+    // for a given image-bytes blob and submits it onto the Session. This
+    // keeps the vision orchestration in the bridge while the Session
+    // lifecycle stays atomic from the engine's perspective.
+    // ────────────────────────────────────────────────────────────────────
+    struct RequestInit {
+        var eosId: UInt32? = nil
+        var maxNewTokens: Int = 128
+        var samplingTemperature: Float = 0.0
+        var captureLogits: Bool = false
+        var topLogprobs: UInt32 = 0
+        var logitBiasDense: [Float]? = nil
+        var minP: Float = 0.0
+        var stopSequences: [[UInt32]] = []
+        var cot: CotState? = nil
+        var controls: [ActiveControl] = []
+    }
+
+    enum InitialSegment {
+        case tokens([UInt32])
+        case image(Data)   // raw image bytes; bridge resolves via vision tower
+    }
+
+    @discardableResult
+    func submitRequest(streamId sid: UInt64,
+                       init initParams: RequestInit,
+                       segments: [InitialSegment],
+                       imageSubmit: ((Session, Data) -> Void)? = nil) -> Session? {
+        // Refuse re-binding a live stream — bridge mistake or leaked sid.
+        if requestForStream[sid] != nil {
+            print("  submitRequest: stream_id \(sid) already live; ignored")
+            return nil
+        }
+        guard let s = openSession(eosId: initParams.eosId,
+                                  maxNewTokens: initParams.maxNewTokens) else {
+            return nil
+        }
+        bindStream(s, streamId: sid)
+        s.samplingTemperature = initParams.samplingTemperature
+        s.captureLogits = initParams.captureLogits
+        s.topLogprobs = initParams.topLogprobs
+        s.logitBiasDense = initParams.logitBiasDense
+        s.minP = initParams.minP
+        s.stopSequences = initParams.stopSequences
+        s.cot = initParams.cot
+        for c in initParams.controls { s.addControl(c) }
+        // Queue every segment in declaration order. Submission has to
+        // happen here (not at the call site) so the Session is in
+        // .priming with chunks before submitRequest returns — no
+        // observable empty-queue window.
+        for seg in segments {
+            switch seg {
+            case .tokens(let toks):
+                s.submit(toks)
+                s.usage.promptTokensSeen &+= UInt32(toks.count)
+            case .image(let bytes):
+                imageSubmit?(s, bytes)
+            }
+        }
+        return s
+    }
+
     // Close: release slot (if any), return pages, drop from residency.
     func closeSession(_ s: Session) {
         s.state = .done
         // 2026-05-07 (M:K): no persistent slotAssignment to clear; slot
         // is per-CB scratch. Just nil out the per-CB field for cleanliness.
         s.slot = nil
-        pageManager.releaseAllForSession(s.id)
+        // 2026-05-07 (anonymous-pool refactor): caller (this session) is
+        // the canonical holder of its phys-page references; decref each
+        // one. PageManager has no per-session ledger to release from.
+        for phys in s.ownedPages { pageManager.decref(physPage: phys) }
         s.ownedPages.removeAll()
         s.consumedTokens.removeAll()
         s.promotedPageCount = 0
         residentSessions.removeValue(forKey: s.id)
+        unbindStream(s)
     }
 
     // After a prefill tile commits, walk any fully-written logical pages

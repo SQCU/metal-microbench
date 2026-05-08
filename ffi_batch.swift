@@ -20,11 +20,15 @@
 import Foundation
 
 // ----------------------------------------------------------------------
-// Stream/session id mapping. The ABI says stream_id is a u64 the bridge
-// owns; internally we use Session.id (Int). Keep both directions.
+// 2026-05-07 (anonymous-pool refactor): the old gStreamToSession +
+// gSessionToStream double-dictionary is gone. Lookup by stream_id is
+// now `engine.requestForStream[sid]` — the engine owns the index, the
+// bridge owns nothing about the request between calls. Same goes for
+// per-stream policy/usage/logprob state, which moved onto Session
+// (see Session.streamId / .usage / .logprobsQueue / etc. in
+// lm_engine.swift). The bridge layer is now a marshaling layer with
+// no long-lived state.
 // ----------------------------------------------------------------------
-private var gStreamToSession: [UInt64: Session] = [:]
-private var gSessionToStream: [Int: UInt64] = [:]
 
 // ----------------------------------------------------------------------
 // Work-conserving FFI: intake queue + engine drive lock.
@@ -358,34 +362,14 @@ private func decodeBatchRequest(_ buf: UnsafePointer<UInt8>, _ len: Int) throws 
     return out
 }
 
-// ----------------------------------------------------------------------
-// Per-stream usage counters. Cache stats are mostly derived from Session's
-// own accumulators (cacheHitTokens / cacheMissTokens); vision stats need
-// to be incremented at submit time around ensureCachedSofts.
-// ----------------------------------------------------------------------
-private struct StreamUsage {
-    var promptTokensSeen: UInt32 = 0
-    var completionTokensEmitted: UInt32 = 0
-    var visionCacheHits: UInt32 = 0
-}
-private var gUsage: [UInt64: StreamUsage] = [:]
-
-// Logprobs capture state. Sets/maps keyed by stream_id.
-//   gCaptureLogits — stream_ids with capture_logits flag set
-//   gTopLogprobs   — per-stream top-K count (0 = sampled-token only)
-//   gLastOutCount  — last-seen Session.outputQueue length, so we can detect
-//                    newly-emitted tokens after each tick
-//   gLogprobsQ     — per-stream queue of (token, sampled_logprob, top_k_pairs)
-//                    parallel to outputQueue; drained when tokens are.
-private var gCaptureLogits: Set<UInt64> = []
-private var gTopLogprobs: [UInt64: UInt32] = [:]
-private var gLastOutCount: [UInt64: Int] = [:]
-private struct LogprobRecord {
-    let token: UInt32
-    let sampledLogprob: Float
-    let topKPairs: [(UInt32, Float)]
-}
-private var gLogprobsQ: [UInt64: [LogprobRecord]] = [:]
+// 2026-05-07: gUsage / gCaptureLogits / gTopLogprobs / gLastOutCount /
+// gLogprobsQ have been deleted. The state they held now lives on
+// Session (see Session.usage / .captureLogits / .topLogprobs /
+// .lastReportedOutputCount / .logprobsQueue). StreamUsage and
+// LogprobRecord type definitions moved to lm_engine.swift since
+// they're now Session fields. Iteration over "streams with the
+// capture-logits flag" is now `engine.requestForStream.values
+// where $0.captureLogits`.
 
 // 2026-05-07: deleted in-batch shared-prefix follower deferral.
 // Per the NO REMOTE LOCKS principle, gating stream B's submission on
@@ -423,53 +407,47 @@ private var gDoneEmittedThisPoll: Set<UInt64> = []
 private func applyStreamAction(_ stream: DecodedStream, engine: LmEngine) {
     let sid = stream.streamId
     switch stream.action {
-    case 0: // start
-        guard gStreamToSession[sid] == nil else {
-            print("  [batch_ffi] start on already-live stream_id \(sid); ignored")
-            return
-        }
+    case 0: // start — atomic creation via engine.submitRequest
         let maxNew = Int(stream.sampling.maxNewTokens > 0
                           ? stream.sampling.maxNewTokens : 512)
         let eosId: UInt32? = stream.sampling.eosTokenId >= 0
             ? UInt32(stream.sampling.eosTokenId) : nil
-        guard let s = engine.openSession(eosId: eosId, maxNewTokens: maxNew) else {
-            print("  [batch_ffi] openSession failed for stream_id \(sid)")
-            return
-        }
-        s.samplingTemperature = stream.sampling.temperature
-        gStreamToSession[sid] = s
-        gSessionToStream[s.id] = sid
-        gUsage[sid] = StreamUsage()
+
+        // Build RequestInit from the wire payload. All per-request
+        // configuration is set ONCE at birth — no setter dance.
+        var initParams = LmEngine.RequestInit()
+        initParams.eosId = eosId
+        initParams.maxNewTokens = maxNew
+        initParams.samplingTemperature = stream.sampling.temperature
         if (stream.flags & 0x01) != 0 {
-            gCaptureLogits.insert(sid)
-            gTopLogprobs[sid] = stream.sampling.topLogprobs
-            gLogprobsQ[sid] = []
-            gLastOutCount[sid] = 0
+            initParams.captureLogits = true
+            initParams.topLogprobs = stream.sampling.topLogprobs
         }
-        // Sampler-side per-stream features.
-        applyLogitBias(s, entries: stream.sampling.logitBias)
-        applyMinP(s, minP: stream.sampling.minP)
-        applyStructuredCot(s, labels: stream.sampling.cotLabels)
-        s.stopSequences = stream.sampling.stopSequences
-        // Forward-pass-side: control vectors.
-        applyControlVectors(s, cvs: stream.controlVectors)
-        // Submit segments. Each tokens-segment goes through s.submit; each
-        // image_bytes segment goes through the vision tower (with caching)
-        // then submits BOI/softTokens/EOI. Order is preserved: text and
-        // image segments interleave per the original message.
-        for seg in stream.segments {
+        initParams.logitBiasDense = denseLogitBias(stream.sampling.logitBias)
+        initParams.minP = max(0, min(1, stream.sampling.minP))
+        initParams.stopSequences = stream.sampling.stopSequences
+        initParams.cot = cotStateForLabels(stream.sampling.cotLabels)
+        initParams.controls = controlsFromDecoded(stream.controlVectors,
+                                                   startPosition: 0,
+                                                   startTurn: 0)
+
+        // Translate wire segments to engine-typed segments. Image
+        // segments stay tagged as raw-bytes; the imageSubmit closure
+        // resolves them through the vision tower at submit time.
+        let segs: [LmEngine.InitialSegment] = stream.segments.compactMap { seg in
             switch seg.kind {
-            case 0:
-                s.submit(seg.tokens)
-                gUsage[sid]?.promptTokensSeen &+= UInt32(seg.tokens.count)
-            case 1:
-                submitImageSegment(s, sid: sid, imageBytes: seg.imageBytes)
-            default:
-                break
+            case 0: return .tokens(seg.tokens)
+            case 1: return .image(seg.imageBytes)
+            default: return nil
             }
         }
-    case 1: // continue
-        guard let s = gStreamToSession[sid] else {
+        _ = engine.submitRequest(streamId: sid, init: initParams,
+                                  segments: segs,
+                                  imageSubmit: { s, bytes in
+                                      submitImageSegment(s, imageBytes: bytes)
+                                  })
+    case 1: // continue — append more segments to a live request
+        guard let s = engine.requestForStream[sid] else {
             print("  [batch_ffi] continue on unknown stream_id \(sid); ignored")
             return
         }
@@ -477,9 +455,9 @@ private func applyStreamAction(_ stream: DecodedStream, engine: LmEngine) {
             switch seg.kind {
             case 0:
                 s.submit(seg.tokens)
-                gUsage[sid]?.promptTokensSeen &+= UInt32(seg.tokens.count)
+                s.usage.promptTokensSeen &+= UInt32(seg.tokens.count)
             case 1:
-                submitImageSegment(s, sid: sid, imageBytes: seg.imageBytes)
+                submitImageSegment(s, imageBytes: seg.imageBytes)
             default:
                 break
             }
@@ -488,24 +466,32 @@ private func applyStreamAction(_ stream: DecodedStream, engine: LmEngine) {
         // adjust mid-conv). All these are no-ops when the stream's
         // values are unchanged from the prior submit.
         s.samplingTemperature = stream.sampling.temperature
-        applyLogitBias(s, entries: stream.sampling.logitBias)
-        applyMinP(s, minP: stream.sampling.minP)
-        applyStructuredCot(s, labels: stream.sampling.cotLabels)
+        s.logitBiasDense = denseLogitBias(stream.sampling.logitBias)
+        s.minP = max(0, min(1, stream.sampling.minP))
+        s.cot = cotStateForLabels(stream.sampling.cotLabels)
         s.stopSequences = stream.sampling.stopSequences
-        applyControlVectors(s, cvs: stream.controlVectors)
+        s.clearControls()
+        for c in controlsFromDecoded(stream.controlVectors,
+                                      startPosition: s.positionForDebug,
+                                      startTurn: s.turnIndex) {
+            s.addControl(c)
+        }
     case 2: // cancel
-        guard let s = gStreamToSession[sid] else { return }
-        engine.closeSession(s)
-        gStreamToSession.removeValue(forKey: sid)
-        gSessionToStream.removeValue(forKey: s.id)
-    case 3: // touch — re-apply all sampling/control state without new tokens
-        guard let s = gStreamToSession[sid] else { return }
+        guard let s = engine.requestForStream[sid] else { return }
+        engine.closeSession(s)  // also unbinds streamId
+    case 3: // touch — re-apply policy without new tokens (same code as continue without submit)
+        guard let s = engine.requestForStream[sid] else { return }
         s.samplingTemperature = stream.sampling.temperature
-        applyLogitBias(s, entries: stream.sampling.logitBias)
-        applyMinP(s, minP: stream.sampling.minP)
-        applyStructuredCot(s, labels: stream.sampling.cotLabels)
+        s.logitBiasDense = denseLogitBias(stream.sampling.logitBias)
+        s.minP = max(0, min(1, stream.sampling.minP))
+        s.cot = cotStateForLabels(stream.sampling.cotLabels)
         s.stopSequences = stream.sampling.stopSequences
-        applyControlVectors(s, cvs: stream.controlVectors)
+        s.clearControls()
+        for c in controlsFromDecoded(stream.controlVectors,
+                                      startPosition: s.positionForDebug,
+                                      startTurn: s.turnIndex) {
+            s.addControl(c)
+        }
     default:
         print("  [batch_ffi] unknown action \(stream.action) for stream_id \(sid)")
     }
@@ -522,12 +508,10 @@ private func applyStreamAction(_ stream: DecodedStream, engine: LmEngine) {
 // in ~50 µs per slot × B = ~0.4 ms per CB. The CPU function below
 // just READS the GPU output buffers — no compute, no allocation.
 // ----------------------------------------------------------------------
-private func captureLogprobForLatestToken(_ sid: UInt64,
-                                           _ s: Session,
-                                           topK: UInt32) {
+private func captureLogprobForLatestToken(_ s: Session, topK: UInt32) {
     guard let slot = s.slot else { return }
-    let prev = gLastOutCount[sid] ?? 0
-    let curr = Int(gUsage[sid]?.completionTokensEmitted ?? 0) + s.pendingOutputCount
+    let prev = s.lastReportedOutputCount
+    let curr = Int(s.usage.completionTokensEmitted) + s.pendingOutputCount
     if curr <= prev { return }
 
     // Read the GPU-computed sampled_logprob + top-K from the output
@@ -567,62 +551,60 @@ private func captureLogprobForLatestToken(_ sid: UInt64,
         // each AR tick. Emit them with sentinel sampled_logprob = 0
         // and empty top-K so the bridge response shape stays consistent.
         for token in recents.dropLast() {
-            gLogprobsQ[sid, default: []].append(LogprobRecord(
+            s.logprobsQueue.append(LogprobRecord(
                 token: token,
                 sampledLogprob: 0.0,
                 topKPairs: []))
         }
-        gLogprobsQ[sid, default: []].append(LogprobRecord(
+        s.logprobsQueue.append(LogprobRecord(
             token: latest,
             sampledLogprob: sampledLogprob,
             topKPairs: topPairs))
     }
-    gLastOutCount[sid] = curr
+    s.lastReportedOutputCount = curr
 }
 
 // ----------------------------------------------------------------------
-// Sampler-side apply paths. All called from applyStreamAction on start /
-// continue / touch — empty input is the no-op path so streams that
-// don't use these features pay zero cost.
+// Wire-payload → engine-typed value builders. These are pure functions
+// (no Session reference, no engine-state mutation) called from
+// applyStreamAction's start case to populate RequestInit, and from the
+// continue/touch paths to overwrite a live request's policy fields.
+// Empty input is the no-op path; nil/empty returns mean "no constraint."
 // ----------------------------------------------------------------------
-private func applyLogitBias(_ s: Session, entries: [(UInt32, Float)]) {
-    if entries.isEmpty {
-        s.logitBiasDense = nil
-        return
-    }
+private func denseLogitBias(_ entries: [(UInt32, Float)]) -> [Float]? {
+    if entries.isEmpty { return nil }
     var dense = [Float](repeating: 0, count: VOCAB)
     for (tok, bias) in entries {
         let i = Int(tok)
         if i >= 0 && i < VOCAB { dense[i] = bias }
     }
-    s.logitBiasDense = dense
+    return dense
 }
 
-private func applyMinP(_ s: Session, minP: Float) {
-    s.minP = max(0, min(1, minP))
-}
-
-// Sampler-side: structured-cot grammar. Empty labels = no constraint
-// (clears the existing cot state if any).
-private func applyStructuredCot(_ s: Session, labels: [String]) {
-    if labels.isEmpty {
-        s.cot = nil
-    } else {
-        s.enableStructuredCot(labels: labels)
+// Structured-cot grammar from caller-supplied phase labels. nil = no
+// constraint. Mirrors the body of Session.enableStructuredCot but
+// returns the value instead of attaching it.
+private func cotStateForLabels(_ labels: [String]) -> CotState? {
+    if labels.isEmpty { return nil }
+    var phases: [CotPhase] = []
+    phases.append(.literal(bytes: Array("<think>\n".utf8)))
+    for label in labels {
+        phases.append(.literal(bytes: Array((label + ": ").utf8)))
+        phases.append(.freeLine)
     }
+    phases.append(.literal(bytes: Array("</think>\n\n".utf8)))
+    return CotState(phases: phases)
 }
 
-// ----------------------------------------------------------------------
-// Forward-pass-side apply path: control vectors. Each DecodedCV refers
-// to a registered cvec id (uploaded via gemma_register_resource). We
-// resolve the buffer, build a CvecEnvelope, and call s.addControl —
-// the existing kernel hook in buildStepCB picks it up.
-// ----------------------------------------------------------------------
-private func applyControlVectors(_ s: Session, cvs: [DecodedCV]) {
-    // Replace any existing controls with the freshly-specified set —
-    // start/continue both re-apply, matching how the legacy bridge
-    // re-attached on each chat turn.
-    s.clearControls()
+// Resolve every DecodedCV reference to an ActiveControl with concrete
+// envelope/buffer pointers. Caller passes startPosition/startTurn so
+// the envelope's t=0 anchor matches the request's current time
+// coordinates (0/0 at request birth; current values during continue).
+private func controlsFromDecoded(_ cvs: [DecodedCV],
+                                  startPosition: Int,
+                                  startTurn: Int) -> [ActiveControl] {
+    var out: [ActiveControl] = []
+    out.reserveCapacity(cvs.count)
     for cv in cvs {
         guard let buf = gCvecRegistry[cv.cvecId] else {
             print("  [batch_ffi] cvec '\(cv.cvecId)' not registered; skipping")
@@ -649,16 +631,16 @@ private func applyControlVectors(_ s: Session, cvs: [DecodedCV]) {
             peakMagnitude: cv.peakMagnitude,
             shape: shape, units: units)
         let target: Float? = cv.target.isNaN ? nil : cv.target
-        let ctrl = ActiveControl(
+        out.append(ActiveControl(
             cvecId: cv.cvecId, buffer: buf, layer: Int(cv.layer),
             envelope: env, polarity: cv.polarity,
-            startPosition: s.positionForDebug,
-            startTurn: s.turnIndex,
+            startPosition: startPosition,
+            startTurn: startTurn,
             mode: mode, target: target,
             transportScale: cv.transportScale,
-            transportOffset: cv.transportOffset)
-        s.addControl(ctrl)
+            transportOffset: cv.transportOffset))
     }
+    return out
 }
 
 // ----------------------------------------------------------------------
@@ -699,15 +681,15 @@ public func gemma_register_resource(_ kindPtr: UnsafePointer<CChar>?,
 // runs on miss), submit BOI / softTokens / EOI to the session. Mirrors
 // the per-session FFI's gemma_session_submit_image_bytes path.
 // ----------------------------------------------------------------------
-private func submitImageSegment(_ s: Session, sid: UInt64, imageBytes: Data) {
+private func submitImageSegment(_ s: Session, imageBytes: Data) {
     let hitsBefore = gVisionCacheHits
     guard let padded = ensureCachedSofts(data: imageBytes) else {
-        print("  [batch_ffi] ensureCachedSofts failed for stream \(sid)")
+        print("  [batch_ffi] ensureCachedSofts failed for stream \(s.streamId)")
         return
     }
     let hitDelta = gVisionCacheHits - hitsBefore
     if hitDelta > 0 {
-        gUsage[sid]?.visionCacheHits &+= UInt32(hitDelta)
+        s.usage.visionCacheHits &+= UInt32(hitDelta)
     }
     // Stable content hash of input bytes — same image in two streams produces
     // identical placeholder positions in the page-cache hash, so prefix
@@ -725,7 +707,7 @@ private func submitImageSegment(_ s: Session, sid: UInt64, imageBytes: Data) {
     s.submit([EOI])
     // Account image-soft-tokens as prompt tokens for billing parity with
     // text. The 2 (BOI + EOI) are negligible.
-    gUsage[sid]?.promptTokensSeen &+= UInt32(padded.count + 2)
+    s.usage.promptTokensSeen &+= UInt32(padded.count + 2)
 }
 
 // ----------------------------------------------------------------------
@@ -842,25 +824,27 @@ private func encodeBatchResponse(_ updates: [StreamUpdateOut]) -> Data {
 // but adds up. The reserveCapacity hint at output-token-budget bound
 // prevents the first append from realloc'ing.
 // ----------------------------------------------------------------------
-private func drainSession(_ s: Session, sid: UInt64) -> [UInt32] {
+private func drainSession(_ s: Session) -> [UInt32] {
     var out: [UInt32] = []
     out.reserveCapacity(8)   // typical per-poll drain is 1-8 tokens
     while let t = s.nextToken() {
         out.append(t)
     }
     if !out.isEmpty {
-        gUsage[sid]?.completionTokensEmitted &+= UInt32(out.count)
+        s.usage.completionTokensEmitted &+= UInt32(out.count)
     }
     return out
 }
 
 private func sessionStateByte(_ state: SessionState) -> UInt8 {
     switch state {
-    case .idle:       return 0
     case .priming:    return 0
     case .generating: return 1
-    case .paused:     return 0
     case .done:       return 2
+    // .paused retired 2026-05-07; .idle retired 2026-05-07 (atomic
+    // construction). Wire format: 0 = priming/inactive, 1 = generating,
+    // 2 = terminal. External pollers that branched on stateCode 3
+    // (.paused) will simply never see it.
     }
 }
 
@@ -1007,15 +991,14 @@ public func gemma_poll(_ timeoutMs: Int32,
                 captureTopKP[slot] = 0
             }
             // Set per-slot capture flags for streams with logprobs=True.
-            for sid in gCaptureLogits {
-                guard let s = gStreamToSession[sid], let slot = s.slot else { continue }
+            for s in engine.requestForStream.values where s.captureLogits {
+                guard let slot = s.slot else { continue }
                 captureActiveP[slot] = 1
-                captureTopKP[slot] = gTopLogprobs[sid] ?? 0
+                captureTopKP[slot] = s.topLogprobs
             }
             engine.syncTickStep()
-            for sid in gCaptureLogits {
-                guard let s = gStreamToSession[sid] else { continue }
-                captureLogprobForLatestToken(sid, s, topK: gTopLogprobs[sid] ?? 0)
+            for s in engine.requestForStream.values where s.captureLogits {
+                captureLogprobForLatestToken(s, topK: s.topLogprobs)
             }
         }
 
@@ -1025,24 +1008,23 @@ public func gemma_poll(_ timeoutMs: Int32,
         //    on subsequent iterations after a stream finishes inside
         //    this poll. Cleanup of finished streams happens once at
         //    poll end, AFTER all driving is done.
-        for (sid, s) in gStreamToSession {
+        for (sid, s) in engine.requestForStream {
             // If this stream finished and we already emitted its
             // state=2 update on a prior iteration of this poll, skip.
-            // (gStreamToSession only loses it during the post-loop
-            // cleanup pass, so still iterating over it here is fine.)
+            // (engine.requestForStream only loses it during the post-
+            // loop cleanup pass, so still iterating over it here is fine.)
             if gDoneEmittedThisPoll.contains(sid) { continue }
-            let newToks = drainSession(s, sid: sid)
+            let newToks = drainSession(s)
             let stateByte = sessionStateByte(s.state)
             let doneByte = sessionDoneReason(s)
             if !newToks.isEmpty || s.state == .done {
-                let usage = gUsage[sid] ?? StreamUsage()
                 var lps: [LogprobRecord] = []
-                if gCaptureLogits.contains(sid) {
-                    let avail = gLogprobsQ[sid] ?? []
+                if s.captureLogits {
+                    let avail = s.logprobsQueue
                     let n = min(avail.count, newToks.count)
                     lps = Array(avail.prefix(n))
                     if n > 0 {
-                        gLogprobsQ[sid] = Array(avail.dropFirst(n))
+                        s.logprobsQueue = Array(avail.dropFirst(n))
                     }
                 }
                 updates.append(StreamUpdateOut(
@@ -1051,11 +1033,11 @@ public func gemma_poll(_ timeoutMs: Int32,
                     doneReason: doneByte,
                     newTokens: newToks,
                     errMsg: "",
-                    promptTokensSeen: usage.promptTokensSeen,
-                    completionTokensEmitted: usage.completionTokensEmitted,
+                    promptTokensSeen: s.usage.promptTokensSeen,
+                    completionTokensEmitted: s.usage.completionTokensEmitted,
                     cacheHits: s.cacheHitTokens,
                     cacheMisses: s.cacheMissTokens,
-                    visionCacheHits: usage.visionCacheHits,
+                    visionCacheHits: s.usage.visionCacheHits,
                     logprobs: lps))
                 if s.state == .done {
                     gDoneEmittedThisPoll.insert(sid)
@@ -1115,18 +1097,14 @@ public func gemma_poll(_ timeoutMs: Int32,
         }
     }
 
-    // Clean up any sessions that finished.
+    // Clean up any sessions that finished. closeSession decrefs page
+    // refs, removes from residentSessions, and (via unbindStream)
+    // drops the streamId entry — request state lives entirely on
+    // Session and dies with it. No bridge-side state to clean.
     for u in updates where u.state == 2 {
-        if let s = gStreamToSession[u.streamId] {
+        if let s = engine.requestForStream[u.streamId] {
             engine.closeSession(s)
-            gSessionToStream.removeValue(forKey: s.id)
         }
-        gStreamToSession.removeValue(forKey: u.streamId)
-        gUsage.removeValue(forKey: u.streamId)
-        gCaptureLogits.remove(u.streamId)
-        gTopLogprobs.removeValue(forKey: u.streamId)
-        gLastOutCount.removeValue(forKey: u.streamId)
-        gLogprobsQ.removeValue(forKey: u.streamId)
     }
 
     let resp = encodeBatchResponse(updates)
@@ -1154,7 +1132,7 @@ public func gemma_status(_ outBuf: UnsafeMutablePointer<UInt8>?,
         let stats = engine.pageManager.stats()
         var generating = 0
         var priming = 0
-        for s in gStreamToSession.values {
+        for s in engine.requestForStream.values {
             switch s.state {
             case .generating: generating += 1
             case .priming:    priming += 1
@@ -1164,7 +1142,7 @@ public func gemma_status(_ outBuf: UnsafeMutablePointer<UInt8>?,
         w.u32(UInt32(stats.totalPages))
         w.u32(UInt32(stats.freePages))
         w.u32(UInt32(stats.cachedHashes))
-        w.u32(UInt32(gStreamToSession.count))
+        w.u32(UInt32(engine.requestForStream.count))
         w.u32(UInt32(generating))
         w.u32(UInt32(priming))
         w.u64(UInt64(engine.totalSteps))
@@ -1190,13 +1168,12 @@ public func gemma_status(_ outBuf: UnsafeMutablePointer<UInt8>?,
 @_cdecl("gemma_shutdown")
 public func gemma_shutdown() -> Int32 {
     if let engine = gEngine {
-        for (_, s) in gStreamToSession {
+        // closeSession unbinds the streamId; iterate on a snapshot of
+        // values to avoid mutating the dict mid-iteration.
+        for s in Array(engine.requestForStream.values) {
             engine.closeSession(s)
         }
     }
-    gStreamToSession.removeAll()
-    gSessionToStream.removeAll()
-    gUsage.removeAll()
     gEngine = nil
     return 0
 }
