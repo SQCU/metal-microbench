@@ -147,6 +147,11 @@ the chat unmanageable.
 full context AND are running with substantial autonomy. Tight system-
 prompt scoping is essential.
 
+The `tree-of-thoughts` prototype demonstrates shape D end-to-end. Phase-3 UX
+work (showing branches as they land vs. waiting for the full synthesis,
+allowing branch cancellation, mid-run re-prompting) needs FE changes -- the
+plugin API is ready.
+
 ## Programmatic / non-LLM tools (orthogonal axis)
 
 The user (2026-05-08) flagged a separate concern: *language models
