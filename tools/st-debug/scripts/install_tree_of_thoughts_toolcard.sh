@@ -91,6 +91,26 @@ def progress(text: str) -> None:
     print(json.dumps({"type": "progress", "text": text}), flush=True)
 
 
+def branch_progress(
+    branch_index: int,
+    branch_label: str,
+    status: str,
+    summary: str | None = None,
+    reasoning: str | None = None,
+) -> None:
+    event: dict[str, Any] = {
+        "type": "branch_progress",
+        "branch_index": branch_index,
+        "branch_label": branch_label,
+        "status": status,
+    }
+    if summary is not None:
+        event["summary"] = summary
+    if reasoning is not None:
+        event["reasoning"] = reasoning
+    print(json.dumps(event), flush=True)
+
+
 def next_call_id() -> int:
     global _NEXT_CALL_ID
     _NEXT_CALL_ID += 1
@@ -111,21 +131,28 @@ def parse_stdin_json(service_name: str) -> dict[str, Any]:
             print(f"[{service_name}] non-JSON stdin: {line[:120]!r}", file=sys.stderr)
 
 
-def parallel_llm_call(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def parallel_llm_call(
+    calls: list[dict[str, Any]],
+    branch_labels: list[str] | None = None,
+) -> list[dict[str, Any]]:
     """Emit all llm_call events first, then collect matching responses."""
     if not calls:
         return []
 
     ordered_ids: list[int] = []
+    branch_by_id: dict[int, tuple[int, str]] = {}
     start_times: dict[int, float] = {}
     pending: set[int] = set()
     responses: dict[int, dict[str, Any]] = {}
 
-    for call in calls:
+    for index, call in enumerate(calls):
         cid = next_call_id()
         ordered_ids.append(cid)
         pending.add(cid)
         start_times[cid] = time.time()
+        if branch_labels is not None and index < len(branch_labels):
+            branch_by_id[cid] = (index, branch_labels[index])
+            branch_progress(index, branch_labels[index], "started")
         print(json.dumps({
             "type": "llm_call",
             "id": cid,
@@ -142,10 +169,21 @@ def parallel_llm_call(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         pending.remove(cid)
         if msg.get("ok"):
+            text = str(msg.get("data", "") or "").strip()
             responses[cid] = {
-                "text": msg.get("data", ""),
+                "text": text,
                 "elapsed_s": time.time() - start_times[cid],
             }
+            branch = branch_by_id.get(cid)
+            if branch is not None:
+                index, label = branch
+                branch_progress(
+                    index,
+                    label,
+                    "complete",
+                    summary=extract_summary(text),
+                    reasoning=text,
+                )
         else:
             raise RuntimeError(f"llm_call {cid} failed: {msg.get('error', 'unknown')}")
 
@@ -252,7 +290,7 @@ def handle(args: dict[str, Any], caller_messages: Any) -> dict[str, Any]:
         }
         for label in branches
     ]
-    branch_responses = parallel_llm_call(branch_calls)
+    branch_responses = parallel_llm_call(branch_calls, branch_labels=branches)
     branch_results = []
     for label, response in zip(branches, branch_responses):
         reasoning = str(response.get("text") or "").strip()

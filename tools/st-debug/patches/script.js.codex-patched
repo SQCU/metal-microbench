@@ -1810,6 +1810,7 @@ export function messageFormatting(mes, ch_name, isSystem, isUser, messageId, san
                 const status = p.status || (p.done ? 'done' : 'running');
                 const isOpen = status === 'running' ? ' open' : '';
                 const statusLines = Array.isArray(p.status_lines) ? p.status_lines : [];
+                const branches = Array.isArray(p.branches) ? p.branches.filter(b => b && typeof b === 'object') : [];
                 const transcript = Array.isArray(p.transcript) ? p.transcript : [];
                 const summaryText = `${label} • ${status}${p.duration_ms ? ` (${(p.duration_ms / 1000).toFixed(1)}s)` : ''}`;
                 const sessionId = typeof p.session_id === 'string' ? p.session_id : '';
@@ -1823,10 +1824,22 @@ export function messageFormatting(mes, ch_name, isSystem, isUser, messageId, san
                 const statusBlock = statusLines.length
                     ? statusLines.map(l => `<div class="tool-progress-status-line">${escapeForAttr(l)}</div>`).join('')
                     : '';
+                const branchesBlock = branches.length
+                    ? `<div class="tool-progress-branches" style="display:flex; flex-direction:column; gap:0.25em; margin:0.4em 0;">${branches.map(b => {
+                        const branchStatus = escapeForAttr(b.status || 'running');
+                        const branchLabel = escapeForAttr(b.label || 'branch');
+                        const summary = typeof b.summary === 'string' ? b.summary : '';
+                        const reasoning = typeof b.reasoning === 'string' ? b.reasoning : '';
+                        const detail = b.status === 'complete'
+                            ? `<details open><summary>${escapeForAttr(summary || 'complete')}</summary><pre>${escapeForAttr(reasoning)}</pre></details>`
+                            : '';
+                        return `<div class="tool-progress-branch" data-status="${branchStatus}" style="border-left:3px solid ${b.status === 'complete' ? '#4a9' : '#999'}; padding:0.2em 0.5em;"><strong>${branchLabel}</strong> · <small>${branchStatus}</small>${detail}</div>`;
+                    }).join('')}</div>`
+                    : '';
                 const transcriptBlock = transcript.length
                     ? transcript.map(s => `<details class="tool-progress-scope"${s.done ? '' : ' open'}><summary>${escapeForAttr(s.scope || 'scope')}${s.done ? '' : ' (live)'}</summary><pre>${escapeForAttr(s.text || '')}</pre></details>`).join('')
                     : '';
-                blocks.push(`<details class="tool-progress-collapsible"${isOpen}><summary>${summaryText}${cancelLink}</summary>${statusBlock}${transcriptBlock}</details>`);
+                blocks.push(`<details class="tool-progress-collapsible"${isOpen}><summary>${summaryText}${cancelLink}</summary>${statusBlock}${branchesBlock}${transcriptBlock}</details>`);
             }
             if (invocations.length) {
                 const cloned = invocations.map(i => {

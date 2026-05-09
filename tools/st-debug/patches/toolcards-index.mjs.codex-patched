@@ -237,7 +237,7 @@ class CardServiceProcess {
             }
             return;
         }
-        if (msg.type === 'llm_call' || msg.type === 'result' || msg.type === 'progress') {
+        if (msg.type === 'llm_call' || msg.type === 'result' || msg.type === 'progress' || msg.type === 'branch_progress') {
             const sess = this.session;
             if (!sess) {
                 console.warn(`[toolcards:${this.card.id}] ${msg.type} with no active session, dropping`);

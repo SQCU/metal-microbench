@@ -145,6 +145,10 @@ async function invokeToolViaSession(cardId, toolName, args, label, callerCtx) {
                 ph.append(typeof event.text === 'string' ? event.text : JSON.stringify(event));
                 continue;
             }
+            if (event.type === 'branch_progress') {
+                ph.branchUpdate(event);
+                continue;
+            }
             if (event.type === 'result') {
                 liveSessions.delete(sessionId);
                 if (!event.ok) {
@@ -301,6 +305,7 @@ function findCallerAssistantMessage(ctx) {
  *   - streamText(scope, full) live raw model output for an in-flight LLM
  *                             call (sub-LLM dispatched by the card)
  *   - streamDone(scope)       mark a streaming scope finished
+ *   - branchUpdate(event)     update per-branch progress for Shape-D cards
  *   - finalize(summary, embed) snap the entry to "done", append inline
  *                              media markers + extra.media entries for any
  *                              image_url parts in `embed` so the model
@@ -383,6 +388,39 @@ function attachToCallerMessage(callerCtx, label, sessionId = null) {
         rerender(true);
     }
 
+    function branchUpdate(event) {
+        const branchIndex = Number(event?.branch_index);
+        if (!Number.isInteger(branchIndex) || branchIndex < 0) return;
+        if (!Array.isArray(entry.branches)) entry.branches = [];
+
+        const current = entry.branches[branchIndex] || {};
+        const label = typeof event.branch_label === 'string'
+            ? event.branch_label
+            : (typeof current.label === 'string' ? current.label : `branch ${branchIndex + 1}`);
+        if (event.status === 'started') {
+            entry.branches[branchIndex] = {
+                ...current,
+                label,
+                status: 'running',
+            };
+        } else if (event.status === 'complete') {
+            entry.branches[branchIndex] = {
+                ...current,
+                label,
+                status: 'complete',
+                summary: typeof event.summary === 'string' ? event.summary : '',
+                reasoning: typeof event.reasoning === 'string' ? event.reasoning : '',
+            };
+        } else {
+            entry.branches[branchIndex] = {
+                ...current,
+                label,
+                status: typeof event.status === 'string' ? event.status : (current.status || 'running'),
+            };
+        }
+        rerender(true);
+    }
+
     function finalize(summary, embed) {
         entry.status = 'done';
         entry.done = true;
@@ -447,7 +485,7 @@ function attachToCallerMessage(callerCtx, label, sessionId = null) {
         }
     }
 
-    return { messageId, msg, append, streamText, streamDone, finalize, fail };
+    return { messageId, msg, append, streamText, streamDone, branchUpdate, finalize, fail };
 }
 
 function registerOneTool(card, tool) {
