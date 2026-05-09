@@ -684,6 +684,18 @@ final class Session {
         return computeCvecDigest(activeControls: activeControls,
                                   pageStart: pageStart, pageSize: pageSize)
     }
+
+    // Apply a client-provided seed to both host and GPU sampling state.
+    // Seed 0 means "unspecified" on the batch FFI wire, so preserve the
+    // randomly initialized per-session GPU seed in that case.
+    func applySamplingSeed(_ seed: UInt64) {
+        guard seed != 0 else { return }
+        rng = SeedableRNG(seed: seed)
+        var mixer = SeedableRNG(seed: seed)
+        let mixed = mixer.next()
+        gpuRngSeed = UInt32(truncatingIfNeeded: mixed ^ (mixed >> 32))
+    }
+
     // Signal a control's sustain → release transition. Caller passes the
     // current (position, turn) so the ADSR decays relative to that point.
     func releaseControl(cvecId: String, position: Int, turn: Int) {
@@ -1367,6 +1379,7 @@ final class LmEngine {
         var eosId: UInt32? = nil
         var maxNewTokens: Int = 4096   // bumped 128 → 4096 (2026-05-07): see openSession default note
         var samplingTemperature: Float = 0.0
+        var samplingSeed: UInt64 = 0
         var captureLogits: Bool = false
         var topLogprobs: UInt32 = 0
         var logitBiasDense: [Float]? = nil
@@ -1397,6 +1410,7 @@ final class LmEngine {
         }
         bindStream(s, streamId: sid)
         s.samplingTemperature = initParams.samplingTemperature
+        s.applySamplingSeed(initParams.samplingSeed)
         s.captureLogits = initParams.captureLogits
         s.topLogprobs = initParams.topLogprobs
         s.logitBiasDense = initParams.logitBiasDense
@@ -3176,5 +3190,4 @@ final class LmEngine {
         return tokenizer.decode(tokens)
     }
 }
-
 

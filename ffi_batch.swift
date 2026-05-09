@@ -419,6 +419,7 @@ private func applyStreamAction(_ stream: DecodedStream, engine: LmEngine) {
         initParams.eosId = eosId
         initParams.maxNewTokens = maxNew
         initParams.samplingTemperature = stream.sampling.temperature
+        initParams.samplingSeed = stream.sampling.seed
         if (stream.flags & 0x01) != 0 {
             initParams.captureLogits = true
             initParams.topLogprobs = stream.sampling.topLogprobs
@@ -466,6 +467,7 @@ private func applyStreamAction(_ stream: DecodedStream, engine: LmEngine) {
         // adjust mid-conv). All these are no-ops when the stream's
         // values are unchanged from the prior submit.
         s.samplingTemperature = stream.sampling.temperature
+        s.applySamplingSeed(stream.sampling.seed)
         s.logitBiasDense = denseLogitBias(stream.sampling.logitBias)
         s.minP = max(0, min(1, stream.sampling.minP))
         s.cot = cotStateForLabels(stream.sampling.cotLabels)
@@ -482,6 +484,7 @@ private func applyStreamAction(_ stream: DecodedStream, engine: LmEngine) {
     case 3: // touch — re-apply policy without new tokens (same code as continue without submit)
         guard let s = engine.requestForStream[sid] else { return }
         s.samplingTemperature = stream.sampling.temperature
+        s.applySamplingSeed(stream.sampling.seed)
         s.logitBiasDense = denseLogitBias(stream.sampling.logitBias)
         s.minP = max(0, min(1, stream.sampling.minP))
         s.cot = cotStateForLabels(stream.sampling.cotLabels)
