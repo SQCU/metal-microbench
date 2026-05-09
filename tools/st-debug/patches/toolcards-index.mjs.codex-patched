@@ -84,6 +84,7 @@ function validateCard(card) {
             if (typeof t.name !== 'string' || !ID_RE.test(t.name)) errs.push(`tools[${i}].name must be [a-z0-9_-]+`);
             if (typeof t.description !== 'string') errs.push(`tools[${i}].description must be a string`);
             if (typeof t.parameters !== 'object' || t.parameters === null) errs.push(`tools[${i}].parameters must be a JSON Schema object`);
+            if (t.async !== undefined && typeof t.async !== 'boolean') errs.push(`tools[${i}].async must be a boolean`);
         }
     }
     if (typeof card.files !== 'object' || card.files === null) {
@@ -680,6 +681,7 @@ export async function init(router) {
                     display_name: t.display_name ?? t.name,
                     description: t.description,
                     parameters: t.parameters,
+                    async: t.async === true,
                 })),
             });
         }

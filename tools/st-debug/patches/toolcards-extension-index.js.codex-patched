@@ -20,7 +20,7 @@
 // continues server-side and we'll pick up the result on next reconcile.
 
 import { oai_settings } from '../../openai.js';
-import { getRequestHeaders } from '../../../script.js';
+import { getRequestHeaders, system_message_types } from '../../../script.js';
 
 const PLUGIN_BASE = '/api/plugins/toolcards';
 
@@ -46,6 +46,14 @@ async function fetchJson(url, opts = {}) {
 async function listCards() {
     const data = await fetchJson(PLUGIN_BASE + '/list');
     return data.cards || [];
+}
+
+function formatArgs(args) {
+    try {
+        return JSON.stringify(args || {});
+    } catch (_) {
+        return String(args);
+    }
 }
 
 /**
@@ -80,7 +88,7 @@ function currentChatId() {
     } catch (_) { return null; }
 }
 
-async function invokeToolViaSession(cardId, toolName, args, label, callerCtx) {
+async function startToolSession(cardId, toolName, args, label, callerCtx) {
     // Snapshot profile + chat metadata at session start. The plugin
     // dispatches llm_call events server-side using these, so the tool
     // continues to run even if this tab is suspended or closed.
@@ -109,6 +117,10 @@ async function invokeToolViaSession(cardId, toolName, args, label, callerCtx) {
     // Track the live session so reconcile-on-resume can dedupe.
     liveSessions.set(sessionId, { ph, cardId, toolName, label });
 
+    return { sessionId, ph };
+}
+
+async function pollToolSession(sessionId, ph) {
     // Drive the cosmetic-progress poll loop. The plugin does the actual
     // llm_call dispatching server-side, so a failed poll loop is no
     // longer fatal — the session keeps running and we'll pick up the
@@ -151,6 +163,7 @@ async function invokeToolViaSession(cardId, toolName, args, label, callerCtx) {
             }
             if (event.type === 'result') {
                 liveSessions.delete(sessionId);
+                _appliedSessionIds.add(sessionId);
                 if (!event.ok) {
                     ph.fail(event.error || 'tool call failed');
                     throw new Error(event.error || 'tool call failed');
@@ -174,6 +187,52 @@ async function invokeToolViaSession(cardId, toolName, args, label, callerCtx) {
         liveSessions.delete(sessionId);
         ph.fail(String(err?.message || err));
         throw err;
+    }
+}
+
+async function invokeToolViaSession(cardId, toolName, args, label, callerCtx) {
+    const { sessionId, ph } = await startToolSession(cardId, toolName, args, label, callerCtx);
+    return await pollToolSession(sessionId, ph);
+}
+
+function startAsyncToolInvocation(cardId, toolName, args, label, callerCtx) {
+    startToolSession(cardId, toolName, args, label, callerCtx)
+        .then(({ sessionId, ph }) => {
+            const live = liveSessions.get(sessionId);
+            if (live) {
+                live.async = true;
+                live.callerCtx = callerCtx;
+            }
+            return pollToolSession(sessionId, ph);
+        })
+        .then(result => onAsyncResult(callerCtx, label, result))
+        .catch(err => console.warn('[toolcards] async invocation failed:', err?.message || err));
+}
+
+function onAsyncResult(callerCtx, label, result) {
+    const ctx = SillyTavern.getContext();
+    const summary = (result && typeof result.summary === 'string')
+        ? result.summary
+        : (typeof result === 'string' ? result : JSON.stringify(result));
+    const message = {
+        name: 'System',
+        is_system: true,
+        is_user: false,
+        send_date: new Date().toLocaleString(),
+        mes: `**Background ${label} result:** ${summary}`,
+        extra: {
+            type: system_message_types.NARRATOR,
+            tool_async_result: true,
+            label,
+            summary,
+            full_result: result,
+            caller_message_id: callerCtx?.idx ?? null,
+        },
+    };
+    ctx.chat.push(message);
+    try { ctx.addOneMessage(message); } catch (_) { /* ignore */ }
+    if (typeof ctx.saveChat === 'function') {
+        ctx.saveChat().catch(() => {});
     }
 }
 
@@ -225,6 +284,13 @@ async function reconcileSessions() {
             const result = r.result || {};
             ph.finalize(typeof result.summary === 'string' ? result.summary : null,
                         Array.isArray(result.embed) ? result.embed : null);
+            if (isAsyncTool(r.card_id, r.tool_name)) {
+                onAsyncResult(
+                    { msg: callerMsg, idx: callerIdx },
+                    `${r.card_id} • ${r.tool_name}`,
+                    result,
+                );
+            }
         } else {
             ph.fail(r.error || 'tool failed (reconciled after disconnect)');
         }
@@ -262,6 +328,15 @@ async function uninstallCard(cardId) {
 // ── Tool registration ─────────────────────────────────────────────────
 
 const registered = new Map(); // qualified_name → cardId (so we can re-register on reinstall)
+const toolMetadata = new Map(); // qualified_name → server-provided tool metadata
+
+function qualifiedToolName(cardId, toolName) {
+    return `${cardId}__${toolName}`;
+}
+
+function isAsyncTool(cardId, toolName) {
+    return toolMetadata.get(qualifiedToolName(cardId, toolName))?.async === true;
+}
 
 function makeMarker() {
     const id = (typeof crypto !== 'undefined' && crypto.randomUUID)
@@ -490,8 +565,9 @@ function attachToCallerMessage(callerCtx, label, sessionId = null) {
 
 function registerOneTool(card, tool) {
     const ctx = SillyTavern.getContext();
-    const qualifiedName = `${card.id}__${tool.name}`;
+    const qualifiedName = qualifiedToolName(card.id, tool.name);
     const displayName = `${card.display_name} • ${tool.display_name ?? tool.name}`;
+    toolMetadata.set(qualifiedName, { ...tool, card_id: card.id });
     ctx.registerFunctionTool({
         name: qualifiedName,
         displayName,
@@ -507,6 +583,10 @@ function registerOneTool(card, tool) {
             // tool-progress entry and any inline image embeds will live on
             // this message's extra (rendered by messageFormatting).
             const callerCtx = findCallerAssistantMessage(ctx);
+            if (tool.async === true) {
+                startAsyncToolInvocation(card.id, tool.name, args, label, callerCtx);
+                return `Background ${tool.name} started for ${formatArgs(args)}; result will arrive separately.`;
+            }
             const result = await invokeToolViaSession(card.id, tool.name, args, label, callerCtx);
             // The model sees ONLY this textual summary in its role:"tool"
             // content. The image (if any) was spliced into the caller
@@ -536,6 +616,7 @@ async function refreshTools() {
     for (const qn of [...registered.keys()]) {
         try { ctx.unregisterFunctionTool(qn); } catch (_) { /* fine */ }
         registered.delete(qn);
+        toolMetadata.delete(qn);
     }
     for (const card of cards) {
         for (const tool of card.tools) {

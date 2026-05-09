@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install the async-lookup toolcard into the debug data root.
 #
-# Shape-C fresh-context async prototype: start_invoke returns a session_id
+# Shape-C true fire-and-forget async prototype: FE action returns immediately
 # immediately, while a deliberately slow descendant process completes later
 # through the existing /poll and pushChatResult paths.
 # Idempotent. Lives under tools/st-debug/_data/toolcards/, NEVER touches
@@ -54,7 +54,7 @@ dst_installed = pathlib.Path(os.environ["DST_INSTALLED"])
 
 service_src = '''"""async-lookup tool service.
 
-Shape-C fresh-context async prototype.
+Shape-C true fire-and-forget async prototype.
 
 The service deliberately takes about six seconds before returning a result.
 That bounded delay is the point: start_invoke should still return a session_id
@@ -193,7 +193,7 @@ card = {
     "id": "async-lookup",
     "display_name": "Async Lookup",
     "description": description,
-    "version": "0.1.0",
+    "version": "0.1.1",
     "author": "fork",
     "runtime": {
         "kind": "python",
@@ -205,6 +205,7 @@ card = {
         {
             "name": "lookup",
             "display_name": "Background lookup",
+            "async": True,
             "description": description,
             "parameters": {
                 "type": "object",
