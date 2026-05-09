@@ -10,7 +10,8 @@
 //   POST /api/plugins/toolcards/uninstall/:id       — remove a card
 //   POST /api/plugins/toolcards/start_invoke/:id/:tool — begin an invocation.
 //                                                       Body: {args, profile,
-//                                                              chat_id?, caller_message_id?}
+//                                                              chat_id?, caller_message_id?,
+//                                                              caller_messages?}
 //                                                       Plugin captures auth
 //                                                       headers from req.headers
 //                                                       and uses them + profile
@@ -316,6 +317,18 @@ class CardServiceProcess {
         // would send. Keep stream:false — we only care about the final
         // text. Sub-LLM streaming for cosmetic display would require us to
         // also pipe partial chunks back to the FE which is not necessary.
+        // Field aliasing: ST's oai_settings uses *_openai-suffixed names
+        // (temperature_openai, seed, openai_max_tokens). The downstream
+        // /api/backends/chat-completions/generate route accepts the
+        // unsuffixed names. Read both forms with the suffixed-form
+        // taking precedence — matches what the FE serializes. Found
+        // 2026-05-08 when python-exec descendant calls were silently
+        // running at temperature=0.7 instead of the temp=0.0 the test
+        // explicitly requested via temperature_openai.
+        const temperature = profile.temperature_openai
+            ?? profile.temperature
+            ?? 0.7;
+        const seed = profile.seed ?? 0;
         const body = {
             stream: false,
             messages: msg.messages,
@@ -326,7 +339,8 @@ class CardServiceProcess {
             reverse_proxy: profile.reverse_proxy,
             proxy_password: profile.proxy_password,
             custom_prompt_post_processing: profile.custom_prompt_post_processing,
-            temperature: profile.temperature ?? 0.7,
+            temperature,
+            seed,
         };
         // The plugin runs in the same Node process as the express app.
         // We use the host header captured from the user's /start_invoke
@@ -362,17 +376,21 @@ class CardServiceProcess {
         }
     }
 
-    async beginSession(session) {
+    async beginSession(session, callerMessages = null) {
         await this.readyPromise;
         this.session = session;
         session.process = this;
         this._bumpIdle();
-        const req = JSON.stringify({
+        const invoke = {
             type: 'invoke',
             id: session.invokeId,
             tool: session.toolName,
             args: session.args,
-        }) + '\n';
+        };
+        if (Array.isArray(callerMessages) && callerMessages.length > 0) {
+            invoke.caller_messages = callerMessages;
+        }
+        const req = JSON.stringify(invoke) + '\n';
         this.proc.stdin.write(req, (err) => {
             if (err) {
                 this._failSession(err.message);
@@ -507,7 +525,7 @@ class CardService {
         };
         const worker = this._acquireProcess();
         try {
-            await worker.beginSession(session);
+            await worker.beginSession(session, opts.callerMessages);
         } catch (e) {
             this.activeProcesses.delete(worker);
             worker.kill();
@@ -701,15 +719,18 @@ export async function init(router) {
             return res.status(404).json({ error: `tool "${tool}" not declared` });
         }
         // Body shape (architectural-shift compatible):
-        //   {args, profile?, chat_id?, caller_message_id?}
+        //   {args, profile?, chat_id?, caller_message_id?, caller_messages?}
         // For backward compatibility with clients that pass args directly
         // without nesting (the original protocol), accept both shapes.
         const body = req.body || {};
-        const isWrapped = (typeof body === 'object' && (body.args || body.profile || body.chat_id));
+        const isWrapped = (typeof body === 'object' && (body.args || body.profile || body.chat_id || body.caller_messages));
         const args = isWrapped ? (body.args || {}) : body;
         const profile = isWrapped ? (body.profile || null) : null;
         const chatId = isWrapped ? (body.chat_id || null) : null;
         const callerMessageId = isWrapped ? (body.caller_message_id ?? null) : null;
+        const callerMessages = isWrapped && Array.isArray(body.caller_messages) && body.caller_messages.length > 0
+            ? body.caller_messages
+            : null;
         // Capture auth from the user's request: cookie + csrf token are
         // valid for the duration of their browser session and let the
         // plugin make authenticated internal calls back to ST's own
@@ -734,7 +755,7 @@ export async function init(router) {
         try {
             const svc = getOrCreateService(card);
             const session = await svc.startSession(tool, args, {
-                profile, authHeaders, chatId, callerMessageId,
+                profile, authHeaders, chatId, callerMessageId, callerMessages,
             });
             sessions.set(session.sessionId, { service: svc, session });
             res.json({ session_id: session.sessionId });

@@ -113,6 +113,17 @@ inserts a "result arrived" affordance.
 mid-sentence interrupt requires scringlo to integrate gracefully —
 some prompting needed.
 
+**Phase-3 handoff**: the `async-lookup` prototype demonstrates that
+the plugin/protocol layer is already capable of fresh-context async
+work: `/start_invoke` can return a `session_id` immediately, the
+descendant can continue running in the background, and the result can
+land later through `/poll` plus `pushChatResult`. Phase-3 work is
+wiring that capability to UX-level fire-and-forget behavior: mid-
+conversation interrupt affordances, partial-result rendering, and
+reconciliation states in the frontend. Those need FE changes; the
+toolcards plugin API itself does not need a new blocking/non-blocking
+mode to expose this pattern.
+
 ### D — context-copying asynchronous (deferred interrupt)
 
 **What**: combines B + C. Descendant inherits context, runs in
