@@ -15,6 +15,16 @@ if [[ ! -f "$DATA_ROOT/default-user/settings.json" ]]; then
     exit 1
 fi
 
+# Kill orphan toolcard service.py processes from previous interrupted
+# test runs. Without this, the toolcards plugin's per-card service queue
+# (plugins/toolcards/index.mjs:338) parks new invocations behind the
+# orphan's still-active session — observable as multi-minute hangs in
+# test 05 / test 06 with no error events. Found via static analysis of
+# the plugin's startSession flow, 2026-05-08.
+pkill -f 'uv run --no-project --with.*python service.py' 2>/dev/null || true
+pkill -f 'uv run --with .*python service.py' 2>/dev/null || true
+sleep 0.5
+
 # Sanity: is the bridge reachable? (warn-only; ST will start regardless)
 if ! curl -sS --max-time 2 http://127.0.0.1:8001/health > /dev/null 2>&1; then
     echo "[run] WARN: bridge at http://127.0.0.1:8001 unreachable — chat will 500"
