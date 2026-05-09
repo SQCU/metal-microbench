@@ -1,0 +1,852 @@
+// Tool cards server plugin.
+//
+// Manages the lifecycle of tool-card Python services. Sessions are
+// server-authoritative: lifecycle (spawn, llm_call dispatch, result
+// collection) is owned by this plugin and survives frontend disconnects
+// (mobile suspend, tab close, page refresh).
+//
+//   GET  /api/plugins/toolcards/list                — installed cards + tools
+//   POST /api/plugins/toolcards/install             — install from card JSON in body
+//   POST /api/plugins/toolcards/uninstall/:id       — remove a card
+//   POST /api/plugins/toolcards/start_invoke/:id/:tool — begin an invocation.
+//                                                       Body: {args, profile,
+//                                                              chat_id?, caller_message_id?}
+//                                                       Plugin captures auth
+//                                                       headers from req.headers
+//                                                       and uses them + profile
+//                                                       to dispatch any llm_call
+//                                                       events server-side.
+//                                                       Returns {session_id}.
+//   GET  /api/plugins/toolcards/poll/:session_id    — long-poll next live event
+//                                                       (cosmetic progress only;
+//                                                       missing this isn't fatal)
+//   GET  /api/plugins/toolcards/sessions?chat_id=X  — pending+completed sessions
+//                                                       for a chat. Used by the FE
+//                                                       on visibilitychange to
+//                                                       reconcile state after
+//                                                       suspend/resume/refresh.
+//   POST /api/plugins/toolcards/cancel/:session_id  — kill an active session
+//   POST /api/plugins/toolcards/respond/:session_id/:call_id
+//                                                  — legacy: feed back FE-dispatched
+//                                                    LLM result. Kept for
+//                                                    cards started by clients
+//                                                    that don't send a `profile`.
+//
+// llm_call dispatch path (post-architectural-shift): when the python service
+// emits {type:"llm_call",...} and the session has a stored profile, the
+// plugin POSTs to /api/backends/chat-completions/generate over local HTTP
+// using the auth headers captured at /start_invoke time. The frontend is
+// not in the loop. See docs/TOOLCARDS.md.
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+import express from 'express';
+
+const ID_RE = /^[a-z0-9_-]+$/;
+const FILE_PATH_RE = /^[a-zA-Z0-9_./-]+$/;
+const READY_TIMEOUT_MS = 30_000;
+const DEFAULT_IDLE_TIMEOUT_S = 600;
+const DEFAULT_WARM_POOL_SIZE = 2;
+const POLL_TIMEOUT_MS = 90_000;
+const SPAWN_CMD = 'uv';
+
+function cardsDir() { return path.join(globalThis.DATA_ROOT, 'toolcards', 'cards'); }
+function installedDir() { return path.join(globalThis.DATA_ROOT, 'toolcards', 'installed'); }
+
+function ensureDirs() {
+    fs.mkdirSync(cardsDir(), { recursive: true });
+    fs.mkdirSync(installedDir(), { recursive: true });
+}
+
+// ── Card validation ───────────────────────────────────────────────────
+
+function validateCard(card) {
+    const errs = [];
+    if (typeof card !== 'object' || card === null) return ['card must be a JSON object'];
+    if (card.card_format_version !== '1') errs.push(`card_format_version must be "1"`);
+    if (typeof card.id !== 'string' || !ID_RE.test(card.id)) errs.push('id must be [a-z0-9_-]+');
+    for (const f of ['display_name', 'description', 'version']) {
+        if (typeof card[f] !== 'string' || !card[f].length) errs.push(`${f} must be a non-empty string`);
+    }
+    if (typeof card.runtime !== 'object' || card.runtime === null) {
+        errs.push('runtime must be an object');
+    } else {
+        if (card.runtime.kind !== 'python') errs.push('runtime.kind must be "python"');
+        if (!Array.isArray(card.runtime.deps)) errs.push('runtime.deps must be an array');
+        if (typeof card.runtime.entrypoint !== 'string') errs.push('runtime.entrypoint must be a string');
+    }
+    if (!Array.isArray(card.tools) || !card.tools.length) {
+        errs.push('tools must be a non-empty array');
+    } else {
+        for (const [i, t] of card.tools.entries()) {
+            if (typeof t.name !== 'string' || !ID_RE.test(t.name)) errs.push(`tools[${i}].name must be [a-z0-9_-]+`);
+            if (typeof t.description !== 'string') errs.push(`tools[${i}].description must be a string`);
+            if (typeof t.parameters !== 'object' || t.parameters === null) errs.push(`tools[${i}].parameters must be a JSON Schema object`);
+        }
+    }
+    if (typeof card.files !== 'object' || card.files === null) {
+        errs.push('files must be an object');
+    } else {
+        for (const p of Object.keys(card.files)) {
+            if (!FILE_PATH_RE.test(p) || p.includes('..')) errs.push(`files["${p}"]: bad path`);
+            if (typeof card.files[p] !== 'string') errs.push(`files["${p}"]: value must be string`);
+        }
+        if (card.runtime?.entrypoint && !card.files[card.runtime.entrypoint]) {
+            errs.push(`runtime.entrypoint "${card.runtime.entrypoint}" not in files`);
+        }
+    }
+    return errs;
+}
+
+function materializeCard(card) {
+    const target = path.join(installedDir(), card.id);
+    fs.mkdirSync(target, { recursive: true });
+    for (const [rel, content] of Object.entries(card.files)) {
+        const full = path.join(target, rel);
+        fs.mkdirSync(path.dirname(full), { recursive: true });
+        fs.writeFileSync(full, content, 'utf8');
+    }
+    fs.writeFileSync(path.join(cardsDir(), `${card.id}.toolcard.json`),
+        JSON.stringify(card, null, 2), 'utf8');
+}
+
+function removeCardFiles(id) {
+    const cardJson = path.join(cardsDir(), `${id}.toolcard.json`);
+    const installed = path.join(installedDir(), id);
+    if (fs.existsSync(cardJson)) fs.unlinkSync(cardJson);
+    if (fs.existsSync(installed)) fs.rmSync(installed, { recursive: true, force: true });
+}
+
+function loadAllCards() {
+    ensureDirs();
+    const out = new Map();
+    for (const fn of fs.readdirSync(cardsDir())) {
+        if (!fn.endsWith('.toolcard.json')) continue;
+        try {
+            const card = JSON.parse(fs.readFileSync(path.join(cardsDir(), fn), 'utf8'));
+            const errs = validateCard(card);
+            if (errs.length) {
+                console.warn(`[toolcards] skipping ${fn}: ${errs.join('; ')}`);
+                continue;
+            }
+            out.set(card.id, card);
+        } catch (e) {
+            console.warn(`[toolcards] failed to load ${fn}: ${e.message}`);
+        }
+    }
+    return out;
+}
+
+// ── Session-aware service lifecycle ───────────────────────────────────
+//
+// Each invocation now owns its own Python service process. The old runtime
+// kept one process per card and serialized sessions through activeSession +
+// invokeQueue; an interrupted client could leave the active session waiting
+// for a result forever, which made every later invocation of the same card
+// block behind that orphan. Per-session processes remove that FIFO sync
+// dependency: result, cancel, process death, and idle timeout clean up only
+// the affected session. A small per-card warm pool keeps the common path from
+// paying the cold start cost on every /start_invoke while preserving the
+// unchanged service.py protocol.
+
+class CardServiceProcess {
+    constructor(card, owner) {
+        this.card = card;
+        this.owner = owner;
+        this.proc = null;
+        this.readyPromise = null;
+        this.idleTimer = null;
+        this.stdoutBuf = '';
+        this.session = null;
+        this.completed = false;
+        this._readyResolve = null;
+        this._readyReject = null;
+    }
+
+    spawn() {
+        if (this.proc) return this.readyPromise;
+        const cwd = path.join(installedDir(), this.card.id);
+        const args = ['run'];
+        for (const dep of this.card.runtime.deps) args.push('--with', dep);
+        args.push('python', this.card.runtime.entrypoint);
+        const proc = spawn(SPAWN_CMD, args, { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+        this.proc = proc;
+
+        proc.stdout.setEncoding('utf8');
+        proc.stdout.on('data', (chunk) => this._onStdout(chunk));
+        proc.stderr.on('data', (chunk) => {
+            process.stderr.write(`[toolcards:${this.card.id}] ${chunk}`);
+        });
+        proc.on('exit', (code, signal) => {
+            console.log(`[toolcards] ${this.card.id} exited code=${code} signal=${signal}`);
+            this._reset(new Error(`service exited (code=${code} signal=${signal})`));
+        });
+        proc.on('error', (err) => {
+            console.error(`[toolcards] spawn error for ${this.card.id}:`, err.message);
+            this._reset(err);
+        });
+
+        this.readyPromise = new Promise((resolve, reject) => {
+            const t = setTimeout(() => {
+                reject(new Error(`service ${this.card.id} did not signal ready within ${READY_TIMEOUT_MS}ms`));
+                this.kill();
+            }, READY_TIMEOUT_MS);
+            this._readyResolve = () => { clearTimeout(t); resolve(); };
+            this._readyReject = (e) => { clearTimeout(t); reject(e); };
+        });
+        return this.readyPromise;
+    }
+
+    isIdle() {
+        return !this.session && !!this.proc && !this.completed;
+    }
+
+    _onStdout(chunk) {
+        this.stdoutBuf += chunk;
+        let nl;
+        while ((nl = this.stdoutBuf.indexOf('\n')) !== -1) {
+            const line = this.stdoutBuf.slice(0, nl).trim();
+            this.stdoutBuf = this.stdoutBuf.slice(nl + 1);
+            if (!line) continue;
+            this._handleLine(line);
+        }
+    }
+
+    _handleLine(line) {
+        let msg;
+        try { msg = JSON.parse(line); }
+        catch (e) {
+            console.warn(`[toolcards:${this.card.id}] non-JSON stdout: ${line.slice(0, 200)}`);
+            return;
+        }
+        // Backward compat with the older protocol:
+        //   {ready: true} → {type: "ready"}
+        //   {id, ok, result|error} (no type) → {type: "result", ...}
+        if (msg.ready === true && !msg.type) msg.type = 'ready';
+        if (typeof msg.id === 'number' && typeof msg.ok === 'boolean' && !msg.type) {
+            msg.type = 'result';
+        }
+
+        if (msg.type === 'ready') {
+            if (this._readyResolve) {
+                this._readyResolve();
+                this._readyResolve = null;
+                this._readyReject = null;
+            }
+            return;
+        }
+        if (msg.type === 'llm_call' || msg.type === 'result' || msg.type === 'progress') {
+            const sess = this.session;
+            if (!sess) {
+                console.warn(`[toolcards:${this.card.id}] ${msg.type} with no active session, dropping`);
+                return;
+            }
+            // Server-side llm_call dispatch (architectural shift): when the
+            // session has a captured profile + auth, the plugin makes the
+            // chat-completion call itself via local HTTP and writes the
+            // response back to python. The frontend's poll loop, if it
+            // even exists, only sees progress + result events for cosmetic
+            // rendering. This makes session liveness independent of the
+            // frontend tab being alive.
+            if (msg.type === 'llm_call' && sess.profile && sess.authHeaders) {
+                this._dispatchLlmCallServerSide(sess, msg).catch((e) => {
+                    console.warn(`[toolcards:${this.card.id}] server-side llm_call failed:`, e?.message || e);
+                });
+                return; // never queued for the FE
+            }
+            // Deliver to a waiting poller if any, else queue (used for
+            // cosmetic progress and the result event the FE renders).
+            this._emitSessionEvent(msg);
+            if (msg.type === 'result') {
+                this.completed = true;
+                this.kill();
+            }
+            return;
+        }
+        console.warn(`[toolcards:${this.card.id}] unknown message type: ${msg.type}`);
+    }
+
+    _reset(err) {
+        if (this._readyReject) { this._readyReject(err); this._readyResolve = null; this._readyReject = null; }
+        if (!this.completed && this.session) {
+            this._failSession(`service died: ${err.message}`);
+        }
+        this.proc = null;
+        this.readyPromise = null;
+        if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null; }
+        this.owner._forgetProcess(this);
+    }
+
+    _bumpIdle() {
+        if (this.idleTimer) clearTimeout(this.idleTimer);
+        const sec = this.card.runtime.idle_timeout_s ?? DEFAULT_IDLE_TIMEOUT_S;
+        this.idleTimer = setTimeout(() => {
+            console.log(`[toolcards] ${this.card.id} session idle ${sec}s, terminating`);
+            this._failSession(`session idle timeout after ${sec}s`);
+            this.kill();
+        }, sec * 1000);
+    }
+
+    kill() {
+        if (!this.proc) return;
+        const proc = this.proc;
+        try { proc.kill('SIGTERM'); } catch (_) { /* ignore */ }
+        setTimeout(() => { try { proc.kill('SIGKILL'); } catch (_) {} }, 5000).unref?.();
+    }
+
+    /**
+     * Dispatch a python-emitted llm_call by POSTing to the host's own
+     * /api/backends/chat-completions/generate route over local HTTP. The
+     * auth headers (cookie + csrf token) captured at /start_invoke time
+     * are reused so the call rides the user's existing session. On
+     * completion, write llm_response back to python's stdin.
+     *
+     * Errors are reported to python as ok:false; the python side decides
+     * whether to retry, abort, or recover.
+     */
+    async _dispatchLlmCallServerSide(session, msg) {
+        const profile = session.profile;
+        const headers = session.authHeaders;
+        if (!profile || !headers) {
+            this.sendLlmResponse(msg.id, false, null, 'no profile/auth captured for server-side dispatch');
+            return;
+        }
+        // Build the same request body shape the FE's ChatCompletionService
+        // would send. Keep stream:false — we only care about the final
+        // text. Sub-LLM streaming for cosmetic display would require us to
+        // also pipe partial chunks back to the FE which is not necessary.
+        const body = {
+            stream: false,
+            messages: msg.messages,
+            max_tokens: msg.max_tokens || 4096,
+            chat_completion_source: profile.chat_completion_source,
+            model: profile.openai_model || profile.model,
+            custom_url: profile.custom_url,
+            reverse_proxy: profile.reverse_proxy,
+            proxy_password: profile.proxy_password,
+            custom_prompt_post_processing: profile.custom_prompt_post_processing,
+            temperature: profile.temperature ?? 0.7,
+        };
+        // The plugin runs in the same Node process as the express app.
+        // We use the host header captured from the user's /start_invoke
+        // request as our base URL — it's whatever the user is talking to
+        // ST on (127.0.0.1:8000, hostname:port behind a reverse proxy,
+        // etc). Keeping it local-only avoids any cross-origin question.
+        const baseUrl = headers['_base_url'] || 'http://127.0.0.1:8000';
+        const url = `${baseUrl}/api/backends/chat-completions/generate`;
+        const fetchHeaders = {
+            'content-type': 'application/json',
+            'accept': 'application/json',
+        };
+        if (headers['cookie']) fetchHeaders['cookie'] = headers['cookie'];
+        if (headers['x-csrf-token']) fetchHeaders['x-csrf-token'] = headers['x-csrf-token'];
+        if (headers['authorization']) fetchHeaders['authorization'] = headers['authorization'];
+        try {
+            const resp = await fetch(url, {
+                method: 'POST',
+                headers: fetchHeaders,
+                body: JSON.stringify(body),
+            });
+            if (!resp.ok) {
+                const errBody = await resp.text().catch(() => '');
+                throw new Error(`upstream ${resp.status}: ${errBody.slice(0, 300)}`);
+            }
+            const data = await resp.json();
+            // OpenAI-shape: choices[0].message.content (or .text for
+            // text-completion). Pull the first non-empty string.
+            const text = extractCompletionText(data);
+            this.sendLlmResponse(msg.id, true, text);
+        } catch (e) {
+            this.sendLlmResponse(msg.id, false, null, String(e?.message || e));
+        }
+    }
+
+    async beginSession(session) {
+        await this.readyPromise;
+        this.session = session;
+        session.process = this;
+        this._bumpIdle();
+        const req = JSON.stringify({
+            type: 'invoke',
+            id: session.invokeId,
+            tool: session.toolName,
+            args: session.args,
+        }) + '\n';
+        this.proc.stdin.write(req, (err) => {
+            if (err) {
+                this._failSession(err.message);
+                this.kill();
+            }
+        });
+    }
+
+    sendLlmResponse(callId, ok, data, error) {
+        if (!this.session || !this.proc) return false;
+        const msg = { type: 'llm_response', id: Number(callId), ok };
+        if (ok) msg.data = data; else msg.error = error;
+        this.proc.stdin.write(JSON.stringify(msg) + '\n');
+        this._bumpIdle();
+        return true;
+    }
+
+    _emitSessionEvent(msg) {
+        const sess = this.session;
+        if (!sess) return;
+        if (sess.pollers.length) {
+            const resolve = sess.pollers.shift();
+            resolve(msg);
+        } else {
+            sess.events.push(msg);
+        }
+        if (msg.type === 'result' && sess.chatId) {
+            pushChatResult(sess.chatId, {
+                session_id: sess.sessionId,
+                card_id: this.card.id,
+                tool_name: sess.toolName,
+                caller_message_id: sess.callerMessageId ?? null,
+                completed_at: Date.now(),
+                ok: !!msg.ok,
+                result: msg.ok ? msg.result : null,
+                error: msg.ok ? null : (msg.error || 'unknown error'),
+            });
+        }
+    }
+
+    _failSession(error) {
+        if (this.completed || !this.session) return;
+        this.completed = true;
+        this._emitSessionEvent({
+            type: 'result',
+            id: this.session.invokeId,
+            ok: false,
+            error,
+        });
+    }
+}
+
+class CardService {
+    constructor(card) {
+        this.card = card;
+        this.idleProcesses = [];
+        this.activeProcesses = new Set();
+        this.warmPoolSize = warmPoolSizeForCard(card);
+        this.shuttingDown = false;
+        this._ensureWarmPool();
+    }
+
+    _createProcess() {
+        const worker = new CardServiceProcess(this.card, this);
+        worker.spawn().catch((e) => {
+            if (!worker.session) {
+                console.warn(`[toolcards:${this.card.id}] warm process failed: ${e.message}`);
+            }
+        });
+        return worker;
+    }
+
+    _ensureWarmPool() {
+        if (this.shuttingDown) return;
+        while (this.idleProcesses.length < this.warmPoolSize) {
+            this.idleProcesses.push(this._createProcess());
+        }
+    }
+
+    _forgetProcess(worker) {
+        const idx = this.idleProcesses.indexOf(worker);
+        if (idx >= 0) this.idleProcesses.splice(idx, 1);
+        this.activeProcesses.delete(worker);
+        this._ensureWarmPool();
+    }
+
+    _acquireProcess() {
+        let worker = null;
+        while (this.idleProcesses.length) {
+            const candidate = this.idleProcesses.shift();
+            if (candidate.isIdle()) {
+                worker = candidate;
+                break;
+            }
+        }
+        if (!worker) worker = this._createProcess();
+        this.activeProcesses.add(worker);
+        this._ensureWarmPool();
+        return worker;
+    }
+
+    async startSession(toolName, args, opts = {}) {
+        const session = {
+            sessionId: cryptoRandomId(),
+            invokeId: nextInvokeId(),
+            toolName,
+            args,
+            // Captured at /start_invoke time so the plugin can dispatch
+            // llm_call events without touching the frontend.
+            //   profile:  oai_settings-shape blob (chat_completion_source,
+            //             model, custom_url, reverse_proxy, proxy_password,
+            //             custom_prompt_post_processing, ...)
+            //   authHeaders: cookie + x-csrf-token from the user's browser
+            //                request that opened this session. Valid for
+            //                the duration of the user's session; reused
+            //                verbatim on every internal call.
+            //   chatId:   stable per-chat identifier the FE chooses; used
+            //             as the key for pushChatResult so reconnecting
+            //             clients can pick up missed results.
+            //   callerMessageId: optional FE chat-array index of the
+            //             assistant message that called the tool, so
+            //             /sessions reconciliation can splice the result
+            //             onto the right bubble.
+            profile: opts.profile || null,
+            authHeaders: opts.authHeaders || null,
+            chatId: opts.chatId || null,
+            callerMessageId: opts.callerMessageId ?? null,
+            startedAt: Date.now(),
+            events: [],
+            pollers: [],
+            process: null,
+        };
+        const worker = this._acquireProcess();
+        try {
+            await worker.beginSession(session);
+        } catch (e) {
+            this.activeProcesses.delete(worker);
+            worker.kill();
+            throw e;
+        }
+        return session;
+    }
+
+    sendLlmResponse(session, callId, ok, data, error) {
+        return session.process?.sendLlmResponse(callId, ok, data, error) || false;
+    }
+
+    cancelSession(session, error = 'cancelled by user') {
+        if (!session.process) return;
+        session.process._failSession(error);
+        session.process.kill();
+    }
+
+    finishSession(session) {
+        session.process?.kill();
+    }
+
+    kill() {
+        this.shuttingDown = true;
+        for (const worker of this.idleProcesses) worker.kill();
+        for (const worker of this.activeProcesses) worker.kill();
+        this.idleProcesses = [];
+        this.activeProcesses.clear();
+    }
+}
+
+function cryptoRandomId() {
+    return (typeof globalThis.crypto?.randomUUID === 'function')
+        ? globalThis.crypto.randomUUID()
+        : Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+}
+
+let _invokeCounter = 0;
+function nextInvokeId() { return ++_invokeCounter; }
+
+function warmPoolSizeForCard(card) {
+    const configured = card.runtime?.warm_pool_size ?? card.runtime?.warm_pool ?? DEFAULT_WARM_POOL_SIZE;
+    if (configured === false || configured === null) return 0;
+    const n = Number(configured);
+    if (!Number.isFinite(n)) return DEFAULT_WARM_POOL_SIZE;
+    return Math.max(0, Math.floor(n));
+}
+
+/**
+ * Pull the assistant text out of a chat-completions/generate response.
+ * The host's backend returns provider-specific shapes; the OpenAI-style
+ * shape has choices[0].message.content. Some providers wrap differently.
+ */
+function extractCompletionText(data) {
+    if (data == null) return '';
+    if (typeof data === 'string') return data;
+    if (Array.isArray(data?.choices) && data.choices.length) {
+        const c = data.choices[0];
+        if (typeof c?.message?.content === 'string') return c.message.content;
+        if (Array.isArray(c?.message?.content)) {
+            return c.message.content
+                .filter(p => p && p.type === 'text' && typeof p.text === 'string')
+                .map(p => p.text).join('');
+        }
+        if (typeof c?.text === 'string') return c.text;
+    }
+    if (typeof data.content === 'string') return data.content;
+    if (typeof data.text === 'string') return data.text;
+    return JSON.stringify(data);
+}
+
+// ── Per-chat results store ────────────────────────────────────────────
+//
+// Server-authoritative session lifecycle: when a session result arrives
+// and the session has a chat_id, push the result onto the chat's queue.
+// The FE picks up missed results via GET /sessions?chat_id=X on
+// visibilitychange / chat load. Capped per-chat to avoid unbounded growth
+// when a client never reconciles.
+const CHAT_RESULTS_CAP = 64;
+const chatResults = new Map();   // chat_id → Array<resultRecord>
+
+function pushChatResult(chatId, record) {
+    if (!chatId) return;
+    let q = chatResults.get(chatId);
+    if (!q) { q = []; chatResults.set(chatId, q); }
+    q.push(record);
+    while (q.length > CHAT_RESULTS_CAP) q.shift();
+}
+
+function takeChatResults(chatId, sinceMs = 0) {
+    const q = chatResults.get(chatId);
+    if (!q || !q.length) return [];
+    const out = sinceMs ? q.filter(r => r.completed_at > sinceMs) : q.slice();
+    return out;
+}
+
+// ── Plugin state ──────────────────────────────────────────────────────
+
+const services = new Map();
+const cards = new Map();
+const sessions = new Map();   // session_id → { service, session }
+
+function getOrCreateService(card) {
+    let svc = services.get(card.id);
+    if (!svc) { svc = new CardService(card); services.set(card.id, svc); }
+    return svc;
+}
+
+function killAll() {
+    for (const svc of services.values()) svc.kill();
+    services.clear();
+}
+
+// ── Plugin export ─────────────────────────────────────────────────────
+
+export const info = {
+    id: 'toolcards',
+    name: 'Tool Cards Runtime',
+    description: 'Lifecycle and bidirectional-RPC for fat-JSON tool-card Python services.',
+};
+
+export async function init(router) {
+    ensureDirs();
+    for (const [id, card] of loadAllCards()) {
+        cards.set(id, card);
+        // Materialize the card's `files` to data/toolcards/installed/<id>/
+        // every boot. Idempotent: overwrites with the same content. Without
+        // this, a card present in cards/<id>.toolcard.json but never POSTed
+        // to /install would have no on-disk service.py for spawn() to find.
+        try {
+            materializeCard(card);
+        } catch (e) {
+            console.warn(`[toolcards] failed to materialize ${id} at boot: ${e.message}`);
+        }
+    }
+    console.log(`[toolcards] loaded ${cards.size} card(s) at boot`);
+
+    router.use(express.json({ limit: '50mb' }));
+
+    router.get('/list', (_req, res) => {
+        const list = [];
+        for (const card of cards.values()) {
+            list.push({
+                id: card.id,
+                display_name: card.display_name,
+                description: card.description,
+                version: card.version,
+                author: card.author ?? null,
+                tools: card.tools.map(t => ({
+                    name: t.name,
+                    qualified_name: `${card.id}__${t.name}`,
+                    display_name: t.display_name ?? t.name,
+                    description: t.description,
+                    parameters: t.parameters,
+                })),
+            });
+        }
+        res.json({ cards: list });
+    });
+
+    router.post('/install', (req, res) => {
+        const card = req.body;
+        const errs = validateCard(card);
+        if (errs.length) return res.status(400).json({ errors: errs });
+        try {
+            services.get(card.id)?.kill();
+            services.delete(card.id);
+            materializeCard(card);
+            cards.set(card.id, card);
+            res.json({ ok: true, id: card.id });
+        } catch (e) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    router.post('/uninstall/:id', (req, res) => {
+        const id = req.params.id;
+        if (!ID_RE.test(id)) return res.status(400).json({ error: 'invalid id' });
+        services.get(id)?.kill();
+        services.delete(id);
+        cards.delete(id);
+        try { removeCardFiles(id); res.json({ ok: true }); }
+        catch (e) { res.status(500).json({ error: e.message }); }
+    });
+
+    router.post('/start_invoke/:id/:tool', async (req, res) => {
+        const { id, tool } = req.params;
+        const card = cards.get(id);
+        if (!card) return res.status(404).json({ error: `card "${id}" not installed` });
+        if (!card.tools.find(t => t.name === tool)) {
+            return res.status(404).json({ error: `tool "${tool}" not declared` });
+        }
+        // Body shape (architectural-shift compatible):
+        //   {args, profile?, chat_id?, caller_message_id?}
+        // For backward compatibility with clients that pass args directly
+        // without nesting (the original protocol), accept both shapes.
+        const body = req.body || {};
+        const isWrapped = (typeof body === 'object' && (body.args || body.profile || body.chat_id));
+        const args = isWrapped ? (body.args || {}) : body;
+        const profile = isWrapped ? (body.profile || null) : null;
+        const chatId = isWrapped ? (body.chat_id || null) : null;
+        const callerMessageId = isWrapped ? (body.caller_message_id ?? null) : null;
+        // Capture auth from the user's request: cookie + csrf token are
+        // valid for the duration of their browser session and let the
+        // plugin make authenticated internal calls back to ST's own
+        // chat-completions backend without the FE having to be alive.
+        // The base URL is whatever Host this user is talking to ST on
+        // (127.0.0.1:port for local-deploy, hostname:port behind a
+        // reverse proxy, etc).
+        const proto = req.headers['x-forwarded-proto'] || (req.secure ? 'https' : 'http');
+        const host = req.headers.host || '127.0.0.1:8000';
+        const authHeaders = {
+            cookie: req.headers.cookie || '',
+            'x-csrf-token': req.headers['x-csrf-token'] || '',
+            // Basic Auth (config.yaml: basicAuthUser/Pass) is middleware
+            // applied before any plugin route, so internal calls back to
+            // our own /api/backends/chat-completions/generate need to
+            // re-present the user's Authorization header. Browsers
+            // auto-send it on every request after the initial 401
+            // challenge, so it's reliably present here.
+            authorization: req.headers.authorization || '',
+            _base_url: `${proto}://${host}`,
+        };
+        try {
+            const svc = getOrCreateService(card);
+            const session = await svc.startSession(tool, args, {
+                profile, authHeaders, chatId, callerMessageId,
+            });
+            sessions.set(session.sessionId, { service: svc, session });
+            res.json({ session_id: session.sessionId });
+        } catch (e) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    /**
+     * Reconcile-side endpoint. The FE calls this on visibilitychange or
+     * chat load to pick up any results that completed while it wasn't
+     * polling. Returns the full chat-scoped result queue (capped at 64
+     * per chat). If `since` query param is provided (ms epoch), only
+     * results completed after that timestamp are returned.
+     *
+     * The queue is NOT cleared on read — multiple visibilitychanges or
+     * tab refreshes within the same chat session should converge on the
+     * same state. The FE is responsible for tracking which results it
+     * has already applied to chat[] (we recommend using session_id as the
+     * dedupe key).
+     */
+    router.get('/sessions', (req, res) => {
+        const chatId = req.query.chat_id;
+        if (typeof chatId !== 'string' || !chatId.length) {
+            return res.status(400).json({ error: 'chat_id query parameter required' });
+        }
+        const since = req.query.since ? Number(req.query.since) : 0;
+        const results = takeChatResults(chatId, isFinite(since) ? since : 0);
+        // Also include in-flight sessions for this chat so the FE can
+        // render "tool still running" placeholders if the page refreshed
+        // mid-invocation.
+        const inFlight = [];
+        for (const [sid, { session }] of sessions.entries()) {
+            if (session.chatId === chatId) {
+                inFlight.push({
+                    session_id: sid,
+                    card_id: session.cardId || null,
+                    tool_name: session.toolName,
+                    caller_message_id: session.callerMessageId ?? null,
+                    started_at: session.startedAt,
+                });
+            }
+        }
+        res.json({ results, in_flight: inFlight });
+    });
+
+    /**
+     * Forcibly cancel an in-flight session. Kills the python service
+     * for that session only, deletes the session record, and leaves other
+     * concurrent invocations of the same card alone. UI cancel button on
+     * the in-progress collapsible posts here.
+     */
+    router.post('/cancel/:session_id', (req, res) => {
+        const sid = req.params.session_id;
+        const entry = sessions.get(sid);
+        if (!entry) return res.status(404).json({ error: 'unknown session' });
+        const { service, session } = entry;
+        // Synthesize a result event for any waiting poller so the FE can
+        // unwind cleanly, then kill.
+        service.cancelSession(session);
+        sessions.delete(sid);
+        res.json({ ok: true });
+    });
+
+    router.get('/poll/:session_id', async (req, res) => {
+        const sid = req.params.session_id;
+        const entry = sessions.get(sid);
+        if (!entry) return res.status(404).json({ error: 'unknown session' });
+        const { service, session } = entry;
+
+        // Helper: send event + clean up on result.
+        const send = (ev) => {
+            if (ev.type === 'result') {
+                service.finishSession(session);
+                sessions.delete(sid);
+            }
+            res.json(ev);
+        };
+
+        if (session.events.length) {
+            send(session.events.shift());
+            return;
+        }
+        let resolved = false;
+        const timeout = setTimeout(() => {
+            if (resolved) return;
+            const idx = session.pollers.indexOf(resolver);
+            if (idx >= 0) session.pollers.splice(idx, 1);
+            resolved = true;
+            res.json({ type: 'heartbeat' });
+        }, POLL_TIMEOUT_MS);
+        const resolver = (ev) => {
+            if (resolved) return;
+            resolved = true;
+            clearTimeout(timeout);
+            send(ev);
+        };
+        session.pollers.push(resolver);
+    });
+
+    router.post('/respond/:session_id/:call_id', (req, res) => {
+        const sid = req.params.session_id;
+        const callId = req.params.call_id;
+        const entry = sessions.get(sid);
+        if (!entry) return res.status(404).json({ error: 'unknown session' });
+        const { ok, data, error } = req.body || {};
+        const wrote = entry.service.sendLlmResponse(entry.session, callId, !!ok, data, error);
+        if (!wrote) return res.status(500).json({ error: 'service unavailable' });
+        res.json({ ok: true });
+    });
+}
+
+export async function exit() {
+    killAll();
+}

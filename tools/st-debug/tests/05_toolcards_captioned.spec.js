@@ -31,35 +31,58 @@ import { test, expect } from '@playwright/test';
 //   - the result event still contains the rasterized PNG (didn't break
 //     the original toolcard)
 
-// Per-test cleanup: kill orphan service.py processes from any previous
-// interrupted test run. Without this, the toolcards plugin's per-card
-// service queue (plugins/toolcards/index.mjs:338) parks our new
-// invocation behind the orphan's still-active session. Observable as
-// multi-minute hangs with no error events. Found via static analysis
-// 2026-05-08.
-import { execSync } from 'node:child_process';
-test.beforeEach(() => {
+function captionedProfile() {
+    return {
+        api: 'openai',
+        mode: 'cc',
+        preset: 'default',
+        chat_completion_source: 'custom',
+        custom_url: 'http://127.0.0.1:8001',
+        custom_model: 'gemma-4-a4b',
+        stream_openai: false,
+        temperature_openai: 0.4,
+        openai_max_tokens: 4096,
+    };
+}
+
+async function startCaptionedInvoke(request, query) {
+    const startResp = await request.post(
+        'http://127.0.0.1:8002/api/plugins/toolcards/start_invoke/query-to-svg-captioned/generate',
+        {
+            data: {
+                args: {
+                    query,
+                    max_iters: 1,
+                    width: 256,
+                    height: 256,
+                },
+                profile: captionedProfile(),
+            },
+        });
+    expect(startResp.status(), 'start_invoke 200').toBe(200);
+    const { session_id } = await startResp.json();
+    return session_id;
+}
+
+async function pollOnce(request, sessionId) {
+    const pollResp = await request.get(
+        `http://127.0.0.1:8002/api/plugins/toolcards/poll/${sessionId}`);
+    expect(pollResp.status(), `poll ${sessionId}`).toBe(200);
+    return pollResp.json();
+}
+
+async function cancelQuietly(request, sessionId) {
     try {
-        execSync("pkill -f 'uv run.*python service.py'", { stdio: 'ignore' });
-    } catch { /* none running, ignore */ }
-});
+        await request.post(`http://127.0.0.1:8002/api/plugins/toolcards/cancel/${sessionId}`);
+    } catch { /* best-effort cleanup */ }
+}
 
 test.describe('toolcards spur-caption integration', () => {
     test.setTimeout(2 * 60 * 1000);   // 2 min plenty for max_iters=1
 
     test('captioned query-to-svg emits caption progress events', async ({ request }) => {
         // Same profile shape as test 04.
-        const profile = {
-            api: 'openai',
-            mode: 'cc',
-            preset: 'default',
-            chat_completion_source: 'custom',
-            custom_url: 'http://127.0.0.1:8001',
-            custom_model: 'gemma-4-a4b',
-            stream_openai: false,
-            temperature_openai: 0.4,
-            openai_max_tokens: 4096,
-        };
+        const profile = captionedProfile();
 
         const startResp = await request.post(
             'http://127.0.0.1:8002/api/plugins/toolcards/start_invoke/query-to-svg-captioned/generate',
@@ -141,5 +164,64 @@ test.describe('toolcards spur-caption integration', () => {
             typeof p?.image_url?.url === 'string' &&
             p.image_url.url.startsWith('data:image/'));
         expect(imagePart, 'result still has rasterized PNG embedded').toBeTruthy();
+    });
+
+    test('two same-card sessions both emit progress before either completes', async ({ request }) => {
+        const [sessionA, sessionB] = await Promise.all([
+            startCaptionedInvoke(request, 'a small green square'),
+            startCaptionedInvoke(request, 'a small blue triangle'),
+        ]);
+        console.log(`  session A: ${sessionA}`);
+        console.log(`  session B: ${sessionB}`);
+
+        const sessions = { A: sessionA, B: sessionB };
+        const progressSeen = { A: false, B: false };
+        const pending = new Map();
+        const arm = (label) => {
+            pending.set(label, pollOnce(request, sessions[label]).then(ev => ({ label, ev })));
+        };
+        arm('A');
+        arm('B');
+
+        const deadline = Date.now() + 60_000;
+        try {
+            while (Date.now() < deadline) {
+                const remaining = deadline - Date.now();
+                const timeout = new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error('timed out waiting for concurrent progress')), remaining));
+                const { label, ev } = await Promise.race([...pending.values(), timeout]);
+                pending.delete(label);
+
+                if (ev.type === 'progress') {
+                    progressSeen[label] = true;
+                    console.log(`  ${label} progress: ${(ev.text || '').slice(0, 100)}`);
+                    if (progressSeen.A && progressSeen.B) break;
+                    arm(label);
+                    continue;
+                }
+                if (ev.type === 'heartbeat') {
+                    arm(label);
+                    continue;
+                }
+                if (ev.type === 'result' || ev.type === 'error') {
+                    throw new Error(
+                        `${label} completed before both sessions emitted progress: ` +
+                        JSON.stringify({ progressSeen, ev }).slice(0, 500));
+                }
+                arm(label);
+            }
+
+            expect(progressSeen.A, 'session A emitted progress').toBe(true);
+            expect(progressSeen.B, 'session B emitted progress').toBe(true);
+        } finally {
+            await Promise.all([
+                cancelQuietly(request, sessionA),
+                cancelQuietly(request, sessionB),
+            ]);
+            await Promise.race([
+                Promise.allSettled([...pending.values()]),
+                new Promise(resolve => setTimeout(resolve, 5000)),
+            ]);
+        }
     });
 });
