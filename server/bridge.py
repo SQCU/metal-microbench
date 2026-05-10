@@ -970,7 +970,18 @@ async def chat_completions(req: Request) -> Any:
                         "vision_cache_hits": u.vision_cache_hits,
                     }
                     done_reason = u.done_reason
+                    err_msg = u.err_msg or ""
                     break
+            # done_reason=3 is the engine-side error code (currently
+            # set by processFailedVisionSessions when the vision tower
+            # returns 0 soft tokens for an item, but reusable for any
+            # future engine-side failure mode that wants to surface to
+            # the client). The errMsg carries the human-readable cause.
+            # Raise an explicit HTTP 500 instead of returning a
+            # success-shaped body with empty/garbage content.
+            if done_reason == 3:
+                print(f"[bridge] stream errored: done_reason=3 err_msg={err_msg!r}")
+                raise HTTPException(500, f"upstream stream errored: {err_msg or 'unspecified engine failure'}")
             text = g.detokenize(all_tokens)
             print(f"[bridge] usage: prompt_tokens={usage.get('prompt_tokens')}, "
                   f"completion_tokens={usage.get('completion_tokens')}, "
@@ -1159,6 +1170,30 @@ async def chat_completions(req: Request) -> Any:
                                         }],
                                     }) + "\n\n")
                 if u.state == 2:
+                    # Engine-side error path: done_reason=3 + err_msg.
+                    # Same handling as non-streaming aggregate path above.
+                    # SSE has no clean "error after partial response"
+                    # shape, so we yield a final delta carrying an
+                    # OpenAI-shape error event then break — the client
+                    # sees finish_reason="error" with the message.
+                    if u.done_reason == 3:
+                        err_msg = u.err_msg or "unspecified engine failure"
+                        print(f"[bridge] (SSE) stream errored: done_reason=3 err_msg={err_msg!r}")
+                        yield ("data: " + json.dumps({
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": MODEL_NAME,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": ""},
+                                "finish_reason": "error",
+                            }],
+                            "error": {"message": err_msg, "type": "engine_error"},
+                        }) + "\n\n")
+                        yield "data: [DONE]\n\n"
+                        clean_close = True
+                        break
                     finish = "stop" if u.done_reason == 1 else (
                         "length" if u.done_reason == 2 else "stop")
                     # Same length-truncation override as the non-streaming

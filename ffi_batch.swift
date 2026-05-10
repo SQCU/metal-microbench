@@ -856,7 +856,16 @@ private func sessionStateByte(_ state: SessionState) -> UInt8 {
 // return 1 (eos) when state is done — the bridge can refine when the
 // engine grows a real done_reason field.
 private func sessionDoneReason(_ s: Session) -> UInt8 {
-    return s.state == .done ? 1 : 0
+    // s.doneReason is the engine-side termination code:
+    //   0 = still running (state != .done)
+    //   1 = stop / EOS (set by AR loop on EOS or stop_sequence match)
+    //   2 = length / max_tokens (currently set by bridge override)
+    //   3 = error (e.g. vision tower returned 0 soft tokens; errMsg populated)
+    // Sessions that hit .done without any explicit doneReason being
+    // set get 1 by default for back-compat with the legacy hardcode.
+    if s.state != .done { return 0 }
+    if s.doneReason == 0 { return 1 }
+    return s.doneReason
 }
 
 // ----------------------------------------------------------------------
@@ -1035,7 +1044,7 @@ public func gemma_poll(_ timeoutMs: Int32,
                     state: stateByte,
                     doneReason: doneByte,
                     newTokens: newToks,
-                    errMsg: "",
+                    errMsg: s.errMsg,
                     promptTokensSeen: s.usage.promptTokensSeen,
                     completionTokensEmitted: s.usage.completionTokensEmitted,
                     cacheHits: s.cacheHitTokens,

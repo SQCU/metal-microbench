@@ -60,6 +60,39 @@ internal class CachedSofts {
 private var gVisionCache: [Data: CachedSofts] = [:]
 internal var gVisionCacheHits: UInt64 = 0
 internal var gVisionCacheMisses: UInt64 = 0
+
+// Vision tower per-item failure tracking. When the batched forward
+// returns rawNPooled <= 0 for an item, the entry's buffer is left
+// zero-filled — but the LM consumer's wait-for-event would still
+// fire (we still encode the signal so the GPU pipeline doesn't
+// deadlock), and the LM would then read zeros and decode garbage
+// (`<unused6226>` repetition is the canonical symptom).
+//
+// To surface the failure honestly: mark the eventTicket as failed
+// here. The engine's tick()/syncTickStep() entry checks each
+// resident session's head chunk; if it's a softTokens chunk whose
+// ticket is in this set, the session transitions to .done with
+// doneReason=3 (error) and errMsg explaining the failure. The
+// bridge's chat-completions handler maps done_reason=3 to a 5xx
+// response carrying the errMsg. See ffi.swift:_kickVisionDispatch
+// completion handler + lm_engine.swift:processFailedVisionSessions.
+internal var gFailedVisionTickets: Set<UInt64> = []
+internal let gFailedVisionTicketsLock = NSLock()
+
+internal func markVisionTicketFailed(_ ticket: UInt64) {
+    gFailedVisionTicketsLock.lock(); defer { gFailedVisionTicketsLock.unlock() }
+    gFailedVisionTickets.insert(ticket)
+}
+
+internal func isVisionTicketFailed(_ ticket: UInt64) -> Bool {
+    gFailedVisionTicketsLock.lock(); defer { gFailedVisionTicketsLock.unlock() }
+    return gFailedVisionTickets.contains(ticket)
+}
+
+internal func clearVisionTicket(_ ticket: UInt64) {
+    gFailedVisionTicketsLock.lock(); defer { gFailedVisionTicketsLock.unlock() }
+    gFailedVisionTickets.remove(ticket)
+}
 private var gVisionCacheTick: UInt64 = 0
 // Convenience for stats endpoints in ffi_batch.swift.
 internal var gVisionCacheEntryCount: Int { return gVisionCache.count }
@@ -869,13 +902,19 @@ private func _kickVisionDispatch(weights: VisionWeights) {
                           size: copyRows * HIDDEN * 4)
             } else {
                 FileHandle.standardError.write(
-                    "[vision] image extraction returned 0 softs (failure)\n".data(using: .utf8)!)
+                    "[vision] image extraction returned 0 softs for ticket \(item.entry.eventTicket); marking failed\n".data(using: .utf8)!)
+                // Mark the ticket failed so the engine can fail the
+                // consuming session before it reads zeros and decodes
+                // garbage. Buffer stays zero-init; the signal still
+                // fires below to keep the GPU pipeline unblocked.
+                markVisionTicketFailed(item.entry.eventTicket)
             }
         }
         blit.endEncoding()
-        // Signal each item's ticket at the same point in the CB timeline
-        // (after the blits). Even failed items get signaled so LM
-        // consumers don't deadlock; their buffers remain zero-init.
+        // Signal each item's ticket. Even failed items get signaled so
+        // the GPU pipeline doesn't deadlock — but the engine's CPU-side
+        // failed-ticket check (processFailedVisionSessions) catches
+        // failed sessions BEFORE they consume the zero buffer.
         for item in items {
             padCB.encodeSignalEvent(gVisionEvent, value: item.entry.eventTicket)
         }

@@ -524,6 +524,16 @@ struct SessionTrigger {
 
 final class Session {
     let id: Int
+    // Termination cause exposed to the bridge. 0 while running; set to
+    // 1 (stop / EOS), 2 (length / max_tokens), or 3 (error) when state
+    // transitions to .done. The bridge maps these onto OpenAI-shape
+    // finish_reason. See ffi_batch.swift:sessionDoneReason which now
+    // reads this field directly.
+    var doneReason: UInt8 = 0
+    // Optional human-readable explanation when doneReason == 3 (error).
+    // Surfaces back to the bridge via StreamUpdate.errMsg → HTTP 5xx
+    // body. Empty for non-error terminations.
+    var errMsg: String = ""
     // 2026-05-07 (M:K permutation): `slot` is now per-CB scratch.
     //   - Set by the engine's per-CB picker (pickKernelMappingForAR /
     //     pickKernelMappingForPrefill) BEFORE each CB runs, to the
@@ -2629,8 +2639,31 @@ final class LmEngine {
     }
 
     @discardableResult
+    // Walk resident sessions whose head chunk is a soft-token chunk
+    // with a vision ticket marked failed by the vision dispatcher,
+    // and transition them to .done with doneReason=3 (error). This
+    // catches the vision-tower-returned-0-softs failure mode BEFORE
+    // the LM consumer reads the zero-filled entry buffer and decodes
+    // garbage. Side-table approach (gFailedVisionTickets) keeps the
+    // chunk struct unchanged. Called at the top of tick() and
+    // syncTickStep() so failed sessions never enter pickChainPath.
+    private func processFailedVisionSessions() {
+        for s in residentSessions.values {
+            guard s.state.isBusy, let head = s.chunkQueue.first else { continue }
+            if case let .softTokens(_, _, _, _, ticket) = head,
+               ticket > 0, isVisionTicketFailed(ticket) {
+                s.state = .done
+                s.doneReason = 3
+                s.errMsg = "vision tower returned 0 soft tokens for an image in this stream (rawNPooled<=0; see [vision] stderr line for ticket \(ticket))"
+                s.chunkQueue.removeAll()
+                clearVisionTicket(ticket)
+            }
+        }
+    }
+
     func tick() -> Int {
         runAdmissionPass()
+        processFailedVisionSessions()
         let busy = activeSessions.filter { $0.state.isBusy }
         if busy.isEmpty { return 0 }
         // Accrues only on productive ticks; matches totalSteps cadence.
@@ -2678,6 +2711,7 @@ final class LmEngine {
     // lists of work queue, or deltas wrt the last work queue.")
     func syncTickStep() {
         runAdmissionPass()
+        processFailedVisionSessions()
         let busy = activeSessions.filter { $0.state.isBusy }
         if busy.isEmpty { return }
         totalSlotTicks += busy.count
