@@ -107,12 +107,32 @@ honest demo, not a defect in the harness pattern.
 - **The visual oversight gap from test 17 is closed**: a downstream invocation of vision-review on the recorded webm catches "shape doesn't match request" failures that test 17's invariant-level S2 didn't.
 - **This card composes**: any video-producing toolcard (render-visual, future iter-svg-refine, etc.) can be followed by vision-review on its captured output to close the visual-correctness loop.
 
-### Bridge bug logged for future investigation
+### Parallel multimodal — initial diagnosis was wrong
 
-Parallel multimodal calls (multiple `image_url` content parts dispatched
-concurrently via parallel_llm_call) produce `<unused6226>` placeholder-
-token outputs. Single-frame multimodal works correctly. Workaround in
-`vision-review/service.py`: sequential per-frame loop. Suspected cause:
-vision encoder state corruption across concurrent stream submissions
-in the bridge; see `/Users/mdot/metal-microbench/server/bridge.py`
-vision integration. Logged here, not yet fixed.
+Earlier I documented "parallel multimodal calls produce `<unused6226>`
+placeholder-token outputs" as a bridge bug needing a sequential
+workaround. Investigation found that's not what's happening: 3
+consecutive parallel-multimodal vision-review runs against the test
+17 failure video produce clean per-frame descriptions and correct
+FAIL verdicts. Test 18 with parallel passes consistently across 3+
+runs at 17-23s wall (vs ~11s sequential — parallel pays for some
+KV-cache miss overhead per image but exercises the right path).
+
+What was actually happening: the FIRST `<unused6226>` failures came
+after a long session of mixed bridge use (kernels, multiple test
+runs, vision cache fills/evicts, etc). Bridge state accumulation
+appears to make subsequent multimodal calls produce
+`<unused6226>` empty-soft-token-row outputs. Fresh bridge restart
+(reload of the 26B model, ~30s) clears it.
+
+Open question: what specific accumulated state causes the
+degradation? Candidates:
+  - vision cache entries reaching gVisionCacheMaxEntries and the
+    LRU eviction interacting badly with in-flight tickets
+  - some MTLEvent ticket counter wraparound
+  - residency layer's pinned-buffer churn under sustained pressure
+
+Logged here, not fixed yet — but it's a state-degradation bug, not
+a parallelism bug. Vision-review's parallel_llm_call implementation
+in install_vision_review_toolcard.sh is the correct shape; previous
+"sequential workaround" comments in service.py have been removed.

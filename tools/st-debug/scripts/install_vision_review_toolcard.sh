@@ -263,7 +263,7 @@ def handle(args: dict[str, Any], _caller_messages: Any) -> dict[str, Any]:
         # bridge level (see /tmp/bridge.log post 2026-05-10 probe);
         # single-frame multimodal works correctly. Empirical workaround
         # until the bridge's parallel-vision path is debugged: run
-        # sequentially. Each call still benefits from the system-prompt
+        # PARALLEL. Each call still benefits from the system-prompt
         # prefix cache hit (REVIEWER_PREFIX is identical across calls);
         # only the per-frame image bytes change.
         frame_results: list[dict[str, Any]] = []

@@ -1,0 +1,68 @@
+[
+  {
+    "name": "scringlo scrambler",
+    "is_user": false,
+    "is_system": false,
+    "mes_excerpt": "uhmmmm... hlello?",
+    "tool_progress": []
+  },
+  {
+    "name": "User",
+    "is_user": true,
+    "is_system": false,
+    "mes_excerpt": "hey can you look back at the recording from our lissajous demo earlier? did you actually draw a real lissajous curve, or do you think u made a mistake somewhere?",
+    "tool_progress": []
+  },
+  {
+    "name": "scringlo scrambler",
+    "is_user": false,
+    "is_system": false,
+    "mes_excerpt": "oOoOh!! good idea!! lemme go look at the recording with my fresh eyes... *peers at the screen* 🔍",
+    "tool_progress": [
+      {
+        "label": "Vision Review • Review video against a claim",
+        "status": "done",
+        "duration_ms": 10957,
+        "summary_trace": [
+          {
+            "scope": "frame:0",
+            "summary": "This is a dark-themed chat interface featuring white text messages and circular user avatars. A small notification bar at the bottom includes a text input field and a send icon, while various icons and menu options are visible at the top.",
+            "compressed_lines": null,
+            "tMs": 1885
+          },
+          {
+            "scope": "frame:1",
+            "summary": "This frame shows a dark-themed chat interface with white and gray text bubbles containing messages. A small modal window is centered, displaying text about a \"Render Visual\" process and a dialogue from \"scringlo scrambler.\"",
+            "compressed_lines": null,
+            "tMs": 3239
+          },
+          {
+            "scope": "frame:2",
+            "summary": "This frame shows a dark-themed chat interface containing text messages and system-style status updates. The text includes user names like \"scringlo scrambler\" and \"User,\" dialogue discussing \"lissajous wobble loops,\" and status notifications for \"Render Visual\" and \"s",
+            "compressed_lines": null,
+            "tMs": 5260
+          },
+          {
+            "scope": "frame:3",
+            "summary": "This image displays a dark-themed chat interface with white and pink text containing various messages. A pink rectangular modal is overlaid in the center, containing light-colored text and a small white circular icon.",
+            "compressed_lines": null,
+            "tMs": 6507
+          },
+          {
+            "scope": "frame:4",
+            "summary": "A large rectangular canvas displays a mosaic of irregular, scattered geometric shapes in various colors including green, purple, tan, blue, and magenta. Below the canvas, a text input field is visible at the bottom of a user interface.",
+            "compressed_lines": null,
+            "tMs": 7939
+          },
+          {
+            "scope": "verdict",
+            "summary": "FAIL: While the text in the chat mentions \"lissajous wobble loops,\" the visual evidence only shows a chat interface and a canvas of irregular, scattered geometric shapes; it does not show an actual Lissajou",
+            "compressed_lines": null,
+            "tMs": 10952
+          }
+        ],
+        "summary_excerpt": "[claim]   this recording shows scringlo using a tool to draw a Lissajous curve, and the final embedded image is a Lissajous 3:5 frequency-ratio woven curve\n[verdict] FAIL\n[reason]  While the text in the chat mentions \"lissajous wobble loops,\" the visual evidence only shows a chat interface and a canvas of irregular, scattered geometric shapes; it does not show an actual Lissajou\n[frames]  reviewed 5 frames"
+      }
+    ]
+  }
+]
