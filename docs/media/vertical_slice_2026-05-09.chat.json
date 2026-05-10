@@ -6,7 +6,8 @@
     "mes_excerpt": "uhmmmm... hlello?",
     "tool_progress_count": 0,
     "branches_count": 0,
-    "summary_excerpt": null
+    "summary_excerpt": null,
+    "summary_trace": []
   },
   {
     "name": "User",
@@ -15,7 +16,8 @@
     "mes_excerpt": "i'm trying to decide whether to spend the weekend learning rust or finishing my novel. could you think it through carefully?",
     "tool_progress_count": 0,
     "branches_count": 0,
-    "summary_excerpt": null
+    "summary_excerpt": null,
+    "summary_trace": []
   },
   {
     "name": "scringlo scrambler",
@@ -24,6 +26,32 @@
     "mes_excerpt": "okie!! lemme think about it for a sec... *taps screen thoughtfully*",
     "tool_progress_count": 1,
     "branches_count": 3,
-    "summary_excerpt": null
+    "summary_excerpt": null,
+    "summary_trace": [
+      {
+        "scope": "branch:practical",
+        "summary": "i'm gonna- deead- deeead- deeead- deeead- deeead- deeead- deeead- deeead- deeead- deeead-",
+        "compressed_lines": 11,
+        "tMs": 9178
+      },
+      {
+        "scope": "branch:creative",
+        "summary": "finish the novel instead of tackling the scary rust stuff!! 📖✨",
+        "compressed_lines": 7,
+        "tMs": 9183
+      },
+      {
+        "scope": "branch:skeptical",
+        "summary": "thought",
+        "compressed_lines": 11,
+        "tMs": 9185
+      },
+      {
+        "scope": "synthesis",
+        "summary": "finish the novel!! 🖋️✨ the rust stuff is super scary-looking and u don't want those unfinished story thoughts haunting u like ghosts!! 📖✨ *wiggles excitedly*",
+        "compressed_lines": 1,
+        "tMs": 15245
+      }
+    ]
   }
 ]

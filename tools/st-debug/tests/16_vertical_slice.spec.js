@@ -339,14 +339,44 @@ test.describe('vertical slice — Scringlo + long-running tool + visible streami
                 tool_progress_count: Array.isArray(m.extra?.tool_progress) ? m.extra.tool_progress.length : 0,
                 branches_count: m.extra?.tool_progress?.[0]?.branches?.length ?? 0,
                 summary_excerpt: m.extra?.tool_progress?.[0]?.summary?.slice(0, 200) || null,
+                summary_trace: (m.extra?.tool_progress?.[0]?.summary_trace || []).map(s => ({
+                    scope: s.scope,
+                    summary: s.summary,
+                    compressed_lines: s.compressed_lines,
+                    tMs: s.tMs,
+                })),
             }));
         });
         const tracePath = testInfo.outputPath('vertical_slice_chat.json');
         fs.mkdirSync(path.dirname(tracePath), { recursive: true });
         fs.writeFileSync(tracePath, JSON.stringify(finalChat, null, 2));
 
-        // Checkpoint 4: final state — synthesis landed, all branches
-        // complete with summaries visible.
+        // Wait for at least 4 summary_progress entries to land (3 branches + 1 synthesis)
+        await page.waitForFunction(() => {
+            const ctx = window.SillyTavern.getContext();
+            for (const m of ctx.chat || []) {
+                const tp = m?.extra?.tool_progress?.[0];
+                if (tp && Array.isArray(tp.summary_trace) && tp.summary_trace.length >= 4) {
+                    return true;
+                }
+            }
+            return false;
+        }, { timeout: 30_000 });
+
+        // Force the collapsible open so the summary_trace block is
+        // visible in the final screenshot. The collapsible auto-closes
+        // when status hits "done"; we override that for the artifact.
+        await page.evaluate(() => {
+            for (const d of document.querySelectorAll(
+                '#chat .mes details.custom-tool-progress-collapsible')) {
+                d.setAttribute('open', '');
+            }
+        });
+        // Brief wait for any pending DOM updates from the override
+        await page.waitForTimeout(500);
+
+        // Checkpoint 4: final state — synthesis landed, summary_trace
+        // visible with all 4 parent-voice n-of-k summaries.
         await page.screenshot({
             path: testInfo.outputPath('checkpoint_4_final.png'),
             fullPage: false,

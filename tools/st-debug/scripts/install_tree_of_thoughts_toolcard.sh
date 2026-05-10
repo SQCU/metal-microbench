@@ -111,6 +111,23 @@ def branch_progress(
     print(json.dumps(event), flush=True)
 
 
+def summary_progress(
+    scope: str,
+    summary: str,
+    compressed_lines: int | None = None,
+) -> None:
+    """Emit a parent-persona-voiced n-of-k compression of recent
+    descendant work. See docs/scalable_oversight_n_of_k.md."""
+    event: dict[str, Any] = {
+        "type": "summary_progress",
+        "scope": scope,
+        "summary": summary.strip()[:300],
+    }
+    if compressed_lines is not None:
+        event["compressed_lines"] = compressed_lines
+    print(json.dumps(event), flush=True)
+
+
 def next_call_id() -> int:
     global _NEXT_CALL_ID
     _NEXT_CALL_ID += 1
@@ -300,6 +317,44 @@ def handle(args: dict[str, Any], caller_messages: Any) -> dict[str, Any]:
             "summary": extract_summary(reasoning),
         })
 
+    # n-of-k: fire one parent-voiced summary per branch IN PARALLEL.
+    # Each summary is ~50 tokens of decode atop a shared-prefix
+    # prefill (parent_context + summary instructions), so the bridge's
+    # in-batch share gives near-free cost. Compresses each branch's
+    # full reasoning (~30-60 lines) to one line.
+    if parent_context:
+        progress("summarizing branches in parent voice")
+        summary_calls = [
+            {
+                "messages": [
+                    *parent_context,
+                    {
+                        "role": "user",
+                        "content": (
+                            f"i just finished thinking through this question from the "
+                            f"\"{branch['label']}\" angle. in ONE short sentence in my OWN voice "
+                            f"(matching the persona established above; first-person, "
+                            f"casual if the persona is casual), summarize what i concluded. "
+                            f"i'm narrating to my user — describe what i thought, briefly.\n\n"
+                            f"---\n{branch['reasoning'][:1500]}\n---\n\n"
+                            f"output: just the one sentence. no preamble. no quotes."
+                        ),
+                    },
+                ],
+                "max_tokens": 80,
+            }
+            for branch in branch_results
+        ]
+        summary_responses = parallel_llm_call(summary_calls)
+        for branch, summary_resp in zip(branch_results, summary_responses):
+            line = str(summary_resp.get("text", "") or "").strip()
+            line = line.split("\n")[0][:200] if line else f"explored the {branch['label']} angle"
+            summary_progress(
+                f"branch:{branch['label']}",
+                line,
+                compressed_lines=len(branch["reasoning"].splitlines()),
+            )
+
     progress("synthesizing")
     synthesis_resp = llm_call([
         *parent_context,
@@ -309,10 +364,37 @@ def handle(args: dict[str, Any], caller_messages: Any) -> dict[str, Any]:
             "content": build_synthesis_user_message(question, branch_results),
         },
     ], max_tokens=512)
+    synthesis_text = str(synthesis_resp.get("text") or "").strip()
+
+    # Final n-of-k summary: parent voice, the synthesis distilled to
+    # one sentence the user (and the parent agent on next turn) can
+    # use as the durable handle on this whole tool call.
+    if parent_context:
+        synth_summary_resp = llm_call([
+            *parent_context,
+            {
+                "role": "user",
+                "content": (
+                    "i just synthesized those branches into a final answer. "
+                    "in ONE short sentence in MY voice (matching the persona "
+                    "above), tell my user what my conclusion was. casual if "
+                    "the persona is casual. don't quote. don't preamble.\n\n"
+                    f"---\n{synthesis_text[:2000]}\n---\n\n"
+                    "output: just the one sentence."
+                ),
+            },
+        ], max_tokens=80)
+        synth_line = str(synth_summary_resp.get("text", "") or "").strip()
+        synth_line = synth_line.split("\n")[0][:200] if synth_line else "synthesized the branches into a final answer"
+        summary_progress(
+            "synthesis",
+            synth_line,
+            compressed_lines=len(synthesis_text.splitlines()),
+        )
 
     return {
         "branches": branch_results,
-        "synthesis": str(synthesis_resp.get("text") or "").strip(),
+        "synthesis": synthesis_text,
         "used_caller_messages": bool(parent_context),
     }
 
