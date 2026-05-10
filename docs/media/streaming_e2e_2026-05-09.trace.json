@@ -1,0 +1,63 @@
+{
+  "sendT0": 2244.4000000059605,
+  "sendT1": 9619.700000017881,
+  "prompt": "Tell me a vivid 250-word story about a tiny lighthouse keeper who befriends a passing albatross. Use multiple paragraphs.",
+  "trace": [
+    {
+      "tMs": 307.7000000178814,
+      "mesid": "49",
+      "len": 1,
+      "jump": 1,
+      "reason": "mutation"
+    },
+    {
+      "tMs": 1282.1000000238419,
+      "mesid": "49",
+      "len": 2,
+      "jump": 1,
+      "reason": "mutation"
+    },
+    {
+      "tMs": 2302.600000023842,
+      "mesid": "49",
+      "len": 32,
+      "jump": 30,
+      "reason": "mutation"
+    },
+    {
+      "tMs": 3331.2000000178814,
+      "mesid": "49",
+      "len": 210,
+      "jump": 178,
+      "reason": "mutation"
+    },
+    {
+      "tMs": 4340.300000011921,
+      "mesid": "49",
+      "len": 372,
+      "jump": 162,
+      "reason": "mutation"
+    },
+    {
+      "tMs": 5345,
+      "mesid": "49",
+      "len": 508,
+      "jump": 136,
+      "reason": "mutation"
+    },
+    {
+      "tMs": 6351.300000011921,
+      "mesid": "49",
+      "len": 661,
+      "jump": 153,
+      "reason": "mutation"
+    },
+    {
+      "tMs": 7378,
+      "mesid": "49",
+      "len": 829,
+      "jump": 168,
+      "reason": "mutation"
+    }
+  ]
+}

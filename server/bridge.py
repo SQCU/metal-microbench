@@ -1045,35 +1045,86 @@ async def chat_completions(req: Request) -> Any:
         all_tokens: list[int] = []
         last_update: g.StreamUpdate | None = None
         clean_close = False
+        # Tokenwise streaming with adaptive tool-call detection.
+        # Previously when had_tools=True, all output was buffered until
+        # end of generation so we could parse `<|tool_call>...<tool_call|>`
+        # blocks. That destroyed live streaming for ALL tool-enabled
+        # chats — including ones where the model never emitted a tool
+        # call. The vast majority of toolcards-enabled scringlo
+        # interactions are prose; the model rarely emits a tool call.
+        # Buffering punished the common case to make the rare one
+        # cleaner.
+        # New behavior: stream content tokenwise as before. Maintain a
+        # rolling buffer to detect the start of `<|tool_call`. Once
+        # detected, switch to BUFFER mode: don't emit further content
+        # deltas (the partial marker has already streamed, but at end
+        # we'll emit a content-clearing replacement via tool_calls
+        # finish path). Until detected, emit live. Found 2026-05-09
+        # via DOM mutation trace: ST chats arrived as 1-2 mutations
+        # because `had_tools` always=true for any toolcards-enabled
+        # session.
+        TOOL_MARKER_PREFIX = "<|tool_call"
+        marker_buffer = ""
+        in_marker_mode = False
         try:
             while True:
                 u: g.StreamUpdate = await response_q.get()
                 last_update = u
                 if u.new_tokens:
                     all_tokens.extend(u.new_tokens)
-                    if not had_tools:
-                        # Tokenwise content streaming (the common path).
-                        # Strip per-turn scaffolding (trailing <turn|>,
-                        # leading channel echoes) per-delta. Found by
-                        # tools/st-debug api_probe: pre-fix, the final
-                        # delta contained "<turn|>" because token id 106
-                        # detokenizes to the literal string. Most deltas
-                        # are unaffected; the strip is a no-op when no
-                        # marker is present.
-                        delta_text = _strip_response_scaffolding(
-                            g.detokenize(u.new_tokens))
-                        if delta_text:
-                            yield ("data: " + json.dumps({
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": MODEL_NAME,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": delta_text},
-                                    "finish_reason": None,
-                                }],
-                            }) + "\n\n")
+                    delta_text = _strip_response_scaffolding(
+                        g.detokenize(u.new_tokens))
+                    if not delta_text:
+                        if u.state == 2:
+                            pass  # fall through to state==2 handler
+                        else:
+                            continue
+                    if not in_marker_mode and delta_text:
+                        # Append to rolling buffer; emit anything that's
+                        # definitely not part of a tool-call marker
+                        # prefix. We only need to withhold up to len()-1
+                        # of the prefix at any time.
+                        marker_buffer += delta_text
+                        # Find any complete marker.
+                        if TOOL_MARKER_PREFIX in marker_buffer:
+                            # Emit prose preceding the marker, then
+                            # switch modes.
+                            cut = marker_buffer.find(TOOL_MARKER_PREFIX)
+                            emit = marker_buffer[:cut]
+                            if emit:
+                                yield ("data: " + json.dumps({
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": MODEL_NAME,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"content": emit},
+                                        "finish_reason": None,
+                                    }],
+                                }) + "\n\n")
+                            in_marker_mode = True
+                            marker_buffer = ""
+                        else:
+                            # Withhold up to len(prefix)-1 trailing chars
+                            # in case the next delta extends a partial
+                            # marker. Emit everything older than that.
+                            keep = len(TOOL_MARKER_PREFIX) - 1
+                            if len(marker_buffer) > keep:
+                                emit = marker_buffer[:-keep]
+                                marker_buffer = marker_buffer[-keep:]
+                                if emit:
+                                    yield ("data: " + json.dumps({
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": MODEL_NAME,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {"content": emit},
+                                            "finish_reason": None,
+                                        }],
+                                    }) + "\n\n")
                 if u.state == 2:
                     finish = "stop" if u.done_reason == 1 else (
                         "length" if u.done_reason == 2 else "stop")
@@ -1084,10 +1135,14 @@ async def chat_completions(req: Request) -> Any:
                     if (finish == "stop"
                             and u.completion_tokens_emitted >= max_tokens):
                         finish = "length"
-                    # When tools were present, drain accumulated content
-                    # through the tool-call extractor and emit the right
-                    # shape: either a final content delta (no tool calls
-                    # found) or a tool_calls delta + finish_reason=tool_calls.
+                    # End-of-stream cleanup. With the live-streaming
+                    # path above, all NON-marker content has already
+                    # been streamed. We still need to:
+                    #   - flush any trailing content that was held in
+                    #     marker_buffer (no tool call was started)
+                    #   - run tool-call extraction on the accumulated
+                    #     tokens; if a tool call IS found, emit the
+                    #     tool_calls delta + flip finish to tool_calls
                     if had_tools:
                         full_text = g.detokenize(all_tokens)
                         cleaned_text, extracted = _extract_tool_calls(
@@ -1098,23 +1153,10 @@ async def chat_completions(req: Request) -> Any:
                             print(f"[bridge] (SSE) extracted "
                                   f"{len(extracted)} tool_call(s); names="
                                   f"{[tc['function']['name'] for tc in extracted]}")
-                            # Surface any non-tool prose first (rare, but
-                            # the model occasionally adds prose before/
-                            # after the tool call).
-                            if cleaned_text:
-                                yield ("data: " + json.dumps({
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created,
-                                    "model": MODEL_NAME,
-                                    "choices": [{
-                                        "index": 0,
-                                        "delta": {"content": cleaned_text},
-                                        "finish_reason": None,
-                                    }],
-                                }) + "\n\n")
-                            # Tool-calls delta. OpenAI's streaming shape
-                            # uses `index` per tool call within the choice.
+                            # Tool-calls delta. The prose prefix
+                            # (cleaned_text) was already streamed live
+                            # before we entered marker_mode, so we don't
+                            # re-emit it here.
                             tc_deltas = [{
                                 "index": i,
                                 "id": tc["id"],
@@ -1133,20 +1175,25 @@ async def chat_completions(req: Request) -> Any:
                                 }],
                             }) + "\n\n")
                         else:
-                            # No tool calls extracted — emit the full
-                            # buffered content as one delta so the
-                            # client at least gets the bytes.
-                            yield ("data: " + json.dumps({
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": MODEL_NAME,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": cleaned_text},
-                                    "finish_reason": None,
-                                }],
-                            }) + "\n\n")
+                            # No tool call. Flush trailing buffer below.
+                            pass
+                    # Flush any held marker_buffer (final ~10 chars
+                    # withheld during streaming as a tool-call lookahead).
+                    # Applies to both had_tools (no extracted call) and
+                    # non-tool paths.
+                    if marker_buffer:
+                        yield ("data: " + json.dumps({
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": MODEL_NAME,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": marker_buffer},
+                                "finish_reason": None,
+                            }],
+                        }) + "\n\n")
+                        marker_buffer = ""
                     yield ("data: " + json.dumps({
                         "id": completion_id,
                         "object": "chat.completion.chunk",
