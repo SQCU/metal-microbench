@@ -215,17 +215,17 @@ def _parse_sampling(body: dict, max_tokens: int) -> g.SamplingParams:
     seed_int = int(seed) if seed is not None else 0
     rep_pen = float(body.get("repetition_penalty",
                               body.get("frequency_penalty", 1.0)))
-    stop = body.get("stop")
+    # OpenAI's `stop` is a list of text strings (or a single string).
+    # The engine takes `stop_sequences` as lists of token IDs — we
+    # tokenize each stop string and append to sampling.stop_sequences
+    # in the caller (chat_completions handler, where we have access
+    # to the tokenizer-aware path). _parse_sampling stays tokenizer-
+    # free; pass the raw strings through `body['stop']` and let the
+    # caller resolve them.
+    # `stop_tokens` (a different SamplingParams field) is documented
+    # as ignored by the engine in ffi_batch.swift:277 — we don't try
+    # to populate it.
     stop_tokens: list[int] = []
-    if isinstance(stop, list):
-        # OpenAI's `stop` is text strings; we'd need to tokenize each
-        # to convert. For now, leave empty; the engine's actual stop
-        # signal for chat-completions is configured via
-        # `sampling.stop_sequences` in the chat_completions handler
-        # below (the engine consumes stop_sequences but ignores
-        # stop_tokens — see ffi_batch.swift:277 vs lm_engine.swift's
-        # AR loop).
-        pass
     capture_logits = bool(body.get("logprobs", False))
     top_logprobs = int(body.get("top_logprobs", 0))
     # OpenAI sends logit_bias as {"<token_id_str>": float}; coerce keys.
@@ -481,22 +481,17 @@ def _build_stream_spec(stream_id: int,
                        sampling: g.SamplingParams,
                        capture_logits: bool,
                        tools: list | None = None) -> tuple[g.StreamSpec, list[StoredSegment]]:
-    """OpenAI messages → (StreamSpec, submitted_text_tokens).
+    """OpenAI messages → (StreamSpec, delta_segments).
 
-    Two paths:
-      * Warm-conversation: messages[:-1] hashes to a known prior turn's
-        prefix tokens. Build submission as
-        `prior_prefix_tokens + tokenize(render_user_turn_delta(messages[-1]))`,
-        bypassing canonical re-render of historical content.
-      * Cold: canonical `render_chat()` + `tokenize_with_specials()`,
-        same as before.
+    Bridge is stateless across chat completions: each request renders
+    canonically through render_chat() + chunks_to_segments. There is
+    no warm-path adoption from a prior conversation-state — multi-turn
+    KV reuse comes from the engine's content-hash KV page cache
+    (passive accelerator at the page_manager layer, not bridge state).
 
-    The returned `submitted_text_tokens` is the flat sequence of token
-    IDs across all `kind=0` (text) segments — image / softs segments
-    contribute their own tokens at the engine level, which we don't
-    attempt to track here. Conversation-state recording therefore runs
-    only for purely text turns; mixed-modality turns fall through to
-    canonical for now (`record_state=False`).
+    Removed 2026-05-07 per the 'NO REMOTE LOCKS / no entanglement'
+    principle: the bridge previously built a warm-conversation path
+    that hashed messages[:-1] to a known prior turn's prefix tokens.
     """
     # 2026-05-07: bridge is stateless across chat completions per the
     # 'NO REMOTE LOCKS / no entanglement' principle. Each request renders
@@ -862,10 +857,31 @@ async def chat_completions(req: Request) -> Any:
             print(f"[bridge] response_format={rf_type!r}: rider injected "
                   f"({len(rider)} chars); messages now {len(messages)}")
     # OpenAI tool calling: tools[] → injected via chat template's native
-    # <|tool>declaration:...<tool|> blocks. tool_choice is currently
-    # advisory; the model decides. (Forced tool selection / "required" /
-    # named-function modes are not yet wired through.)
+    # <|tool>declaration:...<tool|> blocks.
     tools = body.get("tools") if isinstance(body.get("tools"), list) else None
+    # tool_choice modes: only "auto" and "none" (and the implicit absent
+    # case, which is auto) are wired through. "required" and named-
+    # function modes need grammar-constrained decoding which the engine
+    # doesn't expose yet — return 501 rather than silently letting the
+    # model decide on its own (a client passing "required" expecting
+    # forced tool emission would otherwise get a misleading no-tool
+    # response).
+    tc = body.get("tool_choice")
+    if tc is None or tc == "auto":
+        pass  # default behavior, model decides
+    elif tc == "none":
+        # Drop tools entirely — model produces a normal text reply.
+        tools = None
+    elif tc == "required" or (isinstance(tc, dict) and tc.get("type") == "function"):
+        raise HTTPException(
+            501,
+            f"tool_choice={tc!r} not implemented; only 'auto' and 'none' "
+            f"are supported. 'required' and named-function modes need "
+            f"grammar-constrained decoding which the engine doesn't "
+            f"expose yet.",
+        )
+    else:
+        raise HTTPException(400, f"unrecognized tool_choice={tc!r}")
     # Engine-side stop_sequences are matched against the recently-
     # emitted token tail; when any sequence matches, done_reason=1
     # fires and the AR loop terminates. We always include the
@@ -880,6 +896,23 @@ async def chat_completions(req: Request) -> Any:
     sampling.stop_sequences = [list(_TURN_END_TOKENS)]
     if tools and _TOOL_CALL_CLOSE_TOKENS:
         sampling.stop_sequences.append(list(_TOOL_CALL_CLOSE_TOKENS))
+    # Wire user-supplied OpenAI-shape `stop` strings into the engine's
+    # stop_sequences. Each string is tokenized and added as one
+    # sequence; multi-token sequences are matched against the
+    # recently-emitted token tail.
+    user_stop = body.get("stop")
+    if isinstance(user_stop, str):
+        user_stop = [user_stop]
+    if isinstance(user_stop, list):
+        for s in user_stop:
+            if not isinstance(s, str) or not s:
+                continue
+            try:
+                toks = g.tokenize(s)
+                if toks:
+                    sampling.stop_sequences.append(list(toks))
+            except Exception as e:
+                print(f"[bridge] could not tokenize stop string {s!r}: {e}")
     # PYTHONUNBUFFERED=1 (set by the lifecycle launcher) means every
     # write hits stdout immediately; the explicit `flush=True` is
     # gratuitous lock acquisition on each per-request print.
@@ -1032,15 +1065,15 @@ async def chat_completions(req: Request) -> Any:
     async def gen():
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
         created = int(time.time())
-        # 2026-05-07: when tools are present in the request we BUFFER
-        # the response content rather than streaming it tokenwise. This
-        # is so we can parse `<|tool_call>...<tool_call|>` blocks out of
-        # the complete response and emit OpenAI-shape `tool_calls[]`
-        # deltas at the end (matching how every other OAI-compat server
-        # streams tool calls). Tool-call responses are typically short
-        # (engine stops at <tool_call|>), so the latency cost of
-        # buffering is bounded and the shape correctness is worth it.
-        # Non-tool requests stream tokenwise as before.
+        # All chat-completion responses (tool-enabled or not) stream
+        # tokenwise. When tools are in the request, we run a small
+        # rolling-buffer detector for `<|tool_call`; on detection,
+        # streaming pauses for the rest of generation, the accumulated
+        # tokens get tool-call extraction at state==2, and we emit
+        # tool_calls deltas + finish_reason="tool_calls". Until
+        # detection (or if no tool call is emitted), tokens flow live
+        # to the client. See the comment block on TOOL_MARKER_PREFIX
+        # below for the lookahead implementation.
         had_tools = tools is not None
         all_tokens: list[int] = []
         last_update: g.StreamUpdate | None = None
