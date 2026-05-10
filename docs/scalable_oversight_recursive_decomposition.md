@@ -39,27 +39,41 @@ The aggregate work consumes 8×16k effective context — across
 8 (or however many) workers — while the parent stays in scringlo
 mode and sees only a bounded summary.
 
-## Spawn vs. fork
+## Spawn vs. fork (CONTEXT INHERITANCE, not sync/async)
 
-Two flavors of descendant calls, with different semantics:
+The distinction is about **what context the descendant inherits**,
+not about timing. (Sync vs. async is the orthogonal axis covered
+by phase 3c's `async: true` flag.)
 
-**Fork** (synchronous): parent's reply is BLOCKED on the descendant
-result. Parent waits. The descendant's full result is available to
-the parent once it returns. Used when the descendant's output
-materially shapes the parent's next utterance — e.g., the parent
-needs to KNOW whether the validator passed before saying "here's
-your figure."
+**Forked agent**: inherits the parent's FULL conversation context
+(persona block + chat history) and gets an additional instruction
+or directive that focuses its work. The fork sees what the parent
+saw, including features/observations the parent noticed but didn't
+yet act on. Used when the descendant's task benefits from
+already-derived state — e.g., "the user said earlier they want
+something minimal; keep that in mind while you draft."
 
-**Spawn** (asynchronous): parent fires the descendant and continues.
-The descendant reports back later via the interrupt path
-(see Phase 3c — `async-lookup` / `tool_async_result` injection).
-Used when the descendant's work is supplementary — e.g., scringlo
-fires off a "auto-improve-figure" descendant in the background, then
-months later when it's done she shows the better version
-("oh hey! i actually rendered a better one of those for you.").
+> Optimization concern: what important context to surface to the
+> fork so it can rapidly reuse what's already been considered or
+> derived, even in sections of history that had no immediate
+> entailment for the parent when the features were noticed/imputed.
+> The fork PROBABLY benefits from a hint pointing at salient
+> earlier turns, not just the raw history.
 
-In the recursive setting, fork-vs-spawn is a per-edge property of
-the call graph. A typical workflow looks like:
+**Spawned agent**: gets a SPECIFIC ASSIGNED PREFIX and a SPECIFIC
+ASSIGNED UNIT OF WORK. No parent context. The prefix is engineered
+for the task — typically a focused system prompt plus a structured
+input. The output is bounded and well-shaped.
+
+> Optimization concern: optimal context ordering and structuring
+> across SIBLING SPAWNED agents so they share KV-cache prefix.
+> If 5 spawned siblings all have prefix "You are a Python helper.
+> Function spec: [common header]. Test case: [variable per child]",
+> the bridge's content-hash KV page cache hits on the prefix and
+> only the per-child decode pays compute. With prefix-cache-aware
+> design these calls are nearly free at decode time.
+
+The two flavors compose in a recursive workflow:
 
 ```
 Scringlo (parent)
@@ -180,70 +194,104 @@ The bridge's existing parallel-streams capability (we measured
 overlap upstream — so wall-clock time is dominated by the tree's
 critical path, not the sum of all node times.
 
-## Implementation plan (this design's first deliverable)
+## Implementation plan: ~2-fork + ~2-spawn modest demo
 
-A single card, `physics-svg-compose`, demonstrating:
+A single card with a 4-subagent decomposition. Each subagent's
+expected output is small enough that ~4k tokens decode is plenty
+— bounded by SKILLFUL TASK ASSIGNMENT, not by API context limits
+(API truncation produces errored unparseable output, not graceful
+degradation). The 4k-per-subagent budget is constructive, not
+enforced.
 
-1. **3-level bounded recursion**:
-   - Level 0: scringlo (parent agent) calls the card
-   - Level 1: card decomposes into 3 stages (design / implement / render)
-     — these 3 are FORKED in sequence (the implement depends on
-     design's output, render depends on implement's)
-   - Level 2: implement stage forks 3-5 test-runner sub-calls in
-     parallel via parallel_llm_call
+The user's worked example for the demo:
 
-2. **Validation at boundaries**: each stage's output must
-   pass a verification step before being passed to the next. Failures
-   surface as 💭 lines in the parent's trace + the parent agent's
-   own next response can mention them.
+> "user asks scringlo something whose answer involves a small
+> python computation; scringlo delegates to spawned subagents to
+> write+validate the python and forked subagents to do the
+> persona-faithful conversational framing on either end."
 
-3. **n_visible bounded**: parent sees 3-4 trace lines for a workflow
-   producing 100s of lines of intermediate work.
+### Topology
 
-4. **Real-pixel video**: test 17 drives Scringlo through the full
-   recursion, captures video showing the trace landing depth-first
-   as descendants complete.
-
-### Card shape
-
-`physics-svg-compose` manifest:
-- one tool: `compose(description: string)` →
-  returns `{summary, image_url, design_spec, validation_report}`
-
-### Service stages
-
-Each stage is a fork (synchronous descendant llm_call sequence):
-
-**Stage A: design (`compose/design`)**
-- LLM call 1: "given description, propose a Python physics function
-  signature, identify control points, list dimensional/numerical
-  invariants the program must satisfy"
-- LLM call 2: "validate the spec by reviewing the invariants for
-  consistency"
-- emit `summary_progress(scope='compose/design', ...)` with one-line
-  parent-voice summary
-
-**Stage B: implement (`compose/implement`)**
-- LLM call 1: "write the Python function matching the design spec"
-- emits intermediate `summary_progress(scope='compose/implement/write')`
-- Sub-fork: parallel test runners (level-2 recursion)
-  - For each of N=5 test cases: a `test-runner` sub-call evaluates
-    the function with crafted inputs and validates outputs
-  - Each test runner emits its own per-test summary_progress
-- emit roll-up `summary_progress(scope='compose/implement', ...)` aggregating
-
-**Stage C: render (`compose/render`)**
-- Run the validated Python with the chosen control points (host-side,
-  NOT another LLM call — this is the pure execution step)
-- Emit `summary_progress(scope='compose/render', ...)` with results
-
-Final result.summary concatenates:
 ```
-[design]      <line>
-[implement]   <line + test-pass count>
-[render]      <line + svg size>
-[final]       <one-line scringlo-voice wrap-up>
+Scringlo (parent agent in conversation)
+  └─ FORK (full caller_messages):
+        F1: "describe what we're going to compute, in your voice"
+            → ~50-100 tokens out
+            → emits summary_progress (parent's voice line 1)
+
+  └─ SPAWN (focused prefix, no parent context):
+        S1: prefix = "You are a Python helper. Write a function..."
+            input = the spec from F1
+            → ~500-1500 tokens of code
+            → emits summary_progress (one-line technical summary)
+
+  └─ SPAWN (focused prefix, no parent context — SHARES PREFIX with S1):
+        S2: prefix = "You are a Python helper. Validate this..."
+            input = the code from S1 + crafted test inputs
+            → ~100-300 tokens of pass/fail report
+            → emits summary_progress (one-line pass/fail line)
+
+  └─ FORK (full caller_messages + the result of the chain):
+        F2: "wrap up the result for the user, in your voice,
+             mentioning anything notable from validation"
+            → ~50-150 tokens out
+            → emits summary_progress (parent's voice line 4)
 ```
+
+Plus host-side: actually run the validated Python, capture stdout,
+present alongside scringlo's wrap-up.
+
+Total subagent decode: ~700-2000 tokens. Wall: 5-15s on metal.
+
+### Why this exercises spawn/fork distinction
+
+- **F1 and F2** are forks because they need scringlo's persona +
+  conversation context to produce voice-faithful output. Without
+  the chat history they'd produce generic prose; with it they
+  produce "okie!! lemme work this out *taps screen*"-style
+  scringlo voice.
+
+- **S1 and S2** are spawns because they're focused technical tasks
+  where parent context would be a distraction (and a token cost).
+  S1's job is "write a Python function for X"; nothing about
+  scringlo's persona helps. S2's job is "is this Python correct";
+  same.
+
+- **S1 and S2 share a prefix**: "You are a Python helper..." —
+  this is the prefix-sharing optimization the user flagged. The
+  bridge's content-hash KV page cache hits between S1 and S2;
+  only the per-spawn-tail decode pays compute.
+
+### n_visible at parent
+
+Parent's summary_trace gets 4 lines:
+- 💭 "okie! we're computing the trajectory of a damped pendulum"
+- 💭 "wrote a 23-line python function with 4 control params"
+- 💭 "validated against 3 test inputs, all passed"
+- 💭 "✨ here's the answer: x=2.41 at t=5s, full code in collapsible"
+
+For ~700-2000 tokens of total decode work. Compression at this
+small case is ~5-15:1; matters more in larger trees.
+
+### Failure surfacing — affordance, not engineered failure mode
+
+The tasks are designed to succeed by default. Failure surfacing
+is a SAFETY NET for honest reporting if the descendant misbehaves
+(model writes broken code, hits a timeout, etc.). When a stage
+fails:
+
+- The summary_progress line for that stage names the failure
+  ("⚠ test 2 of 3 expected y=1.0, got 0.4")
+- The parent's wrap-up (F2) sees the failure summary in its
+  context and can mention it ("ohhh hmm the script i wrote had a
+  little bug for one of the cases, wanted to flag that")
+- We do NOT auto-retry from within the card by default; that's a
+  separate retry-policy concern. First demo: surface and present.
+
+Doing it this way means the failure path is for DEBUGGING and
+HONEST REPORTING, not as the demo's primary content. The demo
+shows successful flow; failure handling is the affordance that
+makes the system trustable when things go sideways.
 
 ### Test 17: real-pixel demo
 
