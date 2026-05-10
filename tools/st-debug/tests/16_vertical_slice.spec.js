@@ -127,6 +127,31 @@ async function connectApi(page) {
     await page.locator('#api_button_openai').click();
     await expect(page.locator('#send_textarea')).toHaveAttribute(
         'placeholder', 'Type a message, or /? for help', { timeout: 30_000 });
+
+    // Close the API connection drawer so the chat surface is
+    // VISIBLE in the recorded video. Without this dismissal the
+    // drawer covers the entire interface and the video is useless
+    // as a real-pixel demo even when the test's DOM-query
+    // assertions pass. Clicking the API-status-top toggle again
+    // collapses it; if that doesn't work, press Escape and click
+    // the chat surface.
+    await page.locator('#API-status-top').click();
+    await page.waitForTimeout(300);
+    // Defensive: also press Escape and click on the chat area to
+    // ensure no other modal / drawer is on top.
+    await page.keyboard.press('Escape').catch(() => {});
+    // Verify the drawer is no longer visible by checking the chat
+    // container is hit-testable (i.e. nothing covers it).
+    await page.waitForFunction(() => {
+        const chat = document.getElementById('chat');
+        if (!chat) return false;
+        const rect = chat.getBoundingClientRect();
+        const x = rect.left + rect.width / 2;
+        const y = rect.top + rect.height / 2;
+        const el = document.elementFromPoint(x, y);
+        // chat should be the topmost element (or a descendant of it).
+        return el === chat || chat.contains(el);
+    }, { timeout: 10_000 });
 }
 
 test.describe('vertical slice — Scringlo + long-running tool + visible streaming', () => {
@@ -161,6 +186,12 @@ test.describe('vertical slice — Scringlo + long-running tool + visible streami
             return ctx.chat?.length === 1 && /scringlo/i.test(ctx.chat[0]?.name || '');
         }, { timeout: 15_000 });
 
+        // Checkpoint 1: chat surface visible with Scringlo's first_mes
+        await page.screenshot({
+            path: testInfo.outputPath('checkpoint_1_fresh_chat.png'),
+            fullPage: false,
+        });
+
         // 6. Push a synthetic user message into chat (so caller_messages
         //    has the question) and a synthetic Scringlo bubble (so the
         //    tool_progress UI has something to attach to). This avoids
@@ -193,6 +224,12 @@ test.describe('vertical slice — Scringlo + long-running tool + visible streami
             return { chatLen: ctx.chat.length, scrIdx: ctx.chat.length - 1 };
         }, userPrompt);
         expect(setupResult.chatLen).toBeGreaterThanOrEqual(3);
+
+        // Checkpoint 2: user turn + Scringlo placeholder visible
+        await page.screenshot({
+            path: testInfo.outputPath('checkpoint_2_user_question.png'),
+            fullPage: false,
+        });
 
         // 7. Directly invoke tree-of-thoughts with the conversation
         //    as caller_messages. Direct invoke skips the model's
@@ -228,6 +265,12 @@ test.describe('vertical slice — Scringlo + long-running tool + visible streami
             '#chat .mes:not([is_user="true"]):not([is_system="true"]) .custom-tool-progress-branch'
         );
         await expect(branchCards).toHaveCount(3, { timeout: 60_000 });
+
+        // Checkpoint 3: branch cards visible (initially status=running)
+        await page.screenshot({
+            path: testInfo.outputPath('checkpoint_3_branches_started.png'),
+            fullPage: false,
+        });
 
         // 9. Wait for at least 2 of 3 branches to reach status="complete"
         try {
@@ -302,7 +345,14 @@ test.describe('vertical slice — Scringlo + long-running tool + visible streami
         fs.mkdirSync(path.dirname(tracePath), { recursive: true });
         fs.writeFileSync(tracePath, JSON.stringify(finalChat, null, 2));
 
+        // Checkpoint 4: final state — synthesis landed, all branches
+        // complete with summaries visible.
+        await page.screenshot({
+            path: testInfo.outputPath('checkpoint_4_final.png'),
+            fullPage: false,
+        });
+
         // Pause briefly so the video captures the final state visibly.
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(3000);
     });
 });
