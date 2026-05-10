@@ -947,6 +947,18 @@ async def chat_completions(req: Request) -> Any:
                   f"done_reason={done_reason}")
             finish = "stop" if done_reason == 1 else (
                 "length" if done_reason == 2 else "stop")
+            # The engine emits done_reason=1 even when generation hit
+            # the requested max_tokens budget (rather than emitting EOS
+            # naturally), so done_reason alone undercounts "length"
+            # truncations. Detect the budget-hit case explicitly: when
+            # completion_tokens equals the requested max_tokens AND the
+            # engine claimed natural stop, the truncation is actually
+            # length-driven. Without this, automated retry / continuation
+            # logic that branches on finish_reason gets the wrong signal.
+            if (finish == "stop"
+                    and isinstance(usage.get("completion_tokens"), int)
+                    and usage["completion_tokens"] >= max_tokens):
+                finish = "length"
             # 2026-05-07: server-side tool-call extraction. When tools
             # were in the request and the model emitted
             # `<|tool_call>...<tool_call|>` markers, parse them out of
@@ -1065,6 +1077,13 @@ async def chat_completions(req: Request) -> Any:
                 if u.state == 2:
                     finish = "stop" if u.done_reason == 1 else (
                         "length" if u.done_reason == 2 else "stop")
+                    # Same length-truncation override as the non-streaming
+                    # path: engine reports done_reason=1 even when the
+                    # max_tokens budget was the actual cause, so detect
+                    # that here from completion_tokens_emitted.
+                    if (finish == "stop"
+                            and u.completion_tokens_emitted >= max_tokens):
+                        finish = "length"
                     # When tools were present, drain accumulated content
                     # through the tool-call extractor and emit the right
                     # shape: either a final content delta (no tool calls
