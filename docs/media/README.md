@@ -91,3 +91,28 @@ curve?"). Or stronger numerical invariants (e.g., for Lissajous
 3:5: count distinct self-intersections of the path; should be 4).
 Logged as future work; documented here as a feature of the
 honest demo, not a defect in the harness pattern.
+
+### test 18 — vision-review (closes the visual oversight gap from test 17)
+
+| File | What it shows |
+|------|---------------|
+| `2026-05-09_test18_vision_review_audit_9d8bb36.webm` | Scringlo asked "did you actually draw a real lissajous curve?" Invokes vision-review on the curated test 17 failure video. Per-frame multimodal review: frame 4 description is "a tessellated composition of various polygons in colors such as green, purple, blue, tan, brown, and pink." Final verdict: **FAIL** — "no visual evidence of a tool being used to draw, nor is there a Lissajous curve." Closes the test 17 oversight gap with real-pixel evidence: model-on-model audit of recorded transcripts works end-to-end. |
+| `2026-05-09_test18_vision_review_audit_checkpoint4_9d8bb36.png` | Final-state screenshot showing scringlo's bubble with the Vision Review collapsible expanded, displaying 5 💭-prefixed per-frame descriptions in the summary trace + verdict. |
+| `2026-05-09_test18_vision_review_audit_chat_9d8bb36.json` | Full chat[] state with all 5 frame descriptions + the verdict reasoning. Wall time: 11.4s for the whole audit (5 sequential multimodal vision calls + 1 verdict synthesis). |
+
+### Findings from test 18
+
+- **Model-on-model audit works**: gemma-4 in the reviewer role correctly identified the test 17 video's actual content (tessellation, not Lissajous curve) and reported FAIL with reasoning grounded in the per-frame descriptions.
+- **Per-frame review is sequential, not parallel**: parallel multimodal calls produced `<unused6226>` placeholder-token outputs at the bridge (logged for future bridge debugging). Sequential is fine — 5 frames take ~11s with prefix-cache hits on the shared REVIEWER_PREFIX.
+- **The visual oversight gap from test 17 is closed**: a downstream invocation of vision-review on the recorded webm catches "shape doesn't match request" failures that test 17's invariant-level S2 didn't.
+- **This card composes**: any video-producing toolcard (render-visual, future iter-svg-refine, etc.) can be followed by vision-review on its captured output to close the visual-correctness loop.
+
+### Bridge bug logged for future investigation
+
+Parallel multimodal calls (multiple `image_url` content parts dispatched
+concurrently via parallel_llm_call) produce `<unused6226>` placeholder-
+token outputs. Single-frame multimodal works correctly. Workaround in
+`vision-review/service.py`: sequential per-frame loop. Suspected cause:
+vision encoder state corruption across concurrent stream submissions
+in the bridge; see `/Users/mdot/metal-microbench/server/bridge.py`
+vision integration. Logged here, not yet fixed.

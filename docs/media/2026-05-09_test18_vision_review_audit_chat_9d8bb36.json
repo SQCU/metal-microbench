@@ -1,0 +1,68 @@
+[
+  {
+    "name": "scringlo scrambler",
+    "is_user": false,
+    "is_system": false,
+    "mes_excerpt": "uhmmmm... hlello?",
+    "tool_progress": []
+  },
+  {
+    "name": "User",
+    "is_user": true,
+    "is_system": false,
+    "mes_excerpt": "hey can you look back at the recording from our lissajous demo earlier? did you actually draw a real lissajous curve, or do you think u made a mistake somewhere?",
+    "tool_progress": []
+  },
+  {
+    "name": "scringlo scrambler",
+    "is_user": false,
+    "is_system": false,
+    "mes_excerpt": "oOoOh!! good idea!! lemme go look at the recording with my fresh eyes... *peers at the screen* 🔍",
+    "tool_progress": [
+      {
+        "label": "Vision Review • Review video against a claim",
+        "status": "done",
+        "duration_ms": 11390,
+        "summary_trace": [
+          {
+            "scope": "frame:0",
+            "summary": "A dark-themed chat interface shows several text messages in white and grey font. The conversation includes messages from \"springlo scrambler\" and \"User,\" and a small status notification at the bottom indicates a \"Render Visual\" is currently running.",
+            "compressed_lines": null,
+            "tMs": 1975
+          },
+          {
+            "scope": "frame:1",
+            "summary": "This is a screen capture of a chat interface featuring white text on a dark background. A chat bubble contains descriptive text about a rendering process, and a bottom input bar includes a text field and a send icon.",
+            "compressed_lines": null,
+            "tMs": 3198
+          },
+          {
+            "scope": "frame:2",
+            "summary": "The frame shows a dark-themed chat interface with text messages in white and pink. A central modal displaying pink text describes a \"wobbly woven shapes\" rendering process, set against a dark background.",
+            "compressed_lines": null,
+            "tMs": 4465
+          },
+          {
+            "scope": "frame:3",
+            "summary": "A dark-themed chat interface shows white and pink text messages with individual user icons. A small, translucent pink modal box appears in the center, containing white text that describes a rendering process.",
+            "compressed_lines": null,
+            "tMs": 5674
+          },
+          {
+            "scope": "frame:4",
+            "summary": "The frame features a user interface with a central image showing an irregular, tessellated composition of various polygons in colors such as green, purple, blue, tan, brown, and pink. A chat bubble at the top contains the text \"oOoOh!! one of those wobbly woven shapes!! lemme draw u one taps screen",
+            "compressed_lines": null,
+            "tMs": 8035
+          },
+          {
+            "scope": "verdict",
+            "summary": "FAIL: The provided frames show a chat interface and a tessellated polygon composition, but there is no visual evidence of a tool being used to draw, nor is there a Lissajous curve or a 3:5 frequency-ratio w",
+            "compressed_lines": null,
+            "tMs": 11386
+          }
+        ],
+        "summary_excerpt": "[claim]   this recording shows scringlo using a tool to draw a Lissajous curve, and the final embedded image is a Lissajous 3:5 frequency-ratio woven curve\n[verdict] FAIL\n[reason]  The provided frames show a chat interface and a tessellated polygon composition, but there is no visual evidence of a tool being used to draw, nor is there a Lissajous curve or a 3:5 frequency-ratio w\n[frames]  reviewed 5 frames"
+      }
+    ]
+  }
+]
