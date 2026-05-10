@@ -3529,7 +3529,10 @@ func encAttn(_ cb: MTLCommandBuffer,
 // which the NEXT step's embed kernel reads.
 //
 // Direct port of CPU `sampleTokenFromLogits`: inverse-CDF softmax
-// sampling with temperature + min_p, argmax fast path at T <= 0. PRNG
+// sampling with temperature + min_p. The `T <= 0` argmax fast path
+// remains as defensive code but is unreachable from any production
+// path: temperature=0 is forbidden at the bridge API boundary
+// (see server/bridge.py:_parse_sampling). PRNG
 // is philox-4x32-10 keyed on (seed, step, slot) — statistically
 // equivalent to Swift's stdlib RNG, specific draws differ.
 //

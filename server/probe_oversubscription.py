@@ -77,7 +77,7 @@ def run_wave(n_streams: int, completion_tokens: int = 64,
              prompt_tokens: int = 32, deadline_s: float = 180.0) -> dict:
     """Submit N concurrent streams, drive to completion, return metrics."""
     sampling = g.SamplingParams(
-        temperature=0.0,
+        temperature=0.7,
         max_new_tokens=completion_tokens,
         eos_token_id=999_999,  # impossible token → never stops early
     )

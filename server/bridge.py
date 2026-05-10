@@ -208,7 +208,15 @@ def _engine_driver_thread(loop: asyncio.AbstractEventLoop) -> None:
 # fields into a g.SamplingParams.
 # ----------------------------------------------------------------------
 def _parse_sampling(body: dict, max_tokens: int) -> g.SamplingParams:
-    temperature = float(body.get("temperature", 0.0))
+    # API-boundary clamp: temperature=0.0 is forbidden. Per design
+    # principle (no greedy/argmax in eval-instrument paths because
+    # it eliminates the stochastic regime we actually deploy under),
+    # we clamp incoming temperatures up to a small floor. Callers
+    # who omit temperature get the OpenAI default of 1.0 instead of
+    # the previous 0.0. Documented at docs/dataflow_pipeline_spec.md.
+    temperature = float(body.get("temperature", 1.0))
+    if temperature < 0.01:
+        temperature = 0.01
     top_p = float(body.get("top_p", 1.0))
     top_k = int(body.get("top_k", 0))
     seed = body.get("seed")

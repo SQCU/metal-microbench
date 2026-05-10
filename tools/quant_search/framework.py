@@ -336,7 +336,7 @@ async def judge_rollout(
         "model": model_name,
         "messages": parser_messages,
         "max_tokens": 512,         # room for reasoning + answer
-        "temperature": 0.0,
+        "temperature": 0.7,
     }
     if semaphore is None:
         data, err = await _post_with_retry(
@@ -505,7 +505,7 @@ async def _fire_one_rollout(
         "logprobs": True,
         "top_logprobs": config.top_logprobs,
     }
-    if config.sample_temperature > 0.0:
+    if config.sample_temperature > 0:  # 0.0 forbidden upstream
         import hashlib
         seed = int(hashlib.sha256(
             f"{prob['item_id']}|{sample_idx}".encode()).hexdigest()[:8],

@@ -102,7 +102,7 @@ _lib.gemma_max_q_len.restype = C.c_int32
 # ----------------------------------------------------------------------
 @dataclass
 class SamplingParams:
-    temperature: float = 0.0
+    temperature: float = 1.0  # 0.0 is forbidden; see bridge.py:_parse_sampling
     top_p: float = 1.0
     top_k: int = 0
     repetition_penalty: float = 1.0

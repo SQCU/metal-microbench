@@ -75,7 +75,7 @@ test.describe('toolcards svg-from-query', () => {
                     let parsed = JSON.parse(postData);
                     if (firstRequest) {
                         firstRequest = false;
-                        parsed.temperature = 0.0;
+                        parsed.temperature = 0.7;
                         postData = JSON.stringify(parsed);
                     }
                     sentBodies.push(parsed);

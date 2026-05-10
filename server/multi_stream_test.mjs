@@ -11,7 +11,7 @@ function makeBody(seed) {
         {role: 'system', content: sysPrompt},
         {role: 'user', content: 'Make a simple smiley face SVG.'},
     ];
-    return JSON.stringify({messages, max_tokens: 100, temperature: 0.0, stream: false});
+    return JSON.stringify({messages, max_tokens: 100, temperature: 0.7, stream: false});
 }
 
 async function fireOne(idx) {
