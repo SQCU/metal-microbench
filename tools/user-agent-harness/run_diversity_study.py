@@ -224,7 +224,7 @@ def main():
     p.add_argument("--n-conversations", type=int, default=5)
     p.add_argument("--n-turns", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--out", default="diversity_report.md")
+    p.add_argument("--out", default="output/diversity_report.md")
     args = p.parse_args()
 
     personas = load_personas()
