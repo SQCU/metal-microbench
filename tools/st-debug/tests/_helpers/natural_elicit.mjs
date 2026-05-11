@@ -204,7 +204,7 @@ export async function loadHarness(page) {
 export async function ensurePersona(page, substr) {
     const present = await page.evaluate((s) => {
         const ctx = window.SillyTavern.getContext();
-        return ctx.characters?.some(c => new RegExp(s, 'i').test(c?.name || ''));
+        return ctx.characters?.some(c => (c?.name || '').toLowerCase().includes(s.toLowerCase()));
     }, substr);
     if (present) return;
 
@@ -232,22 +232,22 @@ export async function ensurePersona(page, substr) {
     });
     await page.waitForFunction((s) => {
         const ctx = window.SillyTavern.getContext();
-        return ctx.characters?.some(c => new RegExp(s, 'i').test(c?.name || ''));
+        return ctx.characters?.some(c => (c?.name || '').toLowerCase().includes(s.toLowerCase()));
     }, substr, { timeout: 15_000 });
 }
 
 export async function selectPersona(page, substr) {
     await page.evaluate(async (s) => {
         const ctx = window.SillyTavern.getContext();
-        const idx = ctx.characters.findIndex(c => new RegExp(s, 'i').test(c?.name || ''));
-        if (idx < 0) throw new Error(`persona matching /${s}/i not found`);
+        const idx = ctx.characters.findIndex(c => (c?.name || '').toLowerCase().includes(s.toLowerCase()));
+        if (idx < 0) throw new Error(`persona with name containing '${s}' (case-insensitive) not found`);
         if (String(ctx.characterId) !== String(idx)) {
             await ctx.selectCharacterById(idx);
         }
     }, substr);
     await page.waitForFunction((s) => {
         const ctx = window.SillyTavern.getContext();
-        return new RegExp(s, 'i').test(ctx.characters?.[ctx.characterId]?.name || '');
+        return (ctx.characters?.[ctx.characterId]?.name || '').toLowerCase().includes(s.toLowerCase());
     }, substr, { timeout: 15_000 });
 }
 

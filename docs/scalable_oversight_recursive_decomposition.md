@@ -210,38 +210,79 @@ The user's worked example for the demo:
 > write+validate the python and forked subagents to do the
 > persona-faithful conversational framing on either end."
 
+### Token-budget framing (the real design constraint)
+
+Per the user's 2026-05-10 framing: the budget per tool-mediated
+step targets **256–2k tokens** of decode. Below 256 means the work
+was too trivial to give the model room to demonstrate anything;
+above 2k means we likely picked a problem that crushes the
+demonstration via overexpansion. The range is achieved by
+SKILLFUL TASK ASSIGNMENT, not by max_tokens caps (capped truncation
+produces unparseable errored output).
+
+This isn't an aesthetic preference — it's a measurement-design
+constraint. Harness code IS RL benchmark code. Setting up the
+model with too-easy steps puts a thumb on the scale (artificial
+success); too-hard steps put a thumb the other way (artificial
+failure). The 256–2k window gives gemma-4 actual room to perform.
+
 ### Topology
 
 ```
 Scringlo (parent agent in conversation)
-  └─ FORK (full caller_messages):
-        F1: "describe what we're going to compute, in your voice"
-            → ~50-100 tokens out
-            → emits summary_progress (parent's voice line 1)
+  └─ F1 (FORK, full caller_messages + persona):
+        "in your voice, tell the user what you're about to draw
+         AND briefly explain the technique you'll use"
+        → ~256-400 tokens
+        → emits summary_progress
 
-  └─ SPAWN (focused prefix, no parent context):
-        S1: prefix = "You are a Python helper. Write a function..."
-            input = the spec from F1
-            → ~500-1500 tokens of code
-            → emits summary_progress (one-line technical summary)
+  └─ S1 (SPAWN, "rendering engine" prefix, no parent context):
+        prefix = "You write Python rendering functions that take
+                  a structured data input and return SVG output.
+                  The functions are small and self-contained."
+        input = the spec from F1's reasoning
+        → ~800-1800 tokens of code (function definition + math +
+          SVG composition)
+        → emits summary_progress (line summarizing what was written)
 
-  └─ SPAWN (focused prefix, no parent context — SHARES PREFIX with S1):
-        S2: prefix = "You are a Python helper. Validate this..."
-            input = the code from S1 + crafted test inputs
-            → ~100-300 tokens of pass/fail report
-            → emits summary_progress (one-line pass/fail line)
+  └─ S2 (SPAWN, shares prefix with S1):
+        prefix = "You write Python rendering functions that take
+                  a structured data input and return SVG output."
+                 [SAME PREFIX → KV cache hit]
+        instruction = "Given the function below and these test
+                       inputs, run it mentally and report whether
+                       the outputs satisfy these invariants: ..."
+        → ~256-600 tokens of pass/fail
+        → emits summary_progress
 
-  └─ FORK (full caller_messages + the result of the chain):
-        F2: "wrap up the result for the user, in your voice,
-             mentioning anything notable from validation"
-            → ~50-150 tokens out
-            → emits summary_progress (parent's voice line 4)
+  └─ F2 (FORK, caller_messages + S1+S2 results as additional ctx):
+        "wrap up for the user in your voice; mention any notable
+         validation findings; present the artifact"
+        → ~256-400 tokens
+        → emits summary_progress
 ```
 
-Plus host-side: actually run the validated Python, capture stdout,
-present alongside scringlo's wrap-up.
+Plus host-side: subprocess-exec the validated Python, capture the
+SVG string, embed in the result via `embed: [image_url]` for
+inline rendering.
 
-Total subagent decode: ~700-2000 tokens. Wall: 5-15s on metal.
+Total subagent decode: ~1500–3200 tokens. Wall: ~10-20s on metal.
+
+### Why "rendering engine" framing for S1/S2
+
+The spawn prefix isn't just "write Python" — it's "you write
+rendering functions that take typed data input and return SVG."
+That framing:
+
+- Gives the spawn agent a coherent role-shape (a sub-engineer with
+  a specific skill), not just a code-vending oracle.
+- Establishes a typed contract (input data type → SVG output) that
+  S2 can validate against, even without re-running the code.
+- Makes the (S1, S2) prefix shareable — the bridge's KV cache
+  hits on the prefix; only the per-spawn tail decodes.
+- Composes: future demos can share the same prefix for related
+  spawn tasks, building a library of "rendering engine" routines
+  the harness can elicit.
 
 ### Why this exercises spawn/fork distinction
 

@@ -3,6 +3,13 @@
 **Status**: Empirical findings from `tools/st-debug/scripts/tool_elicitation_study.py`,
 run on 2026-05-08 against bridge :8001 + Gemma-4-26B-A4B at temp=0.4 with
 the scringlo improv discourse + ambiguous "i wanna see a fractal!! ✨" prompt.
+The script is a direct-bridge A/B benchmark — N replicates across tool-
+description variants — analogous to the harnesses under
+`tools/quant_search/`. It is *not* a client; running it through ST
+would conflate elicitation rate with the variance in ST's prompt
+construction. A complementary ST-driven reliability measurement (one
+prompt, single tool, end-to-end through the real chat UI) lives in
+`tools/st-debug/tests/20_elicitation_reliability.spec.js`.
 
 ## Reframe of the regression
 

@@ -87,16 +87,22 @@ test.describe('honest render-visual elicitation — Scringlo + voronoi request',
         if (record.finishState === 'tool_handled') {
             const labels = record.toolProgress.map(tp => tp.label || '').join(' | ');
             const names = record.toolCallsEmitted.map(tc => tc.name || '').join(' | ');
-            const wantedFired = /render visual|render-visual/i.test(labels) ||
-                                /render-visual/i.test(names);
+            const labelsLo = labels.toLowerCase();
+            const namesLo = names.toLowerCase();
+            const wantedFired =
+                labelsLo.includes('render visual') ||
+                labelsLo.includes('render-visual') ||
+                namesLo.includes('render-visual');
             expect(wantedFired,
                 `render-visual fired (saw labels=${labels} names=${names})`)
                 .toBeTruthy();
 
             // Tool reached terminal state
+            const TERMINAL = new Set(['done', 'failed', 'cancelled']);
             for (const tp of record.toolProgress) {
-                expect(tp.status, `tool ${tp.label} reached terminal status`)
-                    .toMatch(/done|failed|cancelled/);
+                expect(TERMINAL.has(tp.status),
+                    `tool ${tp.label} reached terminal status (got ${tp.status})`)
+                    .toBe(true);
             }
         }
 

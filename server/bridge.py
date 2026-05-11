@@ -37,8 +37,8 @@ file and exposes BRIDGE_URL / chat_completions_url() / etc.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
-import re
 import os
 import time
 import uuid
@@ -47,9 +47,11 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 import gemma_ffi as g
+import gemma_tool_call_parser as gtc
 
 from chat_template import (
     TextChunk, ImageChunk, render_chat,
@@ -279,155 +281,51 @@ def _parse_sampling(body: dict, max_tokens: int) -> g.SamplingParams:
 # When tools are NOT in the request, this is a no-op. When tools ARE in
 # the request and no markers are found (model declined to call),
 # tool_calls_list is None and content is unchanged.
-# ────────────────────────────────────────────────────────────────────────
-# Per-turn scaffolding bytes the model emits but clients shouldn't see.
-# 2026-05-07: surfaced after a SillyTavern-fork user reported
-# `<|channel|>thought\n` appearing at the start of responses.
-#
-# The chat template's `add_generation_prompt=True, enable_thinking=False`
-# epilogue is `<|turn>model\n<|channel>thought\n<channel|>` (the empty-
-# thought no-thinking marker). The model is supposed to start its
-# response AFTER `<channel|>` closes — and does — but in some contexts
-# (notably multi-turn flows after a prior tool_call) it ECHOES the
-# `<|channel>thought\n<channel|>` structure as the first tokens of its
-# output, presumably as a learned formatting habit. The bytes ride
-# through detokenize verbatim and bleed into client UIs.
-#
-# Likewise, `<turn|>` (id 106) is the engine's natural-stop marker
-# (`_TURN_END_TOKENS`). It's an EOS signal, not response content;
-# clients don't need it.
-#
-# Conservative strip rules:
-#   - Leading `<|channel>BODY<channel|>` ONLY when BODY is short (<= 40
-#     chars between markers) — i.e., the empty/short echo. Real
-#     thinking content (longer body) is preserved so callers using
-#     enable_thinking can still surface it.
-#   - Trailing `<turn|>` regardless.
-_LEADING_CHANNEL_RE = re.compile(
-    r'^\s*<\|channel>[^<]{0,40}<channel\|>\s*',
-    re.DOTALL,
-)
-_TRAILING_TURN_RE = re.compile(r'\s*<turn\|>\s*$', re.DOTALL)
+# Channel-marker scaffolding (`<|channel>thought\n<channel|>` etc.) and
+# tool_call argument double-bracketing used to be patched up here. Both
+# are now fixed at the chat-template level: the no-thinking epilogue is
+# omitted (chat_template.jinja#add_generation_prompt block) and tool_call
+# arguments-as-string are parsed via the `from_json` Jinja filter
+# (chat_template.py:_safe_from_json + chat_template.jinja#tool_calls
+# rendering), so the model sees and emits a single canonical format.
 
 
-def _strip_response_scaffolding(text: str) -> str:
-    """Drop per-turn scaffolding bytes the client shouldn't see.
+# The OUTER block bounds (`<|tool_call>` ... `<tool_call|>`) are atomic
+# tokenizer-vocab tokens; they can't appear nested inside themselves so
+# a simple find/skip walk over the two literal boundaries is sufficient
+# (and equivalent to the prior non-greedy regex). The BODY between is
+# parsed by gemma_tool_call_parser.parse_tool_call_body — a proper
+# recursive-descent parser whose grammar mirrors chat_template.jinja's
+# format_argument macro one-for-one. The previous three-regex-pass +
+# json.loads approach was structurally inadequate (couldn't handle
+# nested braces in atomic-quoted strings, bareword keys inside string
+# content, etc.) and was the proximate cause of "some tool calls
+# rendered, others didn't" — content-dependent parse failures left the
+# raw block in `content` so ST rendered the marker text as markdown
+# instead of getting a structured `tool_calls` chunk.
+_TOOL_CALL_OPEN = '<|tool_call>'
+_TOOL_CALL_CLOSE = '<tool_call|>'
 
-    See _LEADING_CHANNEL_RE / _TRAILING_TURN_RE comments for what's
-    stripped and why. Body content between markers is preserved.
+
+def _iter_tool_call_blocks(content: str):
+    """Yield (start, end, body) for each `<|tool_call>...<tool_call|>`
+    block found in `content`. The OUTER markers are atomic tokenizer
+    tokens that do not nest, so this find/skip walk is equivalent to
+    `re.compile(r'<\\|tool_call>(.*?)<tool_call\\|>', re.DOTALL).finditer`.
     """
-    text = _LEADING_CHANNEL_RE.sub('', text)
-    text = _TRAILING_TURN_RE.sub('', text)
-    return text
-
-
-# Match ANY `<|channel>BODY<channel|>` block, body up to ~200 chars.
-# More permissive than _LEADING_CHANNEL_RE because we're cleaning
-# arbitrary historical contamination — could be anywhere in the message,
-# not just at the start.
-_ANY_CHANNEL_BLOCK_RE = re.compile(
-    r'<\|channel>[^<]{0,200}<channel\|>',
-    re.DOTALL,
-)
-
-
-def _clean_history_message(msg: dict) -> dict:
-    """Normalize a historical message before rendering through the chat
-    template. Two fixes applied:
-
-    1. CHANNEL-MARKER CONTAMINATION (assistant content):
-       Strip `<|channel>...<channel|>` blocks from assistant content
-       that a previous turn's response leaked into client-saved history.
-
-    2. TOOL-CALL ARGUMENTS DOUBLE-BRACKETING (assistant tool_calls):
-       OpenAI's standard tool_calls shape has `arguments` as a JSON-
-       encoded STRING (e.g., `'{"query":"..."}'`). The chat template
-       (chat_template.jinja:244-255) emits its OWN `{` and `}` brackets
-       around this — producing `{{"query":"..."}}` when concatenated
-       with the string's existing brackets. The model is trained on
-       this doubled-bracket format and reproduces it in NEW tool_call
-       output. The bridge's server-side tool-call extractor then fails
-       to parse the doubled braces as JSON.
-
-       Fix: parse the JSON string into a dict so the template takes
-       the `is mapping` branch (lines 245-251) which formats correctly
-       without doubled brackets. As a side effect, the model sees
-       single-bracket format in input AND emits single-bracket format
-       in output — consistency restored.
-
-    Tool messages and user messages pass through (channel markers in
-    user content are likely intentional examples, not bleed).
-    """
-    role = msg.get("role")
-    if role == "assistant":
-        out = dict(msg)
-        # 1. Channel-marker strip on string content.
-        content = msg.get("content")
-        if isinstance(content, str):
-            cleaned = _ANY_CHANNEL_BLOCK_RE.sub('', content)
-            cleaned = _TRAILING_TURN_RE.sub('', cleaned)
-            if cleaned != content:
-                out["content"] = cleaned.strip()
-        # 2. tool_calls arguments string → dict.
-        tcs = msg.get("tool_calls")
-        if isinstance(tcs, list) and tcs:
-            new_tcs = []
-            for tc in tcs:
-                if isinstance(tc, dict):
-                    fn = tc.get("function") or {}
-                    args = fn.get("arguments")
-                    if isinstance(args, str):
-                        try:
-                            parsed = json.loads(args)
-                            new_fn = dict(fn)
-                            new_fn["arguments"] = parsed
-                            new_tc = dict(tc)
-                            new_tc["function"] = new_fn
-                            new_tcs.append(new_tc)
-                            continue
-                        except (TypeError, json.JSONDecodeError):
-                            pass
-                new_tcs.append(tc)
-            out["tool_calls"] = new_tcs
-        return out
-    return msg
-
-
-_TOOL_CALL_BLOCK_RE = re.compile(
-    r'<\|tool_call>(.*?)<tool_call\|>',
-    re.DOTALL,
-)
-# <|"|>STRING<|"|> — training format for atomic-quoted strings
-_ATOMIC_QUOTE_RE = re.compile(r'<\|"\|>(.*?)<\|"\|>', re.DOTALL)
-# <|D...D|> — model's improvised raw-string form. D is any single char
-# that isn't itself `>` or `<` (the surrounding angle brackets) or `|`
-# (which would re-enter the marker syntax). Backtick is what we've
-# observed; the regex accepts any single non-restricted char.
-_RAW_QUOTE_RE = re.compile(r'<\|([^<>|])(.*?)\1\|>', re.DOTALL)
-# Unquoted bareword keys in pseudo-JSON: `{key:` or `,key:`.
-_BAREWORD_KEY_RE = re.compile(r'([\{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:')
-
-
-def _parse_tool_call_args(arg_block: str) -> dict | None:
-    """Convert the model's argument-DSL inside `{...}` to a Python dict.
-
-    Strategy: rewrite the DSL to standard JSON, then json.loads. Returns
-    None if the result isn't parseable as JSON — caller decides whether
-    to fall back (e.g., return raw bytes as the argument value).
-    """
-    # 1. <|"|>X<|"|>  →  "X" (with proper JSON-escape of X)
-    rewritten = _ATOMIC_QUOTE_RE.sub(
-        lambda m: json.dumps(m.group(1)), arg_block)
-    # 2. <|D...D|>  →  "..." (raw-string form, content can have anything)
-    rewritten = _RAW_QUOTE_RE.sub(
-        lambda m: json.dumps(m.group(2)), rewritten)
-    # 3. Bareword keys → quoted keys
-    rewritten = _BAREWORD_KEY_RE.sub(r'\1"\2":', rewritten)
-    # 4. Try to parse as JSON
-    try:
-        return json.loads(rewritten)
-    except json.JSONDecodeError:
-        return None
+    pos = 0
+    while True:
+        s = content.find(_TOOL_CALL_OPEN, pos)
+        if s < 0:
+            return
+        body_start = s + len(_TOOL_CALL_OPEN)
+        e = content.find(_TOOL_CALL_CLOSE, body_start)
+        if e < 0:
+            # Unclosed opener — bail; matches prior regex behaviour
+            # (the non-greedy `.*?` couldn't anchor a close either).
+            return
+        yield s, e + len(_TOOL_CALL_CLOSE), content[body_start:e]
+        pos = e + len(_TOOL_CALL_CLOSE)
 
 
 def _extract_tool_calls(content: str,
@@ -436,49 +334,35 @@ def _extract_tool_calls(content: str,
 
     Returns (cleaned_content, tool_calls_or_None). When a parse fails
     on a particular block, the block stays in cleaned_content as-is
-    so the client at least sees the bytes (debugging affordance).
+    so the client at least sees the bytes (debugging affordance) and
+    the parse error logs to stderr for triage.
     """
-    if not had_tools or '<|tool_call>' not in content:
+    if not had_tools or _TOOL_CALL_OPEN not in content:
         return content, None
 
     tool_calls: list[dict] = []
     cleaned_parts: list[str] = []
     last_end = 0
-    for m in _TOOL_CALL_BLOCK_RE.finditer(content):
-        cleaned_parts.append(content[last_end:m.start()])
-        body = m.group(1).strip()
-        # Body shape: `call:NAME{ARGS}` (NAME is plain identifier;
-        # ARGS may contain nested braces, so split at the FIRST `{`).
-        prefix, _, rest = body.partition('{')
-        prefix = prefix.strip()
-        if not (prefix.startswith('call:') and rest):
-            # Malformed: leave the block unmodified.
-            cleaned_parts.append(m.group(0))
-            last_end = m.end()
-            continue
-        name = prefix[len('call:'):].strip()
-        # rest is "...args...}" — strip the trailing `}` to get the args body.
-        if not rest.endswith('}'):
-            cleaned_parts.append(m.group(0))
-            last_end = m.end()
-            continue
-        args_body = '{' + rest  # restore opening brace; close already there
-        parsed = _parse_tool_call_args(args_body)
-        if parsed is None:
-            # Couldn't convert to JSON — keep raw block visible to
-            # the client and skip the tool_calls[] entry.
-            cleaned_parts.append(m.group(0))
-            last_end = m.end()
+    for block_start, block_end, body in _iter_tool_call_blocks(content):
+        cleaned_parts.append(content[last_end:block_start])
+        body = body.strip()
+        try:
+            name, args = gtc.parse_tool_call_body(body)
+        except gtc.ToolCallParseError as e:
+            print(f"[bridge] tool_call parse failed: {e}; "
+                  f"leaving block as raw content: {body[:80]!r}")
+            cleaned_parts.append(content[block_start:block_end])
+            last_end = block_end
             continue
         tool_calls.append({
             "id": f"call_{uuid.uuid4().hex[:16]}",
             "type": "function",
             "function": {
                 "name": name,
-                "arguments": json.dumps(parsed, ensure_ascii=False),
+                "arguments": json.dumps(args, ensure_ascii=False),
             },
         })
-        last_end = m.end()
+        last_end = block_end
     cleaned_parts.append(content[last_end:])
     cleaned = ''.join(cleaned_parts).strip()
     return cleaned, (tool_calls if tool_calls else None)
@@ -488,7 +372,10 @@ def _build_stream_spec(stream_id: int,
                        messages: list[dict],
                        sampling: g.SamplingParams,
                        capture_logits: bool,
-                       tools: list | None = None) -> tuple[g.StreamSpec, list[StoredSegment]]:
+                       tools: list | None = None,
+                       enable_thinking: bool = False,
+                       capture_cvec_activations: bool = False,
+                       control_vectors: list | None = None) -> tuple[g.StreamSpec, list[StoredSegment]]:
     """OpenAI messages → (StreamSpec, delta_segments).
 
     Bridge is stateless across chat completions: each request renders
@@ -509,21 +396,10 @@ def _build_stream_spec(stream_id: int,
     # bit-identical prefix bytes (passive accelerator, no client-side
     # state); but the bridge itself constructs no cross-request state.
 
-    # Clean prior assistant `content` before rendering: strip any
-    # `<|channel>...<channel|>` blocks that a previous turn's response
-    # may have leaked into the saved history. This was a real failure
-    # mode — the model's first-tokens-per-turn echo of the no-thinking
-    # epilogue would land in client conversation state, then on the
-    # NEXT turn that literal text gets atomic-id-emitted on the input
-    # path (per chat_template.py:SPECIAL_TOKENS) and the model sees a
-    # mid-message empty thought-channel block in its own past output.
-    # Stripping on input is belt to the suspenders of stripping on
-    # output (_strip_response_scaffolding), since old contaminated
-    # history persists even after the output-side fix.
-    messages = [_clean_history_message(m) for m in messages]
     try:
         delta_chunks = render_chat(
-            messages, add_generation_prompt=True, tools=tools)
+            messages, add_generation_prompt=True, tools=tools,
+            enable_thinking=enable_thinking)
     except ValueError as e:
         # image_url that isn't a data: URI is a client-shape error,
         # not a server fault.
@@ -536,10 +412,18 @@ def _build_stream_spec(stream_id: int,
         g.Segment(kind=s.kind, tokens=list(s.tokens), image_bytes=s.image_bytes)
         for s in delta_segments
     ]
+    flags = 0
+    if capture_logits:
+        flags |= 0x01
+    if enable_thinking:
+        flags |= 0x02
+    if capture_cvec_activations:
+        flags |= 0x04
     return g.StreamSpec(
         stream_id=stream_id, action=0,
-        flags=0x01 if capture_logits else 0,
+        flags=flags,
         segments=spec_segments, sampling=sampling,
+        control_vectors=control_vectors or [],
     ), delta_segments
 
 
@@ -706,6 +590,26 @@ async def _shutdown() -> None:
 # ----------------------------------------------------------------------
 # Endpoints.
 # ----------------------------------------------------------------------
+@app.get("/v1/engine/state")
+def engine_state() -> JSONResponse:
+    """Snapshot of engine-internal state for the static visualizers.
+
+    Data NOT scoped to a single completion: KV-cache page tenancy
+    (which phys pages are live, what their refcounts are, which pages
+    are content-cached), the vision cache aggregate hit/miss counters,
+    and the active-stream registry (state, position, pages_owned).
+    Per-completion telemetry (cache_hits, vision_cache_hits, token
+    counts) is on the OAI usage block — clients should read it from
+    there. See docs/engine_telemetry_endpoint.md for the principle.
+
+    Polling-friendly: cheap to invoke at 1-2 Hz from a browser. The
+    underlying FFI call walks active streams + live pages under the
+    same gEngineLock that serializes the AR loop; payload is < 256 KB
+    in the worst realistic case (8192-page pool, 8 active streams).
+    """
+    return JSONResponse(g.engine_state())
+
+
 @app.get("/health")
 def health() -> JSONResponse:
     s = g.status()
@@ -724,6 +628,39 @@ def health() -> JSONResponse:
             "max_q_len": g.max_q_len(),
         },
     })
+
+
+@app.post("/v1/resources/register")
+async def register_resource_endpoint(req: Request) -> JSONResponse:
+    """Register a binary resource (e.g. a control vector) inside the
+    bridge process's libgemma registry. Required because the registry is
+    per-process: a client that calls `gemma_register_resource` from its
+    OWN Python process puts the bytes in its own dylib copy, which the
+    bridge never sees. Body:
+        {"kind": "cvec", "id": "<id>", "data_b64": "<base64>"}
+    `kind` is currently "cvec" (a fp16 HIDDEN-length direction). `data_b64`
+    is the raw bytes base64-encoded. Returns {"rc": int} from the FFI;
+    rc != 0 indicates a size-mismatch or other registration failure
+    (the bridge prints the reason to stderr).
+    """
+    body = await req.json()
+    kind = str(body.get("kind", ""))
+    rid = str(body.get("id", ""))
+    data_b64 = body.get("data_b64")
+    if not kind or not rid or not data_b64:
+        raise HTTPException(400, "kind, id, data_b64 are required")
+    try:
+        data = base64.b64decode(data_b64)
+    except Exception as e:
+        raise HTTPException(400, f"data_b64 decode failed: {e}") from None
+    rc = await asyncio.to_thread(
+        lambda: g.register_resource(kind, rid, data))
+    if rc != 0:
+        raise HTTPException(
+            400,
+            f"register_resource({kind!r}, {rid!r}) returned rc={rc} "
+            f"(usually size mismatch — see bridge stderr for details)")
+    return JSONResponse({"rc": rc, "kind": kind, "id": rid, "bytes": len(data)})
 
 
 @app.post("/v1/tokenize")
@@ -794,17 +731,36 @@ async def chat_completions(req: Request) -> Any:
             raise HTTPException(
                 501, f"'{k}' not yet wired through the unified FFI; "
                      f"see notes/specs/batch_ffi_abi.md")
-    # `controls` (control vectors) is now SamplingParams-shape via
-    # gemma_register_resource + StreamSpec.control_vectors. The
-    # curriculum doesn't send `controls`, but if a research client does
-    # we'd translate body["controls"] here. For now: 501 with pointer
-    # to the unified shape — research callers should use the new
-    # ABI directly once the bridge plumbing lands.
-    if body.get("controls"):
-        raise HTTPException(
-            501, "'controls' is now StreamSpec.control_vectors via the "
-                 "unified ABI. Bridge translation TBD; see notes/specs/"
-                 "batch_ffi_abi.md")
+    # `controls` (control vectors): translate body["controls"] (list of
+    # OAI-shape dicts) into StreamSpec.control_vectors (list of
+    # CVApplication). The cvec_id must reference a CV previously
+    # uploaded via gemma_register_resource(kind='cvec', ...). Each entry
+    # mirrors the CVApplication dataclass — see server/gemma_ffi.py.
+    request_controls: list[g.CVApplication] = []
+    raw_controls = body.get("controls")
+    if raw_controls:
+        if not isinstance(raw_controls, list):
+            raise HTTPException(400, "`controls` must be a list of dicts")
+        for c in raw_controls:
+            if not isinstance(c, dict) or not c.get("cvec_id"):
+                raise HTTPException(400,
+                    "each `controls` entry needs at least a string cvec_id")
+            request_controls.append(g.CVApplication(
+                cvec_id=str(c["cvec_id"]),
+                layer=int(c.get("layer", 0)),
+                polarity=float(c.get("polarity", 1.0)),
+                peak_magnitude=float(c.get("peak_magnitude", 1.0)),
+                attack=float(c.get("attack", 0.0)),
+                decay=float(c.get("decay", 0.0)),
+                sustain_level=float(c.get("sustain_level", 1.0)),
+                release=float(c.get("release", 0.0)),
+                shape=int(c.get("shape", 0)),
+                units=int(c.get("units", 0)),
+                mode=int(c.get("mode", 0)),
+                target=float(c["target"]) if c.get("target") is not None else float("nan"),
+                transport_scale=float(c.get("transport_scale", 0.0)),
+                transport_offset=float(c.get("transport_offset", 0.0)),
+            ))
 
     sampling, capture_logits = _parse_sampling(body, max_tokens)
     # structured_cot: bool → default labels, list → custom labels.
@@ -924,13 +880,35 @@ async def chat_completions(req: Request) -> Any:
     # PYTHONUNBUFFERED=1 (set by the lifecycle launcher) means every
     # write hits stdout immediately; the explicit `flush=True` is
     # gratuitous lock acquisition on each per-request print.
+    # `reasoning_effort` (OpenAI o1-shape): any non-null/non-"none"
+    # value enables the model's thinking-channel. The flag flows
+    # through render_chat (template emits <|think|> prelude) and
+    # through the FFI flags bit so the engine routes channel-block
+    # tokens to its thinkingQueue instead of dropping them. The
+    # bridge then surfaces drained thinking content as
+    # `reasoning_content` in the response.
+    re_raw = body.get("reasoning_effort")
+    enable_thinking = bool(re_raw) and (str(re_raw).lower() != "none")
+    # `capture_cvec_activations` (vendor extension, not in OAI spec):
+    # opt-in flag that asks the engine to report per-(token, ActiveControl)
+    # magnitude + layer records back via `delta.cvec_activations` in the
+    # SSE stream. Used by `server/static/steering.html` for the per-token
+    # cvec heatmap. When unset, the engine's instrumentation path is
+    # dormant — apply kernels still run identically, the per-step records
+    # just don't get queued. Off-path bit-identity verified by
+    # tools/cvec_validation/baseline_logprobs.py.
+    capture_cvec = bool(body.get("capture_cvec_activations", False))
     print(f"[bridge] chat_completions: tools={len(tools) if tools else 0}, "
           f"tool_choice={body.get('tool_choice')!r}, "
           f"messages={len(messages)}, stream={stream}, "
-          f"stop_seqs={len(sampling.stop_sequences)}")
+          f"stop_seqs={len(sampling.stop_sequences)}, "
+          f"reasoning_effort={re_raw!r}, capture_cvec={capture_cvec}")
     stream_id = await _next_stream_id_alloc()
     spec, _ = _build_stream_spec(
-        stream_id, messages, sampling, capture_logits, tools=tools)
+        stream_id, messages, sampling, capture_logits, tools=tools,
+        enable_thinking=enable_thinking,
+        capture_cvec_activations=capture_cvec,
+        control_vectors=request_controls)
     response_q: asyncio.Queue = asyncio.Queue()
     _response_qs[stream_id] = response_q
 
@@ -955,12 +933,14 @@ async def chat_completions(req: Request) -> Any:
         clean_close_aggregate = False
         try:
             all_tokens: list[int] = []
+            all_thinking_tokens: list[int] = []
             usage: dict[str, int] = {}
             done_reason = 0
             collected_logprobs: list[g.TokenLogprob] = []
             while True:
                 u: g.StreamUpdate = await response_q.get()
                 all_tokens.extend(u.new_tokens)
+                all_thinking_tokens.extend(u.new_thinking_tokens)
                 if u.logprobs:
                     collected_logprobs.extend(u.logprobs)
                 # The engine now self-terminates on the <tool_call|>
@@ -999,18 +979,6 @@ async def chat_completions(req: Request) -> Any:
                   f"done_reason={done_reason}")
             finish = "stop" if done_reason == 1 else (
                 "length" if done_reason == 2 else "stop")
-            # The engine emits done_reason=1 even when generation hit
-            # the requested max_tokens budget (rather than emitting EOS
-            # naturally), so done_reason alone undercounts "length"
-            # truncations. Detect the budget-hit case explicitly: when
-            # completion_tokens equals the requested max_tokens AND the
-            # engine claimed natural stop, the truncation is actually
-            # length-driven. Without this, automated retry / continuation
-            # logic that branches on finish_reason gets the wrong signal.
-            if (finish == "stop"
-                    and isinstance(usage.get("completion_tokens"), int)
-                    and usage["completion_tokens"] >= max_tokens):
-                finish = "length"
             # 2026-05-07: server-side tool-call extraction. When tools
             # were in the request and the model emitted
             # `<|tool_call>...<tool_call|>` markers, parse them out of
@@ -1022,9 +990,23 @@ async def chat_completions(req: Request) -> Any:
             # affordant.
             cleaned_text, extracted_tool_calls = _extract_tool_calls(
                 text, had_tools=tools is not None)
-            cleaned_text = _strip_response_scaffolding(cleaned_text)
             message: dict[str, Any] = {"role": "assistant",
                                         "content": cleaned_text}
+            if all_thinking_tokens:
+                # The engine routes every token between CHANNEL_OPEN_ID
+                # and CHANNEL_CLOSE_ID into thinkingQueue verbatim,
+                # which includes the channel-name preamble that gemma's
+                # tokenizer-grammar puts there ("thought\n" terminated
+                # by the first newline). The OAI o1-shape
+                # `reasoning_content` field is supposed to carry the
+                # user-visible thinking body, not the format-internal
+                # channel header — so we strip the preamble here at the
+                # bridge layer. This is api-side translation work, not
+                # client-side rendering work: clients never need to
+                # know that gemma calls its thinking channel "thought".
+                raw = g.detokenize(all_thinking_tokens)
+                nl = raw.find("\n")
+                message["reasoning_content"] = raw[nl + 1:] if nl >= 0 else raw
             if extracted_tool_calls:
                 message["tool_calls"] = extracted_tool_calls
                 finish = "tool_calls"
@@ -1084,99 +1066,97 @@ async def chat_completions(req: Request) -> Any:
     async def gen():
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
         created = int(time.time())
-        # All chat-completion responses (tool-enabled or not) stream
-        # tokenwise. When tools are in the request, we run a small
-        # rolling-buffer detector for `<|tool_call`; on detection,
-        # streaming pauses for the rest of generation, the accumulated
-        # tokens get tool-call extraction at state==2, and we emit
-        # tool_calls deltas + finish_reason="tool_calls". Until
-        # detection (or if no tool call is emitted), tokens flow live
-        # to the client. See the comment block on TOOL_MARKER_PREFIX
-        # below for the lookahead implementation.
+        # Tokenwise live streaming. When tools are in the request, the
+        # model may emit `<|tool_call>...<tool_call|>` markers as part
+        # of the generated text; the markers stream visibly to the
+        # client just like any other token. Tool-call extraction runs
+        # ONCE at end-of-generation against the accumulated text, and
+        # if any markers parsed cleanly we emit a `tool_calls` delta
+        # followed by `finish_reason="tool_calls"`. Clients that
+        # understand OpenAI tool_calls (SillyTavern's tool-calling
+        # extractor, openai's own SDK) consume the structured shape;
+        # clients that don't will see the raw markers as content.
         had_tools = tools is not None
         all_tokens: list[int] = []
         last_update: g.StreamUpdate | None = None
         clean_close = False
-        # Tokenwise streaming with adaptive tool-call detection.
-        # Previously when had_tools=True, all output was buffered until
-        # end of generation so we could parse `<|tool_call>...<tool_call|>`
-        # blocks. That destroyed live streaming for ALL tool-enabled
-        # chats — including ones where the model never emitted a tool
-        # call. The vast majority of toolcards-enabled scringlo
-        # interactions are prose; the model rarely emits a tool call.
-        # Buffering punished the common case to make the rare one
-        # cleaner.
-        # New behavior: stream content tokenwise as before. Maintain a
-        # rolling buffer to detect the start of `<|tool_call`. Once
-        # detected, switch to BUFFER mode: don't emit further content
-        # deltas (the partial marker has already streamed, but at end
-        # we'll emit a content-clearing replacement via tool_calls
-        # finish path). Until detected, emit live. Found 2026-05-09
-        # via DOM mutation trace: ST chats arrived as 1-2 mutations
-        # because `had_tools` always=true for any toolcards-enabled
-        # session.
-        TOOL_MARKER_PREFIX = "<|tool_call"
-        marker_buffer = ""
-        in_marker_mode = False
+        # Per-generator state for stripping the channel-name preamble
+        # from streamed reasoning_content. Gemma's thinking channel
+        # opens with `<|channel>NAME\n...` and the engine routes every
+        # token between the sentinel pair to thinkingQueue verbatim,
+        # including the NAME + newline. We strip everything up to and
+        # including the first newline; flag flips to True once we've
+        # seen it. After that, deltas pass through unchanged. The
+        # newline may not be in the first delta — we accumulate
+        # pending bytes until it shows up, then emit only the body.
+        thinking_header_consumed = False
+        thinking_header_buffer = ""
         try:
             while True:
                 u: g.StreamUpdate = await response_q.get()
                 last_update = u
+                if u.new_thinking_tokens:
+                    raw_delta = g.detokenize(u.new_thinking_tokens)
+                    if not thinking_header_consumed:
+                        thinking_header_buffer += raw_delta
+                        nl = thinking_header_buffer.find("\n")
+                        if nl < 0:
+                            # Still in the header bytes; nothing to emit yet.
+                            thinking_delta = ""
+                        else:
+                            thinking_delta = thinking_header_buffer[nl + 1:]
+                            thinking_header_consumed = True
+                            thinking_header_buffer = ""
+                    else:
+                        thinking_delta = raw_delta
+                    if thinking_delta:
+                        yield ("data: " + json.dumps({
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": MODEL_NAME,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"reasoning_content": thinking_delta},
+                                "finish_reason": None,
+                            }],
+                        }) + "\n\n")
+                if u.new_cvec_activations:
+                    # Vendor extension: per-(ActiveControl, AR-step)
+                    # records. Each tuple is (token_position, layer,
+                    # magnitude). See server/static/steering.html for
+                    # the consumer; off-path bit-identity guard is at
+                    # tools/cvec_validation/baseline_logprobs.py.
+                    yield ("data: " + json.dumps({
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": MODEL_NAME,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"cvec_activations": [
+                                {"token_position": tp, "layer": ly,
+                                 "magnitude": mg}
+                                for (tp, ly, mg) in u.new_cvec_activations
+                            ]},
+                            "finish_reason": None,
+                        }],
+                    }) + "\n\n")
                 if u.new_tokens:
                     all_tokens.extend(u.new_tokens)
-                    delta_text = _strip_response_scaffolding(
-                        g.detokenize(u.new_tokens))
-                    if not delta_text:
-                        if u.state == 2:
-                            pass  # fall through to state==2 handler
-                        else:
-                            continue
-                    if not in_marker_mode and delta_text:
-                        # Append to rolling buffer; emit anything that's
-                        # definitely not part of a tool-call marker
-                        # prefix. We only need to withhold up to len()-1
-                        # of the prefix at any time.
-                        marker_buffer += delta_text
-                        # Find any complete marker.
-                        if TOOL_MARKER_PREFIX in marker_buffer:
-                            # Emit prose preceding the marker, then
-                            # switch modes.
-                            cut = marker_buffer.find(TOOL_MARKER_PREFIX)
-                            emit = marker_buffer[:cut]
-                            if emit:
-                                yield ("data: " + json.dumps({
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created,
-                                    "model": MODEL_NAME,
-                                    "choices": [{
-                                        "index": 0,
-                                        "delta": {"content": emit},
-                                        "finish_reason": None,
-                                    }],
-                                }) + "\n\n")
-                            in_marker_mode = True
-                            marker_buffer = ""
-                        else:
-                            # Withhold up to len(prefix)-1 trailing chars
-                            # in case the next delta extends a partial
-                            # marker. Emit everything older than that.
-                            keep = len(TOOL_MARKER_PREFIX) - 1
-                            if len(marker_buffer) > keep:
-                                emit = marker_buffer[:-keep]
-                                marker_buffer = marker_buffer[-keep:]
-                                if emit:
-                                    yield ("data: " + json.dumps({
-                                        "id": completion_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created,
-                                        "model": MODEL_NAME,
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {"content": emit},
-                                            "finish_reason": None,
-                                        }],
-                                    }) + "\n\n")
+                    delta_text = g.detokenize(u.new_tokens)
+                    if delta_text:
+                        yield ("data: " + json.dumps({
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": MODEL_NAME,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": delta_text},
+                                "finish_reason": None,
+                            }],
+                        }) + "\n\n")
                 if u.state == 2:
                     # Engine-side error path: done_reason=3 + err_msg.
                     # Same handling as non-streaming aggregate path above.
@@ -1204,35 +1184,19 @@ async def chat_completions(req: Request) -> Any:
                         break
                     finish = "stop" if u.done_reason == 1 else (
                         "length" if u.done_reason == 2 else "stop")
-                    # Same length-truncation override as the non-streaming
-                    # path: engine reports done_reason=1 even when the
-                    # max_tokens budget was the actual cause, so detect
-                    # that here from completion_tokens_emitted.
-                    if (finish == "stop"
-                            and u.completion_tokens_emitted >= max_tokens):
-                        finish = "length"
-                    # End-of-stream cleanup. With the live-streaming
-                    # path above, all NON-marker content has already
-                    # been streamed. We still need to:
-                    #   - flush any trailing content that was held in
-                    #     marker_buffer (no tool call was started)
-                    #   - run tool-call extraction on the accumulated
-                    #     tokens; if a tool call IS found, emit the
-                    #     tool_calls delta + flip finish to tool_calls
+                    # End-of-generation tool-call extraction. The marker
+                    # text streamed live to the client; if any markers
+                    # parsed cleanly, also emit a structured tool_calls
+                    # delta and flip finish to "tool_calls" per OAI spec.
                     if had_tools:
                         full_text = g.detokenize(all_tokens)
-                        cleaned_text, extracted = _extract_tool_calls(
+                        _, extracted = _extract_tool_calls(
                             full_text, had_tools=True)
-                        cleaned_text = _strip_response_scaffolding(cleaned_text)
                         if extracted:
                             finish = "tool_calls"
                             print(f"[bridge] (SSE) extracted "
                                   f"{len(extracted)} tool_call(s); names="
                                   f"{[tc['function']['name'] for tc in extracted]}")
-                            # Tool-calls delta. The prose prefix
-                            # (cleaned_text) was already streamed live
-                            # before we entered marker_mode, so we don't
-                            # re-emit it here.
                             tc_deltas = [{
                                 "index": i,
                                 "id": tc["id"],
@@ -1250,26 +1214,6 @@ async def chat_completions(req: Request) -> Any:
                                     "finish_reason": None,
                                 }],
                             }) + "\n\n")
-                        else:
-                            # No tool call. Flush trailing buffer below.
-                            pass
-                    # Flush any held marker_buffer (final ~10 chars
-                    # withheld during streaming as a tool-call lookahead).
-                    # Applies to both had_tools (no extracted call) and
-                    # non-tool paths.
-                    if marker_buffer:
-                        yield ("data: " + json.dumps({
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": MODEL_NAME,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"content": marker_buffer},
-                                "finish_reason": None,
-                            }],
-                        }) + "\n\n")
-                        marker_buffer = ""
                     yield ("data: " + json.dumps({
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -1327,6 +1271,28 @@ async def chat_completions(req: Request) -> Any:
                     pass
             _response_qs.pop(stream_id, None)
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+# ----------------------------------------------------------------------
+# Static visualizers (server/static/). These are bespoke engine-internals
+# dashboards (tetraplex / labeler / loom / steering) that consume the
+# same OAI-compatible chat-completions endpoint as any other client but
+# additionally poll /v1/engine/state for the engine-state slice the OAI
+# response doesn't carry (KV page tenancy, vision cache, active streams).
+# Mounted at /static so the bridge's API namespace (/health, /v1/*) is
+# unchanged; the root path redirects to the visualizer index.
+# ----------------------------------------------------------------------
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+if _STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)),
+              name="static")
+
+    @app.get("/")
+    def _root_redirect() -> RedirectResponse:
+        # 302 to the visualizer index. Keeping the bridge's namespace
+        # clean (no FileResponse routes for individual pages) — every
+        # visualizer is reachable at /static/<name>.html.
+        return RedirectResponse(url="/static/clients.html", status_code=302)
 
 
 def main() -> None:

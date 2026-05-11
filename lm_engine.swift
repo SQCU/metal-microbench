@@ -534,6 +534,22 @@ final class Session {
     // Surfaces back to the bridge via StreamUpdate.errMsg → HTTP 5xx
     // body. Empty for non-error terminations.
     var errMsg: String = ""
+    // True between a sampled `<|channel>` (id 100) and its matching
+    // `<channel|>` (id 101). gemma-4 emits empty thinking-channel
+    // blocks (`<|channel>thought\n<channel|>`) at the start of every
+    // assistant turn as a learned formatting habit; with
+    // enable_thinking=False the contents are scaffolding, not
+    // user-visible content. Tokens sampled while this flag is set
+    // are NOT pushed to outputQueue, so streaming clients never see
+    // the channel block. They still count toward numGenerated /
+    // history (consumedTokens) so the model's own self-attention
+    // sees its own emissions normally. The flag clears when token
+    // 101 is sampled (also dropped from outputQueue). See validation
+    // artifact: tools/st-debug/tests/test-results/
+    // 21_post_cleanup_validation/04_after_response.png — without
+    // the suppression, the channel body leaks into chat as
+    // "thought\n*gasps* tessellation time!!" prefix.
+    var inChannelBlock: Bool = false
     // 2026-05-07 (M:K permutation): `slot` is now per-CB scratch.
     //   - Set by the engine's per-CB picker (pickKernelMappingForAR /
     //     pickKernelMappingForPrefill) BEFORE each CB runs, to the
@@ -804,6 +820,42 @@ final class Session {
 
     // Tokens the caller can consume.
     fileprivate var outputQueue: [UInt32] = []
+
+    // Thinking-channel content. Populated by maybeAppendOutput when
+    // `enableThinking` is true and the session is inside a
+    // `<|channel>...<channel|>` block. The bridge surfaces these to
+    // the client as `reasoning_content` (OpenAI o1-shape). When
+    // `enableThinking` is false, channel-block content is dropped
+    // (the model echoes a `<|channel>thought\n<channel|>` empty
+    // marker as a learned habit; without thinking enabled it's
+    // scaffolding the user shouldn't see).
+    fileprivate var thinkingQueue: [UInt32] = []
+    var enableThinking: Bool = false
+
+    // Buffer for channel-block tokens generated when enableThinking
+    // is false. Normally these are dropped (thinking scaffold, client
+    // didn't ask for it). But if the model emits CHANNEL_OPEN_ID and
+    // hits EOS/max_tokens before CHANNEL_CLOSE_ID — a learned-habit
+    // failure mode where the model writes its WHOLE response inside a
+    // thinking channel that never gets closed — we recover the
+    // contents at .done via flushUnclosedChannel() so the response
+    // isn't silently empty. See docs/streamed_toolcall_marker_leak.md
+    // for the related rendering issue and 2026-05-10 user report.
+    fileprivate var pendingChannelTokens: [UInt32] = []
+
+    // Cvec activations capture. When `captureCvecActivations` is
+    // true, every (ActiveControl, AR step) pair pushes one record
+    // onto `cvecActivationsQueue`; the FFI pump drains the queue
+    // and surfaces records as `choices[0].delta.cvec_activations`
+    // in the bridge's SSE stream. When the flag is false, the
+    // capture path is dormant — recordCvecActivation is a no-op
+    // early-return — so the apply path bit-equals pre-
+    // instrumentation behavior. Validated by
+    // tools/cvec_validation/baseline_logprobs.py.
+    var captureCvecActivations: Bool = false
+    fileprivate var cvecActivationsQueue: [(tokenPosition: UInt32,
+                                            layer: UInt32,
+                                            magnitude: Float)] = []
 
     // ────────────────────────────────────────────────────────────────────
     // Bridge-side per-request state, pulled inside the request 2026-05-07
@@ -1119,6 +1171,132 @@ final class Session {
 
     // Mark as done; engine will release pages + slot on the next tick.
     func finish() { state = .done }
+
+    // Token IDs the engine treats as a self-contained suppression span.
+    // gemma-4 emits `<|channel>...<channel|>` blocks at the start of
+    // every assistant turn (id 100 → ... → id 101). With
+    // enable_thinking=False these are scaffolding, not content. The
+    // helper drops the markers AND any tokens between them from the
+    // output stream surfaced to the bridge. The tokens still count
+    // toward numGenerated and consumedTokens so the model's own
+    // self-attention sees a normal sequence.
+    static let CHANNEL_OPEN_ID: UInt32 = 100   // <|channel>
+    static let CHANNEL_CLOSE_ID: UInt32 = 101  // <channel|>
+
+    func maybeAppendOutput(_ sampled: UInt32) {
+        if sampled == Session.CHANNEL_OPEN_ID {
+            inChannelBlock = true
+            pendingChannelTokens.removeAll(keepingCapacity: true)
+            return
+        }
+        if sampled == Session.CHANNEL_CLOSE_ID {
+            inChannelBlock = false
+            // Channel closed normally: discard the pending buffer.
+            // When enableThinking was on we've already routed those
+            // tokens to thinkingQueue in real time; the buffer is only
+            // populated as a fallback for the !enableThinking case and
+            // a closed channel means the model finished its thinking
+            // scaffold properly, so the bytes were legitimate
+            // scaffolding the client doesn't need.
+            pendingChannelTokens.removeAll(keepingCapacity: true)
+            return
+        }
+        if inChannelBlock {
+            // Inside a thinking-channel block. Two routes:
+            //   - enableThinking → live-stream to thinkingQueue so the
+            //     bridge can emit `delta.reasoning_content` in real time.
+            //   - !enableThinking → BUFFER the tokens in
+            //     pendingChannelTokens. If the channel closes normally
+            //     (CHANNEL_CLOSE_ID branch above) we discard the buffer.
+            //     If the session ends with the channel still open
+            //     (flushUnclosedChannel called from the FFI pump on
+            //     .done) we route the buffered tokens to outputQueue —
+            //     the model was thinking but never closed the block,
+            //     so the bytes ARE the actual response wearing a
+            //     thinking-channel costume. Shipping them as content
+            //     prevents the empty-response failure mode the user
+            //     reported on 2026-05-10.
+            if enableThinking {
+                thinkingQueue.append(sampled)
+            } else {
+                pendingChannelTokens.append(sampled)
+            }
+            return
+        }
+        // The EOS / turn-end marker is a stop signal, not response
+        // content. Engine sites that follow this call still set
+        // state=.done based on `sampled == eosId`, so suppression
+        // here just prevents the marker from bleeding into the
+        // detokenized client-visible text.
+        if sampled == eosId { return }
+        outputQueue.append(sampled)
+    }
+
+    // Drain pending thinking tokens. Returns and clears whatever has
+    // accumulated since the last drain. Called from the FFI pump on
+    // each StreamUpdate so the bridge can stream `reasoning_content`
+    // alongside main `content`.
+    func drainThinking() -> [UInt32] {
+        if thinkingQueue.isEmpty { return [] }
+        let out = thinkingQueue
+        thinkingQueue.removeAll(keepingCapacity: true)
+        return out
+    }
+
+    // Called by the FFI pump at .done transition (and on explicit
+    // closeSession). If the session ends with `inChannelBlock == true`
+    // the model emitted CHANNEL_OPEN_ID and never CHANNEL_CLOSE_ID — a
+    // failure mode where the model writes its whole response inside an
+    // unclosed thinking channel and runs out of tokens before reaching
+    // the close. We recover the buffered tokens here:
+    //   - enableThinking → tokens already flowed to thinkingQueue in
+    //     real time; nothing extra to do. Just clear the in-channel
+    //     flag so subsequent reuse (none currently, but defensive)
+    //     sees a clean state.
+    //   - !enableThinking → buffered tokens were withheld pending the
+    //     channel close. Since the close never came, flush them to
+    //     outputQueue so the assistant turn isn't silently empty.
+    // Idempotent: safe to call multiple times. Safe to call when no
+    // channel was ever opened (no-op).
+    func flushUnclosedChannel() {
+        guard inChannelBlock else {
+            pendingChannelTokens.removeAll(keepingCapacity: true)
+            return
+        }
+        if !enableThinking && !pendingChannelTokens.isEmpty {
+            outputQueue.append(contentsOf: pendingChannelTokens)
+        }
+        pendingChannelTokens.removeAll(keepingCapacity: true)
+        inChannelBlock = false
+    }
+
+    // Record a (token_position, layer, magnitude) tuple for one
+    // (control, AR-step) pair. Early-returns when capture is off so
+    // the call site stays a single conditional branch with no
+    // allocation, matching the off-path bit-identity invariant. Call
+    // sites: the AR-step + prefill-step loops in lm_engine.swift
+    // where `c.magnitudeAt(position:turn:)` is evaluated.
+    func recordCvecActivation(tokenPosition: Int, layer: Int,
+                              magnitude: Float) {
+        if !captureCvecActivations { return }
+        cvecActivationsQueue.append((
+            tokenPosition: UInt32(tokenPosition),
+            layer: UInt32(layer),
+            magnitude: magnitude))
+    }
+
+    // Drain pending cvec activation records. Mirrors drainThinking.
+    func drainCvecActivations() -> [CvecActivationRecord] {
+        if cvecActivationsQueue.isEmpty { return [] }
+        let out = cvecActivationsQueue.map {
+            CvecActivationRecord(
+                tokenPosition: $0.tokenPosition,
+                layer: $0.layer,
+                magnitude: $0.magnitude)
+        }
+        cvecActivationsQueue.removeAll(keepingCapacity: true)
+        return out
+    }
 }
 
 // ============================================================================
@@ -1397,6 +1575,8 @@ final class LmEngine {
         var stopSequences: [[UInt32]] = []
         var cot: CotState? = nil
         var controls: [ActiveControl] = []
+        var enableThinking: Bool = false
+        var captureCvecActivations: Bool = false
     }
 
     enum InitialSegment {
@@ -1423,6 +1603,8 @@ final class LmEngine {
         s.applySamplingSeed(initParams.samplingSeed)
         s.captureLogits = initParams.captureLogits
         s.topLogprobs = initParams.topLogprobs
+        s.enableThinking = initParams.enableThinking
+        s.captureCvecActivations = initParams.captureCvecActivations
         s.logitBiasDense = initParams.logitBiasDense
         s.minP = initParams.minP
         s.stopSequences = initParams.stopSequences
@@ -1931,6 +2113,10 @@ final class LmEngine {
             var measIdx = 0
             for c in s.activeControls {
                 let m = c.magnitudeAt(position: s.position, turn: s.turnIndex)
+                s.recordCvecActivation(
+                    tokenPosition: s.position,
+                    layer: c.layer,
+                    magnitude: m)
                 switch c.mode {
                 case .additive:
                     if m != 0 {
@@ -2180,21 +2366,23 @@ final class LmEngine {
                 // emit, check EOS.
                 if s.chunkQueue.isEmpty {
                     s.state = .generating
-                    s.outputQueue.append(sampled)
+                    s.maybeAppendOutput(sampled)
                     s.consumedTokens.append(sampled)
                     s.nextGeneratedInput = sampled
                     s.recordSample(token: sampled)
                     s.numGenerated += 1; emitted += 1; totalTokensGenerated += 1
                     advanceCotIfActive(s, sampled: sampled)
-                    if sampled == s.eosId
-                        || s.numGenerated >= s.maxNewTokens
-                        || matchesAnyStopSequence(s) {
+                    if sampled == s.eosId || matchesAnyStopSequence(s) {
                         s.state = .done
+                        s.doneReason = 1   // stop / EOS or stop_sequence
+                    } else if s.numGenerated >= s.maxNewTokens {
+                        s.state = .done
+                        s.doneReason = 2   // length / max_tokens budget
                     }
                 }
                 // else: more priming to do — discard this logit.
             } else {
-                s.outputQueue.append(sampled)
+                s.maybeAppendOutput(sampled)
                 // Extend canonical history so promoteFinishedPages can
                 // promote pages covering AR-generated positions.
                 s.consumedTokens.append(sampled)
@@ -2202,10 +2390,12 @@ final class LmEngine {
                 s.recordSample(token: sampled)
                 s.numGenerated += 1; emitted += 1; totalTokensGenerated += 1
                 advanceCotIfActive(s, sampled: sampled)
-                if sampled == s.eosId
-                    || s.numGenerated >= s.maxNewTokens
-                    || matchesAnyStopSequence(s) {
+                if sampled == s.eosId || matchesAnyStopSequence(s) {
                     s.state = .done
+                    s.doneReason = 1   // stop / EOS or stop_sequence
+                } else if s.numGenerated >= s.maxNewTokens {
+                    s.state = .done
+                    s.doneReason = 2   // length / max_tokens budget
                 }
                 // Promote ONLY at page boundaries (every PAGE_SLIDE tokens)
                 // to avoid the per-step hash-compute cost dominating AR
@@ -2522,12 +2712,16 @@ final class LmEngine {
                 .bindMemory(to: UInt32.self, capacity: B)
             let sampled = gpuTokP[p.sslot]
             s.state = .generating
-            s.outputQueue.append(sampled)
+            s.maybeAppendOutput(sampled)
             s.consumedTokens.append(sampled)
             s.nextGeneratedInput = sampled
             s.numGenerated += 1; totalTokensGenerated += 1
-            if sampled == s.eosId || s.numGenerated >= s.maxNewTokens {
+            if sampled == s.eosId {
                 s.state = .done
+                s.doneReason = 1   // stop / EOS
+            } else if s.numGenerated >= s.maxNewTokens {
+                s.state = .done
+                s.doneReason = 2   // length / max_tokens budget
             }
         }
         return true
@@ -2990,12 +3184,16 @@ final class LmEngine {
             if s.chunkQueue.isEmpty {
                 let sampled = gpuTokP[b]
                 s.state = .generating
-                s.outputQueue.append(sampled)
+                s.maybeAppendOutput(sampled)
                 s.consumedTokens.append(sampled)
                 s.nextGeneratedInput = sampled
                 s.numGenerated += 1; totalTokensGenerated += 1
-                if sampled == s.eosId || s.numGenerated >= s.maxNewTokens {
+                if sampled == s.eosId {
                     s.state = .done
+                    s.doneReason = 1   // stop / EOS
+                } else if s.numGenerated >= s.maxNewTokens {
+                    s.state = .done
+                    s.doneReason = 2   // length / max_tokens budget
                 }
             }
         }
@@ -3192,12 +3390,16 @@ final class LmEngine {
             if s.chunkQueue.isEmpty {
                 let sampled = gpuTokP[b]
                 s.state = .generating
-                s.outputQueue.append(sampled)
+                s.maybeAppendOutput(sampled)
                 s.consumedTokens.append(sampled)
                 s.nextGeneratedInput = sampled
                 s.numGenerated += 1; totalTokensGenerated += 1
-                if sampled == s.eosId || s.numGenerated >= s.maxNewTokens {
+                if sampled == s.eosId {
                     s.state = .done
+                    s.doneReason = 1   // stop / EOS
+                } else if s.numGenerated >= s.maxNewTokens {
+                    s.state = .done
+                    s.doneReason = 2   // length / max_tokens budget
                 }
             }
         }

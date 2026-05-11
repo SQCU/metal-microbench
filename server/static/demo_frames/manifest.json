@@ -1,0 +1,11 @@
+{
+  "frames": [
+    {"name": "frame_00.png", "url": "/static/demo_frames/frame_00.png"},
+    {"name": "frame_01.png", "url": "/static/demo_frames/frame_01.png"},
+    {"name": "frame_02.png", "url": "/static/demo_frames/frame_02.png"},
+    {"name": "frame_03.png", "url": "/static/demo_frames/frame_03.png"},
+    {"name": "frame_04.png", "url": "/static/demo_frames/frame_04.png"},
+    {"name": "frame_05.png", "url": "/static/demo_frames/frame_05.png"}
+  ],
+  "source": "test_data/frames_v2/E4qMxJJAszg_squarecropped (sampled frames 0,8,12,16,20,24)"
+}

@@ -1,0 +1,20 @@
+{
+  "tools_attached": [
+    "async-lookup__lookup",
+    "extended-thinking__deliberate",
+    "hello-world__greet",
+    "image-to-svg__convert",
+    "python-exec__run",
+    "query-to-svg-captioned__generate",
+    "query-to-svg__generate",
+    "random-choice__uniform",
+    "render-visual__render",
+    "tree-of-thoughts__explore",
+    "vision-review__review"
+  ],
+  "tool_progress": [],
+  "tool_invocations": [],
+  "assistant_text": "*claps hands excitedly* ta-daaa!! look at all those colorful little wiggle-rooms!! ✨ one for every seed!! 🌈💖",
+  "elapsed_ms": 146515,
+  "finish_state": "completed"
+}

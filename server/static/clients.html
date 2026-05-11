@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>gemma metal bridge — clients</title>
+<title>gemma metal bridge — engine visualizers</title>
 <style>
   :root {
     color-scheme: dark;
@@ -19,13 +19,14 @@
   header h1 { margin:0; font-size:1rem; font-weight:500; color:var(--accent); }
   header .status { font-size:0.78rem; color:var(--mute); }
 
-  main { max-width: 900px; margin: 0 auto; padding: 2em 1.5em; }
+  main { max-width: 960px; margin: 0 auto; padding: 2em 1.5em; }
   .intro {
     color:var(--mute); font-size:0.88rem; line-height:1.6;
     margin-bottom:2em;
   }
   .intro b { color:var(--text); font-weight:500; }
   .intro a { color:var(--accent); }
+  .intro code { background:#111; color:#aef; padding:1px 5px; border-radius:2px; font-size:0.92em; }
 
   .grid {
     display:grid; grid-template-columns: 1fr; gap: 0.9em;
@@ -74,144 +75,127 @@
   .endpoints table { width:100%; border-collapse:collapse; font-size:0.78rem; }
   .endpoints td { padding:0.25em 0.4em; vertical-align:top; }
   .endpoints td.m { color:var(--c1); font-weight:600; width:3em; }
-  .endpoints td.p { color:var(--text); font-family: inherit; width:14em; }
+  .endpoints td.p { color:var(--text); font-family: inherit; width:18em; }
   .endpoints td.d { color:var(--mute); }
+  .endpoints code { background:#1a1a1a; padding:0 4px; border-radius:2px; color:#aef; }
 
-  footer {
+  .footer-note {
     margin-top: 2em; padding: 1em 1.4em; border-top:1px solid var(--border);
-    color: var(--mute); font-size:0.72rem; text-align:center;
+    color: var(--mute); font-size:0.72rem; text-align:center; line-height:1.6;
   }
+  .footer-note a { color: var(--accent); }
 </style>
 </head>
 <body>
 
 <header>
-  <h1>gemma metal bridge</h1>
+  <h1>gemma metal bridge — engine visualizers</h1>
   <span class="status" id="statusText">checking…</span>
 </header>
 
 <main>
   <p class="intro">
-    A FastAPI bridge in front of a Gemma-4-A4B inference engine running on
-    Metal / M5 Max. OpenAI-compatible REST at <b>/v1/*</b>; demo clients
-    below. Every client is the same HTTP API you'd get from any chat
-    endpoint — they differ only in how they exercise the engine's
-    paged-attention + prefix-cache + batched-decode primitives.
+    Four bespoke dashboards that render <b>engine internals</b> a generic chat client
+    cannot show: KV-cache page tenancy, batched bandwidth timeseries, vision-cache
+    behaviour, residual-stream steering deltas, tree-of-thoughts branch trees.
+    All LLM work flows through <code>/v1/chat/completions</code> (the OpenAI-compatible
+    surface any other client uses); the engine-state slice that <code>usage.*</code>
+    can't carry — global KV page tenancy, free-pool size, active-stream registry —
+    comes from <a href="/v1/engine/state">/v1/engine/state</a>, polled at 1-2 Hz.
   </p>
 
   <div class="grid">
 
-    <a class="card" href="/tetraplex" data-color="0">
-      <div class="name">tetraplex <span class="path">/tetraplex</span></div>
+    <a class="card" href="/static/index.html" data-color="0">
+      <div class="name">tetraplex <span class="path">/static/index.html</span></div>
       <div class="desc">
-        Four concurrent chat streams, bandwidth chart + per-session KV
-        tenancy strip. Original demo — exercises batch-of-4 AR decode
-        against a shared model. Optional MODE=multimodal renders an
-        amongus frame into each pane.
+        Four concurrent chat streams, bandwidth chart + KV tenancy strip.
+        Watch the bandwidth chart ramp from solo decode to a 4× plateau as
+        the engine settles into batched AR at B=4. The tenancy strip
+        colors pages by refcount — bright cells = shared across sessions.
       </div>
       <div class="chips">
         <span class="chip">batched AR decode</span>
         <span class="chip">kv tenancy viz</span>
-        <span class="chip">multimodal</span>
+        <span class="chip">multimodal optional</span>
       </div>
     </a>
 
-    <a class="card" href="/labeler" data-color="1">
-      <div class="name">image labeler <span class="path">/labeler</span></div>
+    <a class="card" href="/static/labeler.html" data-color="1">
+      <div class="name">image labeler <span class="path">/static/labeler.html</span></div>
       <div class="desc">
-        Drop PNGs (or load the bundled amongus frames), hand the engine
-        a schema prompt, watch 4 live-decoding ribbons drain the queue.
-        Downloadable JSONL of results. Shows vision tower cache, shared
-        schema-prefix KV pages, and scheduler coalescing work-by-type.
+        Drop PNGs (or load the bundled demo frames at
+        <code>/static/demo_frames</code>), apply a schema prompt, watch 4
+        live-decoding ribbons drain the queue. Vision-cache hit/miss
+        counters update from <code>usage.vision_cache_hits</code> per
+        completion + the global cache snapshot.
       </div>
       <div class="chips">
         <span class="chip">vision cache</span>
-        <span class="chip">shared prefix</span>
-        <span class="chip">multi-slot softs prefill</span>
+        <span class="chip">shared schema prefix</span>
+        <span class="chip">multi-image queue</span>
       </div>
     </a>
 
-    <a class="card" href="/loom" data-color="2">
-      <div class="name">loom <span class="path">/loom</span></div>
+    <a class="card" href="/static/loom.html" data-color="2">
+      <div class="name">loom <span class="path">/static/loom.html</span></div>
       <div class="desc">
         Tree-of-thoughts. Fork N branches from a shared root, each biased
-        by a seed suffix. Click any finished node to fork further from
-        there. SVG threads connect parent to child. Watch the KV tenancy
-        climb as sibling branches share their ancestor-path pages.
+        by a seed suffix. Click any finished node to fork from there.
+        Sibling branches share their ancestor-path KV pages via the
+        content-hash prefix cache — the global tenancy strip pulses
+        bright while siblings adopt shared pages.
       </div>
       <div class="chips">
         <span class="chip">content-hash prefix cache</span>
         <span class="chip">fork-from-node</span>
-        <span class="chip">greedy-sampling pedagogy</span>
+        <span class="chip">parallel branch decode</span>
       </div>
     </a>
 
-    <a class="card" href="/compare" data-color="3">
-      <div class="name">prompt A/B harness <span class="path">/compare</span></div>
+    <a class="card" href="/static/steering.html" data-color="3">
+      <div class="name">residual-stream steering <span class="path">/static/steering.html</span></div>
       <div class="desc">
-        One shared system prompt, K (2-8) user-prompt variants, run
-        concurrently with outputs side-by-side. The system prompt's KV
-        pages are content-hashed and shared across every variant's
-        session — the shared-pages counter in the footer climbs visibly
-        as soon as you hit run.
+        Control-vector steering pedagogy. Currently renders a one-shot
+        chat completion with a usage delta-vs-baseline summary; the
+        legacy per-token activation heatmap requires engine-side
+        instrumentation (see the page banner for the deferred-feature
+        pointer).
       </div>
       <div class="chips">
-        <span class="chip">shared system prompt</span>
-        <span class="chip">prefix cache load-bearing</span>
-        <span class="chip">side-by-side diff</span>
-      </div>
-    </a>
-
-    <a class="card" href="/steering" data-color="0">
-      <div class="name">residual-stream steering <span class="path">/steering</span></div>
-      <div class="desc">
-        Wire up a detector vector + an effector vector + a gated trigger
-        with an ADSR envelope, watch per-token detector intensity as a
-        background heatmap on the streamed output. Below, a time-series
-        plot of detector intensity vs effector magnitude with yellow
-        markers at trigger-fire events.
-      </div>
-      <div class="chips">
-        <span class="chip">cvec write kernel</span>
-        <span class="chip">detector read kernel</span>
-        <span class="chip">cross-tick side-chain</span>
+        <span class="chip">cvec apply</span>
         <span class="chip">ADSR envelope</span>
+        <span class="chip">deferred: per-token heatmap</span>
       </div>
     </a>
 
   </div>
 
   <section class="endpoints">
-    <h2>REST endpoints</h2>
+    <h2>HTTP surface</h2>
     <table>
       <tr><td class="m">GET</td><td class="p">/health</td>
-          <td class="d">engine readiness, model name, cache stats</td></tr>
+          <td class="d">liveness + engine aggregate counters</td></tr>
       <tr><td class="m">POST</td><td class="p">/v1/chat/completions</td>
-          <td class="d">OpenAI-compat chat; supports <code>image_url</code> and <code>softs</code> content items</td></tr>
-      <tr><td class="m">POST</td><td class="p">/v1/completions</td>
-          <td class="d">raw-text completions (no chat template applied)</td></tr>
-      <tr><td class="m">POST</td><td class="p">/v1/images/prewarm</td>
-          <td class="d">run vision tower + cache softs ahead of time</td></tr>
-      <tr><td class="m">POST</td><td class="p">/v1/media/extract</td>
-          <td class="d">run vision, return softs as base64 blob for client-side persistence</td></tr>
-      <tr><td class="m">GET</td><td class="p">/v1/kv/snapshot</td>
-          <td class="d">per-session page ownership + refcount (the tenancy viz data source)</td></tr>
-      <tr><td class="m">GET</td><td class="p">/v1/cache/stats</td>
-          <td class="d">vision soft-tokens cache hit rate + size</td></tr>
-      <tr><td class="m">POST</td><td class="p">/v1/cache/clear</td>
-          <td class="d">flush the vision cache</td></tr>
-      <tr><td class="m">GET</td><td class="p">/v1/demo/frames</td>
-          <td class="d">bundled amongus frames as data URLs (dev convenience)</td></tr>
+          <td class="d">OpenAI-compatible chat; supports <code>image_url</code>, streaming, <code>usage.cache_hits/cache_misses/vision_cache_hits</code></td></tr>
+      <tr><td class="m">POST</td><td class="p">/v1/tokenize</td>
+          <td class="d">stateless tokenizer</td></tr>
       <tr><td class="m">GET</td><td class="p">/v1/models</td>
-          <td class="d">OpenAI-compat model list</td></tr>
+          <td class="d">OpenAI-shape model list</td></tr>
+      <tr><td class="m">GET</td><td class="p">/v1/engine/state</td>
+          <td class="d">JSON snapshot: KV cache page tenancy, vision cache, active streams. Polling-friendly. <a href="/v1/engine/state" style="color:var(--accent)">try it →</a></td></tr>
+      <tr><td class="m">GET</td><td class="p">/static/*</td>
+          <td class="d">visualizers + demo assets (this page lives at <code>/static/clients.html</code>)</td></tr>
     </table>
   </section>
 </main>
 
-<footer>
-  clients are just HTML served from <code>server/static/</code>; server-side
-  state is the engine + vision tower + content-hash prefix cache.
-</footer>
+<div class="footer-note">
+  visualizers are static HTML served from <code>server/static/</code>; all engine
+  work goes through <code>/v1/chat/completions</code> and <code>/v1/engine/state</code>.
+  see <a href="https://github.com/anthropics/claude-code" style="color:var(--accent)">docs/engine_telemetry_endpoint.md</a>
+  for the engine-state shape rationale.
+</div>
 
 <script>
 async function checkHealth() {
@@ -220,7 +204,10 @@ async function checkHealth() {
     const bits = [r.status];
     if (r.model) bits.push(r.model);
     if (r.multimodal) bits.push('multimodal');
-    if (r.active_sessions != null) bits.push(`${r.active_sessions} active session${r.active_sessions === 1 ? '' : 's'}`);
+    if (r.active_streams != null)
+      bits.push(`${r.active_streams} active`);
+    if (r.cached_pages != null)
+      bits.push(`${r.cached_pages} cached pages`);
     document.getElementById('statusText').textContent = bits.join(' · ');
   } catch {
     document.getElementById('statusText').textContent = 'bridge unreachable';

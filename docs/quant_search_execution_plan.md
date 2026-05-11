@@ -26,7 +26,7 @@
 | Cost model (M5 tok/s predictor) | ✗ | — | — | Not started |
 | FP16 GGUF + KL reference baseline | ✗ | — | — | Script 02 not run yet |
 | V1 grid of materialized GGUFs | ✗ | — | — | Script 03 not run yet |
-| **M5 kernel coverage for all V1 formats** | partial | partial | — | See "Kernel coverage map" below — Q5_K and Q6_K kernels currently missing |
+| **M5 kernel coverage for all V1 formats** | ✓ | ✓ (compile) | partial | Bench-side prefill + AR-side GEMV both complete; AR Q5_K/Q6_K landed 2026-05-01. Numerical end-to-end validation pending production wire-up. |
 
 ## Kernel coverage map (M5 substrate)
 
@@ -37,32 +37,73 @@ For each V1 grid format, what kernels exist on the M5 production engine and what
 | **Q4_0**  | ✓ `kernel_mul_mm_q4_0_swiz` | ✓ `kernel_mul_mm_id_q4_0_swiz` | ✓ `dense_gemv_q4_0_v4` | ✓ `moe_gemv_q4_0_v3` |
 | **Q4_K**  | ✓ `kernel_mul_mm_q4_K_swiz` | ✓ `kernel_mul_mm_id_q4K_swiz` | ✓ `dense_gemv_q4k_v4` | ✓ `moe_gemv_q4k_v11_b{1,2,4,8}` |
 | **Q5_1**  | ✓ `kernel_mul_mm_q5_1_swiz` | ✓ `kernel_mul_mm_id_q5_1_swiz` | partial | ✓ `moe_gemv_q5_1_v11_b{1,2,4,8}` |
-| **Q5_K**  | ✓ `kernel_mul_mm_q5_K_swiz` | ✓ `kernel_mul_mm_id_q5_K_swiz` | ✗ (AR port pending) | ✗ (AR port pending) |
-| **Q6_K**  | ✓ `kernel_mul_mm_q6_K_swiz` | ✓ `kernel_mul_mm_id_q6_K_swiz` | ✗ (AR port pending) | ✗ (AR port pending) |
+| **Q5_K**  | ✓ `kernel_mul_mm_q5_K_swiz` | ✓ `kernel_mul_mm_id_q5_K_swiz` | ✓ `dense_gemv_q5_K_v4` | ✓ `moe_gemv_q5_K_v6` |
+| **Q6_K**  | ✓ `kernel_mul_mm_q6_K_swiz` | ✓ `kernel_mul_mm_id_q6_K_swiz` | ✓ `dense_gemv_q6_K_v4` | ✓ `moe_gemv_q6_K_v6` |
 | **Q8_0**  | ✓ `kernel_mul_mm_q8_0_swiz` (prod) | ✓ `kernel_mul_mm_id_q8_0_swiz` | ✓ `dense_gemv_q8_0_btile_b{1,2,4,8}` | n/a (Gemma-4 doesn't use Q8_0 MoE) |
 
-**Bench-level coverage is now complete** — every V1 grid format has both a
-dense and a MoE simdgroup-matmul kernel in `q4k_mma_bench.swift`, all
-validated against CPU references at fp16 floor (RMSE 0.0004 on tiny shapes).
-Throughput ranking at saturated batch is in the **Substrate priors** section
-above.
+**Q5_K_M end-to-end prefill validated 2026-05-01.** A standard
+llama-quantize-output Q5_K_M GGUF loads cleanly and prefill produces
+sensible logits with mean KL = 0.0277 vs the existing reference oracle
+(5/5 argmax match on the `hello` prompt), while the existing Q4_K_M path
+remains intact (mean KL = 0.1146, baseline). The engine now supports the
+following formats per tensor class:
 
-Two layers of follow-up work remain to make uniform-Q5_K and uniform-Q6_K
-configs runnable end-to-end on the M5 production engine:
+- **Dense matmul** (attn QKVO, shared FFN gate/up/down): Q8_0, Q5_K, Q6_K, Q5_1
+- **MoE up** (ffn_gate_up_exps): Q4_K, Q5_K
+- **MoE down** (ffn_down_exps): Q5_1, Q6_K, Q8_0
+- **Token embed/unembed**: Q8_0, Q6_K
+- **Norms / scales / router**: F32 (always)
 
-1. **AR-decode GEMV ports for Q5_K, Q6_K.** The bench validates the prefill
-   path (simdgroup matmul). The AR-decode path uses the GEMV-shaped kernel
-   zoo (`dense_gemv_q*_v4` / `moe_gemv_q*_v11_b{1,2,4,8}`); Q5_K and Q6_K
-   need ports of those patterns. ~half-day each.
+Kernels added (all in `kernels.swift`, validated against CPU references):
 
-2. **Production wire-up in `bootstrap.swift`.** `LayerW` currently hardcodes
-   per-tensor-class formats (Q8_0 dense, Q4_K MoE gate_up, Q5_1 MoE down).
-   For uniform-Q5_K to actually run, `LayerW` needs to be parameterized by
-   per-tensor-class quant, the GGUF loader needs to handle Q5_K/Q6_K, and
-   the prefill+AR dispatchers need to pick the right kernel per tensor. ~1
-   day of plumbing.
+| Kernel | Path | Real-weight validation |
+|---|---|---|
+| `dense_gemv_q5_K_v4` | AR | rel-RMSE 2.1e-4 on Q5_K_M `attn_q.weight` |
+| `dense_gemv_q6_K_v4` | AR | rel-RMSE 2.1e-4 on Q5_K_M `attn_v.weight` |
+| `moe_gemv_q5_K_v6` | AR | rel-RMSE 2.0e-4 on synthetic Gemma-shaped inputs |
+| `moe_gemv_q6_K_v6` | AR | rel-RMSE 2.1e-4 on synthetic Gemma-shaped inputs |
+| `moe_gemv_q8_0_v6` | AR | rel-RMSE 2.1e-4 on Q5_K_M `ffn_down_exps.weight` |
+| `prefill_mm_q5_K_swiz` | Prefill | rel-RMSE 2.9e-4 on Q5_K_M `ffn_gate.weight` |
+| `prefill_mm_q6_K_swiz` | Prefill | rel-RMSE 3.0e-4 |
+| `prefill_mm_q5_1_swiz` | Prefill | end-to-end via `LM_PREFILL_VALIDATE` |
+| `prefill_mm_id_q5_K_swiz` (gate/up) | Prefill | end-to-end |
+| `prefill_mm_id_q6_K_swiz` (down) | Prefill | end-to-end |
+| `prefill_mm_id_q8_0_swiz` (down) | Prefill | rel-RMSE 2.9e-4 on Q5_K_M `ffn_down_exps.weight` |
 
-After both, V1 calibration on M5 (Phase 4.1) can run all 9 configs.
+Engine wire-up (`bootstrap.swift`):
+- `loadDenseAuto`/`loadMoEUpAuto`/`loadMoEDownAuto` detect each tensor's GGUF
+  dtype and dispatch to the appropriate swizzler.
+- `LayerW` carries 9 per-tensor `GGMLType` format fields (one per varying buffer).
+- `encDenseMmPrefill`, `encMoeUpMmPrefill`, `encMoeDownMmPrefill`
+  dispatchers branch on format and call the correct PSO. Same buffer layout
+  across formats — only the PSO differs.
+- `token_embd` dequant supports both Q8_0 (Q4_K_M) and Q6_K (Q5_K_M) source
+  formats; produces fp16 embed table + transposed unembed.
+
+Validation status:
+- **Synthetic random-data correctness**: 18/18 kernel tests at fp16 floor
+  (rel-RMSE ~2e-4). See `test_q5k_q6k_ar/main.swift`.
+- **Real-weight correctness against Q5_K_M GGUF**: 5/5 tests at fp16 floor
+  (Q5_K dense, Q6_K dense, Q5_K prefill, Q8_0 MoE AR, Q8_0 MoE prefill).
+  See `test_q5k_real_weights/main.swift`.
+- **Engine end-to-end on Q5_K_M**: prefill validation against `lm_hello_*`
+  reference passes 5/5 argmax with KL=0.028. Q4_K_M regression test passes
+  with KL=0.115 (matches documented baseline).
+
+**Remaining gap** for full-engine Q5_K_M (not blocking the quant search,
+which needs only prefill-path KL):
+
+- **AR-decode dispatchers are still hardcoded for Q4_K MoE-up + Q5_1
+  MoE-down** (the `encMoeGemv*V11` calls in `buildStepCB`). On Q5_K_M these
+  dispatchers read Q5_K bytes through the Q4_K-shape kernel and produce NaN
+  logits during AR-decode. Wire-up requires either fused-RMSNorm Q5_K kernels
+  (substantial; matches existing AR perf) or unfused fallback (cheap; perf
+  hit, OK for KL-parity-driven workflows). Not in scope for prefill-driven
+  quant search.
+
+After all of the above, V1 calibration on M5 (Phase 4.1) can run uniform-Q5_K
+and uniform-Q6_K configs — and now also the standard `Q5_K_M` mix that
+llama-quantize produces by default, without needing `--pure` overrides.
 
 ## Substrate priors for the cost model
 

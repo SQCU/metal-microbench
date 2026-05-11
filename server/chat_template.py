@@ -23,7 +23,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -78,12 +77,31 @@ def _default_template_path() -> Path:
         "or ensure the file is in the same dir as GEMMA_SAFETENSORS/GEMMA_GGUF")
 
 
+def _safe_from_json(value):
+    """Best-effort JSON parse for use as a Jinja filter.
+
+    OpenAI's `tool_calls[*].function.arguments` is canonically a
+    JSON-encoded string (e.g. `'{"query":"foo"}'`). The chat template
+    needs the parsed mapping so it can render `key:value,key:value`
+    pairs without double-bracketing the JSON object's own braces. If
+    the input isn't a parseable JSON string, returns it unchanged so
+    the template's string-fallback branch can still render it.
+    """
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return value
+
+
 def _load_template(path: Path) -> jinja2.Template:
     cached = _TEMPLATE_CACHE.get(str(path))
     if cached is not None:
         return cached
     env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True,
                               keep_trailing_newline=False)
+    env.filters['from_json'] = _safe_from_json
     tmpl = env.from_string(path.read_text())
     _TEMPLATE_CACHE[str(path)] = tmpl
     return tmpl
@@ -319,10 +337,39 @@ else:
 # that overlaps with a shorter one. (The current Gemma-4 set has no
 # such overlaps, but it's a cheap invariant to maintain — if a future
 # model adds e.g. `<|tool>` and `<|tool_extended>` we want the longer
-# one to win.)
-_SPECIAL_RE = re.compile(
-    "|".join(re.escape(k)
-              for k in sorted(SPECIAL_TOKENS.keys(), key=len, reverse=True)))
+# one to win.) Previously implemented as
+#   re.compile("|".join(re.escape(k) for k in <length-desc>))
+# but the alphabet is a finite set of LITERAL needles — `re.escape` was
+# load-bearing precisely because the pattern is meant to be literal —
+# so a plain longest-prefix scan over the sorted-by-length list is
+# the same finite-state matcher with no regex dependency.
+_SPECIAL_TOKENS_BY_LENGTH = sorted(SPECIAL_TOKENS.keys(), key=len, reverse=True)
+
+
+def _find_special_at(text: str, pos: int) -> str | None:
+    """Return the longest special-token literal that occurs at `text[pos]`
+    or None if none does. Linear in the number of registered specials.
+    """
+    for marker in _SPECIAL_TOKENS_BY_LENGTH:
+        if text.startswith(marker, pos):
+            return marker
+    return None
+
+
+def _iter_specials(text: str):
+    """Yield (start, end, marker) for each occurrence of a registered
+    special-token literal in `text`, leftmost-longest. Equivalent to
+    the prior `_SPECIAL_RE.finditer(text)`.
+    """
+    i = 0
+    n = len(text)
+    while i < n:
+        marker = _find_special_at(text, i)
+        if marker is not None:
+            yield i, i + len(marker), marker
+            i += len(marker)
+        else:
+            i += 1
 
 
 # Boundary text fragments the canonical jinja template emits at turn
@@ -500,8 +547,8 @@ def tokenize_with_specials(text: str, *, tokenize_fn, add_bos: bool) -> list[int
     tokens: list[int] = []
     did_bos = not add_bos
     last_end = 0
-    for m in _SPECIAL_RE.finditer(text):
-        prose = text[last_end:m.start()]
+    for start, end, marker in _iter_specials(text):
+        prose = text[last_end:start]
         if prose:
             tokens.extend(tokenize_fn(prose, add_bos=(not did_bos)))
             did_bos = True
@@ -510,8 +557,8 @@ def tokenize_with_specials(text: str, *, tokenize_fn, add_bos: bool) -> list[int
             # to prepend it via a zero-width call.
             tokens.extend(tokenize_fn("", add_bos=True))
             did_bos = True
-        tokens.append(SPECIAL_TOKENS[m.group()])
-        last_end = m.end()
+        tokens.append(SPECIAL_TOKENS[marker])
+        last_end = end
     tail = text[last_end:]
     if tail:
         tokens.extend(tokenize_fn(tail, add_bos=(not did_bos)))

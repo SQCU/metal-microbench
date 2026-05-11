@@ -1,0 +1,219 @@
+{
+  "prompt": "Write the first sentence of a short story about a cartographer who maps the spaces between bookshelves.",
+  "n_tokens_requested": 12,
+  "top_k": 5,
+  "seed": 42,
+  "content": "Elias did not chart continents or coast",
+  "finish_reason": "length",
+  "elapsed_s": 0.912,
+  "tokens": [
+    {
+      "token": "E",
+      "logprob": "00561bbd",
+      "top": [
+        {
+          "token": "E",
+          "logprob": "00561bbd"
+        },
+        {
+          "token": "Sil",
+          "logprob": "acb687c0"
+        },
+        {
+          "token": "El",
+          "logprob": "acb68ec0"
+        },
+        {
+          "token": "While",
+          "logprob": "acf6a2c0"
+        },
+        {
+          "token": "Arthur",
+          "logprob": "acb6b6c0"
+        }
+      ]
+    },
+    {
+      "token": "lias",
+      "logprob": "00000000",
+      "top": [
+        {
+          "token": "lias",
+          "logprob": "00000000"
+        },
+        {
+          "token": "low",
+          "logprob": "003065c1"
+        },
+        {
+          "token": "ust",
+          "logprob": "006077c1"
+        },
+        {
+          "token": "li",
+          "logprob": "003e98c1"
+        },
+        {
+          "token": "lor",
+          "logprob": "00509ac1"
+        }
+      ]
+    },
+    {
+      "token": " did",
+      "logprob": "0060c0bb",
+      "top": [
+        {
+          "token": " did",
+          "logprob": "0060c0bb"
+        },
+        {
+          "token": " Thorne",
+          "logprob": "18b0c7c0"
+        },
+        {
+          "token": " treated",
+          "logprob": "18f0e4c0"
+        },
+        {
+          "token": " dealt",
+          "logprob": "18f0f7c0"
+        },
+        {
+          "token": " lived",
+          "logprob": "18f0fac0"
+        }
+      ]
+    },
+    {
+      "token": " not",
+      "logprob": "0000b4b8",
+      "top": [
+        {
+          "token": " not",
+          "logprob": "0000b4b8"
+        },
+        {
+          "token": " nothing",
+          "logprob": "5ae03cc1"
+        },
+        {
+          "token": " old",
+          "logprob": "5a2046c1"
+        },
+        {
+          "token": "ing",
+          "logprob": "5ac049c1"
+        },
+        {
+          "token": " note",
+          "logprob": "5ae04ec1"
+        }
+      ]
+    },
+    {
+      "token": " chart",
+      "logprob": "e0cc3abf",
+      "top": [
+        {
+          "token": " chart",
+          "logprob": "e0cc3abf"
+        },
+        {
+          "token": " concern",
+          "logprob": "7066d3bf"
+        },
+        {
+          "token": " map",
+          "logprob": "38b30bc0"
+        },
+        {
+          "token": " care",
+          "logprob": "38b30cc0"
+        },
+        {
+          "token": " measure",
+          "logprob": "38b318c0"
+        }
+      ]
+    },
+    {
+      "token": " continents",
+      "logprob": "70f598bf",
+      "top": [
+        {
+          "token": " continents",
+          "logprob": "70f598bf"
+        },
+        {
+          "token": " the",
+          "logprob": "70f5a4bf"
+        },
+        {
+          "token": " mountains",
+          "logprob": "70f5cabf"
+        },
+        {
+          "token": " coast",
+          "logprob": "b87a26c0"
+        },
+        {
+          "token": " mountain",
+          "logprob": "b87a2ac0"
+        }
+      ]
+    },
+    {
+      "token": " or",
+      "logprob": "000018b8",
+      "top": [
+        {
+          "token": " or",
+          "logprob": "000018b8"
+        },
+        {
+          "token": ",",
+          "logprob": "26c024c1"
+        },
+        {
+          "token": " of",
+          "logprob": "268062c1"
+        },
+        {
+          "token": "/",
+          "logprob": "26c06dc1"
+        },
+        {
+          "token": " Or",
+          "logprob": "266076c1"
+        }
+      ]
+    },
+    {
+      "token": " coast",
+      "logprob": "00d015bc",
+      "top": [
+        {
+          "token": " coast",
+          "logprob": "00d015bc"
+        },
+        {
+          "token": " oceans",
+          "logprob": "e84aa2c0"
+        },
+        {
+          "token": " coastline",
+          "logprob": "e84ad0c0"
+        },
+        {
+          "token": " mountain",
+          "logprob": "e84aeac0"
+        },
+        {
+          "token": " coasts",
+          "logprob": "746509c1"
+        }
+      ]
+    }
+  ]
+}

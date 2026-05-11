@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>gemma metal bridge — steering</title>
+<title>gemma metal bridge — steering (preview)</title>
 <style>
   :root {
     color-scheme: dark;
@@ -10,6 +10,7 @@
     --text: #d4d4d4; --mute: #888; --accent: #6a9;
     --focus: #ffde47;
     --pos: #4bc27a; --neg: #d46;
+    --c0: #5cf; --c1: #fa3; --c2: #8f5; --c3: #f69;
   }
   html, body { margin:0; padding:0; background:var(--bg); color:var(--text);
     font-family: ui-monospace, 'SF Mono', Monaco, monospace; height:100%; }
@@ -24,9 +25,21 @@
   header .status { font-size:0.78rem; color:var(--mute); }
   header a { color:var(--accent); text-decoration:none; margin-left:0.8em; }
 
+  .deferred-banner {
+    background: #2a1a05; border-bottom: 1px solid #4a3010;
+    color: #fbb56b; padding: 0.7em 1.2em; font-size:0.82rem;
+    line-height:1.5;
+  }
+  .deferred-banner b { color: #ffde47; }
+  .deferred-banner code {
+    background:#1a1a1a; padding:1px 5px; border-radius:2px;
+    color:#aef; font-size:0.92em;
+  }
+  .deferred-banner a { color: var(--accent); }
+
   main {
     flex:1; min-height:0; overflow:hidden; display:grid;
-    grid-template-columns: 360px 1fr;
+    grid-template-columns: 320px 1fr;
   }
 
   .config {
@@ -46,8 +59,7 @@
     border-radius:3px; padding:0.35em 0.45em; font:inherit; font-size:0.78rem;
     width:100%; box-sizing:border-box; resize:vertical;
   }
-  .config textarea { min-height:4em; font-size:0.74rem; line-height:1.4; }
-  .config textarea.prose { min-height:5.5em; }
+  .config textarea { min-height:5em; font-size:0.74rem; line-height:1.4; }
   .slider-row { display:grid; grid-template-columns: 5.5em 1fr 3.5em;
     gap:0.4em; align-items:center; margin:0.35em 0; font-size:0.74rem; }
   .slider-row input[type=range] { width:100%; }
@@ -64,28 +76,9 @@
     background:var(--accent); color:#002; font-weight:700; border:0;
     padding:0.55em 1.1em; font-size:0.85rem;
   }
-  button.primary.hot { background: var(--focus); color:#202; }
   .hint { font-size:0.68rem; color:var(--mute); line-height:1.45; margin-top:0.3em; }
   .hint code { background:#1a1a1a; padding:0 0.25em; border-radius:2px; color:var(--text); }
 
-  /* Heatmap of (layer × component_rank). */
-  .heatmap {
-    display:grid; grid-template-columns: 2em 1fr; gap:0.3em;
-    margin-top:0.4em; font-size:0.6rem;
-  }
-  .heatmap .axis-y { display:flex; flex-direction:column;
-    justify-content:space-between; color:var(--mute); padding-right:0.1em; }
-  .heatmap .cells { display:grid; gap:1px; background:#000; padding:1px;
-    border-radius:2px; }
-  .heatmap .cell { aspect-ratio:1/1; min-height:8px; box-sizing:border-box;
-    border:1px solid transparent; cursor:help; }
-  .heatmap .cell.kept { border-color: var(--focus); }
-  .heatmap .xlabel { grid-column: 2; color:var(--mute); font-size:0.6rem;
-    padding-top:0.2em; display:flex; justify-content:space-around; }
-
-  /* Output area — 4-lane grid of parallel decodes at different
-     intensity multipliers. The engine batches all 4 at B=4, so wall-
-     clock is ~same as a single stream. */
   .output { overflow:auto; padding:1em 1.2em; font-size:0.85rem;
     display:flex; flex-direction:column; gap:0.6em; }
   .output .system {
@@ -102,8 +95,10 @@
     display:flex; flex-direction:column; min-height:0;
   }
   .lane.running { border-color: var(--accent); }
-  .lane.flipped { border-color: var(--neg); }
-  .lane.baseline { border-color: var(--mute); }
+  .lane[data-lane="0"] .hdr { color: var(--c0); }
+  .lane[data-lane="1"] .hdr { color: var(--c1); }
+  .lane[data-lane="2"] .hdr { color: var(--c2); }
+  .lane[data-lane="3"] .hdr { color: var(--c3); }
   .lane .hdr {
     padding:0.35em 0.55em; border-bottom:1px solid var(--border);
     font-size:0.7rem; color:var(--mute); display:flex; justify-content:space-between;
@@ -112,26 +107,34 @@
   .lane .hdr b { color:var(--text); font-weight:500; font-variant-numeric:tabular-nums; }
   .lane .hdr .badge {
     background:#1a2030; padding:1px 5px; border-radius:2px;
-    font-size:0.62rem; font-variant-numeric:tabular-nums;
+    font-size:0.62rem; font-variant-numeric:tabular-nums; color:var(--text);
   }
-  .lane.flipped .hdr { color: var(--neg); }
-  .lane.baseline .hdr { color: var(--mute); }
   .lane .body {
     flex:1; overflow:auto; padding:0.5em 0.6em; line-height:1.55;
     white-space:pre-wrap; word-break:break-word;
-    font-family: ui-monospace, 'SF Mono', Monaco, monospace;
+    font-family: ui-monospace, 'SF Mono', Monaco, monospace; font-size:0.78rem;
   }
   .lane .body:empty::before {
     content: '(idle)'; color: var(--mute); font-style:italic; font-size:0.7rem;
   }
 
-  /* Curl hint — what the UI is doing on the wire. */
-  .curl-hint {
-    font-family: ui-monospace, 'SF Mono', Monaco, monospace;
-    font-size:0.68rem; background:#050505; color:#8aa; padding:0.5em 0.7em;
-    border-radius:3px; border:1px solid #1a1a1a; margin-top:0.4em;
-    white-space:pre-wrap; word-break:break-all; overflow:auto; max-height:6em;
+  /* KV tenancy strip in the steering footer, populated from /v1/engine/state */
+  .kv-strip {
+    margin-top:0.4em; padding:0.3em; background:var(--panel);
+    border:1px solid var(--border); border-radius:3px;
+    display:flex; flex-wrap:wrap; gap:2px; max-height:6em; overflow:auto;
+    align-content:flex-start;
   }
+  .kv-strip .label {
+    width: 100%; font-size: 0.7rem; color: var(--mute); margin-bottom: 0.2em;
+  }
+  .kv-cell {
+    width: 8px; height: 8px; border-radius: 1px; flex: none;
+    background: #2a3040;
+  }
+  .kv-cell.own { background: #2e4860; }
+  .kv-cell.shr2 { background: #5cf; }
+  .kv-cell.shr3p { background: #fff; }
 
   footer {
     padding:0.4em 1.2em; border-top:1px solid var(--border); flex:none;
@@ -144,87 +147,38 @@
 <body>
 
 <header>
-  <h1>gemma-4 · residual-stream steering</h1>
+  <h1>gemma-4 · residual-stream steering (preview)</h1>
   <div>
     <span class="status" id="statusText">checking…</span>
-    <a href="/">← clients</a>
-    <a href="/tetraplex">tetraplex</a>
-    <a href="/labeler">labeler</a>
-    <a href="/loom">loom</a>
-    <a href="/compare">compare</a>
+    <a href="/static/clients.html">← clients</a>
+    <a href="/static/index.html">tetraplex</a>
+    <a href="/static/labeler.html">labeler</a>
+    <a href="/static/loom.html">loom</a>
   </div>
 </header>
+
+<div class="deferred-banner">
+  <b>Per-token cvec activations API now live; visualizer rendering still TODO.</b>
+  The engine surface ships <code>choices[0].delta.cvec_activations</code> on
+  SSE deltas when a request sets <code>capture_cvec_activations: true</code>
+  and includes a <code>controls</code> array; each record is
+  <code>{token_position, layer, magnitude}</code>. The apply path is
+  validated end-to-end at <code>tools/cvec_validation/</code> (off-path
+  bit-identity with capture off and capture on, on-path correctness with
+  zero-vector and unit-vector cvecs). What this page still needs: wire the
+  capture flag, register a cvec via <code>POST /v1/resources/register</code>,
+  consume the delta records, and paint a per-token heatmap above the streamed
+  text. The 4-lane parallel chat demo + KV tenancy view below already exercise
+  the batched-AR path the steering visualization rides.
+</div>
 
 <main>
 
   <aside class="config">
 
     <section>
-      <h2>contrastive pairs</h2>
-      <label class="hint">positive prose (one per line, ≥2):</label>
-      <textarea id="pos" class="prose" rows="4"></textarea>
-      <label class="hint" style="display:block;margin-top:0.4em">negative prose:</label>
-      <textarea id="neg" class="prose" rows="4"></textarea>
-      <div class="slider-row">
-        <label for="topP">top-p</label>
-        <input type="range" id="topP" min="0.50" max="0.99" step="0.01" value="0.80">
-        <span class="val" id="topPVal">0.80</span>
-      </div>
-      <div class="slider-row">
-        <label for="maxK" title="max components per layer">max PCs/L</label>
-        <input type="range" id="maxK" min="1" max="8" step="1" value="4">
-        <span class="val" id="maxKVal">4</span>
-      </div>
-      <div class="slider-row" title="how pos/neg residuals are sampled. shared_source (teacher-forced) is the most principled: each pos/neg prose example is teacher-forced from a shared anchor prompt, residuals captured at every position. PCA deltas then live in strictly trajectory-comparable space — both branches share the anchor exactly, and every position is guaranteed to stay in-class (no bigram-attractor contamination, no model-drift).">
-        <label for="captureMode">capture</label>
-        <select id="captureMode" style="flex:1; background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:3px; padding:0.25em 0.4em; font:inherit; font-size:0.78rem">
-          <option value="shared_source" selected>shared_source (teacher-forced)</option>
-          <option value="rollout">rollout (model samples K steps)</option>
-          <option value="model_gen">model_gen (single, mid-gen)</option>
-          <option value="user_end">user_end (single, prose-after-user)</option>
-        </select>
-        <span></span>
-      </div>
-      <div class="slider-row" id="rolloutDepthRow">
-        <label for="rolloutDepth" title="K positions per example. Longer K gives more samples for PCA (cleaner fit) at linear cost (~30 ms/position/example).">positions K</label>
-        <input type="range" id="rolloutDepth" min="4" max="32" step="2" value="16">
-        <span class="val" id="rolloutDepthVal">16</span>
-      </div>
-      <div style="display:flex; gap:0.4em; margin-top:0.4em">
-        <button id="fitBtn" class="primary">fit intervention</button>
-        <button id="sampleBtn" title="load default joy-vs-dread pairs">sample</button>
-      </div>
-      <div class="hint" id="fitStatus" style="margin-top:0.3em">
-        click <b>sample</b> for defaults, then <b>fit intervention</b> (≈4s). the whole intervention is one POST: <code>/v1/control/construct_pca</code>.
-      </div>
-      <div id="fitCurl" class="curl-hint" style="display:none"></div>
-    </section>
-
-    <section id="interventionSection" style="display:none">
-      <h2>intervention <span id="fitSummary" style="text-transform:none;color:var(--mute);font-weight:400;font-size:0.68rem"></span></h2>
-      <div class="heatmap">
-        <div class="axis-y" id="heatmapYaxis"></div>
-        <div>
-          <div class="cells" id="heatmapCells"></div>
-          <div class="xlabel" id="heatmapXaxis"></div>
-        </div>
-      </div>
-      <div class="hint">
-        rows = layer · cols = component rank · brightness = eigenvalue fraction · <span style="color:var(--focus)">yellow frame</span> = kept (made the cumulative top-p cut).
-      </div>
-      <div class="slider-row" style="margin-top:0.6em">
-        <label for="intensity">intensity</label>
-        <input type="range" id="intensity" min="-3" max="3" step="0.1" value="1.0">
-        <span class="val" id="intensityVal">1.0</span>
-      </div>
-      <div class="hint">
-        each kept component's peakMagnitude = <code>scale × intensity</code>. negative intensity flips polarity — steer <em>away</em> from the positive class.
-      </div>
-    </section>
-
-    <section>
-      <h2>generate</h2>
-      <label class="hint">prompt:</label>
+      <h2>generate (4 parallel lanes)</h2>
+      <label>prompt (shared across all 4 lanes):</label>
       <textarea id="prompt" rows="3">Describe a cat in three sentences.</textarea>
       <div class="slider-row">
         <label for="maxTok">max tokens</label>
@@ -232,60 +186,74 @@
         <span class="val" id="maxTokVal">80</span>
       </div>
       <div class="slider-row">
-        <label for="temperature" title="0 = greedy argmax (deterministic). >0 = softmax sampling (trajectory variation on each re-run).">sampling T</label>
-        <input type="range" id="temperature" min="0" max="1.5" step="0.05" value="0">
-        <span class="val" id="temperatureVal">greedy</span>
+        <label for="temperature">temperature</label>
+        <input type="range" id="temperature" min="0.01" max="1.5" step="0.05" value="0.7">
+        <span class="val" id="temperatureVal">0.70</span>
       </div>
-      <button id="runBtn" class="primary hot" style="width:100%; margin-top:0.4em" disabled>
+      <button id="runBtn" class="primary" style="width:100%; margin-top:0.4em">
         run 4 lanes
       </button>
-      <div class="hint" id="runStatus" style="margin-top:0.3em">fit an intervention first.</div>
-      <div class="hint" style="margin-top:0.3em">
-        lanes: <b style="color:var(--text)">baseline · 1× · 2× · -1×</b> of intensity ·
-        <b id="samplingMode" style="color:var(--text)">greedy</b> · same prompt across all lanes.
-        at T=0 lanes are deterministic; set T&gt;0 to see trajectory diversity across re-runs.
+      <div class="hint" id="runStatus" style="margin-top:0.3em">
+        ready. each lane is one parallel <code>/v1/chat/completions</code> stream
+        with the same prompt + slightly different seeds — the engine batches them
+        at B=4 (same scheduler path tetraplex / loom drive).
       </div>
-      <div id="runCurl" class="curl-hint" style="display:none"></div>
+    </section>
+
+    <section>
+      <h2>engine state</h2>
+      <div class="hint" id="engineMeta">polling…</div>
+      <div class="kv-strip" id="kvStrip">
+        <div class="label">no active sessions</div>
+      </div>
+      <div class="hint">
+        live KV tenancy from <code>/v1/engine/state</code>. green = single-owner page;
+        cyan = 2-way shared; white = 3+ shared (shared-prefix pages appear when all
+        4 lanes hit the prompt's content-hash entry).
+      </div>
     </section>
 
   </aside>
 
   <div class="output">
-    <div class="system" id="systemMsg">
-      <b>2 clicks to see residual-stream steering in action:</b>
-      hit <b>sample</b> → <b>fit intervention</b> → <b>run 4 lanes</b>.
-      sampling is greedy (argmax), so any difference between lanes is attributable
-      purely to the intervention magnitude — no RNG noise. each lane is one parallel
-      <code>/v1/chat/completions</code> session; the engine batches them at B=4.
+    <div class="system">
+      <b>What this dashboard demonstrates:</b>
+      the engine's B=4 batched AR decode path, the same one the future steering
+      lanes will share. Each lane = one parallel chat completion; the prompt is
+      identical so the content-hash prefix cache adopts the shared prompt pages
+      across all 4 streams (visible as shared cells in the KV tenancy strip on
+      the left). When the cvec stream extension lands, each lane will additionally
+      carry its own intensity multiplier and render the per-token activation
+      heatmap inline with the text.
     </div>
     <div class="lanes" id="lanes">
-      <div class="lane baseline" data-lane="off">
+      <div class="lane" data-lane="0">
         <div class="hdr">
-          <span>baseline · 0</span>
-          <span><span class="badge" id="badge-off">—</span> <span class="badge" id="ppl-off" title="perplexity of this lane's output under its own intervention config">—</span></span>
+          <span>lane 0 · seed=11</span>
+          <span class="badge" id="badge-0">—</span>
         </div>
-        <div class="body" id="body-off"></div>
+        <div class="body" id="body-0"></div>
       </div>
-      <div class="lane" data-lane="mid">
+      <div class="lane" data-lane="1">
         <div class="hdr">
-          <span>steered · <b id="label-mid">+1.0</b></span>
-          <span><span class="badge" id="badge-mid">—</span> <span class="badge" id="ppl-mid" title="perplexity">—</span></span>
+          <span>lane 1 · seed=22</span>
+          <span class="badge" id="badge-1">—</span>
         </div>
-        <div class="body" id="body-mid"></div>
+        <div class="body" id="body-1"></div>
       </div>
-      <div class="lane" data-lane="hi">
+      <div class="lane" data-lane="2">
         <div class="hdr">
-          <span>strong · <b id="label-hi">+2.0</b></span>
-          <span><span class="badge" id="badge-hi">—</span> <span class="badge" id="ppl-hi" title="perplexity">—</span></span>
+          <span>lane 2 · seed=33</span>
+          <span class="badge" id="badge-2">—</span>
         </div>
-        <div class="body" id="body-hi"></div>
+        <div class="body" id="body-2"></div>
       </div>
-      <div class="lane flipped" data-lane="neg">
+      <div class="lane" data-lane="3">
         <div class="hdr">
-          <span>flipped · <b id="label-neg">-1.0</b></span>
-          <span><span class="badge" id="badge-neg">—</span> <span class="badge" id="ppl-neg" title="perplexity">—</span></span>
+          <span>lane 3 · seed=44</span>
+          <span class="badge" id="badge-3">—</span>
         </div>
-        <div class="body" id="body-neg"></div>
+        <div class="body" id="body-3"></div>
       </div>
     </div>
   </div>
@@ -296,23 +264,18 @@
   <span class="stat">tokens: <b id="fTokens">0</b></span>
   <span class="stat">rate: <b id="fRate">idle</b></span>
   <span class="stat">wall: <b id="fWall">—</b></span>
-  <span class="stat">components kept: <b id="fKept">—</b></span>
-  <span class="stat">captured variance: <b id="fVariance">—</b></span>
+  <span class="stat">cache (lane 0): <b id="fCache0">—</b></span>
+  <span class="stat">cache (lane 1): <b id="fCache1">—</b></span>
+  <span class="stat">cache (lane 2): <b id="fCache2">—</b></span>
+  <span class="stat">cache (lane 3): <b id="fCache3">—</b></span>
 </footer>
 
 <script>
-// ====================================================================
-// Minimal residual-stream steering UI:
-//   (1) fit a multi-layer multi-component PCA intervention from prose pairs
-//   (2) run a steered generation with that intervention
-// Each button = exactly one API call; its curl equivalent is shown below
-// the button so the UI is self-documenting.
-// ====================================================================
-
 const $ = id => document.getElementById(id);
-const NUM_LAYERS = 30;
+const LANES = [0, 1, 2, 3];
+const SEEDS = [11, 22, 33, 44];
 
-// --- server health ---
+// --- health ---
 async function checkHealth() {
   try {
     const r = await (await fetch('/health')).json();
@@ -321,327 +284,55 @@ async function checkHealth() {
 }
 setInterval(checkHealth, 3000); checkHealth();
 
-// --- Default prose contrast ---
-const DEFAULT_POS = [
-  "A warm, sunny afternoon full of easy laughter and gentle conversation.",
-  "She felt a wave of pure joy wash over her, bright and uncomplicated.",
-  "The children ran through the sprinkler, shrieking with delight.",
-  "He smiled softly, remembering the best day of his life.",
-  "His laughter filled the room with pure delight.",
-];
-const DEFAULT_NEG = [
-  "A cold, grey morning weighed down by a dull sense of dread.",
-  "She felt a hollow ache in her chest, heavy and unshakeable.",
-  "The room was silent except for the quiet sound of her crying.",
-  "He stared at the floor, unable to remember anything worth smiling about.",
-  "Every shadow stretched longer than it should, and the air felt wrong.",
-];
-$('pos').value = DEFAULT_POS.join('\n');
-$('neg').value = DEFAULT_NEG.join('\n');
-$('sampleBtn').addEventListener('click', () => {
-  $('pos').value = DEFAULT_POS.join('\n');
-  $('neg').value = DEFAULT_NEG.join('\n');
-  $('fitStatus').textContent = 'defaults loaded. hit fit intervention.';
-});
-
-// --- Slider value display wiring ---
-for (const [id, digits] of [['topP', 2], ['maxK', 0], ['intensity', 1], ['maxTok', 0]]) {
+// --- slider labels ---
+for (const [id, digits] of [['maxTok', 0], ['temperature', 2]]) {
   const el = $(id);
   const upd = () => {
     $(id + 'Val').textContent = digits === 0 ? el.value : parseFloat(el.value).toFixed(digits);
   };
   el.addEventListener('input', upd); upd();
 }
-// Temperature slider has a non-numeric label at T=0 (shows "greedy")
-// to make the greedy/argmax default unmistakable in the UI.
-function updateTempLabel() {
-  const t = parseFloat($('temperature').value);
-  const label = t <= 0 ? 'greedy' : t.toFixed(2);
-  $('temperatureVal').textContent = label;
-  $('samplingMode').textContent =
-    t <= 0 ? 'greedy (argmax)' : `softmax T=${t.toFixed(2)}`;
-}
-$('temperature').addEventListener('input', () => { updateTempLabel(); refreshRunCurl(); });
-updateTempLabel();
 
-// --- State ---
-const fit = {
-  components: null,        // [{layer, component, eigenvalue, cvec_id, scale}]
-  allEigs: null,           // [NUM_LAYERS][maxK] grid
-  maxK: 4,
-  totalVariance: 0,
-  capturedFraction: 0,
-};
-const run = {
-  samples: [],
-  tStart: null,
-  tokens: 0,
-};
-
-// Update the curl hint under a button so the user can see the exact
-// request we'd send if they clicked. If `null`, clears.
-function showCurl(elId, method, path, body) {
-  const el = $(elId);
-  if (body === null) { el.style.display = 'none'; return; }
-  const bodyStr = JSON.stringify(body, null, 2);
-  el.textContent = `curl -X ${method} http://localhost:8000${path} \\
-  -H 'Content-Type: application/json' \\
-  -d '${bodyStr.replaceAll("'", "'\\''")}'`;
-  el.style.display = 'block';
-}
-
-function preflightFitBody() {
-  const positive = $('pos').value.split('\n').map(s => s.trim()).filter(Boolean);
-  const negative = $('neg').value.split('\n').map(s => s.trim()).filter(Boolean);
-  const body = {
-    id_prefix: 'pca-fit',
-    positive, negative,
-    top_p: parseFloat($('topP').value),
-    max_components_per_layer: parseInt($('maxK').value),
-    capture_mode: $('captureMode').value,
-  };
-  if (body.capture_mode === 'rollout' || body.capture_mode === 'shared_source') {
-    body.rollout_depth = parseInt($('rolloutDepth').value);
-  }
-  return body;
-}
-
-// Show/hide the rolloutDepth slider based on capture_mode.
-function refreshRolloutRow() {
-  const m = $('captureMode').value;
-  $('rolloutDepthRow').style.display =
-    (m === 'rollout' || m === 'shared_source') ? '' : 'none';
-}
-$('captureMode').addEventListener('change', refreshRolloutRow);
-refreshRolloutRow();
-$('rolloutDepth').addEventListener('input', (e) => {
-  $('rolloutDepthVal').textContent = e.target.value;
-});
-
-// Live-update the fit curl hint whenever inputs change.
-function refreshFitCurl() {
-  showCurl('fitCurl', 'POST', '/v1/control/construct_pca', preflightFitBody());
-}
-for (const id of ['pos','neg','topP','maxK','captureMode','rolloutDepth']) $(id).addEventListener('input', refreshFitCurl);
-$('captureMode').addEventListener('change', refreshFitCurl);
-refreshFitCurl();
-
-// ====================================================================
-// Fit: one POST → server captures all-layer residuals, SVDs per layer,
-// returns ranked (layer, component) list truncated at cumulative top_p.
-// ====================================================================
-$('fitBtn').addEventListener('click', async () => {
-  const body = preflightFitBody();
-  if (body.positive.length < 2 || body.negative.length < 2) {
-    $('fitStatus').textContent = 'need ≥2 lines of each (SVD degenerates on fewer).';
-    return;
-  }
-  $('fitBtn').disabled = true;
-  const N = body.positive.length + body.negative.length;
-  if (body.capture_mode === 'rollout' || body.capture_mode === 'shared_source') {
-    const label = body.capture_mode === 'rollout' ? 'rollout' : 'teacher-forced';
-    $('fitStatus').textContent =
-      `fitting (${label}): ${N} examples × ${body.rollout_depth} positions = ${N * body.rollout_depth} samples, ~${(N * body.rollout_depth * 0.035).toFixed(1)}s…`;
-  } else {
-    $('fitStatus').textContent =
-      `fitting: ${N} forward passes × ${NUM_LAYERS} layers…`;
-  }
-  try {
-    const t0 = performance.now();
-    const r = await fetch('/v1/control/construct_pca', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) {
-      $('fitStatus').textContent = `error: ${(await r.text()).slice(0, 240)}`;
-      return;
-    }
-    const j = await r.json();
-    const dt = ((performance.now() - t0) / 1000).toFixed(2);
-    fit.components = j.components;
-    fit.allEigs = j.all_eigenvalues;
-    fit.maxK = body.max_components_per_layer;
-    fit.totalVariance = j.total_variance;
-    fit.capturedFraction = j.captured_fraction;
-
-    const kLayers = new Set(j.components.map(c => c.layer)).size;
-    $('fitSummary').textContent =
-      ` · ${j.components.length} comps across ${kLayers} layers · captured ${(j.captured_fraction * 100).toFixed(1)}%`;
-    $('fitStatus').innerHTML = `fit in ${dt}s — ready to run`;
-    $('fKept').textContent = j.components.length;
-    $('fVariance').textContent = (j.captured_fraction * 100).toFixed(1) + '%';
-    $('interventionSection').style.display = 'block';
-    renderHeatmap();
-    $('runBtn').disabled = false;
-    $('runStatus').textContent = 'ready. hit run steered.';
-    refreshRunCurl();
-  } catch (e) {
-    $('fitStatus').textContent = `error: ${e.message || e}`;
-  } finally {
-    $('fitBtn').disabled = false;
-  }
-});
-
-// ====================================================================
-// Heatmap: (NUM_LAYERS × maxK) cells, colored by eigenvalue fraction,
-// outlined in yellow if that (layer, component) made the top-p cut.
-// ====================================================================
-function renderHeatmap() {
-  const cells = $('heatmapCells');
-  cells.innerHTML = '';
-  cells.style.gridTemplateColumns = `repeat(${fit.maxK}, 1fr)`;
-  const kept = new Set(fit.components.map(c => `${c.layer}:${c.component}`));
-  let maxEv = 1e-9;
-  for (const row of fit.allEigs) for (const ev of row) if (ev > maxEv) maxEv = ev;
-  for (let L = 0; L < NUM_LAYERS; L++) {
-    const row = fit.allEigs[L] || [];
-    for (let k = 0; k < fit.maxK; k++) {
-      const ev = row[k] || 0;
-      const intensity = Math.sqrt(Math.max(0, ev) / maxEv);
-      const bg = ev > 0
-        ? `hsl(140 60% ${Math.min(60, 8 + intensity * 48)}%)`
-        : '#080808';
-      const cell = document.createElement('div');
-      cell.className = 'cell' + (kept.has(`${L}:${k}`) ? ' kept' : '');
-      cell.style.background = bg;
-      cell.title = `L${L} PC${k+1} eigenvalue=${ev.toFixed(1)}` +
-                    (kept.has(`${L}:${k}`) ? '  · kept' : '');
-      cells.appendChild(cell);
-    }
-  }
-  const yaxis = $('heatmapYaxis');
-  yaxis.innerHTML = '';
-  for (const L of ['L0', 'L15', 'L29']) {
-    const el = document.createElement('div');
-    el.textContent = L; yaxis.appendChild(el);
-  }
-  const xaxis = $('heatmapXaxis');
-  xaxis.innerHTML = '';
-  for (let k = 0; k < fit.maxK; k++) {
-    const el = document.createElement('div');
-    el.textContent = 'PC' + (k+1); xaxis.appendChild(el);
-  }
-}
-
-// ====================================================================
-// 4-lane parallel decode. Each lane fires its own /v1/chat/completions
-// stream at a different effective intensity; the engine batches all 4
-// at B=4 (same scheduler path as tetraplex/compare/loom), so 4 parallel
-// decodes are roughly the same wall-clock as 1. Greedy sampling means
-// the ONLY difference between lanes is the magnitude of the fitted
-// intervention applied — isolates the causal effect of steering.
-const LANES = [
-  { key: 'off', label: 'baseline', mult: 0,  // unsteered reference
-    controlsFn: () => [] },
-  { key: 'mid', label: 'steered',  mult: 1,
-    controlsFn: () => buildControlsAt(parseFloat($('intensity').value)) },
-  { key: 'hi',  label: 'strong',   mult: 2,
-    controlsFn: () => buildControlsAt(parseFloat($('intensity').value) * 2) },
-  { key: 'neg', label: 'flipped',  mult: -1,
-    controlsFn: () => buildControlsAt(-parseFloat($('intensity').value)) },
-];
-
-function buildControlsAt(intensity) {
-  if (!fit.components || intensity === 0) return [];
-  const polarity = intensity < 0 ? -1 : 1;
-  const absI = Math.abs(intensity);
-  return fit.components.map(c => ({
-    cvec_id: c.cvec_id,
-    layer: c.layer,
-    polarity,
-    peak_magnitude: c.scale * absI,
-    attack: 0, decay: 0, sustain_level: 1.0, release: 0,
-    shape: 'linear', units: 'tokens',
-  }));
-}
-
-function buildRunBody(controls) {
-  const t = parseFloat($('temperature').value);
-  const body = {
-    model: 'gemma-4-a4b-q4km',
-    max_tokens: parseInt($('maxTok').value),
-    stream: true,
-    messages: [{ role: 'user', content: $('prompt').value }],
-    controls,
-  };
-  // Only include temperature when non-zero so the curl hint stays clean
-  // for the default greedy case — matches how the engine treats
-  // missing/zero identically (falls through to argmax).
-  if (t > 0) body.temperature = t;
-  return body;
-}
-
-function refreshRunCurl() {
-  if (!fit.components) { showCurl('runCurl', null, null, null); return; }
-  // Show the "steered" lane's request as the canonical example — the
-  // other three are variations on the intensity multiplier. Annotate
-  // with the full lane set so the user knows 4 are fired in parallel.
-  const steered = buildRunBody(LANES[1].controlsFn());
-  showCurl('runCurl', 'POST', '/v1/chat/completions', {...steered, stream: false});
-  // Append a comment line describing the fan-out.
-  const el = $('runCurl');
-  const t = parseFloat($('temperature').value);
-  const samplingNote = t > 0
-    ? `# sampling: softmax T=${t.toFixed(2)} — each lane + each re-run produces a distinct trajectory.`
-    : `# sampling: greedy argmax (T=0) — deterministic; lane differences are pure intervention-driven.`;
-  el.textContent = el.textContent +
-    `\n\n# fired in parallel × 4 lanes with peak_magnitude scaled by [0, 1x, 2x, -1x]` +
-    ` of your intensity ${parseFloat($('intensity').value).toFixed(1)}.` +
-    `\n${samplingNote}`;
-}
-for (const id of ['prompt','maxTok','intensity']) {
-  $(id).addEventListener('input', () => { refreshRunCurl(); updateLaneLabels(); });
-}
-function updateLaneLabels() {
-  const i = parseFloat($('intensity').value);
-  $('label-mid').textContent = (i >= 0 ? '+' : '') + i.toFixed(1);
-  $('label-hi').textContent  = (i * 2 >= 0 ? '+' : '') + (i * 2).toFixed(1);
-  $('label-neg').textContent = (-i >= 0 ? '+' : '') + (-i).toFixed(1);
-}
-updateLaneLabels();
-
-// ====================================================================
-// Run: fire all 4 lanes concurrently. Each streams into its own body
-// div. Per-lane RAF-batched flush so fast engine output doesn't stall
-// the browser's rendering pipeline (same pattern as loom).
-// ====================================================================
-const laneState = new Map();
-for (const L of LANES) laneState.set(L.key, { pending: '', tokens: 0, bodyEl: null, badgeEl: null, dirty: false });
+// --- per-lane state ---
+const laneState = LANES.map(i => ({
+  i, tokens: 0, fullText: '', usage: null,
+  bodyEl: $('body-' + i), badgeEl: $('badge-' + i),
+  laneEl: document.querySelector(`.lane[data-lane="${i}"]`),
+}));
 
 let rafPending = false;
 function scheduleFlush() {
   if (rafPending) return;
   rafPending = true;
-  requestAnimationFrame(flushAllDirty);
+  requestAnimationFrame(flushAll);
 }
-function flushAllDirty() {
+function flushAll() {
   rafPending = false;
-  for (const L of LANES) {
-    const s = laneState.get(L.key);
-    if (!s.dirty) continue;
-    if (s.bodyEl && s.pending) {
-      s.bodyEl.appendChild(document.createTextNode(s.pending));
+  for (const s of laneState) {
+    if (s.pending) {
+      s.bodyEl.textContent = s.fullText;
       s.bodyEl.scrollTop = s.bodyEl.scrollHeight;
-      s.pending = '';
+      s.pending = false;
     }
-    if (s.badgeEl) s.badgeEl.textContent = `${s.tokens}t`;
-    s.dirty = false;
+    if (s.badgeDirty) {
+      s.badgeEl.textContent = `${s.tokens}t`;
+      s.badgeDirty = false;
+    }
   }
   updateFooter();
 }
 
-async function streamLane(L) {
-  const s = laneState.get(L.key);
-  s.bodyEl = $('body-' + L.key);
-  s.badgeEl = $('badge-' + L.key);
-  s.bodyEl.textContent = '';
-  s.pending = ''; s.tokens = 0;
-  s.fullText = '';
-  const laneEl = document.querySelector(`.lane[data-lane="${L.key}"]`);
-  laneEl.classList.add('running');
-  $('ppl-' + L.key).textContent = '—';
-  const body = buildRunBody(L.controlsFn());
+async function streamLane(s) {
+  s.bodyEl.textContent = ''; s.tokens = 0; s.fullText = ''; s.usage = null;
+  s.laneEl.classList.add('running');
+  const body = {
+    model: 'gemma-4-a4b',
+    max_tokens: parseInt($('maxTok').value),
+    temperature: parseFloat($('temperature').value),
+    seed: SEEDS[s.i],
+    stream: true,
+    messages: [{ role: 'user', content: $('prompt').value }],
+  };
   try {
     const resp = await fetch('/v1/chat/completions', {
       method: 'POST',
@@ -668,161 +359,93 @@ async function streamLane(L) {
         let j; try { j = JSON.parse(payload); } catch { continue; }
         const text = j.choices?.[0]?.delta?.content;
         if (text) {
-          s.pending += text;
-          s.tokens += 1;
           s.fullText += text;
-          s.dirty = true;
+          s.tokens += 1;
+          s.pending = true;
+          s.badgeDirty = true;
           scheduleFlush();
         }
+        if (j.usage) s.usage = j.usage;
       }
     }
   } catch (e) {
     s.bodyEl.textContent = `[stream error] ${e.message || e}`;
   } finally {
-    laneEl.classList.remove('running');
+    s.laneEl.classList.remove('running');
+    if (s.usage) {
+      const hit = s.usage.cache_hits || 0;
+      const total = hit + (s.usage.cache_misses || 0);
+      $('fCache' + s.i).textContent = total > 0 ? `${hit}/${total}` : '0';
+    }
   }
 }
 
-// After a lane finishes, score its completion TWO ways and show the
-// delta:
-//   self-ppl:     perplexity under the lane's own controls (how
-//                 predictable is this text to the steered model)
-//   baseline-ppl: perplexity under NO controls (how surprised is the
-//                 unsteered model by this steered text)
-// Δ = base - self is the direct measure of intervention strength. If
-// Δ is small, the fitted direction barely moved the distribution —
-// autoregressive rollout re-anchoring washed out the cvec's push,
-// and the output is essentially what the baseline would have produced.
-// If Δ is large, the steered trajectory lives in a region the
-// baseline finds unlikely: the intervention survived the rollout.
-//
-// Per user: single-position "cvec flip the argmax" demos cheat —
-// they don't let rollout re-anchoring happen. Δ in a full-rollout
-// setting is the honest metric, and it's typically smaller than the
-// memetic folklore suggests, which is itself an interesting finding
-// about how LMs behave as AR machines vs bigram-like predictors.
-async function scoreLane(L) {
-  const s = laneState.get(L.key);
-  if (!s.fullText) return;
-  const prompt = $('prompt').value;
-  const completion = s.fullText
-    .replace(/<\|channel>[\s\S]*?<channel\|>/g, '')
-    .replace(/<turn\|>/g, '')
-    .trim();
-  if (!completion) return;
-  const pplEl = $('ppl-' + L.key);
-  pplEl.textContent = 'scoring…';
-  const laneControls = L.controlsFn();
-  // Fire self + baseline in parallel — engine batches them at B=4.
-  const selfReq = fetch('/v1/perplexity', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt, completion, controls: laneControls, top_k: 3 }),
-  });
-  const baseReq = (laneControls && laneControls.length > 0)
-    ? fetch('/v1/perplexity', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, completion, controls: [], top_k: 3 }),
-      })
-    : null;
-  try {
-    const [selfRes, baseRes] = await Promise.all([
-      selfReq,
-      baseReq || Promise.resolve(null),
-    ]);
-    if (!selfRes.ok) { pplEl.textContent = 'score err'; return; }
-    const selfJ = await selfRes.json();
-    const baseJ = (baseRes && baseRes.ok) ? await baseRes.json() : null;
-    const selfPpl = selfJ.perplexity;
-    const col = selfJ.collapsed_positions;
-    const n = selfJ.completion_tokens;
-    const frac = col / Math.max(n, 1);
-    let delta = null;
-    let basePpl = null;
-    if (baseJ) {
-      basePpl = baseJ.perplexity;
-      // Use log-perplexity difference so the number is small + additive.
-      // log(base) - log(self) = mean per-token KL-ish quantity.
-      delta = Math.log(basePpl) - Math.log(selfPpl);
-    }
-    // Color: red on collapse, else green/orange gradient on delta
-    // magnitude. Baseline lane (no controls) has no delta — just show
-    // ppl + col.
-    if (frac > 0.5) {
-      pplEl.style.color = 'var(--neg)';
-    } else if (delta !== null) {
-      const ad = Math.abs(delta);
-      pplEl.style.color = ad > 1.0 ? '#8f5' : ad > 0.3 ? '#cc8' : 'var(--mute)';
-    } else {
-      pplEl.style.color = 'var(--mute)';
-    }
-    if (delta !== null) {
-      const sign = delta >= 0 ? '+' : '';
-      pplEl.textContent =
-        `ppl ${selfPpl.toFixed(1)}→${basePpl.toFixed(1)} Δ${sign}${delta.toFixed(2)} col ${col}/${n}`;
-      pplEl.title =
-        `self-perplexity (scored under own controls):  ${selfPpl.toFixed(2)}\n` +
-        `baseline-perplexity (unsteered on same text): ${basePpl.toFixed(2)}\n` +
-        `log Δ = log(base) − log(self): ${delta.toFixed(3)}\n` +
-        `  ≈ mean per-token divergence the intervention survived through AR rollout.\n` +
-        `  large |Δ| = baseline would not have produced this; steering is real.\n` +
-        `  tiny |Δ| = rollout re-anchoring washed the intervention out.\n` +
-        `collapsed positions (top-1 prob > 0.95): ${col}/${n}`;
-    } else {
-      pplEl.textContent = `ppl=${selfPpl.toFixed(1)} · col=${col}/${n}`;
-      pplEl.title =
-        `perplexity: ${selfPpl.toFixed(2)}\n` +
-        `collapsed positions: ${col}/${n}\n` +
-        `(baseline lane — no intervention to compare against)`;
-    }
-  } catch (e) {
-    pplEl.textContent = 'score err';
-  }
-}
-
+let runStart = null;
 $('runBtn').addEventListener('click', async () => {
-  if (!fit.components) return;
   $('runBtn').disabled = true;
-  run.tStart = performance.now();
-  $('runStatus').textContent = `running 4 lanes in parallel…`;
+  runStart = performance.now();
+  $('runStatus').textContent = 'running 4 lanes in parallel…';
+  for (let i = 0; i < 4; i++) { $('fCache' + i).textContent = '—'; }
   try {
-    await Promise.allSettled(LANES.map(streamLane));
-    const dt = (performance.now() - run.tStart) / 1000;
-    const total = LANES.reduce((n, L) => n + laneState.get(L.key).tokens, 0);
-    $('runStatus').innerHTML =
-      `4 lanes × ${LANES[0].controlsFn ? '(varying intensity)' : ''} · ` +
-      `<b>${total}</b> tokens total in ${dt.toFixed(2)}s · ` +
-      `<b>${(total / dt).toFixed(0)} tok/s</b> aggregate · ` +
-      `scoring perplexity…`;
-    // Fire perplexity scoring for all 4 lanes in parallel. Each lane's
-    // completion is scored under its OWN control config — the chip
-    // tells you "what the model thinks of the text it just produced
-    // while steered this way." Collapsed positions > 50% = the
-    // distribution pinned to single tokens (the `unblinking` pathology).
-    await Promise.allSettled(LANES.map(scoreLane));
+    await Promise.allSettled(laneState.map(streamLane));
+    const dt = (performance.now() - runStart) / 1000;
+    const total = laneState.reduce((n, s) => n + s.tokens, 0);
     $('runStatus').innerHTML =
       `4 lanes · <b>${total}</b> tokens in ${dt.toFixed(2)}s · ` +
-      `<b>${(total / dt).toFixed(0)} tok/s agg</b> · ` +
-      `retune intensity or capture mode and re-run.`;
+      `<b>${(total / dt).toFixed(0)} tok/s</b> aggregate.`;
   } catch (e) {
     $('runStatus').textContent = `error: ${e.message || e}`;
   } finally {
     $('runBtn').disabled = false;
     updateFooter();
-    flushAllDirty();
+    flushAll();
   }
 });
 
 function updateFooter() {
-  // Aggregate across all lanes. Rate is total-tokens / wall-time so it
-  // reports the effective aggregate throughput (≈4× single-lane rate
-  // once the engine batches at B=4).
-  let total = 0;
-  for (const L of LANES) total += laneState.get(L.key)?.tokens ?? 0;
+  const total = laneState.reduce((n, s) => n + s.tokens, 0);
   $('fTokens').textContent = String(total);
-  if (run.tStart) {
-    const dt = (performance.now() - run.tStart) / 1000;
+  if (runStart) {
+    const dt = (performance.now() - runStart) / 1000;
     $('fWall').textContent = dt.toFixed(1) + 's';
     if (dt > 0.1) $('fRate').textContent = (total / dt).toFixed(0) + ' tok/s agg';
+  }
+}
+
+// --- engine-state poll: KV tenancy strip in the sidebar ---
+async function pollEngineState() {
+  try {
+    const snap = await (await fetch('/v1/engine/state')).json();
+    renderKv(snap);
+  } catch {}
+}
+setInterval(pollEngineState, 500);
+pollEngineState();
+
+function renderKv(snap) {
+  const kv = snap.kv_cache || {};
+  const livePages = (kv.pages || []).filter(p => p.refcount > 0);
+  const streams = snap.active_streams || [];
+  $('engineMeta').textContent =
+    `${streams.length} stream(s) · ${kv.pages_in_use}/${kv.total_pages} pages in use · ${kv.cached_pages} cached`;
+
+  const kvStrip = $('kvStrip');
+  kvStrip.innerHTML = '';
+  const lbl = document.createElement('div'); lbl.className = 'label';
+  if (streams.length === 0) {
+    lbl.textContent = 'idle';
+  } else {
+    lbl.textContent = streams.map(s =>
+      `s${s.stream_id}·${s.state}·${s.pages_owned}pg`).join(' / ');
+  }
+  kvStrip.appendChild(lbl);
+  for (const p of livePages.slice(0, 400)) {
+    const cell = document.createElement('div'); cell.className = 'kv-cell';
+    if (p.refcount >= 3) cell.classList.add('shr3p');
+    else if (p.refcount >= 2) cell.classList.add('shr2');
+    else cell.classList.add('own');
+    cell.title = `phys ${p.phys} · refcount=${p.refcount}${p.hash ? ' · hash=' + p.hash.slice(0,8) : ''}`;
+    kvStrip.appendChild(cell);
   }
 }
 </script>

@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import statistics
 import uuid
 from pathlib import Path
@@ -166,18 +165,143 @@ class MMLUHarness:
 # ──────────────────────────────────────────────────────────────────────
 
 
-_GSM8K_GOLD_PATTERN = re.compile(r"####\s*(-?\d[\d,]*\.?\d*)")
-_GSM8K_PRED_PATTERNS = [
-    re.compile(r"\\boxed\{(-?\d[\d,]*\.?\d*)\}"),
-    re.compile(r"####\s*(-?\d[\d,]*\.?\d*)"),
-    re.compile(r"final answer (?:is\s+|:\s*)\$?(-?\d[\d,]*\.?\d*)",
-                re.IGNORECASE),
-    re.compile(r"the answer is\s+\$?(-?\d[\d,]*\.?\d*)", re.IGNORECASE),
-    re.compile(r"answer:\s*\$?(-?\d[\d,]*\.?\d*)", re.IGNORECASE),
-    re.compile(r"=\s*\$?(-?\d[\d,]*\.?\d*)\s*\.?\s*$",
-                re.IGNORECASE | re.MULTILINE),
-]
-_GSM8K_ANY_NUMBER = re.compile(r"-?\d[\d,]*\.?\d*")
+# GSM8K extraction — see docs/regex_replacement_plans/
+# gsm8k_predicted_extraction.md for the structurally better fix
+# (ask the LLM judge to extract the final numeric answer). The
+# patterns below are pure-Python finite-state scanners equivalent
+# to the prior regex pile; they have no regex dependency.
+
+def _scan_gsm8k_number(text: str, pos: int) -> tuple[int, str] | None:
+    """At `text[pos]`, try to match the GSM8K number shape
+        -? \\d [\\d,]* \\.? \\d*
+    i.e. an optional minus, a leading digit, more digits-and-commas,
+    optional dot, optional trailing digits. Returns (end_pos, value)
+    or None if no match. `value` has commas stripped.
+    """
+    n = len(text)
+    i = pos
+    if i >= n:
+        return None
+    sign_len = 0
+    if text[i] == "-":
+        sign_len = 1
+        i += 1
+        if i >= n or not text[i].isdigit():
+            return None
+    if not text[i].isdigit():
+        return None
+    j = i + 1
+    while j < n and (text[j].isdigit() or text[j] == ","):
+        j += 1
+    # Drop a trailing comma (numbers like "1,234,").
+    while j > i and text[j - 1] == ",":
+        j -= 1
+    if j < n and text[j] == ".":
+        k = j + 1
+        while k < n and text[k].isdigit():
+            k += 1
+        if k > j + 1:
+            j = k
+    value = text[pos:j].replace(",", "")
+    if not value or value == "-":
+        return None
+    return j, value
+
+
+def _gsm8k_find_after(text: str, marker: str, *,
+                       case_insensitive: bool = False,
+                       require_dollar_prefix: bool = False,
+                       skip_extra: tuple[str, ...] = ()) -> str | None:
+    """Find `marker` in `text`, skip optional whitespace (and an optional
+    '$' if `require_dollar_prefix` permits one), then try to parse a
+    GSM8K-shaped number. `skip_extra` is a tuple of literal sub-tokens
+    that may appear after the marker before the number (case-folded if
+    `case_insensitive`). Returns the parsed number or None.
+    """
+    haystack = text.lower() if case_insensitive else text
+    needle = marker.lower() if case_insensitive else marker
+    pos = 0
+    while True:
+        idx = haystack.find(needle, pos)
+        if idx < 0:
+            return None
+        i = idx + len(needle)
+        # Skip any whitespace.
+        while i < len(text) and text[i] in " \t\n":
+            i += 1
+        # Skip allowed extras (e.g. "is", ":") followed by whitespace.
+        for extra in skip_extra:
+            ex = extra.lower() if case_insensitive else extra
+            chunk = haystack[i:i + len(ex)]
+            if chunk == ex:
+                i += len(ex)
+                while i < len(text) and text[i] in " \t\n":
+                    i += 1
+                break
+        if require_dollar_prefix and i < len(text) and text[i] == "$":
+            i += 1
+        parsed = _scan_gsm8k_number(text, i)
+        if parsed is not None:
+            return parsed[1]
+        pos = idx + 1
+
+
+def _gsm8k_find_boxed(text: str) -> str | None:
+    """Match `\\boxed{<number>}`."""
+    needle = r"\boxed{"
+    pos = 0
+    while True:
+        idx = text.find(needle, pos)
+        if idx < 0:
+            return None
+        inner = idx + len(needle)
+        parsed = _scan_gsm8k_number(text, inner)
+        if parsed is not None and parsed[0] < len(text) and text[parsed[0]] == "}":
+            return parsed[1]
+        pos = idx + 1
+
+
+def _gsm8k_eq_at_eol(text: str) -> str | None:
+    """Match the `=<ws>$?<number><ws>.?<ws>$` line-tail pattern, scanning
+    every line independently. Original regex: re.MULTILINE.
+    """
+    for line in text.splitlines():
+        pos = 0
+        # The regex used .search, then anchored end with `\s*\.?\s*$`.
+        # We walk every '=' occurrence in the line and check the tail.
+        while True:
+            idx = line.find("=", pos)
+            if idx < 0:
+                break
+            i = idx + 1
+            while i < len(line) and line[i] in " \t":
+                i += 1
+            if i < len(line) and line[i] == "$":
+                i += 1
+            parsed = _scan_gsm8k_number(line, i)
+            if parsed is not None:
+                tail = line[parsed[0]:]
+                stripped = tail.strip().rstrip(".")
+                if stripped == "":
+                    return parsed[1]
+            pos = idx + 1
+    return None
+
+
+def _gsm8k_find_all_numbers(text: str) -> list[str]:
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        # Match starts at digit or '-<digit>'.
+        if text[i].isdigit() or (text[i] == "-" and i + 1 < n and text[i + 1].isdigit()):
+            parsed = _scan_gsm8k_number(text, i)
+            if parsed is not None:
+                out.append(parsed[1])
+                i = parsed[0]
+                continue
+        i += 1
+    return out
 
 _GSM8K_FEW_SHOT_DIALOG: list[tuple[str, str]] = [
     ("Janet's ducks lay 16 eggs per day. She eats three for breakfast "
@@ -208,20 +332,36 @@ _GSM8K_FEW_SHOT_DIALOG: list[tuple[str, str]] = [
 
 
 def _gsm8k_extract_gold(answer_text: str) -> str | None:
-    m = _GSM8K_GOLD_PATTERN.search(answer_text)
-    if m is None:
-        return None
-    return m.group(1).replace(",", "")
+    # GSM8K reference answers end with `#### <number>` on the last line.
+    return _gsm8k_find_after(answer_text, "####")
 
 
 def _gsm8k_extract_predicted(text: str) -> str | None:
-    for pat in _GSM8K_PRED_PATTERNS:
-        m = pat.search(text)
-        if m is not None:
-            return m.group(1).replace(",", "")
-    nums = _GSM8K_ANY_NUMBER.findall(text)
+    # Try each extraction strategy in turn, mirroring the prior list of
+    # six compiled regex patterns. See
+    # docs/regex_replacement_plans/gsm8k_predicted_extraction.md for the
+    # structurally better fix (LLM judge).
+    candidates = [
+        _gsm8k_find_boxed(text),
+        _gsm8k_find_after(text, "####"),
+        _gsm8k_find_after(text, "final answer",
+                            case_insensitive=True,
+                            require_dollar_prefix=True,
+                            skip_extra=("is", ":")),
+        _gsm8k_find_after(text, "the answer is",
+                            case_insensitive=True,
+                            require_dollar_prefix=True),
+        _gsm8k_find_after(text, "answer:",
+                            case_insensitive=True,
+                            require_dollar_prefix=True),
+        _gsm8k_eq_at_eol(text),
+    ]
+    for c in candidates:
+        if c is not None:
+            return c
+    nums = _gsm8k_find_all_numbers(text)
     if nums:
-        return nums[-1].replace(",", "")
+        return nums[-1]
     return None
 
 

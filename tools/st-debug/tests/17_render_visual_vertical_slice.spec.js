@@ -36,7 +36,7 @@ async function waitForReady(page) {
 async function ensureScringloImported(page) {
     const present = await page.evaluate(async () => {
         const ctx = window.SillyTavern.getContext();
-        return ctx.characters?.some(c => /scringlo/i.test(c?.name || ''));
+        return ctx.characters?.some(c => (c?.name || '').toLowerCase().includes('scringlo'));
     });
     if (present) return;
     const charPath = '/Users/mdot/metal-microbench/tools/st-debug/_data/default-user/characters/Scringlo.json';
@@ -64,14 +64,14 @@ async function ensureScringloImported(page) {
     });
     await page.waitForFunction(() => {
         const ctx = window.SillyTavern.getContext();
-        return ctx.characters?.some(c => /scringlo/i.test(c?.name || ''));
+        return ctx.characters?.some(c => (c?.name || '').toLowerCase().includes('scringlo'));
     }, { timeout: 15_000 });
 }
 
 async function selectScringlo(page) {
     await page.evaluate(async () => {
         const ctx = window.SillyTavern.getContext();
-        const idx = ctx.characters.findIndex(c => /scringlo/i.test(c?.name || ''));
+        const idx = ctx.characters.findIndex(c => (c?.name || '').toLowerCase().includes('scringlo'));
         if (idx < 0) throw new Error('Scringlo not found');
         if (String(ctx.characterId) !== String(idx)) {
             await ctx.selectCharacterById(idx);
@@ -79,7 +79,7 @@ async function selectScringlo(page) {
     });
     await page.waitForFunction(() => {
         const ctx = window.SillyTavern.getContext();
-        return /scringlo/i.test(ctx.characters?.[ctx.characterId]?.name || '');
+        return (ctx.characters?.[ctx.characterId]?.name || '').toLowerCase().includes('scringlo');
     }, { timeout: 15_000 });
 }
 
@@ -130,7 +130,7 @@ test.describe('render-visual vertical slice — Scringlo + 2-fork + 2-spawn + vi
 
         await page.waitForFunction(() => {
             const ctx = window.SillyTavern.getContext();
-            return ctx.chat?.length === 1 && /scringlo/i.test(ctx.chat[0]?.name || '');
+            return ctx.chat?.length === 1 && (ctx.chat[0]?.name || '').toLowerCase().includes('scringlo');
         }, { timeout: 15_000 });
 
         await page.screenshot({

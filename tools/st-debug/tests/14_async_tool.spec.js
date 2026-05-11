@@ -63,8 +63,16 @@ test.describe('async tool frontend fire-and-forget', () => {
 
         expect(elapsedMs, 'function tool action resolves with placeholder instead of slow result')
             .toBeLessThan(2000);
-        expect(String(result), 'placeholder text explains that the result is separate')
-            .toMatch(/Background|result will arrive separately/);
+        // toMatch(/Background|result will arrive separately/) — case-sensitive
+        // disjunction of two literal substrings.
+        {
+            const s = String(result);
+            const ok = s.includes('Background') ||
+                       s.includes('result will arrive separately');
+            expect(ok,
+                `placeholder text explains that the result is separate (saw '${s.slice(0, 200)}')`)
+                .toBe(true);
+        }
 
         const asyncMessage = await page.waitForFunction((idx) => {
             const ctx = window.SillyTavern?.getContext?.();

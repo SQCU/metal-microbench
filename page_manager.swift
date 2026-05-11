@@ -384,4 +384,35 @@ final class PageManager {
                      cachedHashes: contentIndex.count,
                      pagesInUse: numPoolPages - freeList.count)
     }
+
+    // Per-page diagnostic record (used by the engine-state endpoint that
+    // backs /v1/engine/state for the static visualizers). A page is
+    // returned IFF it has refcount > 0 (in-use) or carries a contentHash
+    // (cached + currently free, eligible for adoption). Pages that have
+    // never been touched are omitted to keep the snapshot small even
+    // when the pool is 8192 entries.
+    struct PageRecord {
+        let phys: Int                  // physical page index
+        let refcount: Int              // > 0 = in-use; 0 = free-but-cached
+        let contentHash: UInt64?       // FNV-1a digest of the tokens on this page
+        let pairMate: Int?             // companion phys page (slide + full sibling)
+    }
+
+    func livePageSnapshot() -> [PageRecord] {
+        var out: [PageRecord] = []
+        // Cap the snapshot to avoid pathological cases where every page
+        // is content-indexed; this is a visualization, not a forensic
+        // dump. 4096 covers the worst realistic case (full pool in use
+        // or fully cached) without producing megabyte-sized payloads.
+        let cap = 4096
+        for phys in basePage..<(basePage + numPoolPages) {
+            let p = pages[phys]
+            if p.refcount == 0 && p.contentHash == nil { continue }
+            out.append(PageRecord(phys: phys, refcount: p.refcount,
+                                   contentHash: p.contentHash,
+                                   pairMate: p.pairMate))
+            if out.count >= cap { break }
+        }
+        return out
+    }
 }

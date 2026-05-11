@@ -77,14 +77,20 @@ test.describe('extended-thinking toolcard direct invoke', () => {
         expect(result.used_caller_messages, 'caller context flag').toBe(true);
         expect(result.summary, 'summary is non-empty').toEqual(expect.any(String));
         expect(result.summary.trim().length, 'summary is non-empty').toBeGreaterThan(0);
-        expect(result.summary, 'summary references inherited budget/value context')
-            // The descendant proves grounding in the caller_messages by
-            // referring to ANY of the three cities the parent named
-            // (Tokyo / Reykjavik / Buenos Aires) or the budget-context
-            // keywords (cost / value / budget). The model's exact
-            // phrasing varies; what matters is that one of these
-            // context-derived tokens appears.
-            .toMatch(/Tokyo|Reykjavik|Buenos|cost|value|budget/i);
+        // The descendant proves grounding in the caller_messages by
+        // referring to ANY of the three cities the parent named
+        // (Tokyo / Reykjavik / Buenos Aires) or the budget-context
+        // keywords (cost / value / budget). The model's exact phrasing
+        // varies; what matters is that one of these context-derived
+        // tokens appears. Plain-string equivalent of
+        // toMatch(/Tokyo|Reykjavik|Buenos|cost|value|budget/i).
+        {
+            const lower = (result.summary || '').toLowerCase();
+            const keywords = ['tokyo', 'reykjavik', 'buenos', 'cost', 'value', 'budget'];
+            const found = keywords.some(k => lower.includes(k));
+            expect(found,
+                'summary references inherited budget/value context').toBe(true);
+        }
         expect(result.reasoning_full, 'reasoning_full is present').toEqual(expect.any(String));
         expect(
             result.reasoning_full.trim().length,

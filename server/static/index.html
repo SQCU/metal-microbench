@@ -17,6 +17,7 @@
   header { padding: 0.7em 1.2em; border-bottom: 1px solid #222; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.6em; flex: none; }
   header h1 { margin: 0; font-size: 1rem; font-weight: 500; color: #6a9; }
   header .status { font-size: 0.78rem; color: #888; }
+  header a { color:#6a9; text-decoration:none; margin-left:0.8em; }
   .launcher {
     display: flex; gap: 0.8em; align-items: center;
     padding: 0.6em 1em; border-bottom: 1px solid #222; flex: none;
@@ -67,25 +68,19 @@
   }
   button.ask:disabled { background: #333; color: #888; cursor: not-allowed; }
   .meta { font-size: 0.7rem; color: #888; margin-left: auto; }
-  /* Output scrolls internally; fade gradients at top/bottom hint there's
-     more text above/below when the pane is tall enough to overflow. We
-     set min-height:0 on flex parents so this div's flex:1 actually shrinks
-     rather than forcing the pane to grow past the viewport. */
   .output {
     position: relative;
     flex: 1 1 0; min-height: 0; overflow-y: auto;
     background: #0a0a0a; border: 1px solid #222; border-radius: 3px;
     padding: 0.5em; white-space: pre-wrap; word-wrap: break-word;
     font-size: 0.8rem; line-height: 1.35;
-    /* CSS mask: fade the top/bottom 1em of visible area so long outputs
-       feel "shimmery" — communicates overflow without chrome. */
     mask-image: linear-gradient(to bottom, transparent 0, #000 1em, #000 calc(100% - 1em), transparent 100%);
     -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 1em, #000 calc(100% - 1em), transparent 100%);
   }
   .output:empty { mask-image: none; -webkit-mask-image: none; }
   .output:empty::before { content: '(output streams here)'; color: #444; }
   .kvstrip { display: flex; flex-wrap: wrap; gap: 2px; padding: 0.3em; background: #0a0a0a; border: 1px solid #222; border-radius: 3px; min-height: 1.6em; font-size: 0.7rem; }
-  .kvstrip .label { color: #666; margin-right: 0.4em; align-self: center; }
+  .kvstrip .label { color: #666; margin-right: 0.4em; align-self: center; white-space: nowrap; }
   .kvstrip .cell {
     width: 0.7em; height: 0.7em; border-radius: 2px; background: #222; flex: none;
   }
@@ -106,7 +101,7 @@
   .bwpanel h3 .legend .swatch { display: inline-block; width: 0.8em; height: 0.8em; vertical-align: middle; margin-right: 0.2em; border-radius: 1px; }
   .bwpanel canvas { width: 100%; height: 140px; display: block; background: #050505; border: 1px solid #222; border-radius: 3px; }
   .bwpanel .counters {
-    display: grid; grid-template-columns: repeat(5, 1fr); gap: 0.5em;
+    display: grid; grid-template-columns: repeat(6, 1fr); gap: 0.5em;
     margin-top: 0.4em; font-size: 0.75rem; color: #888;
   }
   .bwpanel .counters div { padding: 0.25em 0.5em; background: #0a0a0a; border: 1px solid #222; border-radius: 3px; }
@@ -118,16 +113,15 @@
   <h1>gemma metal bridge — tetraplex (4 streams, 1 GPU)</h1>
   <div>
     <span class="status" id="status">checking…</span>
-    <a href="/" style="color:#6a9;text-decoration:none;margin-left:0.8em">← clients</a>
-    <a href="/labeler" style="color:#6a9;text-decoration:none;margin-left:0.8em">labeler</a>
-    <a href="/loom" style="color:#6a9;text-decoration:none;margin-left:0.8em">loom</a>
-    <a href="/compare" style="color:#6a9;text-decoration:none;margin-left:0.8em">compare</a>
-    <a href="/steering" style="color:#6a9;text-decoration:none;margin-left:0.8em">steering</a>
+    <a href="/static/clients.html">← clients</a>
+    <a href="/static/labeler.html">labeler</a>
+    <a href="/static/loom.html">loom</a>
+    <a href="/static/steering.html">steering</a>
   </div>
 </header>
 <div class="launcher">
   <button class="launchAll" id="launchAll" onclick="launchAll()">launch all 4</button>
-  <span class="hint">fires every pane simultaneously — watch the bandwidth chart ramp as they settle into the B=4 batched AR step</span>
+  <span class="hint">fires every pane simultaneously — watch the bandwidth chart ramp as they settle into the B=4 batched AR step. KV tenancy strips are populated from <code>/v1/engine/state</code> at 2 Hz.</span>
 </div>
 <main class="grid">
   <div class="pane" id="paneA">
@@ -214,6 +208,7 @@
     <div>C: <strong id="ctrC">0 tok @ 0.0 tok/s</strong></div>
     <div>D: <strong id="ctrD">0 tok @ 0.0 tok/s</strong></div>
     <div>Σ: <strong id="ctrAgg">0 tok @ 0.0 tok/s</strong></div>
+    <div>engine: <strong id="engineMeta">—</strong></div>
   </div>
 </div>
 
@@ -222,19 +217,20 @@
 const PANES = ['A', 'B', 'C', 'D'];
 const paneColor = {A: '#5cf', B: '#fa3', C: '#8f5', D: '#f69'};
 const imgData = {A: null, B: null, C: null, D: null};
-const paneSid = {A: null, B: null, C: null, D: null};
-// Each pane records per-chunk arrival times + token counts. We derive
-// tokens/sec via a sliding window (500 ms) during render.
-const arrivals = {A: [], B: [], C: [], D: []};   // {t: performance.now(), n: int}
+// Pane → engine usage from the SSE terminal usage chunk (cache_hits,
+// cache_misses, vision_cache_hits, prompt/completion tokens). This is
+// the per-completion telemetry that lives on the OAI usage block — no
+// /v1/kv/snapshot polling needed for these.
+const paneUsage = {A: null, B: null, C: null, D: null};
+const arrivals = {A: [], B: [], C: [], D: []};
 
 // --- health poll ---
 async function pollHealth() {
   try {
     const r = await fetch('/health');
     const j = await r.json();
-    const cache = j.vision_cache || {entries:0, hits:0, misses:0};
     document.getElementById('status').textContent =
-      `${j.status} · ${j.model} · ${j.active_sessions} session${j.active_sessions===1?'':'s'} · cache ${cache.entries}e/${cache.hits}h/${cache.misses}m`;
+      `${j.status} · ${j.model} · ${j.active_streams} active · ${j.cached_pages} cached · ${j.free_pages} free pages`;
   } catch (e) {
     document.getElementById('status').textContent = `down: ${e.message}`;
   }
@@ -272,7 +268,8 @@ async function ask(which) {
   oEl.textContent = '';
   btn.disabled = true;
   meta.textContent = 'streaming…';
-  arrivals[which] = [];  // reset per-stream timeline
+  arrivals[which] = [];
+  paneUsage[which] = null;
 
   const t0 = performance.now();
   let firstTokAt = null, tokenCount = 0;
@@ -292,7 +289,7 @@ async function ask(which) {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
-        model: 'gemma-4-a4b-q4km',
+        model: 'gemma-4-a4b',
         messages: [{ role: 'user', content }],
         max_tokens: 256,
         stream: true,
@@ -302,10 +299,6 @@ async function ask(which) {
       oEl.textContent = `(http ${res.status}) ${await res.text()}`;
       return;
     }
-    const sidHeader = res.headers.get('X-Gemma-Session-Id');
-    paneSid[which] = sidHeader ? parseInt(sidHeader, 10) : null;
-    if (paneSid[which] !== null) kvPoll();
-
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
@@ -331,13 +324,23 @@ async function ask(which) {
               oEl.textContent += delta;
               oEl.scrollTop = oEl.scrollHeight;
             }
+            // Terminal SSE chunk carries usage. Capture it for the
+            // per-pane completion summary (cache_hits/misses come from
+            // here — same numbers SillyTavern would see).
+            if (j.usage) paneUsage[which] = j.usage;
           } catch (e) { /* partial json */ }
         }
       }
     }
     const wall = (performance.now() - t0) / 1000;
     const ttft = firstTokAt ? ((firstTokAt - t0) / 1000).toFixed(2) : '?';
-    meta.textContent = `ttft=${ttft}s · ${tokenCount} chunks in ${wall.toFixed(2)}s`;
+    const u = paneUsage[which] || {};
+    const usageBits = [];
+    if (u.completion_tokens != null) usageBits.push(`${u.completion_tokens} compl`);
+    if (u.prompt_tokens != null) usageBits.push(`${u.prompt_tokens} prompt`);
+    if (u.cache_hits != null) usageBits.push(`${u.cache_hits}/${u.cache_hits + u.cache_misses} cached`);
+    if (u.vision_cache_hits) usageBits.push(`${u.vision_cache_hits} vis-hit`);
+    meta.textContent = `ttft=${ttft}s · ${tokenCount} tok in ${wall.toFixed(2)}s · ${usageBits.join(' · ')}`;
   } finally {
     btn.disabled = false;
   }
@@ -347,8 +350,6 @@ async function ask(which) {
 async function launchAll() {
   const btn = document.getElementById('launchAll');
   btn.disabled = true;
-  // Reset the global timeline anchor + y-axis high-water so each run starts
-  // with a fresh frame of reference.
   chartStart = performance.now();
   yMaxHigh = 60;
   try {
@@ -358,68 +359,69 @@ async function launchAll() {
   }
 }
 
-// --- KV snapshot poll loop (unchanged from 2-pane version) ---
-let kvPolling = false;
-async function kvPoll() {
-  if (kvPolling) return;
-  kvPolling = true;
+// --- engine-state poll loop (replaces the old /v1/kv/snapshot poller) ---
+// Polls /v1/engine/state at 2 Hz; renders the KV tenancy strips and
+// updates the global engine meta line. The endpoint reports every live
+// phys page (refcount > 0) plus cached-but-free pages; the strip groups
+// pages by their refcount color (own / 2-way shared / 3+ shared).
+async function enginePoll() {
   try {
-    while (true) {
-      let snap;
-      try {
-        snap = await (await fetch('/v1/kv/snapshot')).json();
-      } catch (e) {
-        await new Promise(r => setTimeout(r, 300)); continue;
-      }
-      renderKv(snap);
-      const anyAlive = PANES.some(
-        p => paneSid[p] !== null && snap.sessions.some(s => s.sid === paneSid[p]));
-      if (!anyAlive) break;
-      await new Promise(r => setTimeout(r, 300));
-    }
-  } finally {
-    kvPolling = false;
-  }
+    const snap = await (await fetch('/v1/engine/state')).json();
+    renderEngineState(snap);
+  } catch {}
 }
+setInterval(enginePoll, 500);
+enginePoll();
 
-function renderKv(snapshot) {
+function renderEngineState(snap) {
+  // Update the engine meta line in the counters row.
+  const e = snap.engine || {};
+  const kv = snap.kv_cache || {};
+  const meta = `${snap.active_streams?.length || 0} streams · ${kv.pages_in_use}/${kv.total_pages} pages in use · ${kv.cached_pages} cached · ${e.total_steps} steps`;
+  document.getElementById('engineMeta').textContent = meta;
+
+  // For tenancy strips, render the global page set color-coded by
+  // refcount in each pane's strip. The pane association is loose (we
+  // don't know which pane owns which page — that'd need per-page owner
+  // tracking the engine doesn't expose), so each strip shows the SAME
+  // global tenancy view. The per-pane meta line above already carries
+  // each completion's cache_hits/misses from the OAI usage block.
+  const pages = (kv.pages || []).filter(p => p.refcount > 0);
   for (const pane of PANES) {
     const strip = document.getElementById(`kv${pane}`);
-    const sid = paneSid[pane];
-    if (sid === null) { strip.innerHTML = '<span class="label">kv pages:</span>'; continue; }
-    const sess = snapshot.sessions.find(s => s.sid === sid);
-    if (!sess) continue;  // keep last render during session gap
-    strip.innerHTML = '<span class="label">kv pages:</span>';
+    strip.innerHTML = '';
     const label = document.createElement('span');
     label.className = 'label';
-    label.textContent = `s${sid} · ${sess.state} · ${sess.position} tok · ${sess.page_count} pages (${sess.shared_count} shared)`;
+    label.textContent = `kv pages (global): ${pages.length} in-use, ${kv.cached_pages} cached`;
     strip.appendChild(label);
-    for (const p of sess.pages) {
+    // Render up to ~200 cells per strip to keep DOM cost bounded.
+    const shown = pages.slice(0, 200);
+    for (const p of shown) {
       const cell = document.createElement('div');
       cell.className = 'cell';
       if (p.refcount >= 3) cell.classList.add('shr3p');
       else if (p.refcount >= 2) cell.classList.add('shr2');
       else cell.classList.add('own');
-      const others = p.shared_with.length ? ` · shared with s${p.shared_with.join(',s')}` : '';
-      cell.title = `phys ${p.phys}${others}`;
+      cell.title = `phys ${p.phys} · refcount=${p.refcount}${p.hash ? ' · hash=' + p.hash.slice(0,8) : ''}`;
       strip.appendChild(cell);
+    }
+    if (pages.length > 200) {
+      const more = document.createElement('span');
+      more.className = 'label';
+      more.style.color = '#444';
+      more.textContent = ` +${pages.length - 200} more`;
+      strip.appendChild(more);
     }
   }
 }
 
 // --- bandwidth chart ---
 let chartStart = performance.now();
-// High-water mark for the y-axis: grows with instantaneous peaks, decays
-// slowly after streams finish so the plateau stays visible instead of
-// collapsing to the floor the moment every stream hits .done. Re-set to
-// 60 when the user relaunches from zero so an idle reset doesn't keep
-// old peaks around indefinitely.
 let yMaxHigh = 60;
 const chart = document.getElementById('bwChart');
 const cctx = chart.getContext('2d');
 
 function bandwidthAt(pane, now, windowMs = 500) {
-  // Count tokens arrived in [now - windowMs, now]. Rate = count / (windowMs/1000).
   const arr = arrivals[pane];
   let n = 0;
   for (let i = arr.length - 1; i >= 0; i--) {
@@ -445,18 +447,11 @@ function drawChart() {
   const W = cssW, H = cssH;
   cctx.clearRect(0, 0, W, H);
 
-  // X axis: 0 .. historyMs ms. History slides if elapsed > historyMs.
   const now = performance.now();
   const historyMs = 30000;
   const elapsedMs = now - chartStart;
   const xStart = Math.max(0, elapsedMs - historyMs);
   const xEnd = Math.max(historyMs, elapsedMs);
-  // Y axis: grows with the peak aggregate rate across the whole visible
-  // window, and decays slowly (~0.4%/frame ≈ 25%/sec at 60fps) once the
-  // streams finish and rates fall. Without the decay floor, the chart
-  // would re-scale to ~60 the moment gen ends and the historical plateau
-  // would be invisible. With it, the shape of "ramp → plateau → fall"
-  // stays readable for the full 30-second window.
   let peak = 60;
   for (let tMs = xStart; tMs <= elapsedMs; tMs += 250) {
     const tAbs = chartStart + tMs;
@@ -467,7 +462,6 @@ function drawChart() {
   yMaxHigh = Math.max(peak, yMaxHigh * 0.996);
   const yMax = Math.ceil(yMaxHigh / 20) * 20;
 
-  // Grid.
   cctx.strokeStyle = '#1a1a1a'; cctx.lineWidth = 1;
   for (let y = 0; y <= yMax; y += yMax / 4) {
     const py = H - (y / yMax) * H;
@@ -476,7 +470,6 @@ function drawChart() {
     cctx.fillText(y + ' tok/s', 4, py - 2);
   }
 
-  // Sample resolution: 1 pixel = one x sample.
   const samples = W;
   function tMsFor(i) { return xStart + (i / (samples - 1)) * (xEnd - xStart); }
 
@@ -494,7 +487,6 @@ function drawChart() {
     cctx.stroke();
   }
 
-  // Aggregate (sum of all 4) first, behind.
   cctx.beginPath();
   cctx.strokeStyle = 'rgba(204,204,204,0.35)';
   cctx.lineWidth = 2;
@@ -508,13 +500,11 @@ function drawChart() {
   }
   cctx.stroke();
 
-  // Individual lines.
   plot('A', paneColor.A);
   plot('B', paneColor.B);
   plot('C', paneColor.C);
   plot('D', paneColor.D);
 
-  // Update counters.
   let aggTok = 0, aggRate = 0;
   for (const p of PANES) {
     const tok = totalTokens(p);

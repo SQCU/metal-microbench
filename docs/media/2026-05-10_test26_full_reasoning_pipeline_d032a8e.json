@@ -1,0 +1,47 @@
+{
+  "turn1": {
+    "mes_len": 417,
+    "mes_head": "ooooh math time!! *scribbles frantically on a tiny napkin* let's see... we HAVE to get one of each first, right? so... $2 (pen) + $4 (notebook) + $9 (calculator) = $15. phew! we still have $2 left in ",
+    "reasoning_len": 2078,
+    "reasoning_head": "*   User wants to maximize the total number of items with a $17 budget.\n    *   Items/Prices: Pens ($2), Notebooks ($4), Calculator ($9).\n    *   Constraint: At least 1 of each item must be bought.\n  ",
+    "reasoning_starts_with_thought_prefix": false,
+    "reasoning_summary": "maximizing item count within a seventeen dollar budget",
+    "summary_via_poll": "maximizing item count within a seventeen dollar budget"
+  },
+  "turn2": {
+    "mes_len": 527,
+    "reasoning_len": 0,
+    "reasoning_summary": null,
+    "summary_via_poll": null
+  },
+  "turn2_request_forwards_reasoning": true,
+  "collapsible_headings": [
+    "\n                                    Thinking...\n                                    \n                                ",
+    "\n                                    Thinking...\n                                    \n                                ",
+    "\n                                    \n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \nmaximizing item count within a seventeen dollar budget\n                                    \n                                ",
+    "\n                                    Thinking...\n                                    \n                                ",
+    "\n                                    \n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \nThinking...\n                                    \n                                "
+  ],
+  "browser_console": [
+    {
+      "type": "warning",
+      "text": "No input elements found for key: api_key_comfy_runpod"
+    },
+    {
+      "type": "warning",
+      "text": "Unsupported language: en-us"
+    },
+    {
+      "type": "warning",
+      "text": "Failed to insert focus rule: SyntaxError: Failed to execute 'insertRule' on 'CSSStyleSheet': Failed to parse the rule '::-webkit-scrollbar-track:focus-visible { background-color: rgba(126, 126, 126, 0.2); }'.\n    at obj.<computed> [as insertRule] (<anonymous>:108:31)\n    at http://127.0.0.1:8002/scripts/dynamic-styles.js:144:34\n    at Array.forEach (<anonymous>)\n    at applyDynamicFocusStyles (http://127.0.0.1:8002/scripts/dynamic-styles.js:117:16)\n    at http://127.0.0.1:8002/scripts/dynamic-styles.js:192:13\n    at Array.forEach (<anonymous>)\n    at initDynamicStyles (http://127.0.0.1:8002/scripts/dynamic-styles.js:190:38)\n    at firstLoadInit (http://127.0.0.1:8002/script.js:751:5)\n    at async HTMLDocument.<anonymous> (http://127.0.0.1:8002/script.js:12599:5)"
+    },
+    {
+      "type": "warning",
+      "text": "Stream stats: 771 tokens, 24.97 seconds, rate: 30.87 TPS"
+    },
+    {
+      "type": "warning",
+      "text": "Stream stats: 173 tokens, 4.72 seconds, rate: 36.64 TPS"
+    }
+  ]
+}

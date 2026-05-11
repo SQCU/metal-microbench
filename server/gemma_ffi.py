@@ -96,6 +96,9 @@ _lib.gemma_register_resource.restype = C.c_int32
 _lib.gemma_max_q_len.argtypes = []
 _lib.gemma_max_q_len.restype = C.c_int32
 
+_lib.gemma_engine_state.argtypes = [C.POINTER(C.c_uint8), C.c_int32]
+_lib.gemma_engine_state.restype = C.c_int32
+
 
 # ----------------------------------------------------------------------
 # Stream / sampling / segment dataclasses (Python-side shape).
@@ -162,7 +165,7 @@ class Segment:
 class StreamSpec:
     stream_id: int
     action: int                        # 0=start, 1=continue, 2=cancel, 3=touch
-    flags: int = 0                     # bit 0 = capture_logits
+    flags: int = 0                     # bit 0 = capture_logits, bit 1 = enable_thinking, bit 2 = capture_cvec_activations
     segments: list[Segment] = field(default_factory=list)
     sampling: SamplingParams = field(default_factory=SamplingParams)
     # Convenience: pass tokens=[...] in lieu of segments=[Segment(...)].
@@ -191,6 +194,21 @@ class StreamUpdate:
     cache_misses: int
     vision_cache_hits: int
     logprobs: list[TokenLogprob] = field(default_factory=list)
+    # Thinking-channel tokens drained from the engine's per-session
+    # thinkingQueue this poll. Populated only when the StreamSpec was
+    # submitted with flags bit 1 set (enable_thinking). Bridge surfaces
+    # these as `reasoning_content` on the OAI-shape response.
+    new_thinking_tokens: list[int] = field(default_factory=list)
+    # Per-(ActiveControl, AR-step) records drained from the engine's
+    # per-session cvecActivationsQueue this poll. Populated only when
+    # the StreamSpec was submitted with flags bit 2 set
+    # (capture_cvec_activations). Each tuple is
+    #   (token_position, layer, magnitude)
+    # where magnitude is the float scalar the apply kernel saw on that
+    # step. Bridge surfaces these as
+    # `choices[0].delta.cvec_activations` in the SSE stream.
+    new_cvec_activations: list[tuple[int, int, float]] = field(
+        default_factory=list)
 
 
 @dataclass
@@ -327,8 +345,22 @@ def _encode_request(streams: list[StreamSpec]) -> bytes:
                 id_bytes = cv.cvec_id.encode("utf-8")
                 id_off = heap_base + len(heap)
                 heap += id_bytes
+                # Wire layout (64 bytes total) — must match Swift's
+                # DecodedCV decoder in ffi_batch.swift around line 264:
+                #   off+0..3   idOff (u32)
+                #   off+4..7   idLen (u32)
+                #   off+8..11  layer (i32)
+                #   off+12..35 6 floats: polarity, peak_magnitude,
+                #              attack, decay, sustain_level, release
+                #   off+36..39 BBBx: shape, units, mode, pad
+                #   off+40..51 3 floats: target, transport_scale, transport_offset
+                #   off+52..63 12-byte trailing pad
+                # The format historically had 7 `f` slots (one extra) and
+                # the assert was unreachable because the bridge gated
+                # `controls` at HTTP 501; fixed alongside enabling that
+                # gate 2026-05-10.
                 cv_struct = struct.pack(
-                    "<IIifffffffBBBxfff12x",
+                    "<IIiffffffBBBxfff12x",
                     id_off, len(id_bytes),
                     int(cv.layer),
                     float(cv.polarity), float(cv.peak_magnitude),
@@ -384,17 +416,27 @@ def _decode_response(buf: bytes) -> list[StreamUpdate]:
     magic, version, count, heap_off = struct.unpack_from("<IIII", buf, 0)
     if magic != _MAGIC_RESP:
         raise ValueError(f"bad response magic 0x{magic:08x}")
-    if version != 1:
+    # Wire format v2 (2026-05-10): 72-byte slot, last 8 bytes carry the
+    # cvec_activations count + heap offset. v1 was 64-byte slots without
+    # that tail. We pin the version to catch desynchronized clients.
+    if version != 2:
         raise ValueError(f"bad response version {version}")
     out: list[StreamUpdate] = []
     for i in range(count):
-        base = 16 + i * 64
+        base = 16 + i * 72
         (sid, state, done_reason, _r,
          nt_count, nt_off, err_count, err_off,
          pts, cte, ch, cm, vch,
          lp_bytes, lp_off,
-         _r1, _r2) = struct.unpack_from("<QBBHIIIIIIIIIIIII", buf, base)
+         tt_count, tt_off,
+         ca_count, ca_off) = struct.unpack_from("<QBBHIIIIIIIIIIIIIII", buf, base)
         toks = list(struct.unpack_from(f"<{nt_count}I", buf, nt_off)) if nt_count else []
+        thinking_toks = list(struct.unpack_from(f"<{tt_count}I", buf, tt_off)) if tt_count else []
+        cvec_acts: list[tuple[int, int, float]] = []
+        if ca_count:
+            for k in range(ca_count):
+                tp, ly, mg = struct.unpack_from("<IIf", buf, ca_off + k * 12)
+                cvec_acts.append((tp, ly, mg))
         msg = bytes(buf[err_off:err_off + err_count]).decode("utf-8", errors="replace") if err_count else ""
         lps: list[TokenLogprob] = []
         cur, end = lp_off, lp_off + lp_bytes
@@ -411,6 +453,8 @@ def _decode_response(buf: bytes) -> list[StreamUpdate]:
             prompt_tokens_seen=pts, completion_tokens_emitted=cte,
             cache_hits=ch, cache_misses=cm, vision_cache_hits=vch,
             logprobs=lps,
+            new_thinking_tokens=thinking_toks,
+            new_cvec_activations=cvec_acts,
         ))
     return out
 
@@ -527,6 +571,34 @@ def max_q_len() -> int:
     """Engine-side cap on a single teacher-forced eval call (in tokens).
     Longer corpora are stride-windowed by the caller."""
     return _lib.gemma_max_q_len()
+
+
+_ENGINE_STATE_BUF_CAPACITY: int = 256 * 1024  # 256 KB initial; doubles on -ENOSPC
+_ENGINE_STATE_BUF = (C.c_uint8 * _ENGINE_STATE_BUF_CAPACITY)()
+
+
+def engine_state() -> dict:
+    """JSON snapshot of engine internals (KV cache page tenancy, vision
+    cache, active streams). Used by the /v1/engine/state HTTP endpoint
+    that backs the engine-visualizer static clients.
+
+    Polling-friendly: the FFI call holds the engine lock briefly to
+    walk the page array + active streams; runs in O(active_streams +
+    live_pages). At our pool sizes (8192 pages, ≤8 active streams) the
+    payload is < 256 KB and the walk completes in well under 5 ms.
+    """
+    global _ENGINE_STATE_BUF, _ENGINE_STATE_BUF_CAPACITY
+    import json as _json
+    while True:
+        n = _lib.gemma_engine_state(_ENGINE_STATE_BUF, _ENGINE_STATE_BUF_CAPACITY)
+        if n == _ENOSPC:
+            _ENGINE_STATE_BUF_CAPACITY *= 2
+            _ENGINE_STATE_BUF = (C.c_uint8 * _ENGINE_STATE_BUF_CAPACITY)()
+            continue
+        if n < 0:
+            raise RuntimeError(f"gemma_engine_state returned {n}")
+        raw = bytes(_ENGINE_STATE_BUF[:n])
+        return _json.loads(raw.decode("utf-8"))
 
 
 def status() -> ServerStats:

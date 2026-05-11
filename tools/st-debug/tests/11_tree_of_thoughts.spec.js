@@ -104,15 +104,23 @@ test.describe('tree-of-thoughts toolcard direct invoke', () => {
             expectNonEmptyString(branch.summary, `summary for ${branch.label}`);
         }
 
-        const contextRe = /Tokyo|Reykjavik|Buenos|cost|value|budget/i;
+        // Plain-string equivalent of /Tokyo|Reykjavik|Buenos|cost|value|budget/i:
+        // case-fold and check any keyword appears as a substring.
+        const CONTEXT_KEYWORDS = ['tokyo', 'reykjavik', 'buenos',
+                                    'cost', 'value', 'budget'];
+        const hasContext = (s) => {
+            const lo = (s || '').toLowerCase();
+            return CONTEXT_KEYWORDS.some(k => lo.includes(k));
+        };
         const groundedBranches = result.branches.filter(branch =>
-            contextRe.test(`${branch.reasoning}\n${branch.summary}`),
+            hasContext(`${branch.reasoning}\n${branch.summary}`),
         );
         expect(groundedBranches.length, 'at least two branches reference inherited context')
             .toBeGreaterThanOrEqual(2);
 
         expectNonEmptyString(result.synthesis, 'synthesis is non-empty');
-        expect(result.synthesis, 'synthesis references inherited context').toMatch(contextRe);
+        expect(hasContext(result.synthesis),
+            'synthesis references inherited context').toBe(true);
 
         const reasonings = result.branches.map(branch => branch.reasoning.trim());
         expect(new Set(reasonings).size, 'branch reasonings are distinct')

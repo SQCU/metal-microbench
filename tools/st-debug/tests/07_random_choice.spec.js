@@ -60,9 +60,26 @@ function sampledItems(result) {
         .filter(part => part?.type === 'text' && typeof part.text === 'string')
         .map(part => part.text)
         .join('\n');
-    return text
-        .split(/Selected \d+ item\(s\): /)
-        .pop()
+    // Find the last 'Selected <N> item(s): ' header and take everything
+    // after it. Plain-string equivalent of
+    //   text.split(/Selected \d+ item\(s\): /).pop()
+    // without regex. The format is emitted by the random-choice
+    // toolcard verbatim — see toolcards/random-choice/service.py.
+    const PREFIX = 'Selected ';
+    const SUFFIX = ' item(s): ';
+    let cursor = 0;
+    let tail = text;          // fall-through if no match found
+    while (true) {
+        const a = text.indexOf(PREFIX, cursor);
+        if (a < 0) break;
+        let b = a + PREFIX.length;
+        while (b < text.length && text[b] >= '0' && text[b] <= '9') b++;
+        if (b === a + PREFIX.length) { cursor = a + 1; continue; }
+        if (!text.startsWith(SUFFIX, b)) { cursor = a + 1; continue; }
+        tail = text.slice(b + SUFFIX.length);
+        cursor = b + SUFFIX.length;
+    }
+    return tail
         .split(',')
         .map(s => s.trim())
         .filter(Boolean);

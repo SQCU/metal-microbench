@@ -424,6 +424,24 @@ private func applyStreamAction(_ stream: DecodedStream, engine: LmEngine) {
             initParams.captureLogits = true
             initParams.topLogprobs = stream.sampling.topLogprobs
         }
+        if (stream.flags & 0x02) != 0 {
+            // bit 1 = enable_thinking. Routes channel-block content
+            // to the per-session thinkingQueue so the bridge can
+            // surface it as `reasoning_content` in the OAI response.
+            initParams.enableThinking = true
+        }
+        if (stream.flags & 0x04) != 0 {
+            // bit 2 = capture_cvec_activations. Per AR step, each
+            // ActiveControl on the session pushes (token_position,
+            // layer, magnitude) onto Session.cvecActivationsQueue;
+            // the FFI pump drains it and the bridge surfaces the
+            // records as `choices[0].delta.cvec_activations` in the
+            // SSE stream. When this bit is clear the queue stays
+            // untouched and the apply path is bit-identical to
+            // pre-instrumentation behavior (validated by
+            // tools/cvec_validation/baseline_logprobs.py).
+            initParams.captureCvecActivations = true
+        }
         initParams.logitBiasDense = denseLogitBias(stream.sampling.logitBias)
         initParams.minP = max(0, min(1, stream.sampling.minP))
         initParams.stopSequences = stream.sampling.stopSequences
@@ -721,11 +739,28 @@ private func submitImageSegment(_ s: Session, imageBytes: Data) {
 // Streams with no progress since last poll are omitted to keep the response
 // compact. The bridge re-derives state for those streams as "no change."
 // ----------------------------------------------------------------------
+// Per-(step, control) cvec activation record. 12 bytes on the wire.
+//   token_position : UInt32   — session-local AR token index when the
+//                                control fired (i.e. the index of the
+//                                generated token whose forward pass had
+//                                this magnitude applied to its residual)
+//   layer          : UInt32   — LM injection layer the control targets
+//   magnitude      : Float32  — scalar passed to the apply kernel
+//                                (envelope(t)·polarity for additive;
+//                                target value for project/transport)
+struct CvecActivationRecord {
+    var tokenPosition: UInt32
+    var layer: UInt32
+    var magnitude: Float
+}
+
 private struct StreamUpdateOut {
     var streamId: UInt64
     var state: UInt8
     var doneReason: UInt8
     var newTokens: [UInt32]
+    var newThinkingTokens: [UInt32]
+    var newCvecActivations: [CvecActivationRecord]
     var errMsg: String
     var promptTokensSeen: UInt32
     var completionTokensEmitted: UInt32
@@ -738,21 +773,29 @@ private struct StreamUpdateOut {
 private func encodeBatchResponse(_ updates: [StreamUpdateOut]) -> Data {
     var w = BinWriter()
     w.u32(0x52454D47) // 'GEMR' (little-endian: 0x47 0x4D 0x45 0x52 → "GEMR")
-    w.u32(1) // version
+    // Wire format version 2 (2026-05-10): slot grew from 64 → 72 bytes
+    // to make room for cvec_activation count + heap offset. v1 had
+    // 8 reserved bytes at the tail of the slot; v1.5 (intra-day)
+    // repurposed those for thinking tokens; v2 adds another 8 for
+    // cvec activations. Python decoder pins the version + slot size
+    // together so a stale client reading new bytes can't silently
+    // mis-parse: it raises bad-version on read.
+    w.u32(2) // version
     w.u32(UInt32(updates.count))
     let heapOffsetSlot = w.count
     w.u32(0) // patched after we know array end
 
     // Reserve fixed-size StreamUpdate slots; record offsets to backfill heap.
     let updateBase = w.count
-    w.zeros(updates.count * 64)
+    let slotBytes = 72
+    w.zeros(updates.count * slotBytes)
 
     // Heap starts now.
     let heapStart = w.count
     w.patchU32(at: heapOffsetSlot, UInt32(heapStart))
 
     for (i, u) in updates.enumerated() {
-        let off = updateBase + i * 64
+        let off = updateBase + i * slotBytes
         var fix = BinWriter()
         fix.u64(u.streamId)
         fix.u8(u.state)
@@ -773,10 +816,26 @@ private func encodeBatchResponse(_ updates: [StreamUpdateOut]) -> Data {
         fix.u32(0)
         let lpOffSlot = fix.count
         fix.u32(0)
-        fix.zeros(8)
+        // Thinking-channel tokens (slot bytes 56..63 in v1.5; v2 same).
+        fix.u32(UInt32(u.newThinkingTokens.count))
+        let thinkOffSlot = fix.count
+        fix.u32(0)
+        // Cvec activations (slot bytes 64..71, new in v2). Each record
+        // is 12 bytes (token_position u32, layer u32, magnitude f32).
+        fix.u32(UInt32(u.newCvecActivations.count))
+        let cvecActOffSlot = fix.count
+        fix.u32(0)
 
         let newToksHeapOff = w.count
         for t in u.newTokens { w.u32(t) }
+        let thinkToksHeapOff = w.count
+        for t in u.newThinkingTokens { w.u32(t) }
+        let cvecActHeapOff = w.count
+        for rec in u.newCvecActivations {
+            w.u32(rec.tokenPosition)
+            w.u32(rec.layer)
+            w.f32(rec.magnitude)
+        }
         let errMsgHeapOff = w.count
         if !u.errMsg.isEmpty {
             w.bytes(Array(u.errMsg.utf8))
@@ -811,8 +870,14 @@ private func encodeBatchResponse(_ updates: [StreamUpdateOut]) -> Data {
         var lo = UInt32(lpHeapOff)
         fixData.replaceSubrange(lpOffSlot..<(lpOffSlot+4),
                                 with: Data(bytes: &lo, count: 4))
+        var tho = UInt32(thinkToksHeapOff)
+        fixData.replaceSubrange(thinkOffSlot..<(thinkOffSlot+4),
+                                with: Data(bytes: &tho, count: 4))
+        var caho = UInt32(cvecActHeapOff)
+        fixData.replaceSubrange(cvecActOffSlot..<(cvecActOffSlot+4),
+                                with: Data(bytes: &caho, count: 4))
 
-        w.data.replaceSubrange(off..<(off+64), with: fixData)
+        w.data.replaceSubrange(off..<(off+slotBytes), with: fixData)
     }
 
     return w.data
@@ -851,20 +916,18 @@ private func sessionStateByte(_ state: SessionState) -> UInt8 {
     }
 }
 
-// Best-effort done_reason. Engine doesn't yet expose explicit reason;
-// approximate from numGenerated and EOS comparison via context. For now
-// return 1 (eos) when state is done — the bridge can refine when the
-// engine grows a real done_reason field.
+// Surface the engine's per-session termination code.
+//   0 = still running (state != .done)
+//   1 = stop / EOS / stop_sequence
+//   2 = length / max_tokens budget
+//   3 = error (e.g. vision tower returned 0 soft tokens; errMsg populated)
+// Engine writes s.doneReason at every .done transition (lm_engine.swift's
+// AR step + prefill end-of-priming sites). Sessions that close via the
+// explicit closeSession path skip generation entirely; those still
+// report 0 (no AR-loop termination occurred) and the bridge handles
+// that as a separate "client cancelled" state on its side.
 private func sessionDoneReason(_ s: Session) -> UInt8 {
-    // s.doneReason is the engine-side termination code:
-    //   0 = still running (state != .done)
-    //   1 = stop / EOS (set by AR loop on EOS or stop_sequence match)
-    //   2 = length / max_tokens (currently set by bridge override)
-    //   3 = error (e.g. vision tower returned 0 soft tokens; errMsg populated)
-    // Sessions that hit .done without any explicit doneReason being
-    // set get 1 by default for back-compat with the legacy hardcode.
     if s.state != .done { return 0 }
-    if s.doneReason == 0 { return 1 }
     return s.doneReason
 }
 
@@ -1026,10 +1089,23 @@ public func gemma_poll(_ timeoutMs: Int32,
             // (engine.requestForStream only loses it during the post-
             // loop cleanup pass, so still iterating over it here is fine.)
             if gDoneEmittedThisPoll.contains(sid) { continue }
+            // End-of-generation flush: if the session is .done and the
+            // model emitted CHANNEL_OPEN_ID without a matching close,
+            // recover the buffered in-channel tokens to outputQueue
+            // (when enableThinking=false) so the assistant turn isn't
+            // silently empty. See Session.flushUnclosedChannel for the
+            // policy. No-op when no channel was opened or when it
+            // closed normally.
+            if s.state == .done {
+                s.flushUnclosedChannel()
+            }
             let newToks = drainSession(s)
+            let newThinkToks = s.drainThinking()
+            let newCvecActs = s.drainCvecActivations()
             let stateByte = sessionStateByte(s.state)
             let doneByte = sessionDoneReason(s)
-            if !newToks.isEmpty || s.state == .done {
+            if !newToks.isEmpty || !newThinkToks.isEmpty
+                || !newCvecActs.isEmpty || s.state == .done {
                 var lps: [LogprobRecord] = []
                 if s.captureLogits {
                     let avail = s.logprobsQueue
@@ -1044,6 +1120,8 @@ public func gemma_poll(_ timeoutMs: Int32,
                     state: stateByte,
                     doneReason: doneByte,
                     newTokens: newToks,
+                    newThinkingTokens: newThinkToks,
+                    newCvecActivations: newCvecActs,
                     errMsg: s.errMsg,
                     promptTokensSeen: s.usage.promptTokensSeen,
                     completionTokensEmitted: s.usage.completionTokensEmitted,
@@ -1171,6 +1249,135 @@ public func gemma_status(_ outBuf: UnsafeMutablePointer<UInt8>?,
     bytes.withUnsafeBytes { src in
         outBuf.update(from: src.baseAddress!.assumingMemoryBound(to: UInt8.self),
                        count: bytes.count)
+    }
+    return Int32(bytes.count)
+}
+
+// gemma_engine_state: serialize the engine's current state into the
+// caller's buffer as a UTF-8 JSON string. Returns the byte count
+// written (positive), 0 if the engine isn't initialized (writes "{}"),
+// or -28 if the buffer was too small (caller doubles and retries).
+//
+// This is the data source for the static visualizers' /v1/engine/state
+// HTTP endpoint. Polling-friendly (target <5ms p50): the work is
+// O(active_streams + live_pages) and runs under the same gEngineLock
+// that serializes the rest of the FFI surface.
+//
+// Shape (informative; bridge re-parses + re-serializes):
+// {
+//   "kv_cache": {
+//     "total_pages": N, "free_pages": N, "cached_pages": N,
+//     "pages_in_use": N,
+//     "pages": [
+//       {"phys": int, "refcount": int, "promoted": bool,
+//        "hash": "hex", "pair_mate": int|null}, ...
+//     ]
+//   },
+//   "vision_cache": {"entries": N, "hits": N, "misses": N},
+//   "active_streams": [
+//     {"stream_id": int, "state": str, "position": int,
+//      "prompt_tokens_seen": int, "completion_tokens_emitted": int,
+//      "pages_owned": int, "owned_pages": [int, ...],
+//      "cache_hit_tokens": int, "cache_miss_tokens": int}, ...
+//   ],
+//   "engine": {"total_steps": int, "total_tokens": int,
+//              "last_step_ms": float, "max_b": int}
+// }
+@_cdecl("gemma_engine_state")
+public func gemma_engine_state(_ outBuf: UnsafeMutablePointer<UInt8>?,
+                                 _ outCap: Int32) -> Int32 {
+    guard let outBuf = outBuf else { return -22 }
+    // Build the snapshot under gEngineLock. Hot fields (pages, sessions)
+    // are read while the engine isn't mid-CB so we never race.
+    gEngineLock.lock()
+    let payload: String = {
+        guard let engine = gEngine else { return "{}" }
+        let stats = engine.pageManager.stats()
+        let pages = engine.pageManager.livePageSnapshot()
+
+        // Per-stream session info. Iterate requestForStream so the
+        // visualizer can correlate engine state with bridge stream IDs
+        // (the same IDs the OAI-compat endpoint uses internally).
+        var streamLines: [String] = []
+        for (sid, s) in engine.requestForStream {
+            let stateStr: String
+            switch s.state {
+            case .priming:    stateStr = "priming"
+            case .generating: stateStr = "generating"
+            case .done:       stateStr = "done"
+            }
+            // ownedPages is fileprivate inside Session (KV-cache
+            // ownership is engine-internal). The visualizer correlates
+            // streams ↔ pages via aggregate counts here + per-page
+            // refcounts in the pages array. Adding a public per-page
+            // owner list would require a new ledger; the visualizer
+            // doesn't need it to render its tenancy strip.
+            let line = """
+            {"stream_id":\(sid),"state":"\(stateStr)",\
+"position":\(s.positionForDebug),\
+"prompt_tokens_seen":\(Int(s.usage.promptTokensSeen)),\
+"completion_tokens_emitted":\(Int(s.usage.completionTokensEmitted)),\
+"pages_owned":\(s.ownedPageCount),\
+"cache_hit_tokens":\(Int(s.cacheHitTokens)),\
+"cache_miss_tokens":\(Int(s.cacheMissTokens))}
+"""
+            streamLines.append(line)
+        }
+
+        // Pages array. promoted = (refcount > 0 OR contentHash != nil)
+        // — distinguishing in-use from free-but-cached is in the
+        // `refcount` field directly; `promoted` just reflects whether
+        // this page is participating in the content cache at all
+        // (refcount==0 + hash != nil ⇒ cached + adoptable; refcount>0
+        // ⇒ live; both ⇒ live + shareable).
+        var pageLines: [String] = []
+        pageLines.reserveCapacity(pages.count)
+        for p in pages {
+            let hashStr: String
+            if let h = p.contentHash {
+                hashStr = "\"\(String(format: "%016x", h))\""
+            } else {
+                hashStr = "null"
+            }
+            let mateStr = p.pairMate.map { String($0) } ?? "null"
+            let promoted = (p.contentHash != nil) ? "true" : "false"
+            pageLines.append("""
+            {"phys":\(p.phys),"refcount":\(p.refcount),\
+"promoted":\(promoted),"hash":\(hashStr),"pair_mate":\(mateStr)}
+""")
+        }
+
+        let engineSection = """
+        {"total_steps":\(engine.totalSteps),\
+"total_tokens":\(engine.totalTokensGenerated),\
+"last_step_ms":\(engine.lastStepMs),\
+"max_b":\(B)}
+"""
+        let kvSection = """
+        {"total_pages":\(stats.totalPages),\
+"free_pages":\(stats.freePages),\
+"cached_pages":\(stats.cachedHashes),\
+"pages_in_use":\(stats.pagesInUse),\
+"pages":[\(pageLines.joined(separator: ","))]}
+"""
+        let visionSection = """
+        {"entries":\(gVisionCacheEntryCount),\
+"hits":\(gVisionCacheHits),\
+"misses":\(gVisionCacheMisses)}
+"""
+        return """
+        {"kv_cache":\(kvSection),\
+"vision_cache":\(visionSection),\
+"active_streams":[\(streamLines.joined(separator: ","))],\
+"engine":\(engineSection)}
+"""
+    }()
+    gEngineLock.unlock()
+
+    let bytes = Array(payload.utf8)
+    if bytes.count > Int(outCap) { return -28 }
+    bytes.withUnsafeBufferPointer { src in
+        outBuf.update(from: src.baseAddress!, count: bytes.count)
     }
     return Int32(bytes.count)
 }

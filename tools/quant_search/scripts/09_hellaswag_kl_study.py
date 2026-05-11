@@ -60,7 +60,6 @@ import asyncio
 import json
 import math
 import os
-import re
 import sys
 import time
 from pathlib import Path
@@ -166,7 +165,21 @@ def max_tokens_for_strategy(strategy: str) -> int:
 # ──────────────────────────────────────────────────────────────────────
 
 
-_WORD_RE = re.compile(r"[A-Za-z]+")
+def _ascii_alpha_words(s: str) -> list[str]:
+    """Return runs of [A-Za-z]+ as separate tokens. Plain-Python
+    replacement for `re.compile(r"[A-Za-z]+").findall(s)`.
+    """
+    words: list[str] = []
+    buf: list[str] = []
+    for c in s:
+        if "A" <= c <= "Z" or "a" <= c <= "z":
+            buf.append(c)
+        elif buf:
+            words.append("".join(buf))
+            buf = []
+    if buf:
+        words.append("".join(buf))
+    return words
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -360,14 +373,14 @@ async def llm_judge_freeform(client: httpx.AsyncClient, response: str,
 
 def _word_set(s: str) -> set[str]:
     """Lowercased word tokens, stripped of punctuation."""
-    return {w.lower() for w in _WORD_RE.findall(s)}
+    return {w.lower() for w in _ascii_alpha_words(s)}
 
 
 def _looks_like_token_loop(generation: str, min_tokens: int = 4) -> bool:
     """Heuristic for degenerate fixed-point outputs (e.g. 'de-escalating
     de-escalating de-escalating ...'). If half or more of the generation's
     word tokens are the same single word, mark as unscoreable."""
-    tokens = _WORD_RE.findall(generation.lower())
+    tokens = _ascii_alpha_words(generation.lower())
     if len(tokens) < min_tokens:
         return False
     from collections import Counter

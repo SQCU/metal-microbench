@@ -113,8 +113,10 @@ test.describe('toolcards svg-from-query', () => {
             // the toolcard's playwright render) — not a remote URL.
             const imgSrc = await inlineImg.getAttribute('src');
             console.log(`  inline img src starts: ${(imgSrc || '').slice(0, 60)}...`);
-            expect(imgSrc, 'inline image is a data URI')
-                .toMatch(/^data:image\//);
+            // toMatch(/^data:image\//) == startsWith('data:image/').
+            expect((imgSrc || '').startsWith('data:image/'),
+                `inline image is a data URI (saw '${(imgSrc || '').slice(0, 60)}')`)
+                .toBe(true);
 
             // Check that we got progress events somewhere — the toolcard
             // emits at least 1 progress event per iter. The DOM should
@@ -135,7 +137,7 @@ test.describe('toolcards svg-from-query', () => {
                     ? lastMsg.content
                     : JSON.stringify(lastMsg.content || '');
                 // The toolcard's iter-0 prompt asks for SVG of "a small red circle".
-                return /red circle/i.test(content);
+                return content.toLowerCase().includes('red circle');
             });
             console.log(`  generate calls referencing 'red circle': ${callsWithSvgRequest.length}`);
             expect(callsWithSvgRequest.length,

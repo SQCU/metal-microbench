@@ -1,0 +1,16 @@
+--- TEST: off-path bit-identity (capture flag OFF) ---
+PASS: bit-identity verified across 8 tokens × 6 logprobs each
+
+--- TEST: instrumented-but-unused (capture flag ON, no cvecs) ---
+PASS: bit-identity verified across 8 tokens × 6 logprobs each
+
+--- TEST: on-path correctness (zero-cvec + unit-cvec) ---
+[zero-cvec] elapsed=0.57s finish=length activations=11
+Phase 1 PASS: zero-vector cvec applied (11 activation records flowed), output content matches baseline
+  sample activation: {'token_position': 28, 'layer': 12, 'magnitude': 1.0}
+  content head: 'Elias did not chart continents or coast'
+[unit-cvec] elapsed=0.548s finish=length activations=11
+  activations with |magnitude|>1e-6: 11
+  sample non-zero activation: {'token_position': 28, 'layer': 12, 'magnitude': 100.0}
+Phase 2 PASS: unit cvec at peak_magnitude=100 → output content differs from baseline
+  content head: 'The first sentence of a short story about'

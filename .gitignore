@@ -36,3 +36,19 @@ test_data/**/*.bin
 
 # Misc build artifacts
 *.dSYM/
+
+# Working design notes — unpublished, pre-implementation thinking.
+# Promoted files graduate to docs/ once the mechanism is validated.
+/notes/
+
+# Experimental output: ad-hoc benchmark runs, perf probes, harness comparison
+# results. Use this dir instead of /tmp so external validation tools, render
+# inspection, and historical comparison are available across sessions.
+/output_data/
+
+# Bridge stdout/stderr logs (live forensic record across runs;
+# moved out of /tmp/ post-2026-05-06 macOS-watchdog crash so they
+# survive system reboots. Per-launch timestamped files.
+bridge-logs/
+study-records/
+study-logs/

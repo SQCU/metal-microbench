@@ -20,7 +20,7 @@
   }
   header h1 { margin: 0; font-size: 1rem; font-weight: 500; color: var(--accent); }
   header .status { font-size: 0.78rem; color: var(--mute); }
-  header a { color: var(--accent); text-decoration: none; }
+  header a { color: var(--accent); text-decoration: none; margin-left:0.8em; }
   .config {
     display: grid; grid-template-columns: 1fr 1fr;
     gap: 0.8em; padding: 0.8em 1em; border-bottom: 1px solid var(--border);
@@ -106,6 +106,7 @@
     display: flex; flex-wrap: wrap; gap: 2px; padding: 0.3em;
     background: var(--panel); border: 1px solid var(--border);
     border-radius: 3px; min-height: 2em; align-content: flex-start;
+    max-height: 12em; overflow: auto;
   }
   .kv-strip .label {
     width: 100%; font-size: 0.7rem; color: var(--mute); margin-bottom: 0.2em;
@@ -145,11 +146,10 @@
   <h1>gemma-4-a4b · image labeler demo</h1>
   <span class="status" id="statusText">checking…</span>
   <div>
-    <a href="/">← clients</a>
-    <a href="/tetraplex">tetraplex</a>
-    <a href="/loom">loom</a>
-    <a href="/compare">compare</a>
-    <a href="/steering">steering</a>
+    <a href="/static/clients.html">← clients</a>
+    <a href="/static/index.html">tetraplex</a>
+    <a href="/static/loom.html">loom</a>
+    <a href="/static/steering.html">steering</a>
   </div>
 </header>
 
@@ -167,11 +167,13 @@
 
 <div class="row">
   <button id="runBtn">run labeler</button>
-  <button id="loadDemoBtn" class="secondary">load amongus test frames</button>
+  <button id="loadDemoBtn" class="secondary">load demo frames</button>
   <button id="clearBtn" class="secondary">clear queue + results</button>
   <label class="hint" style="margin-left:0.8em">
     <input type="checkbox" id="prewarmFirst" checked>
-    prewarm vision cache first (makes AR batch properly — vision serializes on GPU either way)
+    prewarm vision cache first (a max_tokens=1 chat completion against each image
+    populates the vision cache as a side effect — every queued completion below
+    then hits the cache, so all 4 slots enter AR at the same time)
   </label>
 </div>
 
@@ -208,7 +210,7 @@
   </section>
 
   <section class="col kv-col">
-    <h2>KV tenancy (shared prefix = schema prompt pages)</h2>
+    <h2>KV tenancy (live, polled from /v1/engine/state)</h2>
     <div class="kv-strip" id="kvStrip">
       <div class="label">no active sessions</div>
     </div>
@@ -218,7 +220,8 @@
       <div class="k">done / total</div><div class="v" id="stDone">— / —</div>
       <div class="k">images/sec (agg)</div><div class="v" id="stRate">—</div>
       <div class="k">tokens/sec (agg)</div><div class="v" id="stTok">—</div>
-      <div class="k">vision cache hit rate</div><div class="v" id="stCache">—</div>
+      <div class="k">vision cache hits</div><div class="v" id="stVisionHits">—</div>
+      <div class="k">vision cache entries</div><div class="v" id="stVisionEntries">—</div>
       <div class="k">eta</div><div class="v" id="stEta">—</div>
     </div>
     <h2 style="margin-top:0.4em">results · <a id="dlLink" href="#" style="color:var(--accent);font-weight:normal">download jsonl</a></h2>
@@ -228,17 +231,18 @@
 
 <script>
 const CONCURRENCY = 4;
-const SLOT_COLORS = ['--c0','--c1','--c2','--c3'];
 
 const state = {
-  images: [],        // {id, name, dataUrl, status:'pending'|'running'|'done'|'error', slot?:int, result?, tokens:int, ms?:number}
+  images: [],
   nextId: 0,
   running: false,
   startedAt: null,
   tokenTotal: 0,
+  // Aggregate vision_cache_hits across this run (sum of every
+  // completion's usage.vision_cache_hits).
+  visionCacheHitsTotal: 0,
 };
 
-// --- UI elements ---
 const statusText = document.getElementById('statusText');
 const dropZone = document.getElementById('dropZone');
 const fileInput = document.getElementById('fileInput');
@@ -259,7 +263,8 @@ const stElapsed = document.getElementById('stElapsed');
 const stDone = document.getElementById('stDone');
 const stRate = document.getElementById('stRate');
 const stTok = document.getElementById('stTok');
-const stCache = document.getElementById('stCache');
+const stVisionHits = document.getElementById('stVisionHits');
+const stVisionEntries = document.getElementById('stVisionEntries');
 const stEta = document.getElementById('stEta');
 
 // --- server health ---
@@ -300,25 +305,37 @@ function ingestFiles(files) {
   }
 }
 
-// Load demo frames from server (amongus test frames bundled with repo).
+// Demo frames: load from /static/demo_frames/manifest.json (a static
+// JSON file listing the bundled sample frames). Each frame is a static
+// PNG asset under /static/demo_frames/; we fetch its bytes and convert
+// to a data URL so the rest of the labeler treats it identically to a
+// user-dropped file.
 loadDemoBtn.addEventListener('click', async () => {
   try {
-    const r = await fetch('/v1/demo/frames');
-    if (!r.ok) {
-      // Fall back: populate with some hard-coded filenames and let server stream them.
-      statusText.textContent = 'no /v1/demo/frames endpoint — drop images manually';
+    const manifestResp = await fetch('/static/demo_frames/manifest.json');
+    if (!manifestResp.ok) {
+      statusText.textContent = 'demo_frames/manifest.json missing — drop images manually';
       return;
     }
-    const list = await r.json();
-    for (const it of list.frames) {
+    const manifest = await manifestResp.json();
+    for (const it of manifest.frames) {
+      const imgResp = await fetch(it.url);
+      if (!imgResp.ok) continue;
+      const blob = await imgResp.blob();
+      const dataUrl = await new Promise(res => {
+        const r = new FileReader();
+        r.onload = () => res(r.result);
+        r.readAsDataURL(blob);
+      });
       state.images.push({
         id: state.nextId++, name: it.name,
-        dataUrl: it.data_url, status: 'pending', tokens: 0,
+        dataUrl, status: 'pending', tokens: 0,
       });
     }
     renderImgList();
   } catch (e) {
     console.error(e);
+    statusText.textContent = `demo load failed: ${e.message}`;
   }
 });
 
@@ -350,40 +367,58 @@ clearBtn.addEventListener('click', () => {
   for (const rb of ribbons) { rb.body.textContent = ''; rb.meta.textContent = 'idle'; }
 });
 
-// --- run loop: keeps up to CONCURRENCY requests in flight ---
+// Vision prewarm: send a max_tokens=1 chat completion with the image
+// attached. The vision tower runs as part of priming and populates the
+// content-hash cache for those image bytes; the AR step that follows
+// emits exactly one token before stopping. Cheap (~vision_tower_ms +
+// one AR tick); side-effect is the cache entry that subsequent
+// completions on the same bytes hit (usage.vision_cache_hits=1).
+async function prewarmImage(img) {
+  const body = {
+    model: 'gemma-4-a4b',
+    max_tokens: 1,
+    stream: false,
+    messages: [
+      { role: 'user', content: [
+        { type: 'text', text: 'ok' },
+        { type: 'image_url', image_url: { url: img.dataUrl } },
+      ]},
+    ],
+  };
+  try {
+    await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    console.warn('prewarm failed:', e);
+  }
+}
+
 runBtn.addEventListener('click', async () => {
   if (state.running) return;
   const pending = state.images.filter(i => i.status === 'pending');
   if (pending.length === 0) return;
-  state.running = true; state.startedAt = performance.now(); state.tokenTotal = 0;
+  state.running = true; state.startedAt = performance.now();
+  state.tokenTotal = 0; state.visionCacheHitsTotal = 0;
   runBtn.disabled = true; loadDemoBtn.disabled = true; clearBtn.disabled = true;
 
   const schema = document.getElementById('schemaPrompt').value;
   const userTurn = document.getElementById('userPrompt').value;
   const prewarm = document.getElementById('prewarmFirst').checked;
 
-  // Prewarm phase: hit /v1/images/prewarm sequentially on every pending
-  // image. Vision tower serializes on GPU regardless, but doing it now
-  // means every chat completion below hits the content-hash cache and
-  // skips vision entirely — so all 4 slots enter AR at the same time and
-  // batch decode fires at full 4× throughput. Without prewarm, sessions
-  // trickle into AR as their vision finishes and end up mostly solo-decoding.
   if (prewarm) {
-    statusText.textContent = 'prewarming vision cache…';
-    for (const img of pending) {
-      try {
-        await fetch('/v1/images/prewarm', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ image_url: img.dataUrl }),
-        });
-      } catch (e) { console.warn('prewarm failed:', e); }
-      img.name_prewarmed = true;
-    }
+    statusText.textContent = 'prewarming vision cache (max_tokens=1 chat per image)…';
+    // Prewarm serially: vision tower runs on the GPU and the engine
+    // serializes the per-image patch encoding regardless. Prewarming
+    // in series means every subsequent completion in the run loop
+    // below skips vision entirely (cache hit) and enters AR
+    // immediately — all 4 slots batch decode together.
+    for (const img of pending) await prewarmImage(img);
     statusText.textContent = 'prewarm done · decoding…';
   }
 
-  // Assign slots greedily as images start; slot frees on finish.
   const slotBusy = [false, false, false, false];
 
   async function launchOne(img) {
@@ -397,7 +432,7 @@ runBtn.addEventListener('click', async () => {
     const t0 = performance.now();
     try {
       const body = {
-        model: 'gemma-4-a4b-q4km',
+        model: 'gemma-4-a4b',
         max_tokens: 120,
         stream: true,
         messages: [
@@ -417,6 +452,7 @@ runBtn.addEventListener('click', async () => {
       const dec = new TextDecoder();
       let buf = '';
       let full = '';
+      let lastUsage = null;
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -432,18 +468,29 @@ runBtn.addEventListener('click', async () => {
             const delta = j.choices?.[0]?.delta?.content;
             if (delta) {
               full += delta;
-              img.tokens += 1;   // approx — one SSE frame ≈ one token batch
+              img.tokens += 1;
               state.tokenTotal += 1;
               ribbons[slot].body.textContent = full;
               ribbons[slot].body.scrollTop = ribbons[slot].body.scrollHeight;
             }
+            if (j.usage) lastUsage = j.usage;
           } catch {}
         }
+      }
+      // Capture per-completion usage telemetry — the cache_hits +
+      // vision_cache_hits counters live on the OAI usage block, no
+      // /v1/cache/stats polling required.
+      if (lastUsage) {
+        img.usage = lastUsage;
+        if (lastUsage.vision_cache_hits) state.visionCacheHitsTotal += lastUsage.vision_cache_hits;
       }
       img.ms = Math.round(performance.now() - t0);
       img.result = extractJson(full) || { raw: full.trim() };
       img.status = 'done';
-      ribbons[slot].meta.textContent = `✓ ${img.name} · ${img.ms}ms`;
+      const usageBits = lastUsage
+        ? ` · ${lastUsage.cache_hits || 0}/${(lastUsage.cache_hits || 0) + (lastUsage.cache_misses || 0)} kv · v=${lastUsage.vision_cache_hits || 0}`
+        : '';
+      ribbons[slot].meta.textContent = `✓ ${img.name} · ${img.ms}ms${usageBits}`;
       appendResult(img);
     } catch (e) {
       img.status = 'error'; img.ms = Math.round(performance.now() - t0);
@@ -456,7 +503,6 @@ runBtn.addEventListener('click', async () => {
     }
   }
 
-  // Pump loop: while queue non-empty and slot available, launch; await all.
   const inFlight = new Set();
   while (true) {
     const nextPending = state.images.find(i => i.status === 'pending');
@@ -465,9 +511,6 @@ runBtn.addEventListener('click', async () => {
       const p = launchOne(nextPending);
       inFlight.add(p);
       p.finally(() => inFlight.delete(p));
-      // Stagger microscopically so the server sees them as concurrent,
-      // not all arriving in the same event-loop tick (gives the pump
-      // cleaner slot assignment).
       await new Promise(r => setTimeout(r, 20));
     } else if (inFlight.size > 0) {
       await Promise.race(inFlight);
@@ -482,7 +525,6 @@ runBtn.addEventListener('click', async () => {
 });
 
 function extractJson(s) {
-  // Gemma often wraps output in text; grab the first balanced {} block.
   let d = 0, start = -1;
   for (let i = 0; i < s.length; i++) {
     if (s[i] === '{') { if (d === 0) start = i; d++; }
@@ -507,7 +549,7 @@ function appendResult(img) {
 
 function refreshDownload() {
   const lines = state.images.filter(i => i.status === 'done' || i.status === 'error').map(i =>
-    JSON.stringify({ name: i.name, ms: i.ms, ...i.result })
+    JSON.stringify({ name: i.name, ms: i.ms, usage: i.usage, ...i.result })
   ).join('\n');
   const blob = new Blob([lines + '\n'], { type: 'application/x-ndjson' });
   dlLink.href = URL.createObjectURL(blob);
@@ -515,44 +557,58 @@ function refreshDownload() {
 }
 
 function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  // Char-by-char HTML escape. Replaces the prior char-class regex
+  // s.replace(/[&<>"']/g, c => map[c]); the regex only matched a finite
+  // alphabet of literal chars, so a flat iteration over the input is
+  // the same finite-state mapping with no regex dependency.
+  const map = {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    out += (c in map) ? map[c] : c;
+  }
+  return out;
 }
 
-// --- KV tenancy poll + stats ---
-async function pollKv() {
+// --- engine-state poll: KV tenancy + vision cache stats. Replaces the
+// dead /v1/kv/snapshot + /v1/cache/stats polls. Single endpoint, single
+// poll, sub-5-ms response. ---
+async function pollEngineState() {
   try {
-    const snap = await (await fetch('/v1/kv/snapshot')).json();
+    const snap = await (await fetch('/v1/engine/state')).json();
     renderKv(snap);
-  } catch {}
-  try {
-    const cache = await (await fetch('/v1/cache/stats')).json();
-    const hits = cache.hits || 0, misses = cache.misses || 0;
-    const total = hits + misses;
-    stCache.textContent = total ? `${hits}/${total} (${(100*hits/total).toFixed(0)}%)` : '—';
+    const v = snap.vision_cache || {};
+    stVisionEntries.textContent = String(v.entries || 0);
+    stVisionHits.textContent = `${v.hits || 0} hit · ${v.misses || 0} miss`;
   } catch {}
   updateStats();
 }
-setInterval(pollKv, 250);
+setInterval(pollEngineState, 500);
+pollEngineState();
 
 function renderKv(snap) {
   kvStrip.innerHTML = '';
-  const sessions = snap.sessions || [];
-  if (sessions.length === 0) {
-    const lbl = document.createElement('div'); lbl.className = 'label';
-    lbl.textContent = 'no active sessions'; kvStrip.appendChild(lbl); return;
+  const kv = snap.kv_cache || {};
+  const livePages = (kv.pages || []).filter(p => p.refcount > 0);
+  const streams = snap.active_streams || [];
+  const lbl = document.createElement('div'); lbl.className = 'label';
+  if (streams.length === 0) {
+    lbl.textContent = `idle · pool: ${kv.pages_in_use || 0}/${kv.total_pages || 0} pages in use · ${kv.cached_pages || 0} cached`;
+  } else {
+    const streamsSummary = streams.map(s =>
+      `s${s.stream_id}·${s.state}·${s.pages_owned}pg`).join(' ');
+    lbl.textContent = `${streamsSummary} · ${kv.pages_in_use}/${kv.total_pages} pages · ${kv.cached_pages} cached`;
   }
-  for (const sess of sessions) {
-    const lbl = document.createElement('div'); lbl.className = 'label';
-    lbl.textContent = `s${sess.sid} · ${sess.state} · ${sess.position} tok · ${sess.page_count} pg (${sess.shared_count} shared)`;
-    kvStrip.appendChild(lbl);
-    for (const p of sess.pages) {
-      const cell = document.createElement('div'); cell.className = 'kv-cell';
-      if (p.refcount >= 3) cell.classList.add('shr3p');
-      else if (p.refcount >= 2) cell.classList.add('shr2');
-      else cell.classList.add('own');
-      cell.title = `phys ${p.phys}${p.shared_with.length ? ' · shared with s'+p.shared_with.join(',s') : ''}`;
-      kvStrip.appendChild(cell);
-    }
+  kvStrip.appendChild(lbl);
+  // Render up to 800 cells (covers worst case at full-pool prefill).
+  const shown = livePages.slice(0, 800);
+  for (const p of shown) {
+    const cell = document.createElement('div'); cell.className = 'kv-cell';
+    if (p.refcount >= 3) cell.classList.add('shr3p');
+    else if (p.refcount >= 2) cell.classList.add('shr2');
+    else cell.classList.add('own');
+    cell.title = `phys ${p.phys} · refcount=${p.refcount}${p.hash ? ' · hash=' + p.hash.slice(0,8) : ''}`;
+    kvStrip.appendChild(cell);
   }
 }
 

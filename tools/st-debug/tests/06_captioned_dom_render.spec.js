@@ -136,7 +136,7 @@ test.describe.skip('captioned toolcard DOM render', () => {
 
             const finalText = await messages.last().innerText();
             console.log(`  caller message DOM text (${finalText.length} chars):`);
-            console.log(`  ${finalText.slice(0, 600).replace(/\n/g, ' ⏎ ')}`);
+            console.log(`  ${finalText.slice(0, 600).split('\n').join(' ⏎ ')}`);
 
             expect(finalText, 'caption appears in the assistant turn DOM')
                 .toContain('caption:');

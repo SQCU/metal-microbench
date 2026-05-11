@@ -304,7 +304,10 @@ struct GemmaBpe {
             // Specials: <bos>, <eos>, <end_of_turn>, etc. — pass through
             // unless caller wants them stripped. tokenBytesTable[i] is
             // empty for specials (by design), so we go through the raw
-            // vocab string here.
+            // vocab string here. Channel-block / EOS suppression for
+            // the bridge's output stream lives at the engine layer
+            // (lm_engine.swift:Session.maybeAppendOutput); decode
+            // remains a faithful tokens→bytes mapper.
             if t.hasPrefix("<") && t.hasSuffix(">") && t.count > 2
                && !(t.count == 6 && t.hasPrefix("<0x")) {
                 if !skipSpecial { byteBuf.append(contentsOf: t.utf8) }

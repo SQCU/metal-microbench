@@ -24,7 +24,7 @@ test.use({ video: 'on' });
 async function ensureScringloImported(page) {
     const present = await page.evaluate(async () => {
         const ctx = window.SillyTavern.getContext();
-        return ctx.characters?.some(c => /scringlo/i.test(c?.name || ''));
+        return ctx.characters?.some(c => (c?.name || '').toLowerCase().includes('scringlo'));
     });
     if (present) return;
     const charPath = '/Users/mdot/metal-microbench/tools/st-debug/_data/default-user/characters/Scringlo.json';
@@ -50,14 +50,14 @@ async function ensureScringloImported(page) {
     });
     await page.waitForFunction(() => {
         const ctx = window.SillyTavern.getContext();
-        return ctx.characters?.some(c => /scringlo/i.test(c?.name || ''));
+        return ctx.characters?.some(c => (c?.name || '').toLowerCase().includes('scringlo'));
     }, { timeout: 15_000 });
 }
 
 async function selectScringlo(page) {
     await page.evaluate(async () => {
         const ctx = window.SillyTavern.getContext();
-        const idx = ctx.characters.findIndex(c => /scringlo/i.test(c?.name || ''));
+        const idx = ctx.characters.findIndex(c => (c?.name || '').toLowerCase().includes('scringlo'));
         if (idx < 0) throw new Error('Scringlo not found');
         if (String(ctx.characterId) !== String(idx)) {
             await ctx.selectCharacterById(idx);
@@ -65,7 +65,7 @@ async function selectScringlo(page) {
     });
     await page.waitForFunction(() => {
         const ctx = window.SillyTavern.getContext();
-        return /scringlo/i.test(ctx.characters?.[ctx.characterId]?.name || '');
+        return (ctx.characters?.[ctx.characterId]?.name || '').toLowerCase().includes('scringlo');
     }, { timeout: 15_000 });
 }
 
@@ -242,8 +242,14 @@ test.describe('vision-review vertical slice — scringlo audits her own test 17 
         // The result is a stringified summary (the action callback returns
         // result.summary). Just check the verdict line is FAIL.
         expect(typeof reviewResult, 'review returned a string').toBe('string');
-        expect(reviewResult, 'verdict reported as FAIL')
-            .toMatch(/verdict.*FAIL/i);
+        // Plain-string equivalent of toMatch(/verdict.*FAIL/i):
+        // 'verdict' appears, and 'fail' appears AFTER it. Same finite-
+        // state acceptance condition with no regex dependency.
+        const lower = (reviewResult || '').toLowerCase();
+        const vidx = lower.indexOf('verdict');
+        expect(vidx, "result contains 'verdict'").toBeGreaterThanOrEqual(0);
+        expect(lower.indexOf('fail', vidx),
+            "verdict line followed by FAIL").toBeGreaterThan(vidx);
 
         await page.waitForTimeout(3000);
     });

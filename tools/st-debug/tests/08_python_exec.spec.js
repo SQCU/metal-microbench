@@ -52,9 +52,25 @@ async function invokePythonExec(request, task) {
 }
 
 function parseIntegers(stdout) {
-    return (stdout || '')
-        .match(/-?\d+/g)
-        ?.map(s => Number.parseInt(s, 10)) || [];
+    // Extract every signed integer from `stdout`. Plain-string
+    // replacement for (stdout || '').match(/-?\d+/g)?.map(parseInt) — walk
+    // chars, accumulate digit runs, push as Number when boundary hit.
+    const s = stdout || '';
+    const out = [];
+    let i = 0;
+    while (i < s.length) {
+        const c = s[i];
+        if (c >= '0' && c <= '9') {
+            const start = (i > 0 && s[i - 1] === '-') ? i - 1 : i;
+            let j = i + 1;
+            while (j < s.length && s[j] >= '0' && s[j] <= '9') j++;
+            out.push(Number.parseInt(s.slice(start, j), 10));
+            i = j;
+        } else {
+            i++;
+        }
+    }
+    return out;
 }
 
 test.describe('python-exec toolcard direct invoke', () => {

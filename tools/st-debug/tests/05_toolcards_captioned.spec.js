@@ -152,7 +152,16 @@ test.describe('toolcards spur-caption integration', () => {
         for (const cap of captionLines) {
             expect(cap.length, 'caption non-empty').toBeGreaterThan(0);
             // Caption agent capped at 32 tokens — that's max ~30 words.
-            const wordCount = cap.split(/\s+/).filter(w => w.length).length;
+            // Plain-string word count: walk chars, count transitions
+            // from whitespace to non-whitespace. Equivalent to
+            // cap.split(/\s+/).filter(w => w.length).length.
+            const isWs = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\r';
+            let wordCount = 0;
+            let inWord = false;
+            for (const c of cap) {
+                if (isWs(c)) { inWord = false; }
+                else if (!inWord) { inWord = true; wordCount++; }
+            }
             expect(wordCount, `caption "${cap}" within budget`).toBeLessThanOrEqual(35);
         }
 

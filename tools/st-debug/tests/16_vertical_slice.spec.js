@@ -28,7 +28,7 @@ async function ensureScringloImported(page) {
     // Check if already there.
     const present = await page.evaluate(async () => {
         const ctx = window.SillyTavern.getContext();
-        return ctx.characters?.some(c => /scringlo/i.test(c?.name || ''));
+        return ctx.characters?.some(c => (c?.name || '').toLowerCase().includes('scringlo'));
     });
     if (present) return;
 
@@ -81,14 +81,14 @@ async function ensureScringloImported(page) {
     // Wait for it to land in the in-memory list.
     await page.waitForFunction(() => {
         const ctx = window.SillyTavern.getContext();
-        return ctx.characters?.some(c => /scringlo/i.test(c?.name || ''));
+        return ctx.characters?.some(c => (c?.name || '').toLowerCase().includes('scringlo'));
     }, { timeout: 15_000 });
 }
 
 async function selectScringlo(page) {
     await page.evaluate(async () => {
         const ctx = window.SillyTavern.getContext();
-        const idx = ctx.characters.findIndex(c => /scringlo/i.test(c?.name || ''));
+        const idx = ctx.characters.findIndex(c => (c?.name || '').toLowerCase().includes('scringlo'));
         if (idx < 0) throw new Error('Scringlo not found in character list');
         if (String(ctx.characterId) !== String(idx)) {
             await ctx.selectCharacterById(idx);
@@ -96,7 +96,7 @@ async function selectScringlo(page) {
     });
     await page.waitForFunction(() => {
         const ctx = window.SillyTavern.getContext();
-        return /scringlo/i.test(ctx.characters?.[ctx.characterId]?.name || '');
+        return (ctx.characters?.[ctx.characterId]?.name || '').toLowerCase().includes('scringlo');
     }, { timeout: 15_000 });
 }
 
@@ -183,7 +183,7 @@ test.describe('vertical slice — Scringlo + long-running tool + visible streami
         // Confirm Scringlo's first_mes lands as message 0
         await page.waitForFunction(() => {
             const ctx = window.SillyTavern.getContext();
-            return ctx.chat?.length === 1 && /scringlo/i.test(ctx.chat[0]?.name || '');
+            return ctx.chat?.length === 1 && (ctx.chat[0]?.name || '').toLowerCase().includes('scringlo');
         }, { timeout: 15_000 });
 
         // Checkpoint 1: chat surface visible with Scringlo's first_mes
@@ -326,7 +326,8 @@ test.describe('vertical slice — Scringlo + long-running tool + visible streami
             return await window.__verticalSliceResult;
         });
         expect(typeof finalResult, 'tool returned a result').toBe('string');
-        expect(finalResult, 'result mentions synthesis').toMatch(/synthesis/i);
+        expect((finalResult || '').toLowerCase(),
+            'result mentions synthesis').toContain('synthesis');
 
         // 12. Save the curated trace as a sibling artifact.
         const finalChat = await page.evaluate(() => {
