@@ -1,0 +1,20 @@
+{
+  "qualifiedName": "test-invariant-coverage__empty_object",
+  "params": {},
+  "elapsed_ms": 15,
+  "backend_result_string": "{}",
+  "backend_threw": null,
+  "terminal_statuses": [
+    "done"
+  ],
+  "tool_progress_entries": [
+    {
+      "label": "Test: invariant coverage • Returns {} (empty object)",
+      "status": "done",
+      "duration_ms": 13,
+      "summary_first_300": "(tool returned empty object)",
+      "error": null
+    }
+  ],
+  "dom_concat_body_text": "(tool returned empty object) session c7767a86 started"
+}

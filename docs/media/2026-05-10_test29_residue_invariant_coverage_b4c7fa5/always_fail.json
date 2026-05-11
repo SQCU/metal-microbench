@@ -1,0 +1,20 @@
+{
+  "qualifiedName": "test-invariant-coverage__always_fail",
+  "params": {},
+  "elapsed_ms": 5,
+  "backend_result_string": "Error: intentional failure for test 28 invariant coverage",
+  "backend_threw": null,
+  "terminal_statuses": [
+    "failed"
+  ],
+  "tool_progress_entries": [
+    {
+      "label": "Test: invariant coverage • Always fails",
+      "status": "failed",
+      "duration_ms": 3,
+      "summary_first_300": null,
+      "error": "intentional failure for test 28 invariant coverage"
+    }
+  ],
+  "dom_concat_body_text": "error: intentional failure for test 28 invariant coverage session c95c88f8 started"
+}

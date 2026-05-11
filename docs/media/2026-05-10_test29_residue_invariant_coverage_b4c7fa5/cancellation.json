@@ -1,0 +1,18 @@
+{
+  "elapsed_ms": 104,
+  "sessionId": "50d42abd-7e23-43cd-848d-34d58cbb9e3c",
+  "backend_result_string": "Error: cancelled by user",
+  "final_entries": [
+    {
+      "status": "failed",
+      "error": "cancelled by user",
+      "duration_ms": 102
+    }
+  ],
+  "dom_bodies": [
+    {
+      "headerText": "Test: invariant coverage • Sleeps N seconds then returns • failed (0.1s)",
+      "bodyText": "error: cancelled by user session 50d42abd started"
+    }
+  ]
+}

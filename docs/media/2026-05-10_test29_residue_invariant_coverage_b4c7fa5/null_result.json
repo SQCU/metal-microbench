@@ -1,0 +1,20 @@
+{
+  "qualifiedName": "test-invariant-coverage__null_result",
+  "params": {},
+  "elapsed_ms": 15,
+  "backend_result_string": "null",
+  "backend_threw": null,
+  "terminal_statuses": [
+    "done"
+  ],
+  "tool_progress_entries": [
+    {
+      "label": "Test: invariant coverage • Returns null",
+      "status": "done",
+      "duration_ms": 12,
+      "summary_first_300": "(tool returned null)",
+      "error": null
+    }
+  ],
+  "dom_concat_body_text": "(tool returned null) session 6438f62c started"
+}
