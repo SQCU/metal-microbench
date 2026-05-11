@@ -1,0 +1,25 @@
+[
+  {
+    "t": 1778540990556,
+    "method": "GET",
+    "url": "http://127.0.0.1:8002/api/plugins/user-personas/personas",
+    "body": null
+  },
+  {
+    "t": 1778540992019,
+    "method": "POST",
+    "url": "http://127.0.0.1:8002/api/plugins/user-personas/poll",
+    "body": {
+      "persona_id": "wry-skeptic",
+      "chat": [
+        {
+          "name": "scringlo scrambler",
+          "mes": "uhmmmm... hlello?",
+          "is_user": false,
+          "is_system": false
+        }
+      ],
+      "n_candidates": 2
+    }
+  }
+]
