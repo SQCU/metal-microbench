@@ -1,0 +1,50 @@
+{
+  "sentReasoningEffort": "high",
+  "sawReasoningContentDelta": true,
+  "entries": [
+    {
+      "idx": 0,
+      "is_user": false,
+      "is_system": false,
+      "mes_first_200": "uhmmmm... hlello?",
+      "has_extra_reasoning": false,
+      "extra_reasoning_first_300": null,
+      "extra_reasoning_duration_ms": null
+    },
+    {
+      "idx": 1,
+      "is_user": true,
+      "is_system": false,
+      "mes_first_200": "what is 23 plus 17?",
+      "has_extra_reasoning": false,
+      "extra_reasoning_first_300": "",
+      "extra_reasoning_duration_ms": null
+    },
+    {
+      "idx": 2,
+      "is_user": false,
+      "is_system": false,
+      "mes_first_200": "oohhh number crunching!! *pokes a calculator that is actually just a cracker* let me see... 23 and 17... ummm... 40!! ✨ it's 40!! 🥳",
+      "has_extra_reasoning": true,
+      "extra_reasoning_first_300": "The user is asking a simple math question: \"what is 23 plus 17?\".\nScringlo scrambler's persona: silly, playful, lowercase, improv-comedic, stage-direction-y, kind but absent-minded.\nThis is a NON-visual question.\nShe should reply normally in her usual voice without calling tools.\n\n23 + 17 = 40.\n\nRes",
+      "extra_reasoning_duration_ms": 26798
+    }
+  ],
+  "reasoningDom": [
+    {
+      "visible": false,
+      "summary": "Thinking...",
+      "body_first_200": ""
+    },
+    {
+      "visible": false,
+      "summary": "Thinking...",
+      "body_first_200": ""
+    },
+    {
+      "visible": true,
+      "summary": "persona and response for a simple addition question",
+      "body_first_200": "The user is asking a simple math question: \"what is 23 plus 17?\".\nScringlo scrambler's persona: silly, playful, lowercase, improv-comedic, stage-direction-y, kind but absent-minded.\nThis is a NON-visu"
+    }
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "sawReasoningContentDelta": false,
+  "entries": [
+    {
+      "idx": 0,
+      "is_user": false,
+      "is_system": false,
+      "mes_first_200": "uhmmmm... hlello?",
+      "has_extra_reasoning": false,
+      "extra_reasoning_first_300": null,
+      "extra_reasoning_duration_ms": null
+    },
+    {
+      "idx": 1,
+      "is_user": true,
+      "is_system": false,
+      "mes_first_200": "what is 23 plus 17?",
+      "has_extra_reasoning": false,
+      "extra_reasoning_first_300": "",
+      "extra_reasoning_duration_ms": null
+    },
+    {
+      "idx": 2,
+      "is_user": false,
+      "is_system": false,
+      "mes_first_200": "*squints eyes really hard even though math doesn't have eyes* ...ummm... let me see... uh... 40!! yes!! 40!! ✨",
+      "has_extra_reasoning": false,
+      "extra_reasoning_first_300": "",
+      "extra_reasoning_duration_ms": null
+    }
+  ],
+  "reasoningDom": [
+    {
+      "visible": false,
+      "summary": "Thinking...",
+      "body_first_200": ""
+    },
+    {
+      "visible": false,
+      "summary": "Thinking...",
+      "body_first_200": ""
+    },
+    {
+      "visible": false,
+      "summary": "custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \nThinking...",
+      "body_first_200": ""
+    }
+  ]
+}
