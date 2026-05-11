@@ -1,0 +1,29 @@
+{
+  "qualifiedName": "random-choice__uniform",
+  "elapsed_ms": 52,
+  "backend_result_string": "Selected 1 item(s): BETA_OPTION",
+  "backend_threw": null,
+  "tool_progress_entries": [
+    {
+      "messageIdx": 0,
+      "label": "Random Choice • Uniform random sample",
+      "status": "done",
+      "duration_ms": 13,
+      "summary_first_300": "Selected 1 item(s): BETA_OPTION",
+      "error": null
+    }
+  ],
+  "dom_by_message": [
+    {
+      "idx": 0,
+      "bubble_found": true,
+      "bodies": [
+        {
+          "headerText": "Random Choice • Uniform random sample • done (0.0s)",
+          "bodyText": "Selected 1 item(s): BETA_OPTION session d78f6c80 started"
+        }
+      ]
+    }
+  ],
+  "dom_concat_body_text": "Selected 1 item(s): BETA_OPTION session d78f6c80 started"
+}

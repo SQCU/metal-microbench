@@ -1,0 +1,29 @@
+{
+  "qualifiedName": "hello-world__greet",
+  "elapsed_ms": 15,
+  "backend_result_string": "hello, InvariantTest",
+  "backend_threw": null,
+  "tool_progress_entries": [
+    {
+      "messageIdx": 0,
+      "label": "Hello World • Greet someone",
+      "status": "done",
+      "duration_ms": 11,
+      "summary_first_300": "hello, InvariantTest",
+      "error": null
+    }
+  ],
+  "dom_by_message": [
+    {
+      "idx": 0,
+      "bubble_found": true,
+      "bodies": [
+        {
+          "headerText": "Hello World • Greet someone • done (0.0s)",
+          "bodyText": "hello, InvariantTest session 450374e5 started"
+        }
+      ]
+    }
+  ],
+  "dom_concat_body_text": "hello, InvariantTest session 450374e5 started"
+}

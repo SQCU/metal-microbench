@@ -1,0 +1,29 @@
+{
+  "qualifiedName": "persona-effort-schema__elicit",
+  "elapsed_ms": 3382,
+  "backend_result_string": "reasoning_effort schema for InvariantPersona:\n  • low: I provide deeply analytical, multi-step scratchpads followed by exhaustive, highly nuanced, and meticulously verified answers to complex queries.\n  • medium: I provide deeply analytical, multi-step logical breakdowns that exhaustively verify every nuance of your complex queries with extreme precision.\n  • high: I provide deeply analytical, multi-step logical breakdowns and exhaustive scrutiny to ensure absolute precision and nuanced accuracy in every response.",
+  "backend_threw": null,
+  "tool_progress_entries": [
+    {
+      "messageIdx": 0,
+      "label": "Persona effort schema • Elicit effort schema",
+      "status": "done",
+      "duration_ms": 3378,
+      "summary_first_300": "reasoning_effort schema for InvariantPersona:\n  • low: I provide deeply analytical, multi-step scratchpads followed by exhaustive, highly nuanced, and meticulously verified answers to complex queries.\n  • medium: I provide deeply analytical, multi-step logical breakdowns that exhaustively verify eve",
+      "error": null
+    }
+  ],
+  "dom_by_message": [
+    {
+      "idx": 0,
+      "bubble_found": true,
+      "bodies": [
+        {
+          "headerText": "Persona effort schema • Elicit effort schema • done (3.4s)",
+          "bodyText": "reasoning_effort schema for InvariantPersona:\n  • low: I provide deeply analytical, multi-step scratchpads followed by exhaustive, highly nuanced, and meticulously verified answers to complex queries.\n  • medium: I provide deeply analytical, multi-step logical breakdowns that exhaustively verify every nuance of your complex queries with extreme precision.\n  • high: I provide deeply analytical, multi-step logical breakdowns and exhaustive scrutiny to ensure absolute precision and nuanced accuracy in every response. session f81bb60d started"
+        }
+      ]
+    }
+  ],
+  "dom_concat_body_text": "reasoning_effort schema for InvariantPersona:\n  • low: I provide deeply analytical, multi-step scratchpads followed by exhaustive, highly nuanced, and meticulously verified answers to complex queries.\n  • medium: I provide deeply analytical, multi-step logical breakdowns that exhaustively verify every nuance of your complex queries with extreme precision.\n  • high: I provide deeply analytical, multi-step logical breakdowns and exhaustive scrutiny to ensure absolute precision and nuanced accuracy in every response. session f81bb60d started"
+}

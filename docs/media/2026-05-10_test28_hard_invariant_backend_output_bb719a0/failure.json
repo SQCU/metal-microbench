@@ -1,0 +1,29 @@
+{
+  "qualifiedName": "persona-effort-schema__elicit",
+  "elapsed_ms": 17,
+  "backend_result_string": "Error: missing or empty persona_system_prompt",
+  "backend_threw": null,
+  "tool_progress_entries": [
+    {
+      "messageIdx": 0,
+      "label": "Persona effort schema • Elicit effort schema",
+      "status": "failed",
+      "duration_ms": 13,
+      "summary_first_300": null,
+      "error": "missing or empty persona_system_prompt"
+    }
+  ],
+  "dom_by_message": [
+    {
+      "idx": 0,
+      "bubble_found": true,
+      "bodies": [
+        {
+          "headerText": "Persona effort schema • Elicit effort schema • failed (0.0s)",
+          "bodyText": "error: missing or empty persona_system_prompt session a91cdc7e started"
+        }
+      ]
+    }
+  ],
+  "dom_concat_body_text": "error: missing or empty persona_system_prompt session a91cdc7e started"
+}
