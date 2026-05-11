@@ -1,0 +1,32 @@
+{
+  "modelAttemptedToolCall": true,
+  "sawOaiToolCalls": true,
+  "sawGemmaMarker": true,
+  "visible_tool_residue_nodes": 2,
+  "tool_residue_summary": [
+    {
+      "tag": "details",
+      "classes": [
+        "custom-tool-progress-collapsible"
+      ],
+      "text_first_240": "Persona effort schema • Elicit effort schema • done (3.0s)\nreasoning_effort schema for ToolStreamingTest:\n  • low: I provide deeply analytical, multi-step scratchpads followed by exhaustive, highly nuanced, and meticulously verified answers"
+    },
+    {
+      "tag": "details",
+      "classes": [
+        "custom-tool-invocations-collapsible"
+      ],
+      "text_first_240": "Tool calls: Persona effort schema • Elicit effort schema\n[\n  {\n    \"id\": \"call_ebff7d7a1de14f49\",\n    \"displayName\": \"Persona effort schema • Elicit effort schema\",\n    \"name\": \"persona-effort-schema__elicit\",\n    \"parameters\": {\n      \"per"
+    }
+  ],
+  "orphan_chat_entries": [],
+  "graph_node_count": 354,
+  "chat_entry_count": 4,
+  "interval_screenshots": [
+    "10_interval.png",
+    "11_interval.png",
+    "12_interval.png",
+    "13_interval.png",
+    "14_interval.png"
+  ]
+}
