@@ -116,24 +116,18 @@ print(f"  oai_settings.function_calling       = {existing['function_calling']}")
 print(f"  firstRun                            = False (welcome popup suppressed)")
 PY
 
-# Toolcards + example personas now ride the upstream SillyTavern seed
-# mechanism. Both live in the fork at $ST_SRC/default/content/:
-#   - $ST_SRC/default/content/<persona>.png (referenced in
-#     default/content/index.json with type="character")
-#   - $ST_SRC/default/content/toolcards/<id>.toolcard.json (read by
-#     plugins/toolcards/index.mjs's seedDefaultCards() on every boot)
+# Example personas use the upstream SillyTavern content-manager seed:
+# they live at $ST_SRC/default/content/<persona>.png and are listed in
+# $ST_SRC/default/content/index.json with type="character".
+# content-manager.js copies them into <DATA_ROOT>/default-user/characters/
+# during the brief ST first-launch above (line ~35).
 #
-# Both seed paths fire automatically during the brief ST first-launch
-# above (the node server.js --dataRoot ... line ~35). content-manager.js
-# copies characters into <DATA_ROOT>/default-user/characters/, and the
-# toolcards plugin materializes manifests into <DATA_ROOT>/toolcards/.
-# So this bootstrap script no longer needs to copy either.
-#
-# This means the only fork-side requirement is that $ST_SRC is up to
-# date — the seed propagation is structural, not a bash side-channel.
-# Sanity-check both seed locations and warn if they're missing:
-if [[ ! -d "$ST_SRC/default/content/toolcards" ]]; then
-    echo "[bootstrap] WARN: $ST_SRC/default/content/toolcards/ missing — toolcards plugin will boot with 0 cards. Update the fork checkout."
+# Toolcards live INSIDE the plugin directory at
+# $ST_SRC/plugins/toolcards/cards/<id>.toolcard.json (a regular tracked
+# location, no seed indirection). The plugin reads them on every boot
+# directly — no copy step needed. Updating a manifest IS the publish.
+if [[ ! -d "$ST_SRC/plugins/toolcards/cards" ]]; then
+    echo "[bootstrap] WARN: $ST_SRC/plugins/toolcards/cards/ missing — toolcards plugin will boot with 0 cards. Update the fork checkout."
 fi
 if [[ ! -f "$ST_SRC/default/content/scringlo_scrambler.png" ]] || \
    [[ ! -f "$ST_SRC/default/content/dicemother.png" ]]; then
