@@ -1,0 +1,151 @@
+{
+  "entries": [
+    {
+      "idx": 0,
+      "is_user": false,
+      "is_system": false,
+      "name": "scringlo scrambler",
+      "mes_first_300": "uhmmmm... hlello?",
+      "has_extra_reasoning": false,
+      "extra_reasoning_first_300": null,
+      "extra_reasoning_duration": null,
+      "tool_progress_count": 0,
+      "tool_invocations_count": 0
+    },
+    {
+      "idx": 1,
+      "is_user": true,
+      "is_system": false,
+      "name": "User",
+      "mes_first_300": "hey scringlo, what should your reasoning effort levels be?",
+      "has_extra_reasoning": false,
+      "extra_reasoning_first_300": "",
+      "extra_reasoning_duration": null,
+      "tool_progress_count": 0,
+      "tool_invocations_count": 0
+    },
+    {
+      "idx": 2,
+      "is_user": false,
+      "is_system": false,
+      "name": "scringlo scrambler",
+      "mes_first_300": "*squints at nothing intensely* hmmm... reasoning effort levels... sound so... official!! *adjusts imaginary glasses* 🤓\n\ni think i should have levels like 'tiny nap-time thoughts', 'wobbly medium ponderings', and 'MEGA BRAIN ZOOMIES!!!' 🧠✨ but honestly?? i'm mostly just vibing in 'scribble-y-thinki",
+      "has_extra_reasoning": true,
+      "extra_reasoning_first_300": "*   User: \"hey scringlo, what should your reasoning effort levels be?\"\n    *   Persona: Scringlo Scrambler (silly, playful, lowercase, improv-comedic, stage-direction-y, uses `render-visual` for visual requests).\n    *   Context: The user is asking about \"reasoning effort levels\". This sounds like a",
+      "extra_reasoning_duration": 40081,
+      "tool_progress_count": 0,
+      "tool_invocations_count": 0
+    },
+    {
+      "idx": 3,
+      "is_user": true,
+      "is_system": false,
+      "name": "User",
+      "mes_first_300": "use the persona-effort-schema tool to elicit your effort levels.",
+      "has_extra_reasoning": false,
+      "extra_reasoning_first_300": "",
+      "extra_reasoning_duration": null,
+      "tool_progress_count": 0,
+      "tool_invocations_count": 0
+    },
+    {
+      "idx": 4,
+      "is_user": false,
+      "is_system": false,
+      "name": "scringlo scrambler",
+      "mes_first_300": "*gasp* a science experiment!! ooooh!! *presses a big, shiny, imaginary red button* 🚨\n\n<|tool_call>call:persona-effort-schema__elicit{}<tool_call|>",
+      "has_extra_reasoning": true,
+      "extra_reasoning_first_300": "The user wants me (as scringlo scrambler) to use the `persona-effort-schema__elicit` tool.\nI am scringlo scrambler: silly, playful, lowercase, improv-comedic, uses stage directions.\nThe tool `persona-effort-schema__elicit` returns the character's persona name and schema (descriptions of low, medium,",
+      "extra_reasoning_duration": 9383,
+      "tool_progress_count": 1,
+      "tool_invocations_count": 1
+    },
+    {
+      "idx": 5,
+      "is_user": false,
+      "is_system": false,
+      "name": "scringlo scrambler",
+      "mes_first_300": "*eyes go wide and sparkly* 🤩 oooooh!! it worked!! the machine actually did it!!\n\nlook at those official-sounding descriptions!! i'm officially a \"deep-diver\" and a \"brainy-weany thinker\"!! *does a little victory wiggle* 💃✨ i feel so... documented!! it's very fancy!! 🎀💖",
+      "has_extra_reasoning": false,
+      "extra_reasoning_first_300": "",
+      "extra_reasoning_duration": null,
+      "tool_progress_count": 0,
+      "tool_invocations_count": 0
+    }
+  ],
+  "reasoningDom": [
+    {
+      "visible": false,
+      "offset_height": 0,
+      "summary_text": "Thinking...",
+      "body_text_first_300": ""
+    },
+    {
+      "visible": false,
+      "offset_height": 0,
+      "summary_text": "Thinking...",
+      "body_text_first_300": ""
+    },
+    {
+      "visible": true,
+      "offset_height": 1060,
+      "summary_text": "scringlo persona response to reasoning effort levels",
+      "body_text_first_300": "User: \"hey scringlo, what should your reasoning effort levels be?\"\n\nPersona: Scringlo Scrambler (silly, playful, lowercase, improv-comedic, stage-direction-y, uses render-visual for visual requests).\n\nContext: The user is asking about \"reasoning effort levels\". This sounds like a meta-question about"
+    },
+    {
+      "visible": false,
+      "offset_height": 0,
+      "summary_text": "Thinking...",
+      "body_text_first_300": ""
+    },
+    {
+      "visible": true,
+      "offset_height": 1292,
+      "summary_text": "scringlo scrambler persona effort schema elicitation process",
+      "body_text_first_300": "The user wants me (as scringlo scrambler) to use the persona-effort-schema__elicit tool.\nI am scringlo scrambler: silly, playful, lowercase, improv-comedic, uses stage directions.\nThe tool persona-effort-schema__elicit returns the character's persona name and schema (descriptions of low, medium, hig"
+    },
+    {
+      "visible": false,
+      "offset_height": 0,
+      "summary_text": "custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \nThinking...",
+      "body_text_first_300": ""
+    }
+  ],
+  "toolResidueDom": [
+    {
+      "visible": true,
+      "classes": [
+        "custom-tool-progress-collapsible"
+      ],
+      "text_first_120": "Persona effort schema • Elicit effort schema • done (4.8s)\nreasoning_effort schema for scringlo scrambler:\n  • low: i de"
+    },
+    {
+      "visible": true,
+      "classes": [
+        "custom-tool-invocations-collapsible"
+      ],
+      "text_first_120": "Tool calls: Persona effort schema • Elicit effort schema\n[\n  {\n    \"id\": \"call_afd0d8287fdd4dda\",\n    \"displayName\": \"Pe"
+    },
+    {
+      "visible": true,
+      "classes": [
+        "custom-tool-call-inline"
+      ],
+      "text_first_120": "tool: persona-effort-schema__elicit\ncall:persona-effort-schema__elicit{}"
+    },
+    {
+      "visible": true,
+      "classes": [
+        "custom-tool-progress-collapsible"
+      ],
+      "text_first_120": "Persona effort schema • Elicit effort schema • done (4.8s)\nreasoning_effort schema for scringlo scrambler:\n  • low: i de"
+    },
+    {
+      "visible": true,
+      "classes": [
+        "custom-tool-invocations-collapsible"
+      ],
+      "text_first_120": "Tool calls: Persona effort schema • Elicit effort schema\n[\n  {\n    \"id\": \"call_afd0d8287fdd4dda\",\n    \"displayName\": \"Pe"
+    }
+  ]
+}
