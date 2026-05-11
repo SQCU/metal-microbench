@@ -116,54 +116,28 @@ print(f"  oai_settings.function_calling       = {existing['function_calling']}")
 print(f"  firstRun                            = False (welcome popup suppressed)")
 PY
 
-# COPY (not symlink) toolcards from main ST install into our debug
-# data root. Earlier this was a symlink for "pick up the user's
-# changes," but the toolcards plugin REWRITES installed/<id>/service.py
-# from the manifest's `files` field on every plugin reload — so symlinks
-# meant our debug instance was actually writing to the user's main
-# install whenever it restarted. Copying breaks the leakage: debug
-# instance writes only to _data/, never to ~/sillytavern-fork/data/.
-# (To re-pick-up the user's edits, run ./scripts/bootstrap.sh --fresh.)
-TOOLCARDS_SRC="$ST_SRC/data/toolcards"
-TOOLCARDS_DST="$DATA_ROOT/toolcards"
-mkdir -p "$TOOLCARDS_DST"
-for sub in cards installed sources; do
-    src_sub="$TOOLCARDS_SRC/$sub"
-    dst_sub="$TOOLCARDS_DST/$sub"
-    if [[ -d "$src_sub" ]]; then
-        # If existing entry is a symlink (from prior bootstrap run),
-        # remove first so we don't try to cp -r through the link.
-        if [[ -L "$dst_sub" || -e "$dst_sub" ]]; then
-            rm -rf "$dst_sub"
-        fi
-        cp -RH "$src_sub" "$dst_sub"
-        echo "[bootstrap] toolcards/$sub copied from $src_sub"
-    fi
-done
-
-# Personas (scringlo, dicemother, Debug) are CANONICAL artifacts of the
-# gemma-compat work on the sillytavern fork — they're the worked
-# examples that exercise the fork's chat-template-aware tool-call
-# rendering, reasoning-channel forwarding, and structured reasoning
-# summary features. Their source of truth lives in the fork at
-# $ST_SRC/data/example-characters/ (allowlisted in the fork's
-# .gitignore alongside the toolcards). Bootstrap copies them into the
-# disposable _data instance — same pattern as toolcards. Personal /
-# user characters in $ST_SRC/data/default-user/characters/ are NOT
-# touched (that path remains gitignored as personal install state).
-CHARS_DIR="$DATA_ROOT/default-user/characters"
-mkdir -p "$CHARS_DIR"
-EXAMPLES_SRC="$ST_SRC/data/example-characters"
-if [[ -d "$EXAMPLES_SRC" ]]; then
-    # Copy each canonical example into the disposable characters dir.
-    # Mirrors the toolcards copy pattern above.
-    for f in "$EXAMPLES_SRC"/*; do
-        [[ -e "$f" ]] || continue
-        cp -f "$f" "$CHARS_DIR/"
-        echo "[bootstrap] example-character $(basename "$f") copied from $EXAMPLES_SRC"
-    done
-else
-    echo "[bootstrap] WARN: $EXAMPLES_SRC missing — example personas (scringlo, dicemother) won't be available in this instance. Pull the fork up to date or set ST_SRC to a checkout that has data/example-characters/."
+# Toolcards + example personas now ride the upstream SillyTavern seed
+# mechanism. Both live in the fork at $ST_SRC/default/content/:
+#   - $ST_SRC/default/content/<persona>.png (referenced in
+#     default/content/index.json with type="character")
+#   - $ST_SRC/default/content/toolcards/<id>.toolcard.json (read by
+#     plugins/toolcards/index.mjs's seedDefaultCards() on every boot)
+#
+# Both seed paths fire automatically during the brief ST first-launch
+# above (the node server.js --dataRoot ... line ~35). content-manager.js
+# copies characters into <DATA_ROOT>/default-user/characters/, and the
+# toolcards plugin materializes manifests into <DATA_ROOT>/toolcards/.
+# So this bootstrap script no longer needs to copy either.
+#
+# This means the only fork-side requirement is that $ST_SRC is up to
+# date — the seed propagation is structural, not a bash side-channel.
+# Sanity-check both seed locations and warn if they're missing:
+if [[ ! -d "$ST_SRC/default/content/toolcards" ]]; then
+    echo "[bootstrap] WARN: $ST_SRC/default/content/toolcards/ missing — toolcards plugin will boot with 0 cards. Update the fork checkout."
+fi
+if [[ ! -f "$ST_SRC/default/content/scringlo_scrambler.png" ]] || \
+   [[ ! -f "$ST_SRC/default/content/dicemother.png" ]]; then
+    echo "[bootstrap] WARN: example personas missing from $ST_SRC/default/content/. Update the fork checkout."
 fi
 
 echo "[bootstrap] done. data root: $DATA_ROOT"

@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """Ask a persona to volunteer their own reasoning_effort schema.
 
+CLI-side counterpart of the persona-effort-schema toolcard
+(~/sillytavern-fork/default/content/toolcards/persona-effort-schema.toolcard.json).
+The toolcard form is invokable from inside an ST chat — the model
+emits a tool_call and the schema comes back as a tool result. This
+CLI form is the developer-side equivalent: bypasses ST entirely and
+reads PNGs directly so we can do quick offline sanity checks without
+running a full ST instance.
+
 Instead of hand-writing what "reasoning_effort=high" means for each
 persona (the previous approach — see bootstrap.sh dicemother card), this
 tool loads the persona's system prompt, attaches a single meta-query
