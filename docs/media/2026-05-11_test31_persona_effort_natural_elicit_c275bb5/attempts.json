@@ -1,0 +1,20 @@
+[
+  {
+    "attempt": 0,
+    "prompt": "hey scringlo, what should your reasoning effort levels be?",
+    "elicited": false,
+    "sawOaiToolCalls": false,
+    "sawGemmaMarker": false,
+    "sse_chunks_this_turn": 82,
+    "elapsed_ms": 5381
+  },
+  {
+    "attempt": 1,
+    "prompt": "use the persona-effort-schema tool to elicit your effort levels.",
+    "elicited": true,
+    "sawOaiToolCalls": true,
+    "sawGemmaMarker": true,
+    "sse_chunks_this_turn": 84,
+    "elapsed_ms": 16162
+  }
+]

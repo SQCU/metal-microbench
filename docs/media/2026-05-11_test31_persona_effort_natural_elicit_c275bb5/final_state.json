@@ -1,0 +1,6650 @@
+{
+  "chat_entries": [
+    {
+      "idx": 0,
+      "is_user": false,
+      "is_system": false,
+      "name": "scringlo scrambler",
+      "mes_first_500": "uhmmmm... hlello?",
+      "tool_progress_labels": [],
+      "tool_invocations_names": []
+    },
+    {
+      "idx": 1,
+      "is_user": true,
+      "is_system": false,
+      "name": "User",
+      "mes_first_500": "hey scringlo, what should your reasoning effort levels be?",
+      "tool_progress_labels": [],
+      "tool_invocations_names": []
+    },
+    {
+      "idx": 2,
+      "is_user": false,
+      "is_system": false,
+      "name": "scringlo scrambler",
+      "mes_first_500": "*tilts head so far it almost falls off* hmmm... reasoning effort?? i think... i think i should be like a bouncy ball! low effort is just *boing boing boing* and high effort is like... *heavy dramatic pause*... BIG BRAIN VIBRATIONS!! 🧠✨ maybe a mix of both depending on if the question is spicy or just sleepy!!",
+      "tool_progress_labels": [],
+      "tool_invocations_names": []
+    },
+    {
+      "idx": 3,
+      "is_user": true,
+      "is_system": false,
+      "name": "User",
+      "mes_first_500": "use the persona-effort-schema tool to elicit your effort levels.",
+      "tool_progress_labels": [],
+      "tool_invocations_names": []
+    },
+    {
+      "idx": 4,
+      "is_user": false,
+      "is_system": false,
+      "name": "scringlo scrambler",
+      "mes_first_500": "<|tool_call>call:persona-effort-schema__elicit{}<tool_call|>",
+      "tool_progress_labels": [
+        "Persona effort schema • Elicit effort schema • done • SUMMARY:reasoning_effort schema for scringlo scrambler:\n  • low: i'll be a quick little bean, zipping out silly doodles and tiny chats without overthinking the wiggles! ✨\n  • medium: i'll be my usual silly se"
+      ],
+      "tool_invocations_names": [
+        "Persona effort schema • Elicit effort schema: reasoning_effort schema for scringlo scrambler:\n  • low: i'll be a quick little bean, zipping out silly doodles and tiny chats without overthinking the wiggles! ✨\n  • medium: i'll be my usual silly se"
+      ]
+    },
+    {
+      "idx": 5,
+      "is_user": false,
+      "is_system": false,
+      "name": "scringlo scrambler",
+      "mes_first_500": "*gasp!!* look at me!! i'm a professional being studied!! 😱✨ i've got the official scrolls right here! so... low effort for quick doodles, medium for the sparkly-standard-scringlo, and high effort for the BIG BRAIN VIBRATIONS!! teehee!! 💖",
+      "tool_progress_labels": [],
+      "tool_invocations_names": []
+    }
+  ],
+  "dom_graph_nodes": [
+    {
+      "id": 2,
+      "parent_id": 1,
+      "tag": "div",
+      "classes": [
+        "for_checkbox"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 3,
+      "parent_id": 1,
+      "tag": "input",
+      "classes": [
+        "del_checkbox"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 6,
+      "parent_id": 5,
+      "tag": "img",
+      "classes": [],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 50,
+      "display": "inline"
+    },
+    {
+      "id": 5,
+      "parent_id": 4,
+      "tag": "div",
+      "classes": [
+        "avatar"
+      ],
+      "text_first_500": "\n                        \n                    ",
+      "visible": true,
+      "offset_height": 50,
+      "display": "block"
+    },
+    {
+      "id": 7,
+      "parent_id": 4,
+      "tag": "div",
+      "classes": [
+        "mesIDDisplay"
+      ],
+      "text_first_500": "#0",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 8,
+      "parent_id": 4,
+      "tag": "div",
+      "classes": [
+        "mes_timer"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 9,
+      "parent_id": 4,
+      "tag": "div",
+      "classes": [
+        "tokenCounterDisplay"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 4,
+      "parent_id": 1,
+      "tag": "div",
+      "classes": [
+        "mesAvatarWrapper"
+      ],
+      "text_first_500": "\n                    \n                        \n                    \n                    #0\n                    \n                    \n                ",
+      "visible": true,
+      "offset_height": 50,
+      "display": "block"
+    },
+    {
+      "id": 10,
+      "parent_id": 1,
+      "tag": "div",
+      "classes": [
+        "swipe_left",
+        "fa-solid",
+        "fa-chevron-left",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 25,
+      "display": "block"
+    },
+    {
+      "id": 15,
+      "parent_id": 14,
+      "tag": "span",
+      "classes": [
+        "name_text"
+      ],
+      "text_first_500": "scringlo scrambler",
+      "visible": true,
+      "offset_height": 20,
+      "display": "block"
+    },
+    {
+      "id": 16,
+      "parent_id": 14,
+      "tag": "i",
+      "classes": [
+        "mes_ghost",
+        "fa-solid",
+        "fa-ghost"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 17,
+      "parent_id": 14,
+      "tag": "small",
+      "classes": [
+        "timestamp"
+      ],
+      "text_first_500": "May 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 14,
+      "display": "block"
+    },
+    {
+      "id": 14,
+      "parent_id": 13,
+      "tag": "div",
+      "classes": [
+        "flex-container",
+        "alignItemsBaseline"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 20,
+      "display": "flex"
+    },
+    {
+      "id": 13,
+      "parent_id": 12,
+      "tag": "div",
+      "classes": [
+        "flex-container",
+        "flex1",
+        "alignitemscenter"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 20,
+      "display": "flex"
+    },
+    {
+      "id": 19,
+      "parent_id": 18,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "extraMesButtonsHint",
+        "fa-solid",
+        "fa-ellipsis",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 18,
+      "display": "block"
+    },
+    {
+      "id": 21,
+      "parent_id": 20,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_translate",
+        "fa-solid",
+        "fa-language",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 22,
+      "parent_id": 20,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "sd_message_gen",
+        "fa-solid",
+        "fa-paintbrush",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 23,
+      "parent_id": 20,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_narrate",
+        "fa-solid",
+        "fa-bullhorn",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 24,
+      "parent_id": 20,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_prompt",
+        "fa-solid",
+        "fa-square-poll-horizontal",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 25,
+      "parent_id": 20,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_hide",
+        "fa-solid",
+        "fa-eye",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 26,
+      "parent_id": 20,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_unhide",
+        "fa-solid",
+        "fa-eye-slash",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 27,
+      "parent_id": 20,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_media_gallery",
+        "fa-solid",
+        "fa-photo-film",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 28,
+      "parent_id": 20,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_media_list",
+        "fa-solid",
+        "fa-table-cells-large",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 29,
+      "parent_id": 20,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_embed",
+        "fa-solid",
+        "fa-paperclip",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 30,
+      "parent_id": 20,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_swipe_picker",
+        "fa-solid",
+        "fa-bookmark",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 31,
+      "parent_id": 20,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_create_bookmark",
+        "fa-regular",
+        "fa-solid",
+        "fa-flag-checkered",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 32,
+      "parent_id": 20,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_create_branch",
+        "fa-regular",
+        "fa-code-branch",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 33,
+      "parent_id": 20,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_copy",
+        "fa-solid",
+        "fa-copy",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 20,
+      "parent_id": 18,
+      "tag": "div",
+      "classes": [
+        "extraMesButtons"
+      ],
+      "text_first_500": "\n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                            ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 34,
+      "parent_id": 18,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_bookmark",
+        "fa-solid",
+        "fa-flag",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 35,
+      "parent_id": 18,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_edit",
+        "fa-solid",
+        "fa-pencil",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 18,
+      "display": "block"
+    },
+    {
+      "id": 18,
+      "parent_id": 12,
+      "tag": "div",
+      "classes": [
+        "mes_buttons"
+      ],
+      "text_first_500": "\n                            \n                            \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n            ",
+      "visible": true,
+      "offset_height": 20,
+      "display": "flex"
+    },
+    {
+      "id": 37,
+      "parent_id": 36,
+      "tag": "div",
+      "classes": [
+        "mes_edit_done",
+        "menu_button",
+        "fa-solid",
+        "fa-check",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 38,
+      "parent_id": 36,
+      "tag": "div",
+      "classes": [
+        "mes_edit_copy",
+        "menu_button",
+        "fa-solid",
+        "fa-copy",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 39,
+      "parent_id": 36,
+      "tag": "div",
+      "classes": [
+        "mes_edit_add_reasoning",
+        "menu_button",
+        "fa-solid",
+        "fa-lightbulb",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 40,
+      "parent_id": 36,
+      "tag": "div",
+      "classes": [
+        "mes_edit_delete",
+        "menu_button",
+        "fa-solid",
+        "fa-trash-can",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 41,
+      "parent_id": 36,
+      "tag": "div",
+      "classes": [
+        "mes_edit_up",
+        "menu_button",
+        "fa-solid",
+        "fa-chevron-up",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 42,
+      "parent_id": 36,
+      "tag": "div",
+      "classes": [
+        "mes_edit_down",
+        "menu_button",
+        "fa-solid",
+        "fa-chevron-down",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 43,
+      "parent_id": 36,
+      "tag": "div",
+      "classes": [
+        "mes_edit_cancel",
+        "menu_button",
+        "fa-solid",
+        "fa-xmark",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 36,
+      "parent_id": 12,
+      "tag": "div",
+      "classes": [
+        "mes_edit_buttons"
+      ],
+      "text_first_500": "\n                            \n                            \n                            \n                            \n                            \n                            \n                            \n                        ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 12,
+      "parent_id": 11,
+      "tag": "div",
+      "classes": [
+        "ch_name",
+        "flex-container",
+        "justifySpaceBetween"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 22,
+      "display": "flex"
+    },
+    {
+      "id": 48,
+      "parent_id": 47,
+      "tag": "span",
+      "classes": [
+        "mes_reasoning_header_title"
+      ],
+      "text_first_500": "Thinking...",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 49,
+      "parent_id": 47,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_arrow",
+        "fa-solid",
+        "fa-chevron-up"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 47,
+      "parent_id": 46,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_header",
+        "flex-container"
+      ],
+      "text_first_500": "\n                                    Thinking...\n                                    \n                                ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 46,
+      "parent_id": 45,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_header_block",
+        "flex-container"
+      ],
+      "text_first_500": "\n                                \n                                    Thinking...\n                                    \n                                \n                            ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 51,
+      "parent_id": 50,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_edit_done",
+        "menu_button",
+        "edit_button",
+        "fa-solid",
+        "fa-check",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 52,
+      "parent_id": 50,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_delete",
+        "menu_button",
+        "edit_button",
+        "fa-solid",
+        "fa-trash-can",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 53,
+      "parent_id": 50,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_edit_cancel",
+        "menu_button",
+        "edit_button",
+        "fa-solid",
+        "fa-xmark",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 54,
+      "parent_id": 50,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_close_all",
+        "mes_button",
+        "fa-solid",
+        "fa-minimize"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 55,
+      "parent_id": 50,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_copy",
+        "mes_button",
+        "fa-solid",
+        "fa-copy"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 56,
+      "parent_id": 50,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_edit",
+        "mes_button",
+        "fa-solid",
+        "fa-pencil"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 50,
+      "parent_id": 45,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_actions",
+        "flex-container"
+      ],
+      "text_first_500": "\n                                \n                                \n                                \n                                \n                                \n                                \n                            ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 45,
+      "parent_id": 44,
+      "tag": "summary",
+      "classes": [
+        "mes_reasoning_summary",
+        "flex-container"
+      ],
+      "text_first_500": "\n                            \n                                \n                                    Thinking...\n                                    \n                                \n                            \n                            \n                                \n                                \n                                \n                                \n                                \n                                \n                            \n                        ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 57,
+      "parent_id": 44,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 44,
+      "parent_id": 11,
+      "tag": "details",
+      "classes": [
+        "mes_reasoning_details"
+      ],
+      "text_first_500": "\n                        \n                            \n                                \n                                    Thinking...\n                                    \n                                \n                            \n                            \n                                \n                                \n                                \n                                \n                                \n                                \n                            \n         ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 59,
+      "parent_id": 58,
+      "tag": "p",
+      "classes": [],
+      "text_first_500": "uhmmmm… hlello?",
+      "visible": true,
+      "offset_height": 23,
+      "display": "block"
+    },
+    {
+      "id": 58,
+      "parent_id": 11,
+      "tag": "div",
+      "classes": [
+        "mes_text"
+      ],
+      "text_first_500": "uhmmmm… hlello?",
+      "visible": true,
+      "offset_height": 33,
+      "display": "block"
+    },
+    {
+      "id": 60,
+      "parent_id": 11,
+      "tag": "div",
+      "classes": [
+        "mes_media_wrapper"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 61,
+      "parent_id": 11,
+      "tag": "div",
+      "classes": [
+        "mes_file_wrapper"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 62,
+      "parent_id": 11,
+      "tag": "div",
+      "classes": [
+        "mes_bias"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 11,
+      "parent_id": 1,
+      "tag": "div",
+      "classes": [
+        "mes_block"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM\n\nuhmmmm… hlello?",
+      "visible": true,
+      "offset_height": 55,
+      "display": "block"
+    },
+    {
+      "id": 64,
+      "parent_id": 63,
+      "tag": "div",
+      "classes": [
+        "swipe_right",
+        "fa-solid",
+        "fa-chevron-right",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 25,
+      "display": "flex"
+    },
+    {
+      "id": 65,
+      "parent_id": 63,
+      "tag": "div",
+      "classes": [
+        "swipes-counter"
+      ],
+      "text_first_500": "1​/​1",
+      "visible": false,
+      "offset_height": 15,
+      "display": "flex"
+    },
+    {
+      "id": 63,
+      "parent_id": 1,
+      "tag": "div",
+      "classes": [
+        "flex-container",
+        "swipeRightBlock",
+        "flexFlowColumn",
+        "flexNoGap"
+      ],
+      "text_first_500": "\n                    \n                    1​/​1\n                ",
+      "visible": true,
+      "offset_height": 45,
+      "display": "flex"
+    },
+    {
+      "id": 1,
+      "parent_id": 0,
+      "tag": "div",
+      "classes": [
+        "mes",
+        "fade",
+        "lastInContext"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM\n\nuhmmmm… hlello?",
+      "visible": true,
+      "offset_height": 68,
+      "display": "flex"
+    },
+    {
+      "id": 67,
+      "parent_id": 66,
+      "tag": "div",
+      "classes": [
+        "for_checkbox"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 68,
+      "parent_id": 66,
+      "tag": "input",
+      "classes": [
+        "del_checkbox"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 71,
+      "parent_id": 70,
+      "tag": "img",
+      "classes": [],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 50,
+      "display": "inline"
+    },
+    {
+      "id": 70,
+      "parent_id": 69,
+      "tag": "div",
+      "classes": [
+        "avatar"
+      ],
+      "text_first_500": "\n                        \n                    ",
+      "visible": true,
+      "offset_height": 50,
+      "display": "block"
+    },
+    {
+      "id": 72,
+      "parent_id": 69,
+      "tag": "div",
+      "classes": [
+        "mesIDDisplay"
+      ],
+      "text_first_500": "#1",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 73,
+      "parent_id": 69,
+      "tag": "div",
+      "classes": [
+        "mes_timer"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 74,
+      "parent_id": 69,
+      "tag": "div",
+      "classes": [
+        "tokenCounterDisplay"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 69,
+      "parent_id": 66,
+      "tag": "div",
+      "classes": [
+        "mesAvatarWrapper"
+      ],
+      "text_first_500": "\n                    \n                        \n                    \n                    #1\n                    \n                    \n                ",
+      "visible": true,
+      "offset_height": 50,
+      "display": "block"
+    },
+    {
+      "id": 75,
+      "parent_id": 66,
+      "tag": "div",
+      "classes": [
+        "swipe_left",
+        "fa-solid",
+        "fa-chevron-left",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 25,
+      "display": "block"
+    },
+    {
+      "id": 80,
+      "parent_id": 79,
+      "tag": "span",
+      "classes": [
+        "name_text"
+      ],
+      "text_first_500": "User",
+      "visible": true,
+      "offset_height": 20,
+      "display": "block"
+    },
+    {
+      "id": 81,
+      "parent_id": 79,
+      "tag": "i",
+      "classes": [
+        "mes_ghost",
+        "fa-solid",
+        "fa-ghost"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 82,
+      "parent_id": 79,
+      "tag": "small",
+      "classes": [
+        "timestamp"
+      ],
+      "text_first_500": "May 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 14,
+      "display": "block"
+    },
+    {
+      "id": 79,
+      "parent_id": 78,
+      "tag": "div",
+      "classes": [
+        "flex-container",
+        "alignItemsBaseline"
+      ],
+      "text_first_500": "User\nMay 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 20,
+      "display": "flex"
+    },
+    {
+      "id": 78,
+      "parent_id": 77,
+      "tag": "div",
+      "classes": [
+        "flex-container",
+        "flex1",
+        "alignitemscenter"
+      ],
+      "text_first_500": "User\nMay 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 20,
+      "display": "flex"
+    },
+    {
+      "id": 84,
+      "parent_id": 83,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "extraMesButtonsHint",
+        "fa-solid",
+        "fa-ellipsis",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 18,
+      "display": "block"
+    },
+    {
+      "id": 86,
+      "parent_id": 85,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_translate",
+        "fa-solid",
+        "fa-language",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 87,
+      "parent_id": 85,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "sd_message_gen",
+        "fa-solid",
+        "fa-paintbrush",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 88,
+      "parent_id": 85,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_narrate",
+        "fa-solid",
+        "fa-bullhorn",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 89,
+      "parent_id": 85,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_prompt",
+        "fa-solid",
+        "fa-square-poll-horizontal",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 90,
+      "parent_id": 85,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_hide",
+        "fa-solid",
+        "fa-eye",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 91,
+      "parent_id": 85,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_unhide",
+        "fa-solid",
+        "fa-eye-slash",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 92,
+      "parent_id": 85,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_media_gallery",
+        "fa-solid",
+        "fa-photo-film",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 93,
+      "parent_id": 85,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_media_list",
+        "fa-solid",
+        "fa-table-cells-large",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 94,
+      "parent_id": 85,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_embed",
+        "fa-solid",
+        "fa-paperclip",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 95,
+      "parent_id": 85,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_swipe_picker",
+        "fa-solid",
+        "fa-bookmark",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 96,
+      "parent_id": 85,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_create_bookmark",
+        "fa-regular",
+        "fa-solid",
+        "fa-flag-checkered",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 97,
+      "parent_id": 85,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_create_branch",
+        "fa-regular",
+        "fa-code-branch",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 98,
+      "parent_id": 85,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_copy",
+        "fa-solid",
+        "fa-copy",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 85,
+      "parent_id": 83,
+      "tag": "div",
+      "classes": [
+        "extraMesButtons"
+      ],
+      "text_first_500": "\n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                            ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 99,
+      "parent_id": 83,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_bookmark",
+        "fa-solid",
+        "fa-flag",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 100,
+      "parent_id": 83,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_edit",
+        "fa-solid",
+        "fa-pencil",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 18,
+      "display": "block"
+    },
+    {
+      "id": 83,
+      "parent_id": 77,
+      "tag": "div",
+      "classes": [
+        "mes_buttons"
+      ],
+      "text_first_500": "\n                            \n                            \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n            ",
+      "visible": true,
+      "offset_height": 20,
+      "display": "flex"
+    },
+    {
+      "id": 102,
+      "parent_id": 101,
+      "tag": "div",
+      "classes": [
+        "mes_edit_done",
+        "menu_button",
+        "fa-solid",
+        "fa-check",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 103,
+      "parent_id": 101,
+      "tag": "div",
+      "classes": [
+        "mes_edit_copy",
+        "menu_button",
+        "fa-solid",
+        "fa-copy",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 104,
+      "parent_id": 101,
+      "tag": "div",
+      "classes": [
+        "mes_edit_add_reasoning",
+        "menu_button",
+        "fa-solid",
+        "fa-lightbulb",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 105,
+      "parent_id": 101,
+      "tag": "div",
+      "classes": [
+        "mes_edit_delete",
+        "menu_button",
+        "fa-solid",
+        "fa-trash-can",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 106,
+      "parent_id": 101,
+      "tag": "div",
+      "classes": [
+        "mes_edit_up",
+        "menu_button",
+        "fa-solid",
+        "fa-chevron-up",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 107,
+      "parent_id": 101,
+      "tag": "div",
+      "classes": [
+        "mes_edit_down",
+        "menu_button",
+        "fa-solid",
+        "fa-chevron-down",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 108,
+      "parent_id": 101,
+      "tag": "div",
+      "classes": [
+        "mes_edit_cancel",
+        "menu_button",
+        "fa-solid",
+        "fa-xmark",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 101,
+      "parent_id": 77,
+      "tag": "div",
+      "classes": [
+        "mes_edit_buttons"
+      ],
+      "text_first_500": "\n                            \n                            \n                            \n                            \n                            \n                            \n                            \n                        ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 77,
+      "parent_id": 76,
+      "tag": "div",
+      "classes": [
+        "ch_name",
+        "flex-container",
+        "justifySpaceBetween"
+      ],
+      "text_first_500": "User\nMay 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 22,
+      "display": "flex"
+    },
+    {
+      "id": 113,
+      "parent_id": 112,
+      "tag": "span",
+      "classes": [
+        "mes_reasoning_header_title"
+      ],
+      "text_first_500": "Thinking...",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 114,
+      "parent_id": 112,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_arrow",
+        "fa-solid",
+        "fa-chevron-up"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 112,
+      "parent_id": 111,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_header",
+        "flex-container"
+      ],
+      "text_first_500": "\n                                    Thinking...\n                                    \n                                ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 111,
+      "parent_id": 110,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_header_block",
+        "flex-container"
+      ],
+      "text_first_500": "\n                                \n                                    Thinking...\n                                    \n                                \n                            ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 116,
+      "parent_id": 115,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_edit_done",
+        "menu_button",
+        "edit_button",
+        "fa-solid",
+        "fa-check",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 117,
+      "parent_id": 115,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_delete",
+        "menu_button",
+        "edit_button",
+        "fa-solid",
+        "fa-trash-can",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 118,
+      "parent_id": 115,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_edit_cancel",
+        "menu_button",
+        "edit_button",
+        "fa-solid",
+        "fa-xmark",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 119,
+      "parent_id": 115,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_close_all",
+        "mes_button",
+        "fa-solid",
+        "fa-minimize"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 120,
+      "parent_id": 115,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_copy",
+        "mes_button",
+        "fa-solid",
+        "fa-copy"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 121,
+      "parent_id": 115,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_edit",
+        "mes_button",
+        "fa-solid",
+        "fa-pencil"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 115,
+      "parent_id": 110,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_actions",
+        "flex-container"
+      ],
+      "text_first_500": "\n                                \n                                \n                                \n                                \n                                \n                                \n                            ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 110,
+      "parent_id": 109,
+      "tag": "summary",
+      "classes": [
+        "mes_reasoning_summary",
+        "flex-container"
+      ],
+      "text_first_500": "\n                            \n                                \n                                    Thinking...\n                                    \n                                \n                            \n                            \n                                \n                                \n                                \n                                \n                                \n                                \n                            \n                        ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 122,
+      "parent_id": 109,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 109,
+      "parent_id": 76,
+      "tag": "details",
+      "classes": [
+        "mes_reasoning_details"
+      ],
+      "text_first_500": "\n                        \n                            \n                                \n                                    Thinking...\n                                    \n                                \n                            \n                            \n                                \n                                \n                                \n                                \n                                \n                                \n                            \n         ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 124,
+      "parent_id": 123,
+      "tag": "p",
+      "classes": [],
+      "text_first_500": "hey scringlo, what should your reasoning effort levels be?",
+      "visible": true,
+      "offset_height": 23,
+      "display": "block"
+    },
+    {
+      "id": 123,
+      "parent_id": 76,
+      "tag": "div",
+      "classes": [
+        "mes_text"
+      ],
+      "text_first_500": "hey scringlo, what should your reasoning effort levels be?",
+      "visible": true,
+      "offset_height": 33,
+      "display": "block"
+    },
+    {
+      "id": 125,
+      "parent_id": 76,
+      "tag": "div",
+      "classes": [
+        "mes_media_wrapper"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 126,
+      "parent_id": 76,
+      "tag": "div",
+      "classes": [
+        "mes_file_wrapper"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 127,
+      "parent_id": 76,
+      "tag": "div",
+      "classes": [
+        "mes_bias"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 76,
+      "parent_id": 66,
+      "tag": "div",
+      "classes": [
+        "mes_block"
+      ],
+      "text_first_500": "User\nMay 11, 2026 12:44 AM\n\nhey scringlo, what should your reasoning effort levels be?",
+      "visible": true,
+      "offset_height": 55,
+      "display": "block"
+    },
+    {
+      "id": 129,
+      "parent_id": 128,
+      "tag": "div",
+      "classes": [
+        "swipe_right",
+        "fa-solid",
+        "fa-chevron-right",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 25,
+      "display": "flex"
+    },
+    {
+      "id": 130,
+      "parent_id": 128,
+      "tag": "div",
+      "classes": [
+        "swipes-counter"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 15,
+      "display": "flex"
+    },
+    {
+      "id": 128,
+      "parent_id": 66,
+      "tag": "div",
+      "classes": [
+        "flex-container",
+        "swipeRightBlock",
+        "flexFlowColumn",
+        "flexNoGap"
+      ],
+      "text_first_500": "\n                    \n                    \n                ",
+      "visible": true,
+      "offset_height": 45,
+      "display": "flex"
+    },
+    {
+      "id": 66,
+      "parent_id": 0,
+      "tag": "div",
+      "classes": [
+        "mes",
+        "fade"
+      ],
+      "text_first_500": "User\nMay 11, 2026 12:44 AM\n\nhey scringlo, what should your reasoning effort levels be?",
+      "visible": true,
+      "offset_height": 65,
+      "display": "flex"
+    },
+    {
+      "id": 132,
+      "parent_id": 131,
+      "tag": "div",
+      "classes": [
+        "for_checkbox"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 133,
+      "parent_id": 131,
+      "tag": "input",
+      "classes": [
+        "del_checkbox"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 136,
+      "parent_id": 135,
+      "tag": "img",
+      "classes": [],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 50,
+      "display": "inline"
+    },
+    {
+      "id": 135,
+      "parent_id": 134,
+      "tag": "div",
+      "classes": [
+        "avatar"
+      ],
+      "text_first_500": "\n                        \n                    ",
+      "visible": true,
+      "offset_height": 50,
+      "display": "block"
+    },
+    {
+      "id": 137,
+      "parent_id": 134,
+      "tag": "div",
+      "classes": [
+        "mesIDDisplay"
+      ],
+      "text_first_500": "#2",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 138,
+      "parent_id": 134,
+      "tag": "div",
+      "classes": [
+        "mes_timer"
+      ],
+      "text_first_500": "3.1s",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 139,
+      "parent_id": 134,
+      "tag": "div",
+      "classes": [
+        "tokenCounterDisplay"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 134,
+      "parent_id": 131,
+      "tag": "div",
+      "classes": [
+        "mesAvatarWrapper"
+      ],
+      "text_first_500": "\n                    \n                        \n                    \n                    #2\n                    3.1s\n                    \n                ",
+      "visible": true,
+      "offset_height": 50,
+      "display": "block"
+    },
+    {
+      "id": 140,
+      "parent_id": 131,
+      "tag": "div",
+      "classes": [
+        "swipe_left",
+        "fa-solid",
+        "fa-chevron-left",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 25,
+      "display": "block"
+    },
+    {
+      "id": 145,
+      "parent_id": 144,
+      "tag": "span",
+      "classes": [
+        "name_text"
+      ],
+      "text_first_500": "scringlo scrambler",
+      "visible": true,
+      "offset_height": 20,
+      "display": "block"
+    },
+    {
+      "id": 146,
+      "parent_id": 144,
+      "tag": "i",
+      "classes": [
+        "mes_ghost",
+        "fa-solid",
+        "fa-ghost"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 147,
+      "parent_id": 144,
+      "tag": "small",
+      "classes": [
+        "timestamp"
+      ],
+      "text_first_500": "May 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 14,
+      "display": "block"
+    },
+    {
+      "id": 149,
+      "parent_id": 148,
+      "tag": "title",
+      "classes": [],
+      "text_first_500": "custom - gemma-4-a4b",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 150,
+      "parent_id": 148,
+      "tag": "sodipodi:namedview",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 151,
+      "parent_id": 148,
+      "tag": "defs",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 154,
+      "parent_id": 153,
+      "tag": "path",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 155,
+      "parent_id": 153,
+      "tag": "path",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 153,
+      "parent_id": 152,
+      "tag": "g",
+      "classes": [],
+      "text_first_500": "\n      \n      \n    ",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 152,
+      "parent_id": 148,
+      "tag": "g",
+      "classes": [],
+      "text_first_500": "\n    \n      \n      \n    \n  ",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 148,
+      "parent_id": 144,
+      "tag": "svg",
+      "classes": [
+        "icon-svg",
+        "timestamp-icon"
+      ],
+      "text_first_500": "\n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \n",
+      "visible": false,
+      "display": "block"
+    },
+    {
+      "id": 144,
+      "parent_id": 143,
+      "tag": "div",
+      "classes": [
+        "flex-container",
+        "alignItemsBaseline"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 20,
+      "display": "flex"
+    },
+    {
+      "id": 143,
+      "parent_id": 142,
+      "tag": "div",
+      "classes": [
+        "flex-container",
+        "flex1",
+        "alignitemscenter"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 20,
+      "display": "flex"
+    },
+    {
+      "id": 157,
+      "parent_id": 156,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "extraMesButtonsHint",
+        "fa-solid",
+        "fa-ellipsis",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 18,
+      "display": "block"
+    },
+    {
+      "id": 159,
+      "parent_id": 158,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_translate",
+        "fa-solid",
+        "fa-language",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 160,
+      "parent_id": 158,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "sd_message_gen",
+        "fa-solid",
+        "fa-paintbrush",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 161,
+      "parent_id": 158,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_narrate",
+        "fa-solid",
+        "fa-bullhorn",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 162,
+      "parent_id": 158,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_prompt",
+        "fa-solid",
+        "fa-square-poll-horizontal",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 163,
+      "parent_id": 158,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_hide",
+        "fa-solid",
+        "fa-eye",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 164,
+      "parent_id": 158,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_unhide",
+        "fa-solid",
+        "fa-eye-slash",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 165,
+      "parent_id": 158,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_media_gallery",
+        "fa-solid",
+        "fa-photo-film",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 166,
+      "parent_id": 158,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_media_list",
+        "fa-solid",
+        "fa-table-cells-large",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 167,
+      "parent_id": 158,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_embed",
+        "fa-solid",
+        "fa-paperclip",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 168,
+      "parent_id": 158,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_swipe_picker",
+        "fa-solid",
+        "fa-bookmark",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 169,
+      "parent_id": 158,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_create_bookmark",
+        "fa-regular",
+        "fa-solid",
+        "fa-flag-checkered",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 170,
+      "parent_id": 158,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_create_branch",
+        "fa-regular",
+        "fa-code-branch",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 171,
+      "parent_id": 158,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_copy",
+        "fa-solid",
+        "fa-copy",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 158,
+      "parent_id": 156,
+      "tag": "div",
+      "classes": [
+        "extraMesButtons"
+      ],
+      "text_first_500": "\n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                            ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 172,
+      "parent_id": 156,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_bookmark",
+        "fa-solid",
+        "fa-flag",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 173,
+      "parent_id": 156,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_edit",
+        "fa-solid",
+        "fa-pencil",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 18,
+      "display": "block"
+    },
+    {
+      "id": 156,
+      "parent_id": 142,
+      "tag": "div",
+      "classes": [
+        "mes_buttons"
+      ],
+      "text_first_500": "\n                            \n                            \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n            ",
+      "visible": true,
+      "offset_height": 20,
+      "display": "flex"
+    },
+    {
+      "id": 175,
+      "parent_id": 174,
+      "tag": "div",
+      "classes": [
+        "mes_edit_done",
+        "menu_button",
+        "fa-solid",
+        "fa-check",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 176,
+      "parent_id": 174,
+      "tag": "div",
+      "classes": [
+        "mes_edit_copy",
+        "menu_button",
+        "fa-solid",
+        "fa-copy",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 177,
+      "parent_id": 174,
+      "tag": "div",
+      "classes": [
+        "mes_edit_add_reasoning",
+        "menu_button",
+        "fa-solid",
+        "fa-lightbulb",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 178,
+      "parent_id": 174,
+      "tag": "div",
+      "classes": [
+        "mes_edit_delete",
+        "menu_button",
+        "fa-solid",
+        "fa-trash-can",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 179,
+      "parent_id": 174,
+      "tag": "div",
+      "classes": [
+        "mes_edit_up",
+        "menu_button",
+        "fa-solid",
+        "fa-chevron-up",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 180,
+      "parent_id": 174,
+      "tag": "div",
+      "classes": [
+        "mes_edit_down",
+        "menu_button",
+        "fa-solid",
+        "fa-chevron-down",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 181,
+      "parent_id": 174,
+      "tag": "div",
+      "classes": [
+        "mes_edit_cancel",
+        "menu_button",
+        "fa-solid",
+        "fa-xmark",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 174,
+      "parent_id": 142,
+      "tag": "div",
+      "classes": [
+        "mes_edit_buttons"
+      ],
+      "text_first_500": "\n                            \n                            \n                            \n                            \n                            \n                            \n                            \n                        ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 142,
+      "parent_id": 141,
+      "tag": "div",
+      "classes": [
+        "ch_name",
+        "flex-container",
+        "justifySpaceBetween"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 22,
+      "display": "flex"
+    },
+    {
+      "id": 187,
+      "parent_id": 186,
+      "tag": "title",
+      "classes": [],
+      "text_first_500": "custom - gemma-4-a4b",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 188,
+      "parent_id": 186,
+      "tag": "sodipodi:namedview",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 189,
+      "parent_id": 186,
+      "tag": "defs",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 192,
+      "parent_id": 191,
+      "tag": "path",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 193,
+      "parent_id": 191,
+      "tag": "path",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 191,
+      "parent_id": 190,
+      "tag": "g",
+      "classes": [],
+      "text_first_500": "\n      \n      \n    ",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 190,
+      "parent_id": 186,
+      "tag": "g",
+      "classes": [],
+      "text_first_500": "\n    \n      \n      \n    \n  ",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 186,
+      "parent_id": 185,
+      "tag": "svg",
+      "classes": [
+        "icon-svg",
+        "thinking-icon"
+      ],
+      "text_first_500": "\n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \n",
+      "visible": false,
+      "display": "none"
+    },
+    {
+      "id": 194,
+      "parent_id": 185,
+      "tag": "span",
+      "classes": [
+        "mes_reasoning_header_title"
+      ],
+      "text_first_500": "Thinking...",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 195,
+      "parent_id": 185,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_arrow",
+        "fa-solid",
+        "fa-chevron-up"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 185,
+      "parent_id": 184,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_header",
+        "flex-container"
+      ],
+      "text_first_500": "\n                                    \n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \nThinking...\n                                    \n                                ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 184,
+      "parent_id": 183,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_header_block",
+        "flex-container"
+      ],
+      "text_first_500": "\n                                \n                                    \n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \nThinking...\n                                    \n                                \n                            ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 197,
+      "parent_id": 196,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_edit_done",
+        "menu_button",
+        "edit_button",
+        "fa-solid",
+        "fa-check",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 198,
+      "parent_id": 196,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_delete",
+        "menu_button",
+        "edit_button",
+        "fa-solid",
+        "fa-trash-can",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 199,
+      "parent_id": 196,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_edit_cancel",
+        "menu_button",
+        "edit_button",
+        "fa-solid",
+        "fa-xmark",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 200,
+      "parent_id": 196,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_close_all",
+        "mes_button",
+        "fa-solid",
+        "fa-minimize"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 201,
+      "parent_id": 196,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_copy",
+        "mes_button",
+        "fa-solid",
+        "fa-copy"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 202,
+      "parent_id": 196,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_edit",
+        "mes_button",
+        "fa-solid",
+        "fa-pencil"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 196,
+      "parent_id": 183,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_actions",
+        "flex-container"
+      ],
+      "text_first_500": "\n                                \n                                \n                                \n                                \n                                \n                                \n                            ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 183,
+      "parent_id": 182,
+      "tag": "summary",
+      "classes": [
+        "mes_reasoning_summary",
+        "flex-container"
+      ],
+      "text_first_500": "\n                            \n                                \n                                    \n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \nThinking...\n                                    \n                                \n                            \n                            \n                                \n                                \n                                \n                                \n                                \n                                \n      ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 203,
+      "parent_id": 182,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 182,
+      "parent_id": 141,
+      "tag": "details",
+      "classes": [
+        "mes_reasoning_details"
+      ],
+      "text_first_500": "\n                        \n                            \n                                \n                                    \n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \nThinking...\n                                    \n                                \n                            \n                            \n                                \n                                \n                                \n                                \n                                \n              ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 206,
+      "parent_id": 205,
+      "tag": "em",
+      "classes": [],
+      "text_first_500": "tilts head so far it almost falls off",
+      "visible": true,
+      "offset_height": 20,
+      "display": "inline"
+    },
+    {
+      "id": 207,
+      "parent_id": 205,
+      "tag": "em",
+      "classes": [],
+      "text_first_500": "boing boing boing",
+      "visible": true,
+      "offset_height": 20,
+      "display": "inline"
+    },
+    {
+      "id": 208,
+      "parent_id": 205,
+      "tag": "em",
+      "classes": [],
+      "text_first_500": "heavy dramatic pause",
+      "visible": true,
+      "offset_height": 20,
+      "display": "inline"
+    },
+    {
+      "id": 205,
+      "parent_id": 204,
+      "tag": "p",
+      "classes": [],
+      "text_first_500": "tilts head so far it almost falls off hmmm… reasoning effort?? i think… i think i should be like a bouncy ball! low effort is just boing boing boing and high effort is like… heavy dramatic pause… BIG BRAIN VIBRATIONS!! 🧠✨ maybe a mix of both depending on if the question is spicy or just sleepy!!",
+      "visible": true,
+      "offset_height": 115,
+      "display": "block"
+    },
+    {
+      "id": 204,
+      "parent_id": 141,
+      "tag": "div",
+      "classes": [
+        "mes_text"
+      ],
+      "text_first_500": "tilts head so far it almost falls off hmmm… reasoning effort?? i think… i think i should be like a bouncy ball! low effort is just boing boing boing and high effort is like… heavy dramatic pause… BIG BRAIN VIBRATIONS!! 🧠✨ maybe a mix of both depending on if the question is spicy or just sleepy!!",
+      "visible": true,
+      "offset_height": 125,
+      "display": "block"
+    },
+    {
+      "id": 209,
+      "parent_id": 141,
+      "tag": "div",
+      "classes": [
+        "mes_media_wrapper"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 210,
+      "parent_id": 141,
+      "tag": "div",
+      "classes": [
+        "mes_file_wrapper"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 211,
+      "parent_id": 141,
+      "tag": "div",
+      "classes": [
+        "mes_bias"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 141,
+      "parent_id": 131,
+      "tag": "div",
+      "classes": [
+        "mes_block"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM\n\ntilts head so far it almost falls off hmmm… reasoning effort?? i think… i think i should be like a bouncy ball! low effort is just boing boing boing and high effort is like… heavy dramatic pause… BIG BRAIN VIBRATIONS!! 🧠✨ maybe a mix of both depending on if the question is spicy or just sleepy!!",
+      "visible": true,
+      "offset_height": 147,
+      "display": "block"
+    },
+    {
+      "id": 213,
+      "parent_id": 212,
+      "tag": "div",
+      "classes": [
+        "swipe_right",
+        "fa-solid",
+        "fa-chevron-right",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 25,
+      "display": "flex"
+    },
+    {
+      "id": 214,
+      "parent_id": 212,
+      "tag": "div",
+      "classes": [
+        "swipes-counter"
+      ],
+      "text_first_500": "1​/​1",
+      "visible": false,
+      "offset_height": 15,
+      "display": "flex"
+    },
+    {
+      "id": 212,
+      "parent_id": 131,
+      "tag": "div",
+      "classes": [
+        "flex-container",
+        "swipeRightBlock",
+        "flexFlowColumn",
+        "flexNoGap"
+      ],
+      "text_first_500": "\n                    \n                    1​/​1\n                ",
+      "visible": true,
+      "offset_height": 45,
+      "display": "flex"
+    },
+    {
+      "id": 131,
+      "parent_id": 0,
+      "tag": "div",
+      "classes": [
+        "mes",
+        "fade"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM\n\ntilts head so far it almost falls off hmmm… reasoning effort?? i think… i think i should be like a bouncy ball! low effort is just boing boing boing and high effort is like… heavy dramatic pause… BIG BRAIN VIBRATIONS!! 🧠✨ maybe a mix of both depending on if the question is spicy or just sleepy!!",
+      "visible": true,
+      "offset_height": 157,
+      "display": "flex"
+    },
+    {
+      "id": 216,
+      "parent_id": 215,
+      "tag": "div",
+      "classes": [
+        "for_checkbox"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 217,
+      "parent_id": 215,
+      "tag": "input",
+      "classes": [
+        "del_checkbox"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 220,
+      "parent_id": 219,
+      "tag": "img",
+      "classes": [],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 50,
+      "display": "inline"
+    },
+    {
+      "id": 219,
+      "parent_id": 218,
+      "tag": "div",
+      "classes": [
+        "avatar"
+      ],
+      "text_first_500": "\n                        \n                    ",
+      "visible": true,
+      "offset_height": 50,
+      "display": "block"
+    },
+    {
+      "id": 221,
+      "parent_id": 218,
+      "tag": "div",
+      "classes": [
+        "mesIDDisplay"
+      ],
+      "text_first_500": "#3",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 222,
+      "parent_id": 218,
+      "tag": "div",
+      "classes": [
+        "mes_timer"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 223,
+      "parent_id": 218,
+      "tag": "div",
+      "classes": [
+        "tokenCounterDisplay"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 218,
+      "parent_id": 215,
+      "tag": "div",
+      "classes": [
+        "mesAvatarWrapper"
+      ],
+      "text_first_500": "\n                    \n                        \n                    \n                    #3\n                    \n                    \n                ",
+      "visible": true,
+      "offset_height": 50,
+      "display": "block"
+    },
+    {
+      "id": 224,
+      "parent_id": 215,
+      "tag": "div",
+      "classes": [
+        "swipe_left",
+        "fa-solid",
+        "fa-chevron-left",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 25,
+      "display": "block"
+    },
+    {
+      "id": 229,
+      "parent_id": 228,
+      "tag": "span",
+      "classes": [
+        "name_text"
+      ],
+      "text_first_500": "User",
+      "visible": true,
+      "offset_height": 20,
+      "display": "block"
+    },
+    {
+      "id": 230,
+      "parent_id": 228,
+      "tag": "i",
+      "classes": [
+        "mes_ghost",
+        "fa-solid",
+        "fa-ghost"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 231,
+      "parent_id": 228,
+      "tag": "small",
+      "classes": [
+        "timestamp"
+      ],
+      "text_first_500": "May 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 14,
+      "display": "block"
+    },
+    {
+      "id": 228,
+      "parent_id": 227,
+      "tag": "div",
+      "classes": [
+        "flex-container",
+        "alignItemsBaseline"
+      ],
+      "text_first_500": "User\nMay 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 20,
+      "display": "flex"
+    },
+    {
+      "id": 227,
+      "parent_id": 226,
+      "tag": "div",
+      "classes": [
+        "flex-container",
+        "flex1",
+        "alignitemscenter"
+      ],
+      "text_first_500": "User\nMay 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 20,
+      "display": "flex"
+    },
+    {
+      "id": 233,
+      "parent_id": 232,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "extraMesButtonsHint",
+        "fa-solid",
+        "fa-ellipsis",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 18,
+      "display": "block"
+    },
+    {
+      "id": 235,
+      "parent_id": 234,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_translate",
+        "fa-solid",
+        "fa-language",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 236,
+      "parent_id": 234,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "sd_message_gen",
+        "fa-solid",
+        "fa-paintbrush",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 237,
+      "parent_id": 234,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_narrate",
+        "fa-solid",
+        "fa-bullhorn",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 238,
+      "parent_id": 234,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_prompt",
+        "fa-solid",
+        "fa-square-poll-horizontal",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 239,
+      "parent_id": 234,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_hide",
+        "fa-solid",
+        "fa-eye",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 240,
+      "parent_id": 234,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_unhide",
+        "fa-solid",
+        "fa-eye-slash",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 241,
+      "parent_id": 234,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_media_gallery",
+        "fa-solid",
+        "fa-photo-film",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 242,
+      "parent_id": 234,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_media_list",
+        "fa-solid",
+        "fa-table-cells-large",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 243,
+      "parent_id": 234,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_embed",
+        "fa-solid",
+        "fa-paperclip",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 244,
+      "parent_id": 234,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_swipe_picker",
+        "fa-solid",
+        "fa-bookmark",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 245,
+      "parent_id": 234,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_create_bookmark",
+        "fa-regular",
+        "fa-solid",
+        "fa-flag-checkered",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 246,
+      "parent_id": 234,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_create_branch",
+        "fa-regular",
+        "fa-code-branch",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 247,
+      "parent_id": 234,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_copy",
+        "fa-solid",
+        "fa-copy",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 234,
+      "parent_id": 232,
+      "tag": "div",
+      "classes": [
+        "extraMesButtons"
+      ],
+      "text_first_500": "\n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                            ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 248,
+      "parent_id": 232,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_bookmark",
+        "fa-solid",
+        "fa-flag",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 249,
+      "parent_id": 232,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_edit",
+        "fa-solid",
+        "fa-pencil",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 18,
+      "display": "block"
+    },
+    {
+      "id": 232,
+      "parent_id": 226,
+      "tag": "div",
+      "classes": [
+        "mes_buttons"
+      ],
+      "text_first_500": "\n                            \n                            \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n            ",
+      "visible": true,
+      "offset_height": 20,
+      "display": "flex"
+    },
+    {
+      "id": 251,
+      "parent_id": 250,
+      "tag": "div",
+      "classes": [
+        "mes_edit_done",
+        "menu_button",
+        "fa-solid",
+        "fa-check",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 252,
+      "parent_id": 250,
+      "tag": "div",
+      "classes": [
+        "mes_edit_copy",
+        "menu_button",
+        "fa-solid",
+        "fa-copy",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 253,
+      "parent_id": 250,
+      "tag": "div",
+      "classes": [
+        "mes_edit_add_reasoning",
+        "menu_button",
+        "fa-solid",
+        "fa-lightbulb",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 254,
+      "parent_id": 250,
+      "tag": "div",
+      "classes": [
+        "mes_edit_delete",
+        "menu_button",
+        "fa-solid",
+        "fa-trash-can",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 255,
+      "parent_id": 250,
+      "tag": "div",
+      "classes": [
+        "mes_edit_up",
+        "menu_button",
+        "fa-solid",
+        "fa-chevron-up",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 256,
+      "parent_id": 250,
+      "tag": "div",
+      "classes": [
+        "mes_edit_down",
+        "menu_button",
+        "fa-solid",
+        "fa-chevron-down",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 257,
+      "parent_id": 250,
+      "tag": "div",
+      "classes": [
+        "mes_edit_cancel",
+        "menu_button",
+        "fa-solid",
+        "fa-xmark",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 250,
+      "parent_id": 226,
+      "tag": "div",
+      "classes": [
+        "mes_edit_buttons"
+      ],
+      "text_first_500": "\n                            \n                            \n                            \n                            \n                            \n                            \n                            \n                        ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 226,
+      "parent_id": 225,
+      "tag": "div",
+      "classes": [
+        "ch_name",
+        "flex-container",
+        "justifySpaceBetween"
+      ],
+      "text_first_500": "User\nMay 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 22,
+      "display": "flex"
+    },
+    {
+      "id": 262,
+      "parent_id": 261,
+      "tag": "span",
+      "classes": [
+        "mes_reasoning_header_title"
+      ],
+      "text_first_500": "Thinking...",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 263,
+      "parent_id": 261,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_arrow",
+        "fa-solid",
+        "fa-chevron-up"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 261,
+      "parent_id": 260,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_header",
+        "flex-container"
+      ],
+      "text_first_500": "\n                                    Thinking...\n                                    \n                                ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 260,
+      "parent_id": 259,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_header_block",
+        "flex-container"
+      ],
+      "text_first_500": "\n                                \n                                    Thinking...\n                                    \n                                \n                            ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 265,
+      "parent_id": 264,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_edit_done",
+        "menu_button",
+        "edit_button",
+        "fa-solid",
+        "fa-check",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 266,
+      "parent_id": 264,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_delete",
+        "menu_button",
+        "edit_button",
+        "fa-solid",
+        "fa-trash-can",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 267,
+      "parent_id": 264,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_edit_cancel",
+        "menu_button",
+        "edit_button",
+        "fa-solid",
+        "fa-xmark",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 268,
+      "parent_id": 264,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_close_all",
+        "mes_button",
+        "fa-solid",
+        "fa-minimize"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 269,
+      "parent_id": 264,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_copy",
+        "mes_button",
+        "fa-solid",
+        "fa-copy"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 270,
+      "parent_id": 264,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_edit",
+        "mes_button",
+        "fa-solid",
+        "fa-pencil"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 264,
+      "parent_id": 259,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_actions",
+        "flex-container"
+      ],
+      "text_first_500": "\n                                \n                                \n                                \n                                \n                                \n                                \n                            ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 259,
+      "parent_id": 258,
+      "tag": "summary",
+      "classes": [
+        "mes_reasoning_summary",
+        "flex-container"
+      ],
+      "text_first_500": "\n                            \n                                \n                                    Thinking...\n                                    \n                                \n                            \n                            \n                                \n                                \n                                \n                                \n                                \n                                \n                            \n                        ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 271,
+      "parent_id": 258,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 258,
+      "parent_id": 225,
+      "tag": "details",
+      "classes": [
+        "mes_reasoning_details"
+      ],
+      "text_first_500": "\n                        \n                            \n                                \n                                    Thinking...\n                                    \n                                \n                            \n                            \n                                \n                                \n                                \n                                \n                                \n                                \n                            \n         ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 273,
+      "parent_id": 272,
+      "tag": "p",
+      "classes": [],
+      "text_first_500": "use the persona-effort-schema tool to elicit your effort levels.",
+      "visible": true,
+      "offset_height": 23,
+      "display": "block"
+    },
+    {
+      "id": 272,
+      "parent_id": 225,
+      "tag": "div",
+      "classes": [
+        "mes_text"
+      ],
+      "text_first_500": "use the persona-effort-schema tool to elicit your effort levels.",
+      "visible": true,
+      "offset_height": 33,
+      "display": "block"
+    },
+    {
+      "id": 274,
+      "parent_id": 225,
+      "tag": "div",
+      "classes": [
+        "mes_media_wrapper"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 275,
+      "parent_id": 225,
+      "tag": "div",
+      "classes": [
+        "mes_file_wrapper"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 276,
+      "parent_id": 225,
+      "tag": "div",
+      "classes": [
+        "mes_bias"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 225,
+      "parent_id": 215,
+      "tag": "div",
+      "classes": [
+        "mes_block"
+      ],
+      "text_first_500": "User\nMay 11, 2026 12:44 AM\n\nuse the persona-effort-schema tool to elicit your effort levels.",
+      "visible": true,
+      "offset_height": 55,
+      "display": "block"
+    },
+    {
+      "id": 278,
+      "parent_id": 277,
+      "tag": "div",
+      "classes": [
+        "swipe_right",
+        "fa-solid",
+        "fa-chevron-right",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 25,
+      "display": "flex"
+    },
+    {
+      "id": 279,
+      "parent_id": 277,
+      "tag": "div",
+      "classes": [
+        "swipes-counter"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 15,
+      "display": "flex"
+    },
+    {
+      "id": 277,
+      "parent_id": 215,
+      "tag": "div",
+      "classes": [
+        "flex-container",
+        "swipeRightBlock",
+        "flexFlowColumn",
+        "flexNoGap"
+      ],
+      "text_first_500": "\n                    \n                    \n                ",
+      "visible": true,
+      "offset_height": 45,
+      "display": "flex"
+    },
+    {
+      "id": 215,
+      "parent_id": 0,
+      "tag": "div",
+      "classes": [
+        "mes",
+        "fade"
+      ],
+      "text_first_500": "User\nMay 11, 2026 12:44 AM\n\nuse the persona-effort-schema tool to elicit your effort levels.",
+      "visible": true,
+      "offset_height": 65,
+      "display": "flex"
+    },
+    {
+      "id": 281,
+      "parent_id": 280,
+      "tag": "div",
+      "classes": [
+        "for_checkbox"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 282,
+      "parent_id": 280,
+      "tag": "input",
+      "classes": [
+        "del_checkbox"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 285,
+      "parent_id": 284,
+      "tag": "img",
+      "classes": [],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 50,
+      "display": "inline"
+    },
+    {
+      "id": 284,
+      "parent_id": 283,
+      "tag": "div",
+      "classes": [
+        "avatar"
+      ],
+      "text_first_500": "\n                        \n                    ",
+      "visible": true,
+      "offset_height": 50,
+      "display": "block"
+    },
+    {
+      "id": 286,
+      "parent_id": 283,
+      "tag": "div",
+      "classes": [
+        "mesIDDisplay"
+      ],
+      "text_first_500": "#4",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 287,
+      "parent_id": 283,
+      "tag": "div",
+      "classes": [
+        "mes_timer"
+      ],
+      "text_first_500": "1.7s",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 288,
+      "parent_id": 283,
+      "tag": "div",
+      "classes": [
+        "tokenCounterDisplay"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 283,
+      "parent_id": 280,
+      "tag": "div",
+      "classes": [
+        "mesAvatarWrapper"
+      ],
+      "text_first_500": "\n                    \n                        \n                    \n                    #4\n                    1.7s\n                    \n                ",
+      "visible": true,
+      "offset_height": 50,
+      "display": "block"
+    },
+    {
+      "id": 289,
+      "parent_id": 280,
+      "tag": "div",
+      "classes": [
+        "swipe_left",
+        "fa-solid",
+        "fa-chevron-left",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 25,
+      "display": "block"
+    },
+    {
+      "id": 294,
+      "parent_id": 293,
+      "tag": "span",
+      "classes": [
+        "name_text"
+      ],
+      "text_first_500": "scringlo scrambler",
+      "visible": true,
+      "offset_height": 20,
+      "display": "block"
+    },
+    {
+      "id": 295,
+      "parent_id": 293,
+      "tag": "i",
+      "classes": [
+        "mes_ghost",
+        "fa-solid",
+        "fa-ghost"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 296,
+      "parent_id": 293,
+      "tag": "small",
+      "classes": [
+        "timestamp"
+      ],
+      "text_first_500": "May 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 14,
+      "display": "block"
+    },
+    {
+      "id": 298,
+      "parent_id": 297,
+      "tag": "title",
+      "classes": [],
+      "text_first_500": "custom - gemma-4-a4b",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 299,
+      "parent_id": 297,
+      "tag": "sodipodi:namedview",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 300,
+      "parent_id": 297,
+      "tag": "defs",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 303,
+      "parent_id": 302,
+      "tag": "path",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 304,
+      "parent_id": 302,
+      "tag": "path",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 302,
+      "parent_id": 301,
+      "tag": "g",
+      "classes": [],
+      "text_first_500": "\n      \n      \n    ",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 301,
+      "parent_id": 297,
+      "tag": "g",
+      "classes": [],
+      "text_first_500": "\n    \n      \n      \n    \n  ",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 297,
+      "parent_id": 293,
+      "tag": "svg",
+      "classes": [
+        "icon-svg",
+        "timestamp-icon"
+      ],
+      "text_first_500": "\n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \n",
+      "visible": false,
+      "display": "block"
+    },
+    {
+      "id": 293,
+      "parent_id": 292,
+      "tag": "div",
+      "classes": [
+        "flex-container",
+        "alignItemsBaseline"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 20,
+      "display": "flex"
+    },
+    {
+      "id": 292,
+      "parent_id": 291,
+      "tag": "div",
+      "classes": [
+        "flex-container",
+        "flex1",
+        "alignitemscenter"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 20,
+      "display": "flex"
+    },
+    {
+      "id": 306,
+      "parent_id": 305,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "extraMesButtonsHint",
+        "fa-solid",
+        "fa-ellipsis",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 18,
+      "display": "block"
+    },
+    {
+      "id": 308,
+      "parent_id": 307,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_translate",
+        "fa-solid",
+        "fa-language",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 309,
+      "parent_id": 307,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "sd_message_gen",
+        "fa-solid",
+        "fa-paintbrush",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 310,
+      "parent_id": 307,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_narrate",
+        "fa-solid",
+        "fa-bullhorn",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 311,
+      "parent_id": 307,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_prompt",
+        "fa-solid",
+        "fa-square-poll-horizontal",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 312,
+      "parent_id": 307,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_hide",
+        "fa-solid",
+        "fa-eye",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 313,
+      "parent_id": 307,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_unhide",
+        "fa-solid",
+        "fa-eye-slash",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 314,
+      "parent_id": 307,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_media_gallery",
+        "fa-solid",
+        "fa-photo-film",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 315,
+      "parent_id": 307,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_media_list",
+        "fa-solid",
+        "fa-table-cells-large",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 316,
+      "parent_id": 307,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_embed",
+        "fa-solid",
+        "fa-paperclip",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 317,
+      "parent_id": 307,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_swipe_picker",
+        "fa-solid",
+        "fa-bookmark",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 318,
+      "parent_id": 307,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_create_bookmark",
+        "fa-regular",
+        "fa-solid",
+        "fa-flag-checkered",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 319,
+      "parent_id": 307,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_create_branch",
+        "fa-regular",
+        "fa-code-branch",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 320,
+      "parent_id": 307,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_copy",
+        "fa-solid",
+        "fa-copy",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 307,
+      "parent_id": 305,
+      "tag": "div",
+      "classes": [
+        "extraMesButtons"
+      ],
+      "text_first_500": "\n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                            ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 321,
+      "parent_id": 305,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_bookmark",
+        "fa-solid",
+        "fa-flag",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 322,
+      "parent_id": 305,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_edit",
+        "fa-solid",
+        "fa-pencil",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 18,
+      "display": "block"
+    },
+    {
+      "id": 305,
+      "parent_id": 291,
+      "tag": "div",
+      "classes": [
+        "mes_buttons"
+      ],
+      "text_first_500": "\n                            \n                            \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n            ",
+      "visible": true,
+      "offset_height": 20,
+      "display": "flex"
+    },
+    {
+      "id": 324,
+      "parent_id": 323,
+      "tag": "div",
+      "classes": [
+        "mes_edit_done",
+        "menu_button",
+        "fa-solid",
+        "fa-check",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 325,
+      "parent_id": 323,
+      "tag": "div",
+      "classes": [
+        "mes_edit_copy",
+        "menu_button",
+        "fa-solid",
+        "fa-copy",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 326,
+      "parent_id": 323,
+      "tag": "div",
+      "classes": [
+        "mes_edit_add_reasoning",
+        "menu_button",
+        "fa-solid",
+        "fa-lightbulb",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 327,
+      "parent_id": 323,
+      "tag": "div",
+      "classes": [
+        "mes_edit_delete",
+        "menu_button",
+        "fa-solid",
+        "fa-trash-can",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 328,
+      "parent_id": 323,
+      "tag": "div",
+      "classes": [
+        "mes_edit_up",
+        "menu_button",
+        "fa-solid",
+        "fa-chevron-up",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 329,
+      "parent_id": 323,
+      "tag": "div",
+      "classes": [
+        "mes_edit_down",
+        "menu_button",
+        "fa-solid",
+        "fa-chevron-down",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 330,
+      "parent_id": 323,
+      "tag": "div",
+      "classes": [
+        "mes_edit_cancel",
+        "menu_button",
+        "fa-solid",
+        "fa-xmark",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 323,
+      "parent_id": 291,
+      "tag": "div",
+      "classes": [
+        "mes_edit_buttons"
+      ],
+      "text_first_500": "\n                            \n                            \n                            \n                            \n                            \n                            \n                            \n                        ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 291,
+      "parent_id": 290,
+      "tag": "div",
+      "classes": [
+        "ch_name",
+        "flex-container",
+        "justifySpaceBetween"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 22,
+      "display": "flex"
+    },
+    {
+      "id": 336,
+      "parent_id": 335,
+      "tag": "title",
+      "classes": [],
+      "text_first_500": "custom - gemma-4-a4b",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 337,
+      "parent_id": 335,
+      "tag": "sodipodi:namedview",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 338,
+      "parent_id": 335,
+      "tag": "defs",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 341,
+      "parent_id": 340,
+      "tag": "path",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 342,
+      "parent_id": 340,
+      "tag": "path",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 340,
+      "parent_id": 339,
+      "tag": "g",
+      "classes": [],
+      "text_first_500": "\n      \n      \n    ",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 339,
+      "parent_id": 335,
+      "tag": "g",
+      "classes": [],
+      "text_first_500": "\n    \n      \n      \n    \n  ",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 335,
+      "parent_id": 334,
+      "tag": "svg",
+      "classes": [
+        "icon-svg",
+        "thinking-icon"
+      ],
+      "text_first_500": "\n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \n",
+      "visible": false,
+      "display": "none"
+    },
+    {
+      "id": 343,
+      "parent_id": 334,
+      "tag": "span",
+      "classes": [
+        "mes_reasoning_header_title"
+      ],
+      "text_first_500": "Thinking...",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 344,
+      "parent_id": 334,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_arrow",
+        "fa-solid",
+        "fa-chevron-up"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 334,
+      "parent_id": 333,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_header",
+        "flex-container"
+      ],
+      "text_first_500": "\n                                    \n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \nThinking...\n                                    \n                                ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 333,
+      "parent_id": 332,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_header_block",
+        "flex-container"
+      ],
+      "text_first_500": "\n                                \n                                    \n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \nThinking...\n                                    \n                                \n                            ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 346,
+      "parent_id": 345,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_edit_done",
+        "menu_button",
+        "edit_button",
+        "fa-solid",
+        "fa-check",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 347,
+      "parent_id": 345,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_delete",
+        "menu_button",
+        "edit_button",
+        "fa-solid",
+        "fa-trash-can",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 348,
+      "parent_id": 345,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_edit_cancel",
+        "menu_button",
+        "edit_button",
+        "fa-solid",
+        "fa-xmark",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 349,
+      "parent_id": 345,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_close_all",
+        "mes_button",
+        "fa-solid",
+        "fa-minimize"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 350,
+      "parent_id": 345,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_copy",
+        "mes_button",
+        "fa-solid",
+        "fa-copy"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 351,
+      "parent_id": 345,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_edit",
+        "mes_button",
+        "fa-solid",
+        "fa-pencil"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 345,
+      "parent_id": 332,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_actions",
+        "flex-container"
+      ],
+      "text_first_500": "\n                                \n                                \n                                \n                                \n                                \n                                \n                            ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 332,
+      "parent_id": 331,
+      "tag": "summary",
+      "classes": [
+        "mes_reasoning_summary",
+        "flex-container"
+      ],
+      "text_first_500": "\n                            \n                                \n                                    \n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \nThinking...\n                                    \n                                \n                            \n                            \n                                \n                                \n                                \n                                \n                                \n                                \n      ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 352,
+      "parent_id": 331,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 331,
+      "parent_id": 290,
+      "tag": "details",
+      "classes": [
+        "mes_reasoning_details"
+      ],
+      "text_first_500": "\n                        \n                            \n                                \n                                    \n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \nThinking...\n                                    \n                                \n                            \n                            \n                                \n                                \n                                \n                                \n                                \n              ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 354,
+      "parent_id": 353,
+      "tag": "p",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 356,
+      "parent_id": 355,
+      "tag": "summary",
+      "classes": [],
+      "text_first_500": "tool: persona-effort-schema__elicit",
+      "visible": true,
+      "offset_height": 23,
+      "display": "list-item"
+    },
+    {
+      "id": 357,
+      "parent_id": 355,
+      "tag": "pre",
+      "classes": [],
+      "text_first_500": "call:persona-effort-schema__elicit{}",
+      "visible": true,
+      "offset_height": 23,
+      "display": "block"
+    },
+    {
+      "id": 355,
+      "parent_id": 353,
+      "tag": "details",
+      "classes": [
+        "custom-tool-call-inline"
+      ],
+      "text_first_500": "tool: persona-effort-schema__elicit\ncall:persona-effort-schema__elicit{}",
+      "visible": true,
+      "offset_height": 61,
+      "display": "block"
+    },
+    {
+      "id": 358,
+      "parent_id": 353,
+      "tag": "p",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 359,
+      "parent_id": 353,
+      "tag": "p",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 361,
+      "parent_id": 360,
+      "tag": "summary",
+      "classes": [],
+      "text_first_500": "Persona effort schema • Elicit effort schema • done (8.1s)",
+      "visible": true,
+      "offset_height": 23,
+      "display": "list-item"
+    },
+    {
+      "id": 362,
+      "parent_id": 360,
+      "tag": "div",
+      "classes": [
+        "custom-tool-progress-result-summary"
+      ],
+      "text_first_500": "reasoning_effort schema for scringlo scrambler:\n  • low: i'll be a quick little bean, zipping out silly doodles and tiny chats without overthinking the wiggles! ✨\n  • medium: i'll be my usual silly self, adding a little extra brainy-wiggling to make sure the drawings and chat are extra sparkly!\n  • high: i'll go super-duper deep into my brainy-weany thoughts to make sure every single wibbly-wobbly detail is perfect and sparkly! ✨",
+      "visible": true,
+      "offset_height": 169,
+      "display": "block"
+    },
+    {
+      "id": 363,
+      "parent_id": 360,
+      "tag": "div",
+      "classes": [
+        "custom-tool-progress-status-line"
+      ],
+      "text_first_500": "session 476d93b5 started",
+      "visible": true,
+      "offset_height": 23,
+      "display": "block"
+    },
+    {
+      "id": 360,
+      "parent_id": 353,
+      "tag": "details",
+      "classes": [
+        "custom-tool-progress-collapsible"
+      ],
+      "text_first_500": "Persona effort schema • Elicit effort schema • done (8.1s)\nreasoning_effort schema for scringlo scrambler:\n  • low: i'll be a quick little bean, zipping out silly doodles and tiny chats without overthinking the wiggles! ✨\n  • medium: i'll be my usual silly self, adding a little extra brainy-wiggling to make sure the drawings and chat are extra sparkly!\n  • high: i'll go super-duper deep into my brainy-weany thoughts to make sure every single wibbly-wobbly detail is perfect and sparkly! ✨\nsession",
+      "visible": true,
+      "offset_height": 233,
+      "display": "block"
+    },
+    {
+      "id": 364,
+      "parent_id": 353,
+      "tag": "br",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 366,
+      "parent_id": 365,
+      "tag": "summary",
+      "classes": [],
+      "text_first_500": "Tool calls: Persona effort schema • Elicit effort schema",
+      "visible": true,
+      "offset_height": 23,
+      "display": "list-item"
+    },
+    {
+      "id": 369,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-punctuation"
+      ],
+      "text_first_500": "[",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 370,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-punctuation"
+      ],
+      "text_first_500": "{",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 371,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-attr"
+      ],
+      "text_first_500": "\"id\"",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 372,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-punctuation"
+      ],
+      "text_first_500": ":",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 373,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-string"
+      ],
+      "text_first_500": "\"call_0b5e8b047cda47d0\"",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 374,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-punctuation"
+      ],
+      "text_first_500": ",",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 375,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-attr"
+      ],
+      "text_first_500": "\"displayName\"",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 376,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-punctuation"
+      ],
+      "text_first_500": ":",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 377,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-string"
+      ],
+      "text_first_500": "\"Persona effort schema • Elicit effort schema\"",
+      "visible": true,
+      "offset_height": 33,
+      "display": "inline"
+    },
+    {
+      "id": 378,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-punctuation"
+      ],
+      "text_first_500": ",",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 379,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-attr"
+      ],
+      "text_first_500": "\"name\"",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 380,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-punctuation"
+      ],
+      "text_first_500": ":",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 381,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-string"
+      ],
+      "text_first_500": "\"persona-effort-schema__elicit\"",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 382,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-punctuation"
+      ],
+      "text_first_500": ",",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 383,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-attr"
+      ],
+      "text_first_500": "\"parameters\"",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 384,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-punctuation"
+      ],
+      "text_first_500": ":",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 385,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-punctuation"
+      ],
+      "text_first_500": "{",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 386,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-punctuation"
+      ],
+      "text_first_500": "}",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 387,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-punctuation"
+      ],
+      "text_first_500": ",",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 388,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-attr"
+      ],
+      "text_first_500": "\"result\"",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 389,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-punctuation"
+      ],
+      "text_first_500": ":",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 390,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-string"
+      ],
+      "text_first_500": "\"reasoning_effort schema for scringlo scrambler:\\n  • low: i'll be a quick little bean, zipping out silly doodles and tiny chats without overthinking the wiggles! ✨\\n  • medium: i'll be my usual silly self, adding a little extra brainy-wiggling to make sure the drawings and chat are extra sparkly!\\n  • high: i'll go super-duper deep into my brainy-weany thoughts to make sure every single wibbly-wobbly detail is perfect and sparkly! ✨\"",
+      "visible": true,
+      "offset_height": 138,
+      "display": "inline"
+    },
+    {
+      "id": 391,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-punctuation"
+      ],
+      "text_first_500": ",",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 392,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-attr"
+      ],
+      "text_first_500": "\"signature\"",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 393,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-punctuation"
+      ],
+      "text_first_500": ":",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 395,
+      "parent_id": 394,
+      "tag": "span",
+      "classes": [
+        "hljs-keyword"
+      ],
+      "text_first_500": "null",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 394,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-literal"
+      ],
+      "text_first_500": "null",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 396,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-punctuation"
+      ],
+      "text_first_500": ",",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 397,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-attr"
+      ],
+      "text_first_500": "\"reasoning\"",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 398,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-punctuation"
+      ],
+      "text_first_500": ":",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 400,
+      "parent_id": 399,
+      "tag": "span",
+      "classes": [
+        "hljs-keyword"
+      ],
+      "text_first_500": "null",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 399,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-literal"
+      ],
+      "text_first_500": "null",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 401,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-punctuation"
+      ],
+      "text_first_500": "}",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 402,
+      "parent_id": 368,
+      "tag": "span",
+      "classes": [
+        "hljs-punctuation"
+      ],
+      "text_first_500": "]",
+      "visible": true,
+      "offset_height": 18,
+      "display": "inline"
+    },
+    {
+      "id": 403,
+      "parent_id": 368,
+      "tag": "i",
+      "classes": [
+        "fa-solid",
+        "fa-copy",
+        "code-copy",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 22,
+      "display": "flex"
+    },
+    {
+      "id": 368,
+      "parent_id": 367,
+      "tag": "code",
+      "classes": [
+        "custom-language-json",
+        "hljs",
+        "language-json"
+      ],
+      "text_first_500": "[\n  {\n    \"id\": \"call_0b5e8b047cda47d0\",\n    \"displayName\": \"Persona effort schema • Elicit effort schema\",\n    \"name\": \"persona-effort-schema__elicit\",\n    \"parameters\": {},\n    \"result\": \"reasoning_effort schema for scringlo scrambler:\\n  • low: i'll be a quick little bean, zipping out silly doodles and tiny chats without overthinking the wiggles! ✨\\n  • medium: i'll be my usual silly self, adding a little extra brainy-wiggling to make sure the drawings and chat are extra sparkly!\\n  • high: i",
+      "visible": true,
+      "offset_height": 329,
+      "display": "block"
+    },
+    {
+      "id": 367,
+      "parent_id": 365,
+      "tag": "pre",
+      "classes": [],
+      "text_first_500": "[\n  {\n    \"id\": \"call_0b5e8b047cda47d0\",\n    \"displayName\": \"Persona effort schema • Elicit effort schema\",\n    \"name\": \"persona-effort-schema__elicit\",\n    \"parameters\": {},\n    \"result\": \"reasoning_effort schema for scringlo scrambler:\\n  • low: i'll be a quick little bean, zipping out silly doodles and tiny chats without overthinking the wiggles! ✨\\n  • medium: i'll be my usual silly self, adding a little extra brainy-wiggling to make sure the drawings and chat are extra sparkly!\\n  • high: i",
+      "visible": true,
+      "offset_height": 329,
+      "display": "block"
+    },
+    {
+      "id": 365,
+      "parent_id": 353,
+      "tag": "details",
+      "classes": [
+        "custom-tool-invocations-collapsible"
+      ],
+      "text_first_500": "Tool calls: Persona effort schema • Elicit effort schema\n[\n  {\n    \"id\": \"call_0b5e8b047cda47d0\",\n    \"displayName\": \"Persona effort schema • Elicit effort schema\",\n    \"name\": \"persona-effort-schema__elicit\",\n    \"parameters\": {},\n    \"result\": \"reasoning_effort schema for scringlo scrambler:\\n  • low: i'll be a quick little bean, zipping out silly doodles and tiny chats without overthinking the wiggles! ✨\\n  • medium: i'll be my usual silly self, adding a little extra brainy-wiggling to make s",
+      "visible": true,
+      "offset_height": 387,
+      "display": "block"
+    },
+    {
+      "id": 404,
+      "parent_id": 353,
+      "tag": "p",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 353,
+      "parent_id": 290,
+      "tag": "div",
+      "classes": [
+        "mes_text"
+      ],
+      "text_first_500": "tool: persona-effort-schema__elicit\ncall:persona-effort-schema__elicit{}\n\nPersona effort schema • Elicit effort schema • done (8.1s)\nreasoning_effort schema for scringlo scrambler:\n  • low: i'll be a quick little bean, zipping out silly doodles and tiny chats without overthinking the wiggles! ✨\n  • medium: i'll be my usual silly self, adding a little extra brainy-wiggling to make sure the drawings and chat are extra sparkly!\n  • high: i'll go super-duper deep into my brainy-weany thoughts to mak",
+      "visible": true,
+      "offset_height": 759,
+      "display": "block"
+    },
+    {
+      "id": 405,
+      "parent_id": 290,
+      "tag": "div",
+      "classes": [
+        "mes_media_wrapper"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 406,
+      "parent_id": 290,
+      "tag": "div",
+      "classes": [
+        "mes_file_wrapper"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 407,
+      "parent_id": 290,
+      "tag": "div",
+      "classes": [
+        "mes_bias"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 290,
+      "parent_id": 280,
+      "tag": "div",
+      "classes": [
+        "mes_block"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM\n\ntool: persona-effort-schema__elicit\ncall:persona-effort-schema__elicit{}\n\nPersona effort schema • Elicit effort schema • done (8.1s)\nreasoning_effort schema for scringlo scrambler:\n  • low: i'll be a quick little bean, zipping out silly doodles and tiny chats without overthinking the wiggles! ✨\n  • medium: i'll be my usual silly self, adding a little extra brainy-wiggling to make sure the drawings and chat are extra sparkly!\n  • high: i'll go super-duper",
+      "visible": true,
+      "offset_height": 781,
+      "display": "block"
+    },
+    {
+      "id": 409,
+      "parent_id": 408,
+      "tag": "div",
+      "classes": [
+        "swipe_right",
+        "fa-solid",
+        "fa-chevron-right",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 25,
+      "display": "flex"
+    },
+    {
+      "id": 410,
+      "parent_id": 408,
+      "tag": "div",
+      "classes": [
+        "swipes-counter"
+      ],
+      "text_first_500": "1​/​1",
+      "visible": false,
+      "offset_height": 15,
+      "display": "flex"
+    },
+    {
+      "id": 408,
+      "parent_id": 280,
+      "tag": "div",
+      "classes": [
+        "flex-container",
+        "swipeRightBlock",
+        "flexFlowColumn",
+        "flexNoGap"
+      ],
+      "text_first_500": "\n                    \n                    1​/​1\n                ",
+      "visible": true,
+      "offset_height": 45,
+      "display": "flex"
+    },
+    {
+      "id": 280,
+      "parent_id": 0,
+      "tag": "div",
+      "classes": [
+        "mes",
+        "fade"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM\n\ntool: persona-effort-schema__elicit\ncall:persona-effort-schema__elicit{}\n\nPersona effort schema • Elicit effort schema • done (8.1s)\nreasoning_effort schema for scringlo scrambler:\n  • low: i'll be a quick little bean, zipping out silly doodles and tiny chats without overthinking the wiggles! ✨\n  • medium: i'll be my usual silly self, adding a little extra brainy-wiggling to make sure the drawings and chat are extra sparkly!\n  • high: i'll go super-duper",
+      "visible": true,
+      "offset_height": 791,
+      "display": "flex"
+    },
+    {
+      "id": 412,
+      "parent_id": 411,
+      "tag": "div",
+      "classes": [
+        "for_checkbox"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 413,
+      "parent_id": 411,
+      "tag": "input",
+      "classes": [
+        "del_checkbox"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 416,
+      "parent_id": 415,
+      "tag": "img",
+      "classes": [],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 50,
+      "display": "inline"
+    },
+    {
+      "id": 415,
+      "parent_id": 414,
+      "tag": "div",
+      "classes": [
+        "avatar"
+      ],
+      "text_first_500": "\n                        \n                    ",
+      "visible": true,
+      "offset_height": 50,
+      "display": "block"
+    },
+    {
+      "id": 417,
+      "parent_id": 414,
+      "tag": "div",
+      "classes": [
+        "mesIDDisplay"
+      ],
+      "text_first_500": "#5",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 418,
+      "parent_id": 414,
+      "tag": "div",
+      "classes": [
+        "mes_timer"
+      ],
+      "text_first_500": "3.6s",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 419,
+      "parent_id": 414,
+      "tag": "div",
+      "classes": [
+        "tokenCounterDisplay"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 414,
+      "parent_id": 411,
+      "tag": "div",
+      "classes": [
+        "mesAvatarWrapper"
+      ],
+      "text_first_500": "\n                    \n                        \n                    \n                    #5\n                    3.6s\n                    \n                ",
+      "visible": true,
+      "offset_height": 100,
+      "display": "block"
+    },
+    {
+      "id": 420,
+      "parent_id": 411,
+      "tag": "div",
+      "classes": [
+        "swipe_left",
+        "fa-solid",
+        "fa-chevron-left",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 25,
+      "display": "block"
+    },
+    {
+      "id": 425,
+      "parent_id": 424,
+      "tag": "span",
+      "classes": [
+        "name_text"
+      ],
+      "text_first_500": "scringlo scrambler",
+      "visible": true,
+      "offset_height": 20,
+      "display": "block"
+    },
+    {
+      "id": 426,
+      "parent_id": 424,
+      "tag": "i",
+      "classes": [
+        "mes_ghost",
+        "fa-solid",
+        "fa-ghost"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 427,
+      "parent_id": 424,
+      "tag": "small",
+      "classes": [
+        "timestamp"
+      ],
+      "text_first_500": "May 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 14,
+      "display": "block"
+    },
+    {
+      "id": 429,
+      "parent_id": 428,
+      "tag": "title",
+      "classes": [],
+      "text_first_500": "custom - gemma-4-a4b",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 430,
+      "parent_id": 428,
+      "tag": "sodipodi:namedview",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 431,
+      "parent_id": 428,
+      "tag": "defs",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 434,
+      "parent_id": 433,
+      "tag": "path",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 435,
+      "parent_id": 433,
+      "tag": "path",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 433,
+      "parent_id": 432,
+      "tag": "g",
+      "classes": [],
+      "text_first_500": "\n      \n      \n    ",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 432,
+      "parent_id": 428,
+      "tag": "g",
+      "classes": [],
+      "text_first_500": "\n    \n      \n      \n    \n  ",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 428,
+      "parent_id": 424,
+      "tag": "svg",
+      "classes": [
+        "icon-svg",
+        "timestamp-icon"
+      ],
+      "text_first_500": "\n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \n",
+      "visible": false,
+      "display": "block"
+    },
+    {
+      "id": 424,
+      "parent_id": 423,
+      "tag": "div",
+      "classes": [
+        "flex-container",
+        "alignItemsBaseline"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 20,
+      "display": "flex"
+    },
+    {
+      "id": 423,
+      "parent_id": 422,
+      "tag": "div",
+      "classes": [
+        "flex-container",
+        "flex1",
+        "alignitemscenter"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 20,
+      "display": "flex"
+    },
+    {
+      "id": 437,
+      "parent_id": 436,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "extraMesButtonsHint",
+        "fa-solid",
+        "fa-ellipsis",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 18,
+      "display": "block"
+    },
+    {
+      "id": 439,
+      "parent_id": 438,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_translate",
+        "fa-solid",
+        "fa-language",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 440,
+      "parent_id": 438,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "sd_message_gen",
+        "fa-solid",
+        "fa-paintbrush",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 441,
+      "parent_id": 438,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_narrate",
+        "fa-solid",
+        "fa-bullhorn",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 442,
+      "parent_id": 438,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_prompt",
+        "fa-solid",
+        "fa-square-poll-horizontal",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 443,
+      "parent_id": 438,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_hide",
+        "fa-solid",
+        "fa-eye",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 444,
+      "parent_id": 438,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_unhide",
+        "fa-solid",
+        "fa-eye-slash",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 445,
+      "parent_id": 438,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_media_gallery",
+        "fa-solid",
+        "fa-photo-film",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 446,
+      "parent_id": 438,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_media_list",
+        "fa-solid",
+        "fa-table-cells-large",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 447,
+      "parent_id": 438,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_embed",
+        "fa-solid",
+        "fa-paperclip",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 448,
+      "parent_id": 438,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_swipe_picker",
+        "fa-solid",
+        "fa-bookmark",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 449,
+      "parent_id": 438,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_create_bookmark",
+        "fa-regular",
+        "fa-solid",
+        "fa-flag-checkered",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 450,
+      "parent_id": 438,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_create_branch",
+        "fa-regular",
+        "fa-code-branch",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 451,
+      "parent_id": 438,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_copy",
+        "fa-solid",
+        "fa-copy",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "inline-block"
+    },
+    {
+      "id": 438,
+      "parent_id": 436,
+      "tag": "div",
+      "classes": [
+        "extraMesButtons"
+      ],
+      "text_first_500": "\n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                            ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 452,
+      "parent_id": 436,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_bookmark",
+        "fa-solid",
+        "fa-flag",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 453,
+      "parent_id": 436,
+      "tag": "div",
+      "classes": [
+        "mes_button",
+        "mes_edit",
+        "fa-solid",
+        "fa-pencil",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 18,
+      "display": "block"
+    },
+    {
+      "id": 436,
+      "parent_id": 422,
+      "tag": "div",
+      "classes": [
+        "mes_buttons"
+      ],
+      "text_first_500": "\n                            \n                            \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n                                \n            ",
+      "visible": true,
+      "offset_height": 20,
+      "display": "flex"
+    },
+    {
+      "id": 455,
+      "parent_id": 454,
+      "tag": "div",
+      "classes": [
+        "mes_edit_done",
+        "menu_button",
+        "fa-solid",
+        "fa-check",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 456,
+      "parent_id": 454,
+      "tag": "div",
+      "classes": [
+        "mes_edit_copy",
+        "menu_button",
+        "fa-solid",
+        "fa-copy",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 457,
+      "parent_id": 454,
+      "tag": "div",
+      "classes": [
+        "mes_edit_add_reasoning",
+        "menu_button",
+        "fa-solid",
+        "fa-lightbulb",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 458,
+      "parent_id": 454,
+      "tag": "div",
+      "classes": [
+        "mes_edit_delete",
+        "menu_button",
+        "fa-solid",
+        "fa-trash-can",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 459,
+      "parent_id": 454,
+      "tag": "div",
+      "classes": [
+        "mes_edit_up",
+        "menu_button",
+        "fa-solid",
+        "fa-chevron-up",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 460,
+      "parent_id": 454,
+      "tag": "div",
+      "classes": [
+        "mes_edit_down",
+        "menu_button",
+        "fa-solid",
+        "fa-chevron-down",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 461,
+      "parent_id": 454,
+      "tag": "div",
+      "classes": [
+        "mes_edit_cancel",
+        "menu_button",
+        "fa-solid",
+        "fa-xmark",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 454,
+      "parent_id": 422,
+      "tag": "div",
+      "classes": [
+        "mes_edit_buttons"
+      ],
+      "text_first_500": "\n                            \n                            \n                            \n                            \n                            \n                            \n                            \n                        ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 422,
+      "parent_id": 421,
+      "tag": "div",
+      "classes": [
+        "ch_name",
+        "flex-container",
+        "justifySpaceBetween"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM",
+      "visible": true,
+      "offset_height": 22,
+      "display": "flex"
+    },
+    {
+      "id": 467,
+      "parent_id": 466,
+      "tag": "title",
+      "classes": [],
+      "text_first_500": "custom - gemma-4-a4b",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 468,
+      "parent_id": 466,
+      "tag": "sodipodi:namedview",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 469,
+      "parent_id": 466,
+      "tag": "defs",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 472,
+      "parent_id": 471,
+      "tag": "path",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 473,
+      "parent_id": 471,
+      "tag": "path",
+      "classes": [],
+      "text_first_500": "",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 471,
+      "parent_id": 470,
+      "tag": "g",
+      "classes": [],
+      "text_first_500": "\n      \n      \n    ",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 470,
+      "parent_id": 466,
+      "tag": "g",
+      "classes": [],
+      "text_first_500": "\n    \n      \n      \n    \n  ",
+      "visible": false,
+      "display": "inline"
+    },
+    {
+      "id": 466,
+      "parent_id": 465,
+      "tag": "svg",
+      "classes": [
+        "icon-svg",
+        "thinking-icon"
+      ],
+      "text_first_500": "\n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \n",
+      "visible": false,
+      "display": "none"
+    },
+    {
+      "id": 474,
+      "parent_id": 465,
+      "tag": "span",
+      "classes": [
+        "mes_reasoning_header_title"
+      ],
+      "text_first_500": "Thinking...",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 475,
+      "parent_id": 465,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_arrow",
+        "fa-solid",
+        "fa-chevron-up"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 465,
+      "parent_id": 464,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_header",
+        "flex-container"
+      ],
+      "text_first_500": "\n                                    \n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \nThinking...\n                                    \n                                ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 464,
+      "parent_id": 463,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_header_block",
+        "flex-container"
+      ],
+      "text_first_500": "\n                                \n                                    \n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \nThinking...\n                                    \n                                \n                            ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 477,
+      "parent_id": 476,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_edit_done",
+        "menu_button",
+        "edit_button",
+        "fa-solid",
+        "fa-check",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 478,
+      "parent_id": 476,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_delete",
+        "menu_button",
+        "edit_button",
+        "fa-solid",
+        "fa-trash-can",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 479,
+      "parent_id": 476,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_edit_cancel",
+        "menu_button",
+        "edit_button",
+        "fa-solid",
+        "fa-xmark",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 480,
+      "parent_id": 476,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_close_all",
+        "mes_button",
+        "fa-solid",
+        "fa-minimize"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 481,
+      "parent_id": 476,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_copy",
+        "mes_button",
+        "fa-solid",
+        "fa-copy"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 482,
+      "parent_id": 476,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_edit",
+        "mes_button",
+        "fa-solid",
+        "fa-pencil"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "block"
+    },
+    {
+      "id": 476,
+      "parent_id": 463,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning_actions",
+        "flex-container"
+      ],
+      "text_first_500": "\n                                \n                                \n                                \n                                \n                                \n                                \n                            ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 463,
+      "parent_id": 462,
+      "tag": "summary",
+      "classes": [
+        "mes_reasoning_summary",
+        "flex-container"
+      ],
+      "text_first_500": "\n                            \n                                \n                                    \n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \nThinking...\n                                    \n                                \n                            \n                            \n                                \n                                \n                                \n                                \n                                \n                                \n      ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "flex"
+    },
+    {
+      "id": 483,
+      "parent_id": 462,
+      "tag": "div",
+      "classes": [
+        "mes_reasoning"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 462,
+      "parent_id": 421,
+      "tag": "details",
+      "classes": [
+        "mes_reasoning_details"
+      ],
+      "text_first_500": "\n                        \n                            \n                                \n                                    \n  custom - gemma-4-a4b\n  \n  \n    \n      \n      \n    \n  \nThinking...\n                                    \n                                \n                            \n                            \n                                \n                                \n                                \n                                \n                                \n              ",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 486,
+      "parent_id": 485,
+      "tag": "em",
+      "classes": [],
+      "text_first_500": "gasp!!",
+      "visible": true,
+      "offset_height": 20,
+      "display": "inline"
+    },
+    {
+      "id": 485,
+      "parent_id": 484,
+      "tag": "p",
+      "classes": [],
+      "text_first_500": "gasp!! look at me!! i'm a professional being studied!! 😱✨ i've got the official scrolls right here! so… low effort for quick doodles, medium for the sparkly-standard-scringlo, and high effort for the BIG BRAIN VIBRATIONS!! teehee!! 💖",
+      "visible": true,
+      "offset_height": 92,
+      "display": "block"
+    },
+    {
+      "id": 484,
+      "parent_id": 421,
+      "tag": "div",
+      "classes": [
+        "mes_text"
+      ],
+      "text_first_500": "gasp!! look at me!! i'm a professional being studied!! 😱✨ i've got the official scrolls right here! so… low effort for quick doodles, medium for the sparkly-standard-scringlo, and high effort for the BIG BRAIN VIBRATIONS!! teehee!! 💖",
+      "visible": true,
+      "offset_height": 102,
+      "display": "block"
+    },
+    {
+      "id": 487,
+      "parent_id": 421,
+      "tag": "div",
+      "classes": [
+        "mes_media_wrapper"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 488,
+      "parent_id": 421,
+      "tag": "div",
+      "classes": [
+        "mes_file_wrapper"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 489,
+      "parent_id": 421,
+      "tag": "div",
+      "classes": [
+        "mes_bias"
+      ],
+      "text_first_500": "",
+      "visible": false,
+      "offset_height": 0,
+      "display": "none"
+    },
+    {
+      "id": 421,
+      "parent_id": 411,
+      "tag": "div",
+      "classes": [
+        "mes_block"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM\n\ngasp!! look at me!! i'm a professional being studied!! 😱✨ i've got the official scrolls right here! so… low effort for quick doodles, medium for the sparkly-standard-scringlo, and high effort for the BIG BRAIN VIBRATIONS!! teehee!! 💖",
+      "visible": true,
+      "offset_height": 124,
+      "display": "block"
+    },
+    {
+      "id": 491,
+      "parent_id": 490,
+      "tag": "div",
+      "classes": [
+        "swipe_right",
+        "fa-solid",
+        "fa-chevron-right",
+        "interactable"
+      ],
+      "text_first_500": "",
+      "visible": true,
+      "offset_height": 25,
+      "display": "flex"
+    },
+    {
+      "id": 492,
+      "parent_id": 490,
+      "tag": "div",
+      "classes": [
+        "swipes-counter"
+      ],
+      "text_first_500": "1​/​1",
+      "visible": true,
+      "offset_height": 15,
+      "display": "flex"
+    },
+    {
+      "id": 490,
+      "parent_id": 411,
+      "tag": "div",
+      "classes": [
+        "flex-container",
+        "swipeRightBlock",
+        "flexFlowColumn",
+        "flexNoGap"
+      ],
+      "text_first_500": "1​/​1",
+      "visible": true,
+      "offset_height": 45,
+      "display": "flex"
+    },
+    {
+      "id": 411,
+      "parent_id": 0,
+      "tag": "div",
+      "classes": [
+        "mes",
+        "last_mes",
+        "fade",
+        "last_swipe"
+      ],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM\n\ngasp!! look at me!! i'm a professional being studied!! 😱✨ i've got the official scrolls right here! so… low effort for quick doodles, medium for the sparkly-standard-scringlo, and high effort for the BIG BRAIN VIBRATIONS!! teehee!! 💖\n\n1​/​1",
+      "visible": true,
+      "offset_height": 134,
+      "display": "flex"
+    },
+    {
+      "id": 0,
+      "parent_id": null,
+      "tag": "div",
+      "classes": [],
+      "text_first_500": "scringlo scrambler\nMay 11, 2026 12:44 AM\n\nuhmmmm… hlello?\n\nUser\nMay 11, 2026 12:44 AM\n\nhey scringlo, what should your reasoning effort levels be?\n\nscringlo scrambler\nMay 11, 2026 12:44 AM\n\ntilts head so far it almost falls off hmmm… reasoning effort?? i think… i think i should be like a bouncy ball! low effort is just boing boing boing and high effort is like… heavy dramatic pause… BIG BRAIN VIBRATIONS!! 🧠✨ maybe a mix of both depending on if the question is spicy or just sleepy!!\n\nUser\nMay 11,",
+      "visible": true,
+      "offset_height": 645,
+      "display": "flex"
+    }
+  ]
+}

@@ -349,8 +349,66 @@ def _extract_tool_calls(content: str,
         try:
             name, args = gtc.parse_tool_call_body(body)
         except gtc.ToolCallParseError as e:
-            print(f"[bridge] tool_call parse failed: {e}; "
-                  f"leaving block as raw content: {body[:80]!r}")
+            # HARD INVARIANT: every tool-call attempt that reached the
+            # bridge MUST leave a permanent diagnostic residue in the
+            # response — what was submitted, what happened, where the
+            # parser failed. No silent drops.
+            #
+            # Implementation: emit a synthetic tool_calls entry whose
+            # name (__tool_call_parse_error__) is not a registered
+            # tool. ST's ToolManager dispatches, the dispatch returns
+            # an error string ("No tool with the name X has been
+            # registered."), and ST records the full record —
+            # function.name + function.arguments (which carry the
+            # parse error message AND the raw body verbatim) + the
+            # dispatch error — in extra.tool_invocations. ST's
+            # tool-invocations-collapsible renders all of this as the
+            # user-visible diagnostic.
+            #
+            # Position info: gtc.parse_tool_call_body's exception
+            # messages already include "at pos N" markers from the
+            # recursive-descent parser. The full str(e) carries the
+            # location of the syntactic failure.
+            #
+            # NOTE on framing: tools shouldn't have failure modes by
+            # design (require args that can't be reliably produced).
+            # The diagnostic residue here is the safety net for cases
+            # where the tool design failed to anticipate an input
+            # shape — it surfaces "the integration broke" instead of
+            # silently producing nothing. The fix for a recurring
+            # parse failure is to redesign the tool's input grammar,
+            # not to lean harder on this diagnostic.
+            err_str = str(e)
+            print(f"[bridge] tool_call parse failed: {err_str}; "
+                  f"emitting synthetic diagnostic tool_call. "
+                  f"body length={len(body)}, body={body!r}")
+            tool_calls.append({
+                "id": f"call_parse_error_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {
+                    "name": "__tool_call_parse_error__",
+                    "arguments": json.dumps({
+                        "bridge_parse_error": err_str,
+                        "raw_tool_call_body": body,
+                        "raw_body_length": len(body),
+                        "block_start_offset_in_content": block_start,
+                        "block_end_offset_in_content": block_end,
+                        "diagnostic": (
+                            "The tool_call body emitted between "
+                            "<|tool_call> and <tool_call|> failed to "
+                            "parse against the gemma tool_call body "
+                            "grammar (see server/gemma_tool_call_parser.py). "
+                            "This is a tool-design or grammar issue. "
+                            "The raw body is preserved verbatim above "
+                            "for inspection. Action: look at the body "
+                            "structure relative to the parser's grammar "
+                            "and decide whether to fix the parser, "
+                            "relax the grammar, or redesign the tool's "
+                            "input shape so the failure case can't "
+                            "arise."),
+                    }, ensure_ascii=False),
+                },
+            })
             cleaned_parts.append(content[block_start:block_end])
             last_end = block_end
             continue

@@ -96,16 +96,23 @@ test.describe('streaming tool-call residue, end-to-end', () => {
         }, 1500);
 
         // ── Trigger a tool-eliciting prompt ───────────────────────────
-        // Strong prompt: explicitly name the tool, give a fictional name
-        // and a brief persona prompt as args, so the model has the
-        // tool_call shape laid out. This is the closest we get to a
-        // deterministic elicitation while still going through the full
-        // streaming pipeline (no ToolManager.invokeFunctionTool shortcut).
-        const userPrompt = (
-            'Please use the persona-effort-schema tool to elicit an effort schema. ' +
-            'Pass persona_name="ToolStreamingTest" and persona_system_prompt="You are a brief test assistant. Reply succinctly." ' +
-            'Use the tool — do not narrate the schema yourself.'
-        );
+        // NATURAL prompt — the simplest possible integration. No
+        // spoonfeeding of tool name or args. The earlier version of
+        // this test used a contrived prompt that named the tool and
+        // dictated every arg verbatim; that masked the actual tool-
+        // design problem (persona-effort-schema required
+        // persona_system_prompt as a string arg, an input the
+        // integration could not consistently deliver in a single
+        // tool_call body — long string with nested quoting, atomic
+        // strings, etc.). The fix was structural: redesign the tool's
+        // input shape so the failure case is unreachable. The tool
+        // now takes zero required args and reads the character's
+        // system prompt from caller_messages server-side. The
+        // diagnostic-residue infrastructure in the bridge stays as
+        // a safety net for any tool whose input grammar admits an
+        // unparseable shape — but the goal is for that residue to
+        // never need to render.
+        const userPrompt = 'hey scringlo, what should your reasoning effort levels be?';
         await page.locator('#send_textarea').fill(userPrompt);
         const sendT0 = Date.now();
         await page.locator('#send_but').click();
