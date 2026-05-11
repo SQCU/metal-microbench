@@ -1,0 +1,35 @@
+{
+  "direct": {
+    "evt": {
+      "id": 9,
+      "ok": true,
+      "result": {
+        "persona_name": "TestPersona",
+        "schema": {
+          "low": "I provide deep, multi-step analytical reasoning, meticulously verifying every logical step and edge case to ensure absolute accuracy and depth.",
+          "medium": "I provide deep, multi-step analytical breakdowns, meticulously verifying every logical step and edge case to ensure absolute accuracy and depth.",
+          "high": "I provide deeply analytical, multi-step chain-of-thought reasoning to solve complex problems with exhaustive precision and thoroughness."
+        },
+        "summary": "reasoning_effort schema for TestPersona:\n  • low: I provide deep, multi-step analytical reasoning, meticulously verifying every logical step and edge case to ensure absolute accuracy and depth.\n  • medium: I provide deep, multi-step analytical breakdowns, meticulously verifying every logical step and edge case to ensure absolute accuracy and depth.\n  • high: I provide deeply analytical, multi-step chain-of-thought reasoning to solve complex problems with exhaustive precision and thoroughness.",
+        "meta": {
+          "retries_per_level_budget": 4,
+          "retries_used_per_level": {
+            "low": 0,
+            "medium": 0,
+            "high": 0
+          },
+          "bridge_url": "http://127.0.0.1:8001",
+          "model": "gemma-4-a4b"
+        }
+      },
+      "type": "result"
+    },
+    "derivedSummary": "reasoning_effort schema for TestPersona:\n  • low: I provide deep, multi-step analytical reasoning, meticulously verifying every logical step and edge case to ensure absolute accuracy and depth.\n  • medium: I provide deep, multi-step analytical breakdowns, meticulously verifying every logical step and edge case to ensure absolute accuracy and depth.\n  • high: I provide deeply analytical, multi-step chain-of-thought reasoning to solve complex problems with exhaustive precision and thoroughness."
+  },
+  "rendered": [
+    {
+      "headerText": "persona-effort-schema__elicit • done (8.0s)",
+      "bodyText": "reasoning_effort schema for TestPersona:\n  • low: I provide deep, multi-step analytical reasoning, meticulously verifying every logical step and edge case to ensure absolute accuracy and depth.\n  • medium: I provide deep, multi-step analytical breakdowns, meticulously verifying every logical step and edge case to ensure absolute accuracy and depth.\n  • high: I provide deeply analytical, multi-step chain-of-thought reasoning to solve complex problems with exhaustive precision and thoroughness."
+    }
+  ]
+}

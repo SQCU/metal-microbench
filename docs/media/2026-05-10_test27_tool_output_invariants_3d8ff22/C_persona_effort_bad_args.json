@@ -1,0 +1,21 @@
+{
+  "direct": {
+    "sessionId": "561e4cbd-b262-4ee8-8657-9ac9482b691d",
+    "resultEvent": {
+      "id": 8,
+      "ok": false,
+      "error": "missing or empty persona_system_prompt",
+      "type": "result"
+    }
+  },
+  "injected": {
+    "error": "missing or empty persona_system_prompt",
+    "idx": 1
+  },
+  "rendered": [
+    {
+      "headerText": "persona-effort-schema__elicit • failed (1.0s)",
+      "bodyText": "error: missing or empty persona_system_prompt"
+    }
+  ]
+}

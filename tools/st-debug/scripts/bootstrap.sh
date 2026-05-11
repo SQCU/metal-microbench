@@ -87,12 +87,12 @@ oai = {
     "max_context_unlocked": True,
     "stream_openai": True,
     "function_calling": True,
-    # Reasoning channel: ST sends `reasoning_effort` to the bridge,
+    # Reasoning channel: ST sends reasoning_effort to the bridge,
     # bridge enables the model's thinking-channel and emits
-    # `delta.reasoning_content` chunks back. ST renders the trace in
+    # delta.reasoning_content chunks back. ST renders the trace in
     # a collapsible "thoughts" section on the assistant turn. With
-    # `auto`, ST passes the param through unchanged; with `high`/
-    # `medium`/`low` the user can dial it. Default to `auto` so the
+    # "auto", ST passes the param through unchanged; with high/
+    # medium/low the user can dial it. Default to "auto" so the
     # operator decides per-conversation; the bootstrap-provided
     # default just makes sure show_thoughts is enabled so the UI
     # actually renders whatever comes back.

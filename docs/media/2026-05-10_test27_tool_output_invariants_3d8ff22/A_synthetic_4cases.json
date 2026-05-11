@@ -1,0 +1,22 @@
+[
+  {
+    "headerText": "synth-card__case1_done_with_summary • done (1.5s)",
+    "bodyText": "CASE-1 SUMMARY: tool succeeded; here is what it produced.",
+    "bodyNonEmpty": true
+  },
+  {
+    "headerText": "synth-card__case2_done_empty • done (0.8s)",
+    "bodyText": "(no detail emitted by this tool — status: done)",
+    "bodyNonEmpty": true
+  },
+  {
+    "headerText": "synth-card__case3_failed_with_error • failed (2.0s)",
+    "bodyText": "error: CASE-3 ERROR: missing required parameter persona_system_prompt",
+    "bodyNonEmpty": true
+  },
+  {
+    "headerText": "synth-card__case4_failed_empty • failed (0.5s)",
+    "bodyText": "(no detail emitted by this tool — status: failed)",
+    "bodyNonEmpty": true
+  }
+]
