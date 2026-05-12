@@ -1,0 +1,107 @@
+[
+  {
+    "t": 1778548212813,
+    "type": "log",
+    "text": "[user-personas] button installed"
+  },
+  {
+    "t": 1778548212813,
+    "type": "log",
+    "text": "[user-personas] human-typing tracker attached to #send_textarea"
+  },
+  {
+    "t": 1778548212813,
+    "type": "log",
+    "text": "[user-personas] event handlers attached"
+  },
+  {
+    "t": 1778548221200,
+    "type": "log",
+    "text": "[user-personas] multi-user round: 2 candidates"
+  },
+  {
+    "t": 1778548224276,
+    "type": "log",
+    "text": "[user-personas] participants: wry-skeptic, polite-naturalist; sitting out: "
+  },
+  {
+    "t": 1778548230866,
+    "type": "log",
+    "text": "[user-personas] non-empty polls: wry-skeptic (len=532), polite-naturalist (len=776)"
+  },
+  {
+    "t": 1778548240650,
+    "type": "log",
+    "text": "[user-personas] multi-user round: 2 candidates"
+  },
+  {
+    "t": 1778548246933,
+    "type": "log",
+    "text": "[user-personas] participants: wry-skeptic, polite-naturalist; sitting out: "
+  },
+  {
+    "t": 1778548276986,
+    "type": "warning",
+    "text": "[user-personas] is_send_press still true after 30s; abandoning multi-user round"
+  },
+  {
+    "t": 1778548344036,
+    "type": "log",
+    "text": "[user-personas] multi-user round: 2 candidates"
+  },
+  {
+    "t": 1778548347703,
+    "type": "log",
+    "text": "[user-personas] participants: wry-skeptic, polite-naturalist; sitting out: "
+  },
+  {
+    "t": 1778548357754,
+    "type": "log",
+    "text": "[user-personas] non-empty polls: wry-skeptic (len=847), polite-naturalist (len=1088)"
+  },
+  {
+    "t": 1778548370126,
+    "type": "log",
+    "text": "[user-personas] multi-user round: 2 candidates"
+  },
+  {
+    "t": 1778548377824,
+    "type": "log",
+    "text": "[user-personas] participants: wry-skeptic, polite-naturalist; sitting out: "
+  },
+  {
+    "t": 1778548388266,
+    "type": "log",
+    "text": "[user-personas] non-empty polls: wry-skeptic (len=808), polite-naturalist (len=1140)"
+  },
+  {
+    "t": 1778548405756,
+    "type": "log",
+    "text": "[user-personas] multi-user round: 2 candidates"
+  },
+  {
+    "t": 1778548415253,
+    "type": "log",
+    "text": "[user-personas] participants: wry-skeptic, polite-naturalist; sitting out: "
+  },
+  {
+    "t": 1778548445345,
+    "type": "warning",
+    "text": "[user-personas] is_send_press still true after 30s; abandoning multi-user round"
+  },
+  {
+    "t": 1778548545557,
+    "type": "log",
+    "text": "[user-personas] multi-user round: 2 candidates"
+  },
+  {
+    "t": 1778548550158,
+    "type": "log",
+    "text": "[user-personas] participants: wry-skeptic, polite-naturalist; sitting out: "
+  },
+  {
+    "t": 1778548561696,
+    "type": "log",
+    "text": "[user-personas] non-empty polls: wry-skeptic (len=1128), polite-naturalist (len=1180)"
+  }
+]

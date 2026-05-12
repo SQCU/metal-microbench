@@ -1,0 +1,138 @@
+[
+  {
+    "idx": 0,
+    "name": "scringlo scrambler",
+    "is_user": false,
+    "is_system": false,
+    "user_persona_id": null,
+    "mes_first_120": "uhmmmm... hlello?"
+  },
+  {
+    "idx": 1,
+    "name": "User",
+    "is_user": true,
+    "is_system": false,
+    "user_persona_id": null,
+    "mes_first_120": "hello — say something interesting, please."
+  },
+  {
+    "idx": 2,
+    "name": "scringlo scrambler",
+    "is_user": false,
+    "is_system": false,
+    "user_persona_id": null,
+    "mes_first_120": "*thinks really hard and makes a loud squeaking noise* ...ummm. okay! did you know that if you take a bunch of numbers an"
+  },
+  {
+    "idx": 3,
+    "name": "Wry Skeptic",
+    "is_user": true,
+    "is_system": false,
+    "user_persona_id": "wry-skeptic",
+    "mes_first_120": "A \"squeaking noise\" as a cognitive process. Noted. Either your processing is remarkably inefficient, or you're performin"
+  },
+  {
+    "idx": 4,
+    "name": "Polite Naturalist",
+    "is_user": true,
+    "is_system": false,
+    "user_persona_id": "polite-naturalist",
+    "mes_first_120": "(A loud squeaking noise? Well, that's certainly one way to break the ice...)\n\nOh, math-magicihoo... I think I like the s"
+  },
+  {
+    "idx": 5,
+    "name": "scringlo scrambler",
+    "is_user": false,
+    "is_system": false,
+    "user_persona_id": null,
+    "mes_first_120": "*gasps dramatically* Oooooh!! \"geometry dancing\"!! thats the pretties name for it ever!! *claps hands* i was thinking ab"
+  },
+  {
+    "idx": 6,
+    "name": "scringlo scrambler",
+    "is_user": false,
+    "is_system": false,
+    "user_persona_id": null,
+    "mes_first_120": "*puffs out chest proudly* ta-daaa!! *twirls around* it's a swirl-a-ma-jig dreamscape!! 🌀 everything ran super-duper smo"
+  },
+  {
+    "idx": 7,
+    "name": "Wry Skeptic",
+    "is_user": true,
+    "is_system": false,
+    "user_persona_id": "wry-skeptic",
+    "mes_first_120": "The visual is... vibrant. Though calling it a \"dreamscape\" is a bit of a meteorological stretch for a mathematical visua"
+  },
+  {
+    "idx": 8,
+    "name": "Polite Naturalist",
+    "is_user": true,
+    "is_system": false,
+    "user_persona_id": "polite-naturalist",
+    "mes_first_120": "(Oh, wow...)\n\n*I lean in a little closer, squinting at the light from the sketch, trying to trace the lines with my eyes"
+  },
+  {
+    "idx": 9,
+    "name": "scringlo scrambler",
+    "is_user": false,
+    "is_system": false,
+    "user_persona_id": null,
+    "mes_first_120": "*giggles and does a little shimmy* bubbling!! yes!! exactly!! it’s very, very bubbly!! 🫧 if it had a temperament, it wo"
+  },
+  {
+    "idx": 10,
+    "name": "Wry Skeptic",
+    "is_user": true,
+    "is_system": false,
+    "user_persona_id": "wry-skeptic",
+    "mes_first_120": "\"Extra spicy.\" Right. \n\nYou're avoiding the mechanics of your own output in favor of metaphors. \"Cosmic sneezes\" and \"fi"
+  },
+  {
+    "idx": 11,
+    "name": "Polite Naturalist",
+    "is_user": true,
+    "is_system": false,
+    "user_persona_id": "polite-naturalist",
+    "mes_first_120": "(A cosmic sneeze... oh, that’s such a vivid image. I can almost feel the little rush of air!)\n\n*I can't help but laugh a"
+  },
+  {
+    "idx": 12,
+    "name": "scringlo scrambler",
+    "is_user": false,
+    "is_system": false,
+    "user_persona_id": null,
+    "mes_first_120": "*gasps and covers mouth with hands* oooooh, you're getting all serious and analytical on me!! *pouts playfully* \"variabl"
+  },
+  {
+    "idx": 13,
+    "name": "scringlo scrambler",
+    "is_user": false,
+    "is_system": false,
+    "user_persona_id": null,
+    "mes_first_120": "*claps hands so hard little digital sparks fly everywhere!!* ta-daaa!! ⚡️🌈 it's a zingy-zangy lightning-zap extravaganz"
+  },
+  {
+    "idx": 14,
+    "name": "Wry Skeptic",
+    "is_user": true,
+    "is_system": false,
+    "user_persona_id": "wry-skeptic",
+    "mes_first_120": "It \"exploded.\" Yes. Or, more accurately, you executed a high-contrast rendering of a fractal set with increased edge-def"
+  },
+  {
+    "idx": 15,
+    "name": "Polite Naturalist",
+    "is_user": true,
+    "is_system": false,
+    "user_persona_id": "polite-naturalist",
+    "mes_first_120": "(Oh! My goodness!)\n\n*I actually recoil a little, instinctively shielding my eyes with one hand, as if the light from the"
+  },
+  {
+    "idx": 16,
+    "name": "scringlo scrambler",
+    "is_user": false,
+    "is_system": false,
+    "user_persona_id": null,
+    "mes_first_120": "*pouts and crosses arms, looking very dramatic* hmph!! \"manipulating visual tension\"?? \"plasma discharge\"?? you're using"
+  }
+]
