@@ -1,0 +1,10 @@
+{
+  "baseline_chat_len": 1,
+  "chat_len_after_growth": 8,
+  "chat_len_after_stop": 8,
+  "chat_len_after_calm": 8,
+  "initial_poll_count": 0,
+  "polls_after_growth": 4,
+  "polls_after_stop": 4,
+  "polls_after_calm": 4
+}

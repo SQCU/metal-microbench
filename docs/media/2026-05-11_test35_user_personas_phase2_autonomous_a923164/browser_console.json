@@ -1,0 +1,67 @@
+[
+  {
+    "t": 1778544282109,
+    "type": "log",
+    "text": "[user-personas] button installed"
+  },
+  {
+    "t": 1778544282109,
+    "type": "log",
+    "text": "[user-personas] human-typing tracker attached to #send_textarea"
+  },
+  {
+    "t": 1778544282109,
+    "type": "log",
+    "text": "[user-personas] event handlers attached"
+  },
+  {
+    "t": 1778544292697,
+    "type": "log",
+    "text": "[user-personas] autoSubmitFor(wry-skeptic) starting"
+  },
+  {
+    "t": 1778544297845,
+    "type": "log",
+    "text": "[user-personas] poll returned, text length: 558"
+  },
+  {
+    "t": 1778544297846,
+    "type": "log",
+    "text": "[user-personas] calling sendTextareaMessage() directly with auto-filled text (len=558)"
+  },
+  {
+    "t": 1778544312856,
+    "type": "log",
+    "text": "[user-personas] autoSubmitFor(wry-skeptic) starting"
+  },
+  {
+    "t": 1778544323000,
+    "type": "log",
+    "text": "[user-personas] poll returned, text length: 906"
+  },
+  {
+    "t": 1778544323001,
+    "type": "log",
+    "text": "[user-personas] calling sendTextareaMessage() directly with auto-filled text (len=906)"
+  },
+  {
+    "t": 1778544330705,
+    "type": "log",
+    "text": "[user-personas] autoSubmitFor(wry-skeptic) starting"
+  },
+  {
+    "t": 1778544339726,
+    "type": "log",
+    "text": "[user-personas] poll returned, text length: 876"
+  },
+  {
+    "t": 1778544369764,
+    "type": "warning",
+    "text": "[user-personas] is_send_press still true after 30s; abandoning tick"
+  },
+  {
+    "t": 1778544449190,
+    "type": "log",
+    "text": "[user-personas] autoSubmitFor(wry-skeptic) starting"
+  }
+]
