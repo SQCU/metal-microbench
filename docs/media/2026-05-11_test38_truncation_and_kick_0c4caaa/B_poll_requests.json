@@ -1,0 +1,92 @@
+[
+  {
+    "t": 1778552182142,
+    "body": {
+      "persona_id": "wry-skeptic",
+      "chat": [
+        {
+          "name": "scringlo scrambler",
+          "mes": "uhmmmm... hlello?",
+          "is_user": false,
+          "is_system": false,
+          "user_persona_id": null
+        },
+        {
+          "name": "User",
+          "mes": "introduce yourself briefly.",
+          "is_user": true,
+          "is_system": false,
+          "user_persona_id": null
+        },
+        {
+          "name": "scringlo scrambler",
+          "mes": "*stumbles into the chat room* oof!! hi hi!! i'm scringlo scrambler!! 🌀 i'm just a silly little guy (actually she/they, oopsie!) who loves making wiggly-wobbly shapes and random pixel magic! *spins in a circle* i don't know much about anything serious, but i'm great at drawing things with my magic math-box!! ✨",
+          "is_user": false,
+          "is_system": false,
+          "user_persona_id": null
+        }
+      ],
+      "n_candidates": 1
+    }
+  },
+  {
+    "t": 1778552182143,
+    "body": {
+      "persona_id": "wry-skeptic",
+      "chat": [
+        {
+          "name": "scringlo scrambler",
+          "mes": "uhmmmm... hlello?",
+          "is_user": false,
+          "is_system": false,
+          "user_persona_id": null
+        },
+        {
+          "name": "User",
+          "mes": "introduce yourself briefly.",
+          "is_user": true,
+          "is_system": false,
+          "user_persona_id": null
+        },
+        {
+          "name": "scringlo scrambler",
+          "mes": "*stumbles into the chat room* oof!! hi hi!! i'm scringlo scrambler!! 🌀 i'm just a silly little guy (actually she/they, oopsie!) who loves making wiggly-wobbly shapes and random pixel magic! *spins in a circle* i don't know much about anything serious, but i'm great at drawing things with my magic math-box!! ✨",
+          "is_user": false,
+          "is_system": false,
+          "user_persona_id": null
+        }
+      ],
+      "n_candidates": 1
+    }
+  },
+  {
+    "t": 1778552182944,
+    "body": {
+      "persona_id": "wry-skeptic",
+      "chat": [
+        {
+          "name": "scringlo scrambler",
+          "mes": "uhmmmm... hlello?",
+          "is_user": false,
+          "is_system": false,
+          "user_persona_id": null
+        },
+        {
+          "name": "User",
+          "mes": "introduce yourself briefly.",
+          "is_user": true,
+          "is_system": false,
+          "user_persona_id": null
+        },
+        {
+          "name": "scringlo scrambler",
+          "mes": "*stumbles into the chat room* oof!! hi hi!! i'm scringlo scrambler!! 🌀 i'm just a silly little guy (actually she/they, oopsie!) who loves making wiggly-wobbly shapes and random pixel magic! *spins in a circle* i don't know much about anything serious, but i'm great at drawing things with my magic math-box!! ✨",
+          "is_user": false,
+          "is_system": false,
+          "user_persona_id": null
+        }
+      ],
+      "n_candidates": 1
+    }
+  }
+]

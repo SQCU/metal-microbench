@@ -1,0 +1,30 @@
+[
+  {
+    "t": 1778552173329,
+    "text": "[user-personas] button installed"
+  },
+  {
+    "t": 1778552173329,
+    "text": "[user-personas] human-typing tracker attached to #send_textarea"
+  },
+  {
+    "t": 1778552173329,
+    "text": "[user-personas] event handlers attached"
+  },
+  {
+    "t": 1778552182142,
+    "text": "[user-personas] kick autonomous from chat[2]"
+  },
+  {
+    "t": 1778552182944,
+    "text": "[user-personas] autoSubmitFor(wry-skeptic) starting"
+  },
+  {
+    "t": 1778552185835,
+    "text": "[user-personas] poll returned, text length: 257"
+  },
+  {
+    "t": 1778552185836,
+    "text": "[user-personas] calling sendTextareaMessage() directly with auto-filled text (len=257)"
+  }
+]
