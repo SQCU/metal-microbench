@@ -1,0 +1,24 @@
+[
+  {
+    "t": 1778549435554,
+    "endpoint": "personas",
+    "body": null
+  },
+  {
+    "t": 1778549439462,
+    "endpoint": "poll",
+    "body": {
+      "persona_id": "wry-skeptic",
+      "chat": [
+        {
+          "name": "scringlo scrambler",
+          "mes": "uhmmmm... hlello?",
+          "is_user": false,
+          "is_system": false,
+          "user_persona_id": null
+        }
+      ],
+      "n_candidates": 1
+    }
+  }
+]
