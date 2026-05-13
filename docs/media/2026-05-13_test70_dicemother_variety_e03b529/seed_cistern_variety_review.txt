@@ -1,0 +1,16 @@
+{
+  "agent_signatures": {
+    "Gushing Fan": "Uses high-energy emotional outbursts, emojis, and intense roleplay to express visceral fear and excitement.",
+    "Polite Naturalist": "Employs a contemplative, sensory-focused approach that prioritizes atmospheric observation and gentle inquiry.",
+    "Pushy Completionist": "Utilizes a structured, list-based format to maximize mechanical efficiency and rapid information gathering.",
+    "Wry Skeptic": "Adopts a detached, analytical tone that treats narrative elements as variables to be logically assessed."
+  },
+  "spread": "The four candidates spread out into highly distinct strategic positions, ranging from hyper-emotional immersion to clinical, list-based data acquisition.",
+  "truncation_flags": [
+    "Gushing Fan",
+    "Polite Naturalist",
+    "Pushy Completionist",
+    "Wry Skeptic"
+  ],
+  "cumulative_variety": "high",
+  "notes": "The sample demonstrates exceptional behavioral variety, with each agent occupying a unique psychological and structural niche. While the Gushing Fan and Polite Naturalist focus on narrative immersion and sensory experience, the Pushy Completionist and Wry Skeptic pivot toward utility and logic. However, all four agents suffer from signific

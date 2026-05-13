@@ -3,6 +3,15 @@ import { defineConfig } from '@playwright/test';
 // Talks to the st-debug instance launched by ../scripts/run.sh on :8002.
 // (Our bridge sits at :8001; ST forwards chat-completions traffic there
 // based on the bootstrap-patched settings.json.)
+//
+// Viewport projects:
+//   - desktop (default): 1280×800, what a laptop / desktop user sees
+//   - tablet:            768×1024, iPad-ish
+//   - mobile:            390×844,  iPhone 12/13/14-ish
+//
+// Tests that don't care about viewport rendering should run under
+// `desktop`. Tests validating UI affordances across form factors
+// should run under all three (or filter via --project=mobile etc.).
 export default defineConfig({
     testDir: '.',
     testMatch: '*.spec.js',
@@ -22,4 +31,18 @@ export default defineConfig({
     expect: {
         timeout: 30_000,
     },
+    projects: [
+        {
+            name: 'desktop',
+            use: { viewport: { width: 1280, height: 800 } },
+        },
+        {
+            name: 'tablet',
+            use: { viewport: { width: 768, height: 1024 } },
+        },
+        {
+            name: 'mobile',
+            use: { viewport: { width: 390, height: 844 } },
+        },
+    ],
 });

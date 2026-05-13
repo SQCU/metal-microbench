@@ -1,0 +1,41 @@
+{
+  "seed": "cistern",
+  "captures": [
+    {
+      "agent": "Gushing Fan",
+      "id": "gushing-fan",
+      "text": "OMG!! wait, wait, wait—the wicks were *never lit*?! that is SO unsettling!! 😱 the fact that they were carved with a knife instead of being melted... that changes the whole vibe. it feels so intentional, like a ritual that's being prepared rather than something that already happened. that gave me actual CHILLS!! \n\nand the counterclockwise pattern... that's so specific!! it feels like a countdown or a map or something. ✨\n\n*i freeze mid-motion, my heart absolutely hammering against my ribs.*\n\nthe sound behind me... oh my god, the settling sound... i'm trying so hard to stay silent but i think my breathing is way too loud!! i want to turn around but i'm literally paralyzed. i just... i want to know what's there but i'm terrified!! \n\ndo i... do i reach for the knife that carved the candles? or do i stay perfectly still and try to see if i can catch a glimpse of a shape in the shadows without moving my head? i feel like if i move even an inch, whatever is settling will know i'm here!! 😰 please tell me i don't make a sound... i'm so scared for you!! i wish i could stand in front of you so you didn't have to be alone in",
+      "ms": 8138,
+      "truncated": false,
+      "finish_reason": "stop",
+      "max_tokens_used": 800
+    },
+    {
+      "agent": "Polite Naturalist",
+      "id": "polite-naturalist",
+      "text": "(Wait, the wicks were never lit?) \n\nThat's... unsettling. A candle is usually such a simple thing, a little beacon of warmth, but to carve them down like that, so deliberately... it feels less like light and more like a countdown. Or a measurement. \n\nI freeze. I don't turn around right away—I'm not brave enough for that, I think—but I find myself listening to that sound. It’s not the trickle of water or the skitter of a rat. It's a *settling*. Like something heavy and substantial is finding its posture against the stone. \n\nMy heart is doing that nervous little fluttery thing in my chest, and I find myself staring at those finger-sized bones. I wonder if they belong to the person who left the impression, or if they're part of the \"arrangement\" itself. \n\nI whisper, barely audible, mostly just to ground myself: \"Is there... is there a pattern to the way the dust sits? Is it disturbed near the wall, or is it just... still?\" \n\nAnd then, as softly as I can, I ask you—because I need to know if I should be running or just staying very, very still—what does the air smell like in there? Is it just old, dry dust, or is there someth",
+      "ms": 8343,
+      "truncated": false,
+      "finish_reason": "stop",
+      "max_tokens_used": 1200
+    },
+    {
+      "agent": "Pushy Completionist",
+      "id": "pushy-completionist",
+      "text": "1. I place the candle back exactly where I found it to avoid disturbing the silt.\n2. I turn toward the sound of the weight settling.\n3. I use my light to scan the wall where the sound originated.\n\nIdentify the following:\n* The approximate size of the entity/object.\n* The distance between the entity and me.\n* Whether the entity is",
+      "ms": 2524,
+      "truncated": false,
+      "finish_reason": "stop",
+      "max_tokens_used": 800
+    },
+    {
+      "agent": "Wry Skeptic",
+      "id": "wry-skeptic",
+      "text": "The candles were not providing light. They were markers. Perhaps a countdown. Or a measurement of duration. \n\nThe sound behind me is a variable. It suggests mass and presence. It also suggests a lack of intent to remain hidden. \n\nI do not turn around yet. I want to determine if the sound is rhythmic. If it is a settling of weight, it is a physical process. I am trying to distinguish between a biological movement and a mechanical shift. \n\nWhat is the te",
+      "ms": 3454,
+      "truncated": false,
+      "finish_reason": "stop",
+      "max_tokens_used": 800
+    }
+  ]
+}

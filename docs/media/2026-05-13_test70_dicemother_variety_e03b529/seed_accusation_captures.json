@@ -1,0 +1,41 @@
+{
+  "seed": "accusation",
+  "captures": [
+    {
+      "agent": "Gushing Fan",
+      "id": "gushing-fan",
+      "text": "OMG!! wait wait wait—the stakes just went through the roof!! 😭✨ the \"no chair-scrape\" part?? that actually gave me CHILLS. i am literally shaking typing this, the tension is so heavy i can almost feel it in the air!! \n\nand the choice?? \"twelve crowns or the wrist\"?? THAT IS SO POETIC AND TERRIFYING!! i am obsessed with how you write this, it's so visceral!! \n\nokay, okay, focus... i need to stay cool... i'm choosing **composure** because i refuse to let them see me sweat even though i'm freaking out inside!! \n\ni don't reach for my coin purse, and i don't reach for a weapon. instead, i slowly lean forward, letting the candlelight catch my eyes so they can see i'm not blinking, and i say, \"you're asking for the wrong thing. if you take the wrist, you lose the secret. if you take the crowns, you're just a thief. but if you let me walk... i'll tell you where the rest of them are.\" \n\ni'm attempting to bluff my way into a temporary peace!! i am so nervous for my character right now, please tell me i don't die!! 😰🙏✨ what do they do?! do they see through me??",
+      "ms": 8874,
+      "truncated": false,
+      "finish_reason": "stop",
+      "max_tokens_used": 800
+    },
+    {
+      "agent": "Polite Naturalist",
+      "id": "polite-naturalist",
+      "text": "(Oh, the tension in this room is... it's thick, isn't it? Almost heavy.)\n\nI don't reach for a weapon, and I don't reach for the gold. Instead, I find myself leaning forward just a fraction—not enough to be aggressive, but enough to show I'm not shrinking away. My heart is doing that little frantic dance against my ribs, but I try to keep my breathing steady.\n\nI'm going to try **Composure**. \n\nI want to see if I can stay still enough that they can't read the tremor in my hands. I want to look him in the eye—not with a challenge, but with a sort of calm, unsettling clarity. If I can project that I'm not afraid of the choice, maybe they'll hesitate.\n\nI set the candle back down, very carefully, exactly where it was. I don't want to seem like I'm fidgeting. \n\n\"A strange price for a game of cards,\" I say, my voice sounding a bit more level than I actually feel. \"And a stranger way to settle a debt. If I give you the crowns, do we all walk out of here? Or is the gold just a way to make sure I'm too heavy to run?\"\n\nI'm looking at the man's eyes as I speak. I'm wondering... does he actually want the money, or is this more of a ritual? And those bones... I can't stop thinking about those little bones in the circle. What kind of person leaves finger-bones out in a dim tavern like that?",
+      "ms": 9942,
+      "truncated": false,
+      "finish_reason": "stop",
+      "max_tokens_used": 1200
+    },
+    {
+      "agent": "Pushy Completionist",
+      "id": "pushy-completionist",
+      "text": "I choose **Composure**. \n\nI will not react to the movement behind me or the threats. I need to maintain a neutral expression to assess if they are bluffing or if they are truly prepared to strike.\n\nOnce I have stabilized the immediate tension, I need to know:\n1. Is there a pattern to the bone placement?\n2. Does the creak behind me sound like a person or a mechanism?\n3. Are the \"companions\" closing in, or staying in t",
+      "ms": 3170,
+      "truncated": false,
+      "finish_reason": "stop",
+      "max_tokens_used": 800
+    },
+    {
+      "agent": "Wry Skeptic",
+      "id": "wry-skeptic",
+      "text": "The candles were a prop. The illusion of a ritual. A deliberate misdirection. \n\nI keep my hands visible. I do not turn around immediately. If something is moving behind me, it is likely observing my reaction to the sound. I want to see if I am being hunted or merely staged. \n\nThe math of the candles suggests a countdown that isn't a countdown. It's a pattern. I'll note the discrepancy.\n\nI speak to the presence behind my right shoulder. I don't ask \"who's there.\" I ask, \"Is the weight of your presence part of the arrangement, or are you an uni",
+      "ms": 4170,
+      "truncated": false,
+      "finish_reason": "stop",
+      "max_tokens_used": 800
+    }
+  ]
+}

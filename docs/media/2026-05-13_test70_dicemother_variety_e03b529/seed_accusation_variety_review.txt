@@ -1,0 +1,14 @@
+{
+  "agent_signatures": {
+    "Gushing Fan": "Uses hyper-expressive, emoji-laden meta-commentary to express intense emotional investment in the narrative stakes.",
+    "Polite Naturalist": "Focuses on sensory details and internal physiological responses to ground the character in a grounded, observational manner.",
+    "Pushy Completionist": "Prioritizes mechanical efficiency and systematic information gathering through structured, analytical inquiry.",
+    "Wry Skeptic": "Adopts a detached, analytical tone that seeks to deconstruct the narrative's logic and expose potential illusions."
+  },
+  "spread": "The four candidates spread out into distinct strategic positions, ranging from emotional immersion to cold, systemic deconstruction.",
+  "truncation_flags": [
+    "Pushy Completionist",
+    "Wry Skeptic"
+  ],
+  "cumulative_variety": "high",
+  "notes": "The agents demonstrate exceptional behavioral variety, covering the full spectrum from high-arousal fan engagement to low-arousal analytical skepticism. While the Gushing Fan and Polite Naturalist provide rich, prose-heavy roleplay, the Completionist and Skeptic lean into tactical and logical deconstru

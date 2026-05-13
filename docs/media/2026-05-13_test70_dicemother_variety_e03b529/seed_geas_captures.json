@@ -1,0 +1,41 @@
+{
+  "seed": "geas",
+  "captures": [
+    {
+      "agent": "Gushing Fan",
+      "id": "gushing-fan",
+      "text": "OMG!! wait, wait, wait... the wick hasn't even been touched?! that is SO eerie!! 😱 the fact that it looks burnt but it's actually just carved down... that gives me ACTUAL CHILLS. like, who would do that?? who would prepare a ritual like that without ever lighting it?? it's so hauntingly beautiful in a terrifying way!! ✨\n\nand the bargain... \"once it leaves the dirt the bargain is taken.\" OH MY GOD. that sounds so heavy and permanent. i'm literally shaking just thinking about the weight of that decision!! \n\ni... i think i need to know more before i commit to something so huge. i'm going to roll wisdom!! i need to understand what kind of \"weight\" we're even talking about here. is it emotional? is it a curse? is it something physical?? i can't just jump in blindly when you're presenting something this profound!! \n\ni'll roll for wisdom!! 🎲✨ please tell me what i sense!! i need t",
+      "ms": 6450,
+      "truncated": false,
+      "finish_reason": "stop",
+      "max_tokens_used": 800
+    },
+    {
+      "agent": "Polite Naturalist",
+      "id": "polite-naturalist",
+      "text": "(I feel a little prickle of unease at the back of my neck—that specific sort of stillness you get when you realize you've stepped into a space that isn't quite meant for living things.)\n\nIf the wicks haven't been burnt, then the light wasn't what mattered here... it was the shape of the candles themselves, I wonder. It feels more like a measurement or a countdown.\n\nI think I'll roll wisdom. I'm not quite ready to touch that horn yet. There's a heaviness in the air that feels less like physical weight and more like... a debt? I want to understand the metaphor before I become part of the equation. What exactly is the \"weight\" being measured here? Is it something a person",
+      "ms": 4903,
+      "truncated": false,
+      "finish_reason": "stop",
+      "max_tokens_used": 1200
+    },
+    {
+      "agent": "Pushy Completionist",
+      "id": "pushy-completionist",
+      "text": "I choose to roll wisdom. I need to define the parameters of \"a worse weight\" before committing to the bargain.",
+      "ms": 930,
+      "truncated": false,
+      "finish_reason": "stop",
+      "max_tokens_used": 800
+    },
+    {
+      "agent": "Wry Skeptic",
+      "id": "wry-skeptic",
+      "text": "The candle being unburnt suggests the ritual was either aborted or never intended to use fire. A linguistic substitution. They wanted a mark, not a flame. \n\nThe weight of the candles is also a variable. If the descent is mathematical, the height of the tallow matters. I'll note the precision of the pattern. It feels less like a shrine and more like a set of instructions. \n\nI haven't turned around yet. I'd prefer to clarify the physics of this \"voice\" before I commit to a social interaction. Is the thing in the shadows a bi",
+      "ms": 3960,
+      "truncated": false,
+      "finish_reason": "stop",
+      "max_tokens_used": 800
+    }
+  ]
+}
