@@ -1,0 +1,56 @@
+{
+  "viewport": {
+    "width": 390,
+    "height": 844
+  },
+  "project": "mobile",
+  "cards_rendered": 4,
+  "fully_in_viewport": 1,
+  "partial_visible": 2,
+  "cards": [
+    {
+      "name": "Gushing Fan",
+      "rect": {
+        "top": 686,
+        "left": 9,
+        "width": 372,
+        "height": 95
+      },
+      "inViewport": true,
+      "partialVisible": true
+    },
+    {
+      "name": "Polite Naturalist",
+      "rect": {
+        "top": 789,
+        "left": 9,
+        "width": 372,
+        "height": 131
+      },
+      "inViewport": false,
+      "partialVisible": true
+    },
+    {
+      "name": "Pushy Completionist",
+      "rect": {
+        "top": 927,
+        "left": 9,
+        "width": 372,
+        "height": 149
+      },
+      "inViewport": false,
+      "partialVisible": false
+    },
+    {
+      "name": "Wry Skeptic",
+      "rect": {
+        "top": 1084,
+        "left": 9,
+        "width": 372,
+        "height": 95
+      },
+      "inViewport": false,
+      "partialVisible": false
+    }
+  ]
+}
