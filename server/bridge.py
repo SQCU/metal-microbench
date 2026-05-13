@@ -307,6 +307,93 @@ _TOOL_CALL_OPEN = '<|tool_call>'
 _TOOL_CALL_CLOSE = '<tool_call|>'
 
 
+class _StreamMarkerStripper:
+    """Stateful filter that suppresses `<|tool_call>...<tool_call|>` spans
+    from streamed content deltas.
+
+    The marker tokens are atomic in the tokenizer, so the most common
+    case is that `<|tool_call>` arrives whole inside a single delta_text.
+    But because detokenize() coalesces multiple new_tokens per stream
+    update, and because the surrounding text may end inside a marker
+    span, we keep state across calls:
+
+      - `in_marker` is True iff we have seen an open marker and have
+        not yet seen its matching close. While in this state, ALL
+        incoming text is suppressed.
+      - `tail` is up to (max_marker_len - 1) characters held back from
+        the previous yield, in case the delta boundary fell inside a
+        marker literal (e.g. delta ends with `<|tool_ca` and the next
+        delta starts with `ll>...`). This way we never yield a partial
+        marker prefix.
+
+    Note: this is a stripper, not a parser. It does NOT attempt to
+    materialise tool_calls out of the suppressed spans during streaming.
+    Bridge's existing end-of-stream `_extract_tool_calls(full_text, ...)`
+    call is the authoritative parser; this just stops the literal marker
+    bytes from leaking into the client's visible prose mid-stream.
+    """
+
+    __slots__ = ("in_marker", "tail")
+
+    def __init__(self):
+        self.in_marker = False
+        self.tail = ""
+
+    def feed(self, chunk: str) -> str:
+        """Consume `chunk`, return the portion safe to emit now."""
+        buf = self.tail + chunk
+        out: list[str] = []
+        i = 0
+        n = len(buf)
+        m_open = _TOOL_CALL_OPEN
+        m_close = _TOOL_CALL_CLOSE
+        # Max bytes we might need to hold back so we don't accidentally
+        # emit a partial open or close marker. -1 because if we have a
+        # FULL marker we should consume it now, not hold it back.
+        hold = max(len(m_open), len(m_close)) - 1
+        while i < n:
+            if not self.in_marker:
+                idx = buf.find(m_open, i)
+                if idx == -1:
+                    # No more opens visible. Emit everything except a
+                    # trailing hold-window that might be a marker prefix.
+                    safe_end = max(i, n - hold)
+                    out.append(buf[i:safe_end])
+                    i = safe_end
+                    break
+                out.append(buf[i:idx])
+                self.in_marker = True
+                i = idx + len(m_open)
+            else:
+                idx = buf.find(m_close, i)
+                if idx == -1:
+                    # In-marker tail extends beyond this chunk; hold the
+                    # last `hold` bytes in case they're part of a close
+                    # marker prefix split across deltas. Drop the rest.
+                    i = max(i, n - hold)
+                    break
+                self.in_marker = False
+                i = idx + len(m_close)
+        # Whatever's left at [i:] becomes the new tail.
+        self.tail = buf[i:]
+        return ''.join(out)
+
+    def flush(self) -> str:
+        """Emit any held-back tail at end-of-stream.
+
+        At stream end, a leftover tail is either:
+          - some out-of-marker text that happened to look like a marker
+            prefix (we should emit it verbatim), or
+          - in-marker bytes with an unclosed open (we should drop them).
+        """
+        t = self.tail
+        self.tail = ""
+        if self.in_marker:
+            self.in_marker = False
+            return ""
+        return t
+
+
 def _iter_tool_call_blocks(content: str):
     """Yield (start, end, body) for each `<|tool_call>...<tool_call|>`
     block found in `content`. The OUTER markers are atomic tokenizer
@@ -336,9 +423,31 @@ def _extract_tool_calls(content: str,
     on a particular block, the block stays in cleaned_content as-is
     so the client at least sees the bytes (debugging affordance) and
     the parse error logs to stderr for triage.
+
+    Marker stripping is unconditional: even when had_tools is False
+    (the caller did not register any tool grammar this turn), the
+    model can still spontaneously emit `<|tool_call>...<tool_call|>`
+    spans. Those are sampling drift / hallucination artefacts. We
+    strip them from the content so they don't leak into the user-
+    facing prose, but we do NOT emit them as structured tool_calls
+    (because there are no tools to dispatch against and the parse
+    would be meaningless). The diagnostic residue pathway above is
+    only reached on the had_tools=True branch.
     """
-    if not had_tools or _TOOL_CALL_OPEN not in content:
+    if _TOOL_CALL_OPEN not in content:
         return content, None
+    if not had_tools:
+        # Strip the spans verbatim; drop any inner text. The model
+        # got into tool-call-token territory without being asked to,
+        # so the inner content is not a real tool invocation — it's
+        # the assistant freelancing markup that has no consumer.
+        cleaned_parts: list[str] = []
+        last_end = 0
+        for block_start, block_end, _body in _iter_tool_call_blocks(content):
+            cleaned_parts.append(content[last_end:block_start])
+            last_end = block_end
+        cleaned_parts.append(content[last_end:])
+        return ''.join(cleaned_parts).strip(), None
 
     tool_calls: list[dict] = []
     cleaned_parts: list[str] = []
@@ -1149,6 +1258,15 @@ async def chat_completions(req: Request) -> Any:
         # pending bytes until it shows up, then emit only the body.
         thinking_header_consumed = False
         thinking_header_buffer = ""
+        # Per-generator state for stripping `<|tool_call>...<tool_call|>`
+        # spans from streamed content deltas. The model can emit these
+        # markers spontaneously (sampling drift) even when no tools were
+        # registered, and the raw marker text leaks into client-visible
+        # prose if we don't filter mid-stream. End-of-stream extraction
+        # (the had_tools branch below) still runs against the full
+        # accumulated text and supersedes this filter for the structured
+        # tool_calls payload. This is purely a content-cleanliness gate.
+        marker_stripper = _StreamMarkerStripper()
         try:
             while True:
                 u: g.StreamUpdate = await response_q.get()
@@ -1204,17 +1322,22 @@ async def chat_completions(req: Request) -> Any:
                     all_tokens.extend(u.new_tokens)
                     delta_text = g.detokenize(u.new_tokens)
                     if delta_text:
-                        yield ("data: " + json.dumps({
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": MODEL_NAME,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"content": delta_text},
-                                "finish_reason": None,
-                            }],
-                        }) + "\n\n")
+                        # Filter `<|tool_call>...<tool_call|>` spans out
+                        # of the visible content stream. Markers are
+                        # processed structurally at end-of-stream below.
+                        filtered = marker_stripper.feed(delta_text)
+                        if filtered:
+                            yield ("data: " + json.dumps({
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": MODEL_NAME,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": filtered},
+                                    "finish_reason": None,
+                                }],
+                            }) + "\n\n")
                 if u.state == 2:
                     # Engine-side error path: done_reason=3 + err_msg.
                     # Same handling as non-streaming aggregate path above.
@@ -1242,10 +1365,27 @@ async def chat_completions(req: Request) -> Any:
                         break
                     finish = "stop" if u.done_reason == 1 else (
                         "length" if u.done_reason == 2 else "stop")
+                    # Flush any held-back tail from the marker stripper
+                    # before final extraction. The stripper holds up to
+                    # (max_marker_len-1) bytes that *might* have been a
+                    # marker prefix; at stream end we know they aren't.
+                    final_tail = marker_stripper.flush()
+                    if final_tail:
+                        yield ("data: " + json.dumps({
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": MODEL_NAME,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": final_tail},
+                                "finish_reason": None,
+                            }],
+                        }) + "\n\n")
                     # End-of-generation tool-call extraction. The marker
-                    # text streamed live to the client; if any markers
-                    # parsed cleanly, also emit a structured tool_calls
-                    # delta and flip finish to "tool_calls" per OAI spec.
+                    # spans were stripped mid-stream; if any parsed
+                    # cleanly here, emit a structured tool_calls delta
+                    # and flip finish to "tool_calls" per OAI spec.
                     if had_tools:
                         full_text = g.detokenize(all_tokens)
                         _, extracted = _extract_tool_calls(

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ctypes as C
 import os
+import re
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -514,6 +515,44 @@ def tokenize(text: str, add_bos: bool = False) -> list[int]:
     return list(out[:n])
 
 
+# SentencePiece byte-fallback escape collapsing.
+#
+# The Swift/C detokenizer renders byte-fallback tokens — used for any
+# codepoint not covered by the model's vocabulary, which includes most
+# uncommon emoji — as a literal `\xHH` ASCII escape string rather than
+# emitting the raw byte. So a single 📿 (U+1F4FF, UTF-8 = F0 9F 93 BF)
+# arrives here as the 16-character string `\xF0\x9F\x93\xBF` instead of
+# the 1-character glyph.
+#
+# Symptom in the wild: turn 35 of the 2026-05-12 scringlo_scrambler chat
+# ended with literal `\xF0\x9F\x93\xBF` in the rendered message. Same
+# class of bug would also affect rarer scripts (e.g. ancient-script
+# codepoints that fall to byte-fallback).
+#
+# Fix here is consumer-side rather than C-side: scan the decoded string
+# for consecutive `\xHH` runs and try to re-decode them as UTF-8. If the
+# byte sequence forms valid UTF-8, substitute the proper character(s);
+# if not, leave the escape literal in place so the user still sees a
+# diagnostic remnant rather than U+FFFD soup.
+_BYTE_FALLBACK_RUN_RE = re.compile(r'(?:\\x[0-9A-Fa-f]{2})+')
+_BYTE_FALLBACK_ONE_RE = re.compile(r'\\x([0-9A-Fa-f]{2})')
+
+
+def _collapse_byte_fallback_escapes(s: str) -> str:
+    if '\\x' not in s:
+        return s
+
+    def repl(m: re.Match) -> str:
+        hex_pairs = _BYTE_FALLBACK_ONE_RE.findall(m.group(0))
+        raw = bytes(int(h, 16) for h in hex_pairs)
+        try:
+            return raw.decode('utf-8')
+        except UnicodeDecodeError:
+            return m.group(0)
+
+    return _BYTE_FALLBACK_RUN_RE.sub(repl, s)
+
+
 def detokenize(tokens: list[int]) -> str:
     n = len(tokens)
     if n == 0:
@@ -528,7 +567,8 @@ def detokenize(tokens: list[int]) -> str:
         cap = written + 1
         buf = C.create_string_buffer(cap)
         written = _lib.gemma_detokenize(arr, n, buf, cap)
-    return buf.value.decode("utf-8", errors="replace")
+    raw = buf.value.decode("utf-8", errors="replace")
+    return _collapse_byte_fallback_escapes(raw)
 
 
 def submit(streams: list[StreamSpec]) -> int:
