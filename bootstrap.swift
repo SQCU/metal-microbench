@@ -562,7 +562,25 @@ let logits      = emptyHalf(B * VOCAB)
 // If long-context workloads need more headroom, bump SCRATCH_PAGE_BASE.
 let MAX_RESIDENT_SESSIONS = 64                    // logical users held in KV
 let SCRATCH_STRIP = 256                           // silenced-slot scratch (shared)
-let SCRATCH_PAGE_BASE = 8192                     // DEBUG: pool=12288 to capture all Metal validation messages
+// 2026-05-14 cliff diagnosis result: pool=12288 boots clean (no
+// Metal validation errors with MTL_DEBUG_LAYER=1 MTL_GPU_VALIDATION=1)
+// but produces silent KV corruption — generated text is coherent
+// English unrelated to the prompt (e.g. prompt "What is 2 plus 2?"
+// returned " eyes\n[]\n[]\n[]…"). So the cliff is NOT a Metal limit;
+// it's a kernel-side addressing bug that produces wrong-but-in-bounds
+// reads at larger pool sizes. The bug is therefore harder to find
+// than a bounds violation (Metal can't catch it — the reads are
+// legal, just to the wrong cells). Candidates:
+//   - Hardcoded 8192 in a kernel address calculation
+//   - 32-bit signed overflow in an intermediate offset (768MB buffer
+//     × multiplier could overflow Int32)
+//   - block_table or page-translation table size assumption
+//   - Per-layer K/V buffer stride assumption (cache buffer grew
+//     proportionally, but kernel may use a constant stride somewhere)
+// Until that's pinpointed and fixed, pool stays at 8192. The
+// admission-backpressure path (lm_engine.swift submitRequest) is the
+// correct way to handle pool pressure given the current capacity.
+let SCRATCH_PAGE_BASE = 8192
 let REAL_PAGE_BASE = 0
 let PHYS_POOL_PAGES = SCRATCH_PAGE_BASE
 let TOTAL_PAGES = SCRATCH_PAGE_BASE + SCRATCH_STRIP
