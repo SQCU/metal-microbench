@@ -1651,8 +1651,10 @@ func runLmLayerDump(ggufPath: String, refDir: String, tag: String, outDir: Strin
     // We snapshot it at the end; by then entries 0..S-1 should hold the
     // post-rope/post-k_norm K from each AR step.
     do {
-        let Kc = w.K_caches[0]
-        let Vc = w.V_caches[0]
+        // Diagnostic dump samples chunk 0 only (the pages used by slot 0
+        // in this harness's setup fall in chunk 0).
+        let Kc = w.K_chunks[0][0]
+        let Vc = w.V_chunks[0][0]
         // Layer 0 is sliding (PAGE=16, H_KV=8, HD=256).
         let pageElems = PAGE_SLIDE * 8 * 256
         var kFp32 = [Float](repeating: 0, count: pageElems)

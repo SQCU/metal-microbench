@@ -10,6 +10,37 @@ let msl = """
 #include <metal_simdgroup_matrix>
 using namespace metal;
 
+// ─────────────────────────────────────────────────────────────────────
+// KV virtual-page-table indirection.
+//
+// Each per-layer K/V cache is split across KV_NUM_CHUNKS device buffers.
+// Phys-page id `p` maps to (chunk_idx, local_phys) via:
+//     chunk_idx = p / chunk_pages
+//     local_phys = p - chunk_idx * chunk_pages
+//
+// Kernels receive an argument buffer (Tier 2; M-series supported) that
+// encodes the per-layer chunk pointer array. The kernel indexes into
+// the array at runtime; the GPU's residency tracker only sees the
+// chunks listed by the dispatcher's useResource() hints. This is the
+// scatter-gather pattern: 100+ GB of total KV addressable, but only
+// the ~6 GB working-set actually touched per CB is residency-tracked.
+//
+// KV_NUM_CHUNKS is hardcoded here and must match the Swift-side
+// constant. Bumping it doubles addressable pool capacity (split-by-4
+// allows ~32K pages = ~105 GB KV; split-by-8 allows ~64K = ~210 GB).
+#define KV_NUM_CHUNKS 4
+
+// Argument buffer carrying KV_NUM_CHUNKS device pointers. Same shape
+// for K and V chunks; layer-level Swift allocation creates one of these
+// per layer's K and one per layer's V.
+struct KVChunks {
+    device const half* chunks[KV_NUM_CHUNKS];
+};
+// Write-side variant (non-const) for kv_write / kv_write_multi.
+struct KVChunksW {
+    device half* chunks[KV_NUM_CHUNKS];
+};
+
 // RMSNorm with learnable scale gamma.
 kernel void rms_norm(
     device const half* x [[buffer(0)]], device const half* gamma [[buffer(1)]],
@@ -604,12 +635,12 @@ kernel void rope_half(
 // K, V layout: [B, Q_LEN, H, D]. q_positions: [B, Q_LEN].
 kernel void kv_write_multi(
     device const half* K [[buffer(0)]], device const half* V [[buffer(1)]],
-    device half* K_cache [[buffer(2)]], device half* V_cache [[buffer(3)]],
+    device const KVChunksW& k_chunks [[buffer(2)]],
+    device const KVChunksW& v_chunks [[buffer(3)]],
     device const uint* block_table [[buffer(4)]], device const uint* q_positions [[buffer(5)]],
     constant uint& H [[buffer(6)]], constant uint& D [[buffer(7)]],
     constant uint& PAGE [[buffer(8)]], constant uint& max_pages [[buffer(9)]],
     constant uint& q_len [[buffer(10)]],
-    device half* K_cache_hi [[buffer(25)]], device half* V_cache_hi [[buffer(26)]],
     constant uint& chunk_pages [[buffer(27)]],
     uint3 tg [[threadgroup_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]])
 {
@@ -618,10 +649,10 @@ kernel void kv_write_multi(
     uint pos = q_positions[q_flat];
     uint lp = pos / PAGE; uint off = pos % PAGE;
     uint phys = block_table[b * max_pages + lp];
-    bool is_hi = phys >= chunk_pages;
-    uint local_phys = is_hi ? (phys - chunk_pages) : phys;
-    device half* Kx = is_hi ? K_cache_hi : K_cache;
-    device half* Vx = is_hi ? V_cache_hi : V_cache;
+    uint chunk_idx = phys / chunk_pages;
+    uint local_phys = phys - chunk_idx * chunk_pages;
+    device half* Kx = k_chunks.chunks[chunk_idx];
+    device half* Vx = v_chunks.chunks[chunk_idx];
     device const half* Ks = K + (q_flat * H + h) * D;
     device const half* Vs = V + (q_flat * H + h) * D;
     device half* Kd = Kx + ((local_phys * PAGE + off) * H + h) * D;
@@ -673,28 +704,26 @@ kernel void bf16_to_fp16(
     dst[i] = half(f);
 }
 
-// KV cache write — supports virtual-page-table indirection across two
-// device buffers per layer K/V. See bootstrap.swift KV_NUM_CHUNKS comment.
-// When chunk_pages == TOTAL_PAGES (or any value > max phys), the hi
-// buffer is unused and all writes go to the lo buffer (behavior identical
-// to pre-refactor single-buffer K/V).
+// KV cache write — scatter-gathers writes across KV_NUM_CHUNKS device
+// buffers per layer K/V via argument buffer indirection. See the
+// KVChunks struct + KV_NUM_CHUNKS #define at top of file.
 kernel void kv_write(
     device const half* K [[buffer(0)]], device const half* V [[buffer(1)]],
-    device half* K_cache [[buffer(2)]], device half* V_cache [[buffer(3)]],
+    device const KVChunksW& k_chunks [[buffer(2)]],
+    device const KVChunksW& v_chunks [[buffer(3)]],
     device const uint* block_table [[buffer(4)]], device const uint* positions [[buffer(5)]],
     constant uint& H [[buffer(6)]], constant uint& D [[buffer(7)]],
     constant uint& PAGE [[buffer(8)]], constant uint& max_pages [[buffer(9)]],
-    device half* K_cache_hi [[buffer(25)]], device half* V_cache_hi [[buffer(26)]],
     constant uint& chunk_pages [[buffer(27)]],
     uint3 tg [[threadgroup_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]])
 {
     uint b = tg.x; uint h = tg.y; uint t = lid.x;
     uint pos = positions[b]; uint lp = pos / PAGE; uint off = pos % PAGE;
     uint phys = block_table[b * max_pages + lp];
-    bool is_hi = phys >= chunk_pages;
-    uint local_phys = is_hi ? (phys - chunk_pages) : phys;
-    device half* Kx = is_hi ? K_cache_hi : K_cache;
-    device half* Vx = is_hi ? V_cache_hi : V_cache;
+    uint chunk_idx = phys / chunk_pages;
+    uint local_phys = phys - chunk_idx * chunk_pages;
+    device half* Kx = k_chunks.chunks[chunk_idx];
+    device half* Vx = v_chunks.chunks[chunk_idx];
     device const half* Ks = K + (b * H + h) * D; device const half* Vs = V + (b * H + h) * D;
     device half* Kd = Kx + ((local_phys * PAGE + off) * H + h) * D;
     device half* Vd = Vx + ((local_phys * PAGE + off) * H + h) * D;
@@ -776,13 +805,12 @@ kernel void paged_attn_split_reduce(
 kernel void fake_attention(
     device const half* Q [[buffer(0)]],
     device half* O [[buffer(1)]],
-    device const half* K_cache [[buffer(2)]],
-    device const half* V_cache [[buffer(3)]],
+    device const KVChunks& k_chunks [[buffer(2)]],
+    device const KVChunks& v_chunks [[buffer(3)]],
     device const uint* block_table [[buffer(4)]],
     constant uint& num_pages [[buffer(5)]],
     constant uint& H [[buffer(6)]], constant uint& D [[buffer(7)]], constant uint& PAGE [[buffer(8)]],
     constant uint& max_pages [[buffer(9)]],
-    device const half* K_cache_hi [[buffer(25)]], device const half* V_cache_hi [[buffer(26)]],
     constant uint& chunk_pages [[buffer(27)]],
     uint3 tg [[threadgroup_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]])
 {
@@ -794,10 +822,10 @@ kernel void fake_attention(
     float acc = 0.0f;
     for (uint p = 0; p < num_pages; ++p) {
         uint phys = block_table[b * max_pages + p];
-        bool is_hi = phys >= chunk_pages;
-        uint local_phys = is_hi ? (phys - chunk_pages) : phys;
-        device const half* Kx = is_hi ? K_cache_hi : K_cache;
-        device const half* Vx = is_hi ? V_cache_hi : V_cache;
+        uint chunk_idx = phys / chunk_pages;
+        uint local_phys = phys - chunk_idx * chunk_pages;
+        device const half* Kx = k_chunks.chunks[chunk_idx];
+        device const half* Vx = v_chunks.chunks[chunk_idx];
         device const half* Kp = Kx + (local_phys * PAGE * H + h) * D;
         device const half* Vp = Vx + (local_phys * PAGE * H + h) * D;
         // Each lane touches D/32 elements × PAGE rows. Read pattern is
@@ -9948,8 +9976,8 @@ constant bool FC_USE_SLIDE [[function_constant(3)]];
 
 kernel void flex_attn_v0(
     device const half* Q                    [[buffer(0)]],
-    device const half* K_cache              [[buffer(1)]],
-    device const half* V_cache              [[buffer(2)]],
+    device const KVChunks& k_chunks         [[buffer(1)]],
+    device const KVChunks& v_chunks         [[buffer(2)]],
     device const uint* block_table          [[buffer(3)]],
     device float* m_partials                [[buffer(4)]],
     device float* l_partials                [[buffer(5)]],
@@ -9968,8 +9996,6 @@ kernel void flex_attn_v0(
     constant uint& prefix_pages             [[buffer(18)]],    // skip logical pages < this (tail mode). 0 = process all.
     constant uint& split_offset             [[buffer(19)]],    // write partials at total_splits_out stride, + split_offset + tg.y.
     constant uint& total_splits_out         [[buffer(20)]],    // output layout stride. 0 → fallback to N_SPLITS.
-    device const half* K_cache_hi           [[buffer(25)]],
-    device const half* V_cache_hi           [[buffer(26)]],
     constant uint& chunk_pages              [[buffer(27)]],
     uint3 tg_pos                            [[threadgroup_position_in_grid]],
     uint3 lid3                              [[thread_position_in_threadgroup]])
@@ -10077,10 +10103,10 @@ kernel void flex_attn_v0(
         if (p < prefix_pages) continue;
 
         const uint phys = bt_s[p];
-        const bool is_hi = phys >= chunk_pages;
-        const uint local_phys = is_hi ? (phys - chunk_pages) : phys;
-        device const half* Kx = is_hi ? K_cache_hi : K_cache;
-        device const half* Vx = is_hi ? V_cache_hi : V_cache;
+        const uint chunk_idx = phys / chunk_pages;
+        const uint local_phys = phys - chunk_idx * chunk_pages;
+        device const half* Kx = k_chunks.chunks[chunk_idx];
+        device const half* Vx = v_chunks.chunks[chunk_idx];
         device const half* Kbase = Kx + (local_phys * PAGE * H_KV + kv_head) * D;
         device const half* Vbase = Vx + (local_phys * PAGE * H_KV + kv_head) * D;
 
@@ -10203,8 +10229,8 @@ kernel void flex_attn_v0(
 // per-row q_positions. Partials laid out per (q_pos, q_head).
 kernel void flex_attn_slide_v1_q8(
     device const half* Q                    [[buffer(0)]],   // [B, Q_LEN, H_Q, D]
-    device const half* K_cache              [[buffer(1)]],
-    device const half* V_cache              [[buffer(2)]],
+    device const KVChunks& k_chunks         [[buffer(1)]],
+    device const KVChunks& v_chunks         [[buffer(2)]],
     device const uint* block_table          [[buffer(3)]],
     device float* m_partials                [[buffer(4)]],   // [B, Q_LEN, H_Q, N_SPLITS]
     device float* l_partials                [[buffer(5)]],
@@ -10223,8 +10249,6 @@ kernel void flex_attn_slide_v1_q8(
     constant uint& sliding_window           [[buffer(18)]],  // legacy: ignored when mask bitmap drives masking
     constant uint& q_len                    [[buffer(19)]],
     device const uint* partial_block_masks  [[buffer(20)]],  // [total_partials, Q_BLOCK] uint; bit k set = keep
-    device const half* K_cache_hi           [[buffer(25)]],
-    device const half* V_cache_hi           [[buffer(26)]],
     constant uint& chunk_pages              [[buffer(27)]],
     uint3 tg_pos                            [[threadgroup_position_in_grid]],
     uint3 lid3                              [[thread_position_in_threadgroup]])
@@ -10307,10 +10331,10 @@ kernel void flex_attn_slide_v1_q8(
         }
 
         const uint phys = bt_s[p];
-        const bool is_hi = phys >= chunk_pages;
-        const uint local_phys = is_hi ? (phys - chunk_pages) : phys;
-        device const half* Kx = is_hi ? K_cache_hi : K_cache;
-        device const half* Vx = is_hi ? V_cache_hi : V_cache;
+        const uint chunk_idx = phys / chunk_pages;
+        const uint local_phys = phys - chunk_idx * chunk_pages;
+        device const half* Kx = k_chunks.chunks[chunk_idx];
+        device const half* Vx = v_chunks.chunks[chunk_idx];
         device const half* Kbase = Kx + (local_phys * PAGE * H_KV + kv_head) * D;
         device const half* Vbase = Vx + (local_phys * PAGE * H_KV + kv_head) * D;
 
@@ -10441,8 +10465,8 @@ kernel void flex_attn_slide_v1_q8(
 // Mask: pure causal (full-attn layers have no sliding window).
 kernel void flex_attn_full_prefill(
     device const half* Q                    [[buffer(0)]],
-    device const half* K_cache              [[buffer(1)]],
-    device const half* V_cache              [[buffer(2)]],
+    device const KVChunks& k_chunks         [[buffer(1)]],
+    device const KVChunks& v_chunks         [[buffer(2)]],
     device const uint* block_table          [[buffer(3)]],
     device float* m_partials                [[buffer(4)]],
     device float* l_partials                [[buffer(5)]],
@@ -10460,8 +10484,6 @@ kernel void flex_attn_full_prefill(
     constant uint& N_SPLITS                 [[buffer(17)]],
     constant uint& q_len                    [[buffer(18)]],
     device const uint* partial_block_masks  [[buffer(19)]],  // [total_partials, Q_BLOCK] uint
-    device const half* K_cache_hi           [[buffer(25)]],
-    device const half* V_cache_hi           [[buffer(26)]],
     constant uint& chunk_pages              [[buffer(27)]],
     uint3 tg_pos                            [[threadgroup_position_in_grid]],
     uint3 lid3                              [[thread_position_in_threadgroup]])
@@ -10553,10 +10575,10 @@ kernel void flex_attn_full_prefill(
         }
 
         const uint phys = bt_s[p];
-        const bool is_hi = phys >= chunk_pages;
-        const uint local_phys = is_hi ? (phys - chunk_pages) : phys;
-        device const half* Kx = is_hi ? K_cache_hi : K_cache;
-        device const half* Vx = is_hi ? V_cache_hi : V_cache;
+        const uint chunk_idx = phys / chunk_pages;
+        const uint local_phys = phys - chunk_idx * chunk_pages;
+        device const half* Kx = k_chunks.chunks[chunk_idx];
+        device const half* Vx = v_chunks.chunks[chunk_idx];
         device const half* Kbase = Kx + (local_phys * PAGE * H_KV + kv_head) * D;
         device const half* Vbase = Vx + (local_phys * PAGE * H_KV + kv_head) * D;
 

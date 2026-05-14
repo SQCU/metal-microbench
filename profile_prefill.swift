@@ -103,10 +103,10 @@ func runLmPrefillProfile(ggufPath: String) {
             let q_out = isFull ? pre_q_full_out : pre_q_slide_out
             let k_out = isFull ? pre_k_full_out : pre_k_slide_out
             let v_out = isFull ? pre_v_full_out : pre_v_slide_out
-            let Kc = w.K_caches[L]
-            let Vc = w.V_caches[L]
-            let KcHi = w.K_caches_hi[L]
-            let VcHi = w.V_caches_hi[L]
+            let kArgBuf = w.K_chunks_argbuf[L]
+            let vArgBuf = w.V_chunks_argbuf[L]
+            let kChunks = w.K_chunks[L]
+            let vChunks = w.V_chunks[L]
 
             // QKV: RMSNorm + 3 simdgroup matmuls (Q, K, V) on v6-swizzled Q8_0.
             stages.append(runStage("qkv", layer: L) { cb in
@@ -134,19 +134,22 @@ func runLmPrefillProfile(ggufPath: String) {
 
             stages.append(runStage("kv_attn", layer: L) { cb in
                 let pg = isFull ? PAGE_FULL : PAGE_SLIDE
-                encKVWriteMulti(cb, K: k_out, V: v_out, Kc: Kc, Vc: Vc,
-                                KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
+                encKVWriteMulti(cb, K: k_out, V: v_out,
+                                kArgBuf: kArgBuf, vArgBuf: vArgBuf,
+                                kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                                 q_positions: pre_q_positions,
                                 H: KV_H, D: HD, page: pg, qLen: qLen)
                 let klBuf = isFull ? pre_k_len_full : pre_k_len_slide
                 if isFull {
-                    encFlexAttnFullPrefill(cb, Q: q_out, O: pre_attn_out, Kc: Kc, Vc: Vc,
-                                            KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
+                    encFlexAttnFullPrefill(cb, Q: q_out, O: pre_attn_out,
+                                            kArgBuf: kArgBuf, vArgBuf: vArgBuf,
+                                            kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                                             kLenBuf: klBuf, qPositions: pre_q_positions,
                                             H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
                 } else {
-                    encFlexAttnSlidePrefill(cb, Q: q_out, O: pre_attn_out, Kc: Kc, Vc: Vc,
-                                             KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
+                    encFlexAttnSlidePrefill(cb, Q: q_out, O: pre_attn_out,
+                                             kArgBuf: kArgBuf, vArgBuf: vArgBuf,
+                                             kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                                              kLenBuf: klBuf, qPositions: pre_q_positions,
                                              H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
                 }

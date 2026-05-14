@@ -1437,19 +1437,17 @@ final class LmEngine {
     // Cost: ~32 KB per page across 25 layers ≈ 800 KB memset, ~3 μs on
     // M5's ~250 GB/s memcpy bandwidth. Negligible vs the ~30 ms step.
     private func zeroPhysPageKV(_ phys: Int) {
-        // Virtual-page-table-aware zero-fill. phys < kvChunkPages goes to
-        // the lo buffer at local offset; phys >= kvChunkPages goes to the
-        // hi buffer with local_phys = phys - kvChunkPages. Same pattern
-        // as the kernel's address derivation.
-        let isHi = phys >= weights.kvChunkPages
-        let localPhys = isHi ? (phys - weights.kvChunkPages) : phys
+        // Virtual-page-table-aware zero-fill. Map phys → (chunk_idx,
+        // local_phys) using the same arithmetic the kernels do.
+        let chunkIdx = phys / weights.kvChunkPages
+        let localPhys = phys - chunkIdx * weights.kvChunkPages
         for L in 0..<NUM_LAYERS {
             let lw = weights.layers[L]
             let pg = lw.isFull ? PAGE_FULL : PAGE_SLIDE
             let bytesPerPage = pg * lw.KV_H * lw.HD * 2
             let off = localPhys * bytesPerPage
-            let kBuf = isHi ? weights.K_caches_hi[L] : weights.K_caches[L]
-            let vBuf = isHi ? weights.V_caches_hi[L] : weights.V_caches[L]
+            let kBuf = weights.K_chunks[L][chunkIdx]
+            let vBuf = weights.V_chunks[L][chunkIdx]
             memset(kBuf.contents().advanced(by: off), 0, bytesPerPage)
             memset(vBuf.contents().advanced(by: off), 0, bytesPerPage)
         }
@@ -1487,10 +1485,9 @@ final class LmEngine {
     // many * 2 bytes.
     fileprivate func installPrefixKV(_ s: Session, k: [Data], v: [Data]) {
         let phys = s.ownedPages[0]
-        // Virtual-page-table-aware K/V write. Same routing as the kernels:
-        // phys >= kvChunkPages → hi buffer with local_phys offset.
-        let isHi = phys >= weights.kvChunkPages
-        let localPhys = isHi ? (phys - weights.kvChunkPages) : phys
+        // Virtual-page-table-aware K/V write. Same routing as kernels.
+        let chunkIdx = phys / weights.kvChunkPages
+        let localPhys = phys - chunkIdx * weights.kvChunkPages
         for L in 0..<NUM_LAYERS {
             let lw = weights.layers[L]
             let pg = lw.isFull ? PAGE_FULL : PAGE_SLIDE
@@ -1506,8 +1503,8 @@ final class LmEngine {
                       "expected \(sliceHalves * 2))")
                 continue
             }
-            let kBuf = isHi ? weights.K_caches_hi[L] : weights.K_caches[L]
-            let vBuf = isHi ? weights.V_caches_hi[L] : weights.V_caches[L]
+            let kBuf = weights.K_chunks[L][chunkIdx]
+            let vBuf = weights.V_chunks[L][chunkIdx]
             let kDst = kBuf.contents().advanced(by: byteOffset)
             let vDst = vBuf.contents().advanced(by: byteOffset)
             kBlob.withUnsafeBytes { memcpy(kDst, $0.baseAddress, sliceHalves * 2) }

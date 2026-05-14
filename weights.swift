@@ -110,19 +110,29 @@ struct LmWeights {
     let unembedW: MTLBuffer          // fp16 [HIDDEN, VOCAB] transposed tied view
     let outputNorm: MTLBuffer        // fp16 [HIDDEN] final RMSNorm gamma
     let embedScaleBuf: MTLBuffer     // fp32 single scalar = sqrt(HIDDEN)
-    let K_caches: [MTLBuffer]        // per-layer K cache, LO half (chunk 0)
-    let V_caches: [MTLBuffer]        // per-layer V cache, LO half (chunk 0)
-    // Virtual-page-table indirection across two device buffers per layer.
-    // 2026-05-14 buffer-split refactor: the hardware/driver cliff at
-    // ~768 MB per-buffer means we can't allocate a single K (or V)
-    // device buffer large enough for pools beyond ~12K pages. Split
-    // into two buffers per layer, indexed by phys-page-id in the
-    // attention kernels via `is_hi = phys >= kvChunkPages`. When
-    // kvChunkPages > maxPhysPage, _hi is unused and behavior matches
-    // pre-refactor single-buffer K/V.
-    let K_caches_hi: [MTLBuffer]     // per-layer K cache, HI half (chunk 1)
-    let V_caches_hi: [MTLBuffer]     // per-layer V cache, HI half (chunk 1)
-    let kvChunkPages: Int            // phys-page split point (phys >= → _hi buffer)
+    // Virtual-page-table KV cache, scatter-gather via argument buffers.
+    //
+    // 2026-05-14 argbuf refactor. Each layer's K and V cache live across
+    // KV_NUM_CHUNKS=4 device buffers; phys-page-id `p` maps via
+    //   chunk_idx = p / kvChunkPages
+    //   local_phys = p - chunk_idx * kvChunkPages
+    // and the chunks live at K_chunks[L][chunk_idx] / V_chunks[L][chunk_idx].
+    //
+    // Kernels access them through an argument buffer (KVChunks struct)
+    // pre-encoded once at startup and bound at a single buffer index per
+    // kernel invocation. Per-CB useResource() hints make the GPU's
+    // residency tracker list only the chunks actually touched, not the
+    // full ~100+ GB pool. This is the whole point: scatter-gather lets
+    // the addressable pool grow to 110 GB+ while the per-CB working set
+    // stays at ~6 GB.
+    //
+    // The legacy K_caches/V_caches (single buffer or lo/hi pair) is
+    // deleted — every consumer goes through K_chunks_argbuf now.
+    let K_chunks: [[MTLBuffer]]              // [NUM_LAYERS][KV_NUM_CHUNKS]
+    let V_chunks: [[MTLBuffer]]              // [NUM_LAYERS][KV_NUM_CHUNKS]
+    let K_chunks_argbuf: [MTLBuffer]         // [NUM_LAYERS], encoded argument buffer
+    let V_chunks_argbuf: [MTLBuffer]         // [NUM_LAYERS], encoded argument buffer
+    let kvChunkPages: Int                    // pages per chunk (rounded up)
     let bosTokenId: UInt32
     let eosTokenId: UInt32           // tokenizer.ggml.eos_token_id (Gemma4: 106 = <end_of_turn>)
     let addBosToken: Bool            // tokenizer.ggml.add_bos_token
@@ -552,77 +562,104 @@ func loadLmWeights(ggufPath: String) throws -> LmWeights {
     // anyone noticing. The threshold is set with margin: 768 MB hard
     // ceiling reduces to 752 MB enforced ceiling (16 MB safety
     // margin matching the 2026-05-14 production setting).
+    // Per-chunk hardware cliff. The 2026-05-14 bisection found Metal
+    // silently produces wrong-but-in-bounds reads above ~768 MB per
+    // device buffer. With KV_NUM_CHUNKS=4 chunks per layer, each
+    // chunk's K (or V) buffer must stay below this ceiling.
     let KV_BUFFER_HARD_LIMIT_BYTES = 768 * 1024 * 1024     // 768 MB tested-OK
     let KV_BUFFER_SAFETY_MARGIN    =  16 * 1024 * 1024     // 16 MB margin
     let KV_BUFFER_ENFORCED_CEILING = KV_BUFFER_HARD_LIMIT_BYTES - KV_BUFFER_SAFETY_MARGIN
 
-    // Split-by-2 virtual page table. Each layer's K (and V) cache lives
-    // in TWO device buffers; kernels index into them based on
-    // `is_hi = phys >= kvChunkPages`. With kvChunkPages set to
-    // (TOTAL_PAGES + 1) / 2 (rounded up), the split is as balanced as
-    // the pool size allows. The kernel's address arithmetic uses
-    // `local_phys = phys - chunk_pages` for the hi-side.
+    // Virtual-page-table KV cache, scatter-gather via argument buffers.
     //
-    // GUARD: the PER-CHUNK buffer size — not the total per-layer K/V
-    // memory — must stay below the cliff. At pool=20000, split-by-2
-    // → 10000 pages per chunk × 64 KB = 625 MB per buffer. Comfortably
-    // below 752 MB ceiling.
-    let kvChunkPages = (TOTAL_PAGES + 1) / 2
+    // Per-layer K (and V) cache lives across KV_NUM_CHUNKS device
+    // buffers. The kernels see a single argument-buffer reference (the
+    // KVChunks struct from kernels.swift's MSL); the GPU dereferences
+    // chunks[chunk_idx] dynamically. Per-CB useResource() hints (set
+    // by the dispatchers) let the GPU's residency table list only the
+    // chunks actually touched.
+    //
+    // KV_NUM_CHUNKS must match the MSL #define in kernels.swift.
+    let kvChunkPages = (TOTAL_PAGES + KV_NUM_CHUNKS - 1) / KV_NUM_CHUNKS
 
     let tCache = Date()
-    var K_caches: [MTLBuffer] = []
-    var V_caches: [MTLBuffer] = []
-    var K_caches_hi: [MTLBuffer] = []
-    var V_caches_hi: [MTLBuffer] = []
-    K_caches.reserveCapacity(NUM_LAYERS)
-    V_caches.reserveCapacity(NUM_LAYERS)
-    K_caches_hi.reserveCapacity(NUM_LAYERS)
-    V_caches_hi.reserveCapacity(NUM_LAYERS)
+    var K_chunks: [[MTLBuffer]] = []
+    var V_chunks: [[MTLBuffer]] = []
+    var K_chunks_argbuf: [MTLBuffer] = []
+    var V_chunks_argbuf: [MTLBuffer] = []
+    K_chunks.reserveCapacity(NUM_LAYERS)
+    V_chunks.reserveCapacity(NUM_LAYERS)
+    K_chunks_argbuf.reserveCapacity(NUM_LAYERS)
+    V_chunks_argbuf.reserveCapacity(NUM_LAYERS)
     var kvBytes = 0
+    // Argument-buffer encoding via direct gpuAddress packing. The MSL
+    // KVChunks struct is `device const half* chunks[N]` — just an array
+    // of GPU virtual addresses. We allocate one arg-buf per layer (one
+    // for K, one for V) sized for N pointers and write each chunk's
+    // gpuAddress directly. Tier 2 argument buffers on M-series let the
+    // kernel dereference these at runtime; useResource() in the
+    // dispatcher tells the GPU which chunks are legal targets.
+    // This avoids MTLArgumentEncoder entirely — simpler API surface,
+    // no kernel-bufferIndex coupling.
+    let argBufBytes = KV_NUM_CHUNKS * MemoryLayout<UInt64>.size
     for L in 0..<NUM_LAYERS {
         let lw = layers[L]
         let pg = lw.isFull ? PAGE_FULL : PAGE_SLIDE
-        let hiChunkPages = TOTAL_PAGES - kvChunkPages
-        let loElems = kvChunkPages * pg * lw.KV_H * lw.HD
-        let hiElems = hiChunkPages * pg * lw.KV_H * lw.HD
-        let loBytes = loElems * 2
-        let hiBytes = hiElems * 2
-        let maxChunkBytes = max(loBytes, hiBytes)
-        if maxChunkBytes > KV_BUFFER_ENFORCED_CEILING {
-            // Per-chunk too big even after split-by-2. Either bump
-            // split count (refactor would need per-buffer N>2) or
-            // reduce pool. Compute the safe pool ceiling for this
-            // layer at split-by-2.
+        // Per-chunk page count. The last chunk may carry fewer pages
+        // if TOTAL_PAGES doesn't divide evenly. Per-chunk allocation
+        // uses kvChunkPages (rounded up) so all chunks are the same
+        // size — last chunk's tail simply stays zero / unused.
+        let perChunkPages = kvChunkPages
+        let elemsPerChunk = perChunkPages * pg * lw.KV_H * lw.HD
+        let bytesPerChunk = elemsPerChunk * 2
+        if bytesPerChunk > KV_BUFFER_ENFORCED_CEILING {
             let safePagesPerChunk = KV_BUFFER_ENFORCED_CEILING / (pg * lw.KV_H * lw.HD * 2)
-            let safePoolPages = safePagesPerChunk * 2 - SCRATCH_STRIP
+            let safePoolPages = safePagesPerChunk * KV_NUM_CHUNKS - SCRATCH_STRIP
             fail("""
               KV-pool guard tripped at layer \(L) (\(lw.isFull ? "full" : "slide")):
-                per-chunk bytes (split-by-2) = \(maxChunkBytes) (\(maxChunkBytes / (1024*1024)) MB)
-                enforced ceiling             = \(KV_BUFFER_ENFORCED_CEILING) (\(KV_BUFFER_ENFORCED_CEILING / (1024*1024)) MB)
-                hardware cliff               = ~768 MB per buffer (empirical 2026-05-14)
-              SCRATCH_PAGE_BASE = \(SCRATCH_PAGE_BASE) is too large even for split-by-2.
-              Reduce to ≤ \(safePoolPages) for safe operation at split-by-2,
-              OR extend the buffer-split refactor to N>2 chunks per layer.
+                per-chunk bytes = \(bytesPerChunk) (\(bytesPerChunk / (1024*1024)) MB)
+                ceiling         = \(KV_BUFFER_ENFORCED_CEILING) (\(KV_BUFFER_ENFORCED_CEILING / (1024*1024)) MB)
+                hardware cliff  = ~768 MB per buffer (empirical 2026-05-14)
+              SCRATCH_PAGE_BASE=\(SCRATCH_PAGE_BASE) too large for KV_NUM_CHUNKS=\(KV_NUM_CHUNKS).
+              Reduce SCRATCH_PAGE_BASE to ≤ \(safePoolPages), OR bump KV_NUM_CHUNKS
+              (must match between bootstrap.swift and kernels.swift's MSL #define).
               """)
         }
-        let Kbuf   = device.makeBuffer(length: loBytes, options: .storageModeShared)!
-        let Vbuf   = device.makeBuffer(length: loBytes, options: .storageModeShared)!
-        let KbufHi = device.makeBuffer(length: hiBytes, options: .storageModeShared)!
-        let VbufHi = device.makeBuffer(length: hiBytes, options: .storageModeShared)!
-        memset(Kbuf.contents(), 0, Kbuf.length)
-        memset(Vbuf.contents(), 0, Vbuf.length)
-        memset(KbufHi.contents(), 0, KbufHi.length)
-        memset(VbufHi.contents(), 0, VbufHi.length)
-        K_caches.append(Kbuf)
-        V_caches.append(Vbuf)
-        K_caches_hi.append(KbufHi)
-        V_caches_hi.append(VbufHi)
-        kvBytes += Kbuf.length + Vbuf.length + KbufHi.length + VbufHi.length
+        // Allocate the N chunks and zero-fill.
+        var Lchunks: [MTLBuffer] = []
+        var Vchunks: [MTLBuffer] = []
+        Lchunks.reserveCapacity(KV_NUM_CHUNKS)
+        Vchunks.reserveCapacity(KV_NUM_CHUNKS)
+        for _ in 0..<KV_NUM_CHUNKS {
+            let kbuf = device.makeBuffer(length: bytesPerChunk, options: .storageModeShared)!
+            let vbuf = device.makeBuffer(length: bytesPerChunk, options: .storageModeShared)!
+            memset(kbuf.contents(), 0, kbuf.length)
+            memset(vbuf.contents(), 0, vbuf.length)
+            Lchunks.append(kbuf)
+            Vchunks.append(vbuf)
+            kvBytes += kbuf.length + vbuf.length
+        }
+        K_chunks.append(Lchunks)
+        V_chunks.append(Vchunks)
+        // Pack chunk gpuAddresses directly. Each arg buffer carries
+        // N=KV_NUM_CHUNKS UInt64 entries; the kernel side declares
+        // `device const half* chunks[N]` which matches this layout
+        // on M-series under Tier 2 argument buffers.
+        let kArgBuf = device.makeBuffer(length: argBufBytes, options: .storageModeShared)!
+        let vArgBuf = device.makeBuffer(length: argBufBytes, options: .storageModeShared)!
+        let kPtr = kArgBuf.contents().assumingMemoryBound(to: UInt64.self)
+        let vPtr = vArgBuf.contents().assumingMemoryBound(to: UInt64.self)
+        for i in 0..<KV_NUM_CHUNKS {
+            kPtr[i] = Lchunks[i].gpuAddress
+            vPtr[i] = Vchunks[i].gpuAddress
+        }
+        K_chunks_argbuf.append(kArgBuf)
+        V_chunks_argbuf.append(vArgBuf)
     }
-    print(String(format: "  per-layer K/V caches allocated: %.1f MB in %.2f sec (split-by-2: lo %d MB + hi %d MB per layer / cliff %d MB)",
+    print(String(format: "  per-layer K/V caches allocated: %.1f MB in %.2f sec (KV_NUM_CHUNKS=%d, chunk %d MB / cliff %d MB)",
                  Double(kvBytes) / (1024*1024), Date().timeIntervalSince(tCache),
-                 (K_caches[0].length) / (1024*1024),
-                 (K_caches_hi[0].length) / (1024*1024),
+                 KV_NUM_CHUNKS,
+                 (K_chunks[0][0].length) / (1024*1024),
                  KV_BUFFER_HARD_LIMIT_BYTES / (1024*1024)))
 
     // ---------- Gemma-4 embed scale = sqrt(hidden) ----------
@@ -677,8 +714,8 @@ func loadLmWeights(ggufPath: String) throws -> LmWeights {
     print(String(format: "  == TOTAL load: %.2f sec ==", Date().timeIntervalSince(t0)))
     return LmWeights(layers: layers, embedTable: embedTable, unembedW: unembedW,
                       outputNorm: outputNorm, embedScaleBuf: embedScaleBuf,
-                      K_caches: K_caches, V_caches: V_caches,
-                      K_caches_hi: K_caches_hi, V_caches_hi: V_caches_hi,
+                      K_chunks: K_chunks, V_chunks: V_chunks,
+                      K_chunks_argbuf: K_chunks_argbuf, V_chunks_argbuf: V_chunks_argbuf,
                       kvChunkPages: kvChunkPages,
                       bosTokenId: bosTokenId, eosTokenId: eosTokenId,
                       addBosToken: addBosToken, vocabTokens: vocabTokens, merges: merges)

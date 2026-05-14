@@ -132,10 +132,10 @@ func runLmARProfile(ggufPath: String) {
             let q_out = isFull ? q_full_out : q_slide_out
             let k_out = isFull ? k_full_out : k_slide_out
             let v_out = isFull ? v_full_out : v_slide_out
-            let Kc = w.K_caches[L]
-            let Vc = w.V_caches[L]
-            let KcHi = w.K_caches_hi[L]
-            let VcHi = w.V_caches_hi[L]
+            let kArgBuf = w.K_chunks_argbuf[L]
+            let vArgBuf = w.V_chunks_argbuf[L]
+            let kChunks = w.K_chunks[L]
+            let vChunks = w.V_chunks[L]
 
             stages.append(runARStage("qkv", layer: L) { cb in
                 let Wv = lw.attnV ?? lw.attnK
@@ -235,12 +235,14 @@ func runLmARProfile(ggufPath: String) {
 
             stages.append(runARStage("kv_attn", layer: L) { cb in
                 let pg = isFull ? PAGE_FULL : PAGE_SLIDE
-                encKVWrite(cb, K: k_out, V: v_out, Kc: Kc, Vc: Vc,
-                            KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
+                encKVWrite(cb, K: k_out, V: v_out,
+                            kArgBuf: kArgBuf, vArgBuf: vArgBuf,
+                            kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                             H: KV_H, D: HD, page: pg)
                 let klBuf = isFull ? k_len_full : k_len_slide
-                encAttn(cb, Q: q_out, O: attn_out, Kc: Kc, Vc: Vc,
-                        KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
+                encAttn(cb, Q: q_out, O: attn_out,
+                        kArgBuf: kArgBuf, vArgBuf: vArgBuf,
+                        kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                         kLenBuf: klBuf, H_Q: H, H_KV: KV_H, D: HD,
                         isFull: isFull)
             })

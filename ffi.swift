@@ -119,8 +119,12 @@ public func gemma_init(_ ggufPath: UnsafePointer<CChar>?) -> Int32 {
         // mid-conversation kills in-flight generations. Explicitly pin them
         // as .nonVolatile (buffers default non-volatile, but explicit makes
         // the policy legible and survives any ambient purgeability changes).
-        for kc in w.K_caches { _ = kc.setPurgeableState(.nonVolatile) }
-        for vc in w.V_caches { _ = vc.setPurgeableState(.nonVolatile) }
+        // Pin every K/V chunk across every layer. Each layer holds
+        // KV_NUM_CHUNKS chunks for K and V; iterate over all of them.
+        for L in 0..<w.K_chunks.count {
+            for kc in w.K_chunks[L] { _ = kc.setPurgeableState(.nonVolatile) }
+            for vc in w.V_chunks[L] { _ = vc.setPurgeableState(.nonVolatile) }
+        }
         gEngine = LmEngine(weights: w)
         // Subscribe to macOS memory-pressure events. .warn ⇒ just ask for
         // vision soft-cache flush; .critical ⇒ drop vision working weights
