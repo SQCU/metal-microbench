@@ -566,6 +566,14 @@ let SCRATCH_PAGE_BASE = 8192                     // DEBUG: pool=12288 to capture
 let REAL_PAGE_BASE = 0
 let PHYS_POOL_PAGES = SCRATCH_PAGE_BASE
 let TOTAL_PAGES = SCRATCH_PAGE_BASE + SCRATCH_STRIP
+
+// Admission-backpressure floor. submitRequest refuses to admit a new
+// session when fewer than this many pages are free in the pool. The
+// floor is sized for one typical prefill cycle (~1K-4K tokens =
+// 64-256 pages at PAGE_FULL=8 granularity); below it a new submission
+// would almost certainly starve. 256 leaves 7.5% headroom on an
+// 8192-page pool — enough for one fresh prefill plus a small margin.
+let ADMISSION_FREE_PAGE_FLOOR = 256
 // Load-time assert: if this ever drops below B*MAX_PAGES_PER_SLOT, default
 // initLmState's `(b*MAX + p) % TOTAL_PAGES` routing will alias batches.
 let PAGE_SLIDE = 16

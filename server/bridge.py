@@ -1127,15 +1127,24 @@ async def chat_completions(req: Request) -> Any:
                     done_reason = u.done_reason
                     err_msg = u.err_msg or ""
                     break
-            # done_reason=3 is the engine-side error code (currently
-            # set by processFailedVisionSessions when the vision tower
-            # returns 0 soft tokens for an item, but reusable for any
-            # future engine-side failure mode that wants to surface to
-            # the client). The errMsg carries the human-readable cause.
-            # Raise an explicit HTTP 500 instead of returning a
-            # success-shaped body with empty/garbage content.
+            # done_reason=3 is the engine-side error code. Two flavors:
+            #   - Admission backpressure (engine refused new session
+            #     because pool was below the free-page floor or the
+            #     residency cap was hit). errMsg starts with "admission
+            #     backpressure:". Surface as HTTP 503 + Retry-After so
+            #     clients back off and retry. This is the right status
+            #     for week-long ops where many clients open and close
+            #     sessions on their own cadence.
+            #   - Other engine failures (vision tower returned 0 soft
+            #     tokens, etc.). Surface as HTTP 500.
+            # In both cases, errMsg carries the human-readable cause.
             if done_reason == 3:
                 print(f"[bridge] stream errored: done_reason=3 err_msg={err_msg!r}")
+                if err_msg.startswith("admission backpressure"):
+                    raise HTTPException(
+                        503,
+                        f"engine admission backpressure: {err_msg}",
+                        headers={"Retry-After": "2"})
                 raise HTTPException(500, f"upstream stream errored: {err_msg or 'unspecified engine failure'}")
             text = g.detokenize(all_tokens)
             print(f"[bridge] usage: prompt_tokens={usage.get('prompt_tokens')}, "
@@ -1347,7 +1356,15 @@ async def chat_completions(req: Request) -> Any:
                     # sees finish_reason="error" with the message.
                     if u.done_reason == 3:
                         err_msg = u.err_msg or "unspecified engine failure"
-                        print(f"[bridge] (SSE) stream errored: done_reason=3 err_msg={err_msg!r}")
+                        # Distinguish admission backpressure (transient,
+                        # client should retry) from genuine engine
+                        # failure (likely persistent). Both yield as
+                        # SSE error events but with different error
+                        # types so clients can react differently.
+                        is_backpressure = err_msg.startswith("admission backpressure")
+                        err_type = ("admission_backpressure"
+                                    if is_backpressure else "engine_error")
+                        print(f"[bridge] (SSE) stream errored: done_reason=3 type={err_type} err_msg={err_msg!r}")
                         yield ("data: " + json.dumps({
                             "id": completion_id,
                             "object": "chat.completion.chunk",
@@ -1358,7 +1375,7 @@ async def chat_completions(req: Request) -> Any:
                                 "delta": {"content": ""},
                                 "finish_reason": "error",
                             }],
-                            "error": {"message": err_msg, "type": "engine_error"},
+                            "error": {"message": err_msg, "type": err_type},
                         }) + "\n\n")
                         yield "data: [DONE]\n\n"
                         clean_close = True

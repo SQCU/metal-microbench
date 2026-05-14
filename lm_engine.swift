@@ -1594,6 +1594,27 @@ final class LmEngine {
             print("  submitRequest: stream_id \(sid) already live; ignored")
             return nil
         }
+        // Admission backpressure: refuse new submissions when the page
+        // pool is below the absolute floor needed for one prefill cycle.
+        // The 2026-05-13 page-pool exhaustion under /sweep load motivated
+        // this: 26 concurrent submissions with no admission cap let each
+        // session grow into the shared pool until ensurePages began
+        // failing mid-prefill, wedging the engine. Refusing admission at
+        // submit time means the FAILURE surfaces immediately as a clean
+        // "try again" signal rather than a half-prefilled session stuck
+        // waiting for pages that won't come.
+        //
+        // Floor = ADMISSION_FREE_PAGE_FLOOR (set at boot from bootstrap
+        // constants). Rationale: one prefill cycle for a typical user-
+        // facing prompt (~1K-4K tokens) needs 64-256 pages. We refuse
+        // admission when fewer pages are available than the floor, so
+        // the new request can at least PROBABLY make progress without
+        // immediately starving its peers.
+        let poolStats = pageManager.stats()
+        if poolStats.freePages < ADMISSION_FREE_PAGE_FLOOR {
+            print("  submitRequest: admission backpressure (free=\(poolStats.freePages) < floor=\(ADMISSION_FREE_PAGE_FLOOR), live=\(poolStats.pagesInUse))")
+            return nil
+        }
         guard let s = openSession(eosId: initParams.eosId,
                                   maxNewTokens: initParams.maxNewTokens) else {
             return nil

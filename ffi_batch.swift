@@ -49,6 +49,14 @@ import Foundation
 // ----------------------------------------------------------------------
 private let gIntakeCond = NSCondition()    // protects gIntakeQueue + idle wait
 private var gIntakeQueue: [DecodedStream] = []
+
+// Admission-rejected stream IDs. Pushed when submitRequest returns nil
+// (engine refused admission due to pool pressure or residency cap);
+// drained at the top of each gemma_poll iteration into synthetic
+// StreamUpdateOut records carrying done_reason=3 + admission errMsg.
+// Protected by gEngineLock (applyStreamAction runs under it; gemma_poll
+// also holds it). 2026-05-13: added with admission backpressure.
+private var gRejectedAdmissions: [(streamId: UInt64, reason: String)] = []
 // 2026-05-06: lock removal attempted, reverted after bisect — the
 // bridge wedged after admission burst when gemma_poll ran without
 // gEngineLock held across the drive loop. Some path in the engine
@@ -460,11 +468,21 @@ private func applyStreamAction(_ stream: DecodedStream, engine: LmEngine) {
             default: return nil
             }
         }
-        _ = engine.submitRequest(streamId: sid, init: initParams,
-                                  segments: segs,
-                                  imageSubmit: { s, bytes in
-                                      submitImageSegment(s, imageBytes: bytes)
-                                  })
+        let admitted = engine.submitRequest(streamId: sid, init: initParams,
+                                             segments: segs,
+                                             imageSubmit: { s, bytes in
+                                                 submitImageSegment(s, imageBytes: bytes)
+                                             })
+        if admitted == nil {
+            // Admission backpressure: engine refused the new session
+            // (page-pool floor or residency cap). Surface as a
+            // synthetic terminal update so the bridge gets a clean
+            // signal instead of waiting forever for a stream_id that
+            // never appears in poll results.
+            let stats = engine.pageManager.stats()
+            let msg = "admission backpressure: free=\(stats.freePages) live=\(stats.pagesInUse) total=\(stats.totalPages); retry shortly"
+            gRejectedAdmissions.append((streamId: sid, reason: msg))
+        }
     case 1: // continue — append more segments to a live request
         guard let s = engine.requestForStream[sid] else {
             print("  [batch_ffi] continue on unknown stream_id \(sid); ignored")
@@ -1033,6 +1051,34 @@ public func gemma_poll(_ timeoutMs: Int32,
     while true {
         // 1. Drain new submissions into engine state.
         drainIntakeIntoEngine(engine)
+
+        // 1b. Drain rejected admissions into synthetic terminal updates.
+        // applyStreamAction queues stream_ids here when submitRequest
+        // refuses admission (pool floor / residency cap). Emit each as
+        // a state=2 (done) update with done_reason=3 (error) + errMsg
+        // describing the backpressure condition. The bridge then
+        // surfaces this as an HTTP 503 to the client.
+        if !gRejectedAdmissions.isEmpty {
+            for r in gRejectedAdmissions {
+                updates.append(StreamUpdateOut(
+                    streamId: r.streamId,
+                    state: 2,           // .done
+                    doneReason: 3,      // error
+                    newTokens: [],
+                    newThinkingTokens: [],
+                    newCvecActivations: [],
+                    errMsg: r.reason,
+                    promptTokensSeen: 0,
+                    completionTokensEmitted: 0,
+                    cacheHits: 0,
+                    cacheMisses: 0,
+                    visionCacheHits: 0,
+                    logprobs: []
+                ))
+                gDoneEmittedThisPoll.insert(r.streamId)
+            }
+            gRejectedAdmissions.removeAll(keepingCapacity: true)
+        }
 
         // 2. (Removed 2026-05-07): deferred-start retry. Shared-prefix
         //    follower deferral was a cross-stream coupling that the
