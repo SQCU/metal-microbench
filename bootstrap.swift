@@ -609,7 +609,7 @@ let KV_NUM_CHUNKS = 4
 // Bumping from 8192 → 11776 gives us 43% more capacity for free
 // — no refactor, no risk. Worth taking now; the split refactor
 // becomes a "if we need >50% growth" trigger later.
-let SCRATCH_PAGE_BASE = 33000   // ~108 GB KV via argbuf + lazy-commit + chunk-set narrowing
+let SCRATCH_PAGE_BASE = 33000   // ~108 GB KV via argbuf + lazy-commit + narrowing
 let REAL_PAGE_BASE = 0
 let PHYS_POOL_PAGES = SCRATCH_PAGE_BASE
 let TOTAL_PAGES = SCRATCH_PAGE_BASE + SCRATCH_STRIP
@@ -3275,9 +3275,6 @@ func useResourceForActiveChunks(_ enc: MTLComputeCommandEncoder,
     // only the chunks activeChunkIdxs says are touched. If any kernel
     // actually accesses a non-listed chunk, the GPU treats it as non-
     // resident → reads return stale bytes → silent output corruption.
-    if ProcessInfo.processInfo.environment["KV_DEBUG_CHUNKSET"] != nil {
-        print("  [kv-debug] useResource chunks=\(activeChunkIdxs) usage=\(usage == .read ? "read" : "write")")
-    }
     for idx in activeChunkIdxs {
         enc.useResource(kChunks[idx], usage: usage)
         enc.useResource(vChunks[idx], usage: usage)
