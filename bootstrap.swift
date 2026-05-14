@@ -5811,6 +5811,30 @@ func loadLmWeights(ggufPath: String) throws -> LmWeights {
     let outputNorm = try loadF32AsF16("output_norm.weight")
 
     // ---------- Per-layer paged K/V caches (zero-filled) ----------
+    //
+    // GUARD: each per-layer K (or V) buffer must stay strictly below
+    // the empirically-measured hardware/driver corruption cliff. The
+    // 2026-05-14 bisection (with full Metal validation enabled) found:
+    //   - per-buffer ≤ 768 MB (= 0x3000_0000 bytes): correct results
+    //   - per-buffer ≥ 784 MB:                       SILENT KV
+    //     corruption (model emits coherent-English-but-unrelated
+    //     text; Metal validation reports NOTHING).
+    // Apple Silicon driver / TLB limit; no Swift code change fixes
+    // it within the current single-buffer-per-layer layout. The
+    // ONLY workaround is the per-layer buffer-split refactor (split
+    // each layer's K/V into N device buffers + 2-level kernel
+    // addressing), which is a substantial Metal kernel rewrite.
+    //
+    // Until that refactor lands, this guard fails-fast at startup
+    // if a config would push past the cliff, preventing the silent-
+    // corruption mode where the bridge serves wrong content without
+    // anyone noticing. The threshold is set with margin: 768 MB hard
+    // ceiling reduces to 752 MB enforced ceiling (16 MB safety
+    // margin matching the 2026-05-14 production setting).
+    let KV_BUFFER_HARD_LIMIT_BYTES = 768 * 1024 * 1024     // 768 MB tested-OK
+    let KV_BUFFER_SAFETY_MARGIN    =  16 * 1024 * 1024     // 16 MB margin
+    let KV_BUFFER_ENFORCED_CEILING = KV_BUFFER_HARD_LIMIT_BYTES - KV_BUFFER_SAFETY_MARGIN
+
     let tCache = Date()
     var K_caches: [MTLBuffer] = []
     var V_caches: [MTLBuffer] = []
@@ -5821,16 +5845,34 @@ func loadLmWeights(ggufPath: String) throws -> LmWeights {
         let lw = layers[L]
         let pg = lw.isFull ? PAGE_FULL : PAGE_SLIDE
         let cacheElems = TOTAL_PAGES * pg * lw.KV_H * lw.HD
-        let Kbuf = device.makeBuffer(length: cacheElems * 2, options: .storageModeShared)!
-        let Vbuf = device.makeBuffer(length: cacheElems * 2, options: .storageModeShared)!
+        let bufBytes = cacheElems * 2
+        if bufBytes > KV_BUFFER_ENFORCED_CEILING {
+            // Compute what TOTAL_PAGES would be at the safe ceiling.
+            let safePages = KV_BUFFER_ENFORCED_CEILING / (pg * lw.KV_H * lw.HD * 2)
+            let maxScratchBase = safePages - SCRATCH_STRIP
+            fail("""
+              KV-pool guard tripped at layer \(L) (\(lw.isFull ? "full" : "slide")):
+                requested per-buffer bytes = \(bufBytes) (\(bufBytes / (1024*1024)) MB)
+                enforced ceiling           = \(KV_BUFFER_ENFORCED_CEILING) (\(KV_BUFFER_ENFORCED_CEILING / (1024*1024)) MB)
+                hardware cliff             = ~768 MB per buffer (empirical 2026-05-14)
+              SCRATCH_PAGE_BASE = \(SCRATCH_PAGE_BASE) is too large. Reduce to
+              ≤ \(maxScratchBase) for safe operation, OR implement the per-layer
+              buffer-split refactor described in the comment trail at
+              bootstrap.swift:SCRATCH_PAGE_BASE.
+              """)
+        }
+        let Kbuf = device.makeBuffer(length: bufBytes, options: .storageModeShared)!
+        let Vbuf = device.makeBuffer(length: bufBytes, options: .storageModeShared)!
         memset(Kbuf.contents(), 0, Kbuf.length)
         memset(Vbuf.contents(), 0, Vbuf.length)
         K_caches.append(Kbuf)
         V_caches.append(Vbuf)
         kvBytes += Kbuf.length + Vbuf.length
     }
-    print(String(format: "  per-layer K/V caches allocated: %.1f MB in %.2f sec",
-                 Double(kvBytes) / (1024*1024), Date().timeIntervalSince(tCache)))
+    print(String(format: "  per-layer K/V caches allocated: %.1f MB in %.2f sec (per-buffer %d MB / cliff %d MB)",
+                 Double(kvBytes) / (1024*1024), Date().timeIntervalSince(tCache),
+                 (K_caches[0].length) / (1024*1024),
+                 KV_BUFFER_HARD_LIMIT_BYTES / (1024*1024)))
 
     // ---------- Gemma-4 embed scale = sqrt(hidden) ----------
     let embedScaleBuf = device.makeBuffer(length: 4, options: .storageModeShared)!
