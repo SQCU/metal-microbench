@@ -609,7 +609,7 @@ let KV_NUM_CHUNKS = 4
 // Bumping from 8192 → 11776 gives us 43% more capacity for free
 // — no refactor, no risk. Worth taking now; the split refactor
 // becomes a "if we need >50% growth" trigger later.
-let SCRATCH_PAGE_BASE = 11776   // works with KV_NUM_CHUNKS=4 argbuf indirection
+let SCRATCH_PAGE_BASE = 33000   // ~108 GB KV via argbuf + lazy-commit
 let REAL_PAGE_BASE = 0
 let PHYS_POOL_PAGES = SCRATCH_PAGE_BASE
 let TOTAL_PAGES = SCRATCH_PAGE_BASE + SCRATCH_STRIP

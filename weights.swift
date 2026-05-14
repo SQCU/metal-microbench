@@ -625,7 +625,23 @@ func loadLmWeights(ggufPath: String) throws -> LmWeights {
               (must match between bootstrap.swift and kernels.swift's MSL #define).
               """)
         }
-        // Allocate the N chunks and zero-fill.
+        // Allocate the N chunks WITHOUT eager memset. Critical at large
+        // pool sizes: each `storageModeShared` buffer is virtual address
+        // space until first touch. macOS lazy-commits physical pages on
+        // first write, and freshly-faulted pages are zero by default
+        // — so we get the same "zero-on-first-read" guarantee without
+        // the up-front 100+ GB commitment that an explicit memset would
+        // force. The engine's zeroPhysPageKV already does an explicit
+        // memset when a phys page is first ASSIGNED to a session, which
+        // is the only place we actually need zeros for correctness.
+        //
+        // Eagerly memsetting all chunks at startup was tripping the
+        // pool=33000 wedge earlier: 240 chunks × 519 MB = 124 GB of
+        // forced page commits on a 128 GB system → swap thrash, GPU
+        // contention, bluetooth audio glitches. The lazy path means
+        // actual RAM consumption scales with the working set
+        // (~6 GB for batch=8 with typical max_tokens), not the
+        // total addressable pool (108 GB).
         var Lchunks: [MTLBuffer] = []
         var Vchunks: [MTLBuffer] = []
         Lchunks.reserveCapacity(KV_NUM_CHUNKS)
@@ -633,8 +649,6 @@ func loadLmWeights(ggufPath: String) throws -> LmWeights {
         for _ in 0..<KV_NUM_CHUNKS {
             let kbuf = device.makeBuffer(length: bytesPerChunk, options: .storageModeShared)!
             let vbuf = device.makeBuffer(length: bytesPerChunk, options: .storageModeShared)!
-            memset(kbuf.contents(), 0, kbuf.length)
-            memset(vbuf.contents(), 0, vbuf.length)
             Lchunks.append(kbuf)
             Vchunks.append(vbuf)
             kvBytes += kbuf.length + vbuf.length
