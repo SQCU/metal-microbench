@@ -609,7 +609,7 @@ let KV_NUM_CHUNKS = 4
 // Bumping from 8192 → 11776 gives us 43% more capacity for free
 // — no refactor, no risk. Worth taking now; the split refactor
 // becomes a "if we need >50% growth" trigger later.
-let SCRATCH_PAGE_BASE = 33000   // ~108 GB KV via argbuf + lazy-commit
+let SCRATCH_PAGE_BASE = 11776   // narrowing test: known-correct at this pool size pre-narrowing
 let REAL_PAGE_BASE = 0
 let PHYS_POOL_PAGES = SCRATCH_PAGE_BASE
 let TOTAL_PAGES = SCRATCH_PAGE_BASE + SCRATCH_STRIP
@@ -3184,6 +3184,7 @@ func encRope(_ cb: MTLCommandBuffer, _ x: MTLBuffer, H: Int, D: Int, rotary: Int
 func encKVWrite(_ cb: MTLCommandBuffer, K: MTLBuffer, V: MTLBuffer,
                 kArgBuf: MTLBuffer, vArgBuf: MTLBuffer,
                 kChunks: [MTLBuffer], vChunks: [MTLBuffer], chunkPages: Int,
+                activeChunkIdxs: [Int],
                 H: Int, D: Int, page: Int, activeB: Int = B) {
     let enc = cb.makeComputeCommandEncoder()!
     enc.setComputePipelineState(kvwPSO)
@@ -3195,15 +3196,67 @@ func encKVWrite(_ cb: MTLCommandBuffer, K: MTLBuffer, V: MTLBuffer,
     enc.setBytes(&pv, length: 4, index: 8); enc.setBytes(&mv, length: 4, index: 9)
     var cp = UInt32(chunkPages)
     enc.setBytes(&cp, length: 4, index: 27)
-    // Mark argbuf-referenced chunks for residency. usage: .write because
-    // this kernel writes new K/V values into the chunks.
-    for c in kChunks { enc.useResource(c, usage: .write) }
-    for c in vChunks { enc.useResource(c, usage: .write) }
+    // Mark argbuf-referenced chunks for residency — narrowed to the
+    // chunks this CB's active slots actually touch.
+    useResourceForActiveChunks(enc, kChunks: kChunks, vChunks: vChunks,
+                                 activeChunkIdxs: activeChunkIdxs, usage: .write)
     enc.dispatchThreadgroups(MTLSize(width: B, height: H, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
 }
 
+// Compute the set of KV chunk indices that the current CB's active slots
+// will actually reference, by walking each slot's block_table up to its
+// per-slot num_pages count. This is the per-CB scatter-gather narrowing
+// that lets useResource list only the chunks actually touched, not the
+// full pool. At KV_NUM_CHUNKS=4 and batch=8 with typical workloads each
+// slot's pages cluster in 1-2 chunks → ~2-4 unique chunks per CB instead
+// of N=4 unconditionally.
+//
+// blockTable, numPagesA, numPagesB are the per-CB metadata buffers — the
+// caller passes the right buffers (e.g. num_pages_{slide,full} for AR,
+// pre_num_pages_{slide,full} for prefill). We walk the MAX of slide and
+// full per slot since block_table indexing covers both attention types
+// at PAGE_FULL granularity (the smaller of the two — see lm_engine.swift
+// ensurePages comment).
+func activeKVChunkIdxs(blockTable: MTLBuffer,
+                       numPagesA: MTLBuffer, numPagesB: MTLBuffer,
+                       activeB: Int, kvChunkPages: Int) -> [Int] {
+    let btP = blockTable.contents().assumingMemoryBound(to: UInt32.self)
+    let nsP = numPagesA.contents().assumingMemoryBound(to: UInt32.self)
+    let nfP = numPagesB.contents().assumingMemoryBound(to: UInt32.self)
+    var idxs = Set<Int>()
+    for b in 0..<activeB {
+        let n = max(Int(nsP[b]), Int(nfP[b]))
+        for p in 0..<n {
+            let phys = Int(btP[b * MAX_PAGES_PER_SLOT + p])
+            idxs.insert(phys / kvChunkPages)
+        }
+    }
+    return Array(idxs).sorted()
+}
+
+// Helper to call useResource on the subset of chunks referenced this CB.
+// Passing usage explicitly so write-side dispatchers (kv_write,
+// kv_write_multi) hint .write while read-side attention dispatchers
+// hint .read — Metal uses this for hazard tracking.
+@inline(__always)
+func useResourceForActiveChunks(_ enc: MTLComputeCommandEncoder,
+                                 kChunks: [MTLBuffer], vChunks: [MTLBuffer],
+                                 activeChunkIdxs: [Int],
+                                 usage: MTLResourceUsage) {
+    // 2026-05-14: activeChunkIdxs narrowing was producing silent KV
+    // corruption (even at pool=11776 which worked pre-narrowing).
+    // Walking block_table[slot][0..num_pages-1] is apparently missing
+    // some chunk the kernels actually access — needs more careful
+    // diagnosis. For correctness, useResource ALL chunks for now.
+    // The activeChunkIdxs parameter is retained in signatures so the
+    // narrowing can be re-enabled trivially when the missed-chunk
+    // case is fixed.
+    _ = activeChunkIdxs
+    for c in kChunks { enc.useResource(c, usage: usage) }
+    for c in vChunks { enc.useResource(c, usage: usage) }
+}
 
 
 // Host-side block-mask precompute for the flex attention kernel. v0 supports
@@ -3427,6 +3480,7 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
 func encFlexAttnSlidePrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
                               kArgBuf: MTLBuffer, vArgBuf: MTLBuffer,
                               kChunks: [MTLBuffer], vChunks: [MTLBuffer], chunkPages: Int,
+                              activeChunkIdxs: [Int],
                               kLenBuf: MTLBuffer, qPositions: MTLBuffer,
                               H_Q: Int, H_KV: Int, D: Int, qLen: Int) {
     let qBlocks = (qLen + 8 - 1) / 8
@@ -3452,8 +3506,8 @@ func encFlexAttnSlidePrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
     enc1.setBytes(&ns, length: 4, index: 17); enc1.setBytes(&sw, length: 4, index: 18)
     enc1.setBytes(&ql, length: 4, index: 19)
     enc1.setBytes(&cp, length: 4, index: 27)
-    for c in kChunks { enc1.useResource(c, usage: .read) }
-    for c in vChunks { enc1.useResource(c, usage: .read) }
+    useResourceForActiveChunks(enc1, kChunks: kChunks, vChunks: vChunks,
+                                 activeChunkIdxs: activeChunkIdxs, usage: .read)
     // 2026-05-06: x-dim is now B*H_Q (was B*H_KV) after switching
     // flex_attn_slide_v1_q8 to one-q-head-per-TG geometry. Each TG
     // handles a single q_head; previously Q_PER_TG=2 q_heads shared
@@ -3482,6 +3536,7 @@ func encFlexAttnSlidePrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
 func encFlexAttnFullPrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
                              kArgBuf: MTLBuffer, vArgBuf: MTLBuffer,
                              kChunks: [MTLBuffer], vChunks: [MTLBuffer], chunkPages: Int,
+                             activeChunkIdxs: [Int],
                              kLenBuf: MTLBuffer, qPositions: MTLBuffer,
                              H_Q: Int, H_KV: Int, D: Int, qLen: Int) {
     let qBlocks = (qLen + 8 - 1) / 8
@@ -3506,8 +3561,8 @@ func encFlexAttnFullPrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
     enc1.setBytes(&hq, length: 4, index: 15); enc1.setBytes(&hkv, length: 4, index: 16)
     enc1.setBytes(&ns, length: 4, index: 17); enc1.setBytes(&ql, length: 4, index: 18)
     enc1.setBytes(&cp, length: 4, index: 27)
-    for c in kChunks { enc1.useResource(c, usage: .read) }
-    for c in vChunks { enc1.useResource(c, usage: .read) }
+    useResourceForActiveChunks(enc1, kChunks: kChunks, vChunks: vChunks,
+                                 activeChunkIdxs: activeChunkIdxs, usage: .read)
     enc1.dispatchThreadgroups(MTLSize(width: B * H_Q, height: qBlocks, depth: ATTN_N_SPLITS),
                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc1.endEncoding()
@@ -3530,6 +3585,7 @@ func encFlexAttnFullPrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
 func encKVWriteMulti(_ cb: MTLCommandBuffer, K: MTLBuffer, V: MTLBuffer,
                       kArgBuf: MTLBuffer, vArgBuf: MTLBuffer,
                       kChunks: [MTLBuffer], vChunks: [MTLBuffer], chunkPages: Int,
+                      activeChunkIdxs: [Int],
                       q_positions: MTLBuffer,
                       H: Int, D: Int, page: Int, qLen: Int) {
     let enc = cb.makeComputeCommandEncoder()!
@@ -3543,8 +3599,8 @@ func encKVWriteMulti(_ cb: MTLCommandBuffer, K: MTLBuffer, V: MTLBuffer,
     enc.setBytes(&pv, length: 4, index: 8); enc.setBytes(&mv, length: 4, index: 9)
     enc.setBytes(&qv, length: 4, index: 10)
     enc.setBytes(&cp, length: 4, index: 27)
-    for c in kChunks { enc.useResource(c, usage: .write) }
-    for c in vChunks { enc.useResource(c, usage: .write) }
+    useResourceForActiveChunks(enc, kChunks: kChunks, vChunks: vChunks,
+                                 activeChunkIdxs: activeChunkIdxs, usage: .write)
     enc.dispatchThreadgroups(MTLSize(width: B, height: qLen, depth: H),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
@@ -3608,12 +3664,14 @@ func encAttn(_ cb: MTLCommandBuffer,
              Q: MTLBuffer, O: MTLBuffer,
              kArgBuf: MTLBuffer, vArgBuf: MTLBuffer,
              kChunks: [MTLBuffer], vChunks: [MTLBuffer], chunkPages: Int,
+             activeChunkIdxs: [Int],
              kLenBuf: MTLBuffer,
              H_Q: Int, H_KV: Int, D: Int,
              isFull: Bool,
              activeB: Int = B) {
     encFlexAttnV0(cb, Q: Q, O: O, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                    kChunks: kChunks, vChunks: vChunks, chunkPages: chunkPages,
+                   activeChunkIdxs: activeChunkIdxs,
                    kLenBuf: kLenBuf, H_Q: H_Q, H_KV: H_KV, D: D,
                    isFull: isFull, activeB: activeB)
 }
@@ -3774,6 +3832,7 @@ func encExtractLogprobs(_ cb: MTLCommandBuffer,
 func encFlexAttnV0(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
                     kArgBuf: MTLBuffer, vArgBuf: MTLBuffer,
                     kChunks: [MTLBuffer], vChunks: [MTLBuffer], chunkPages: Int,
+                    activeChunkIdxs: [Int],
                     kLenBuf: MTLBuffer,
                     H_Q: Int, H_KV: Int, D: Int,
                     isFull: Bool,
@@ -3809,8 +3868,8 @@ func encFlexAttnV0(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
     enc1.setBytes(&pp, length: 4, index: 18);    enc1.setBytes(&so, length: 4, index: 19)
     enc1.setBytes(&tso, length: 4, index: 20)
     enc1.setBytes(&cp, length: 4, index: 27)
-    for c in kChunks { enc1.useResource(c, usage: .read) }
-    for c in vChunks { enc1.useResource(c, usage: .read) }
+    useResourceForActiveChunks(enc1, kChunks: kChunks, vChunks: vChunks,
+                                 activeChunkIdxs: activeChunkIdxs, usage: .read)
     enc1.dispatchThreadgroups(MTLSize(width: activeB * H_KV, height: ATTN_N_SPLITS, depth: 1),
                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc1.endEncoding()
@@ -4296,6 +4355,16 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
     let cb = queue.makeCommandBuffer()!
     let aB = max(1, min(B, activeB))
 
+    // Per-CB chunk-set narrowing. Compute the set of KV chunks our
+    // active slots actually reference; useResource will be called only
+    // on these in the dispatchers below. Walk block_table for the
+    // active slot range up to each slot's num_pages (max of slide and
+    // full, since block_table indexes both at PAGE_FULL granularity).
+    let activeChunkIdxs = activeKVChunkIdxs(
+        blockTable: block_table,
+        numPagesA: num_pages_slide, numPagesB: num_pages_full,
+        activeB: aB, kvChunkPages: w.kvChunkPages)
+
     // Embed lookup + Gemma-4 sqrt(hidden) scale on token embeddings.
     encEmbed(cb, embedTable: w.embedTable)
     encScaleByScalar(cb, x: hidden, scalar: w.embedScaleBuf, N: HIDDEN, numVecs: aB)
@@ -4367,12 +4436,14 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
         let pg = isFull ? PAGE_FULL : PAGE_SLIDE
         encKVWrite(cb, K: k_out, V: v_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                     kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                    activeChunkIdxs: activeChunkIdxs,
                     H: KV_H, D: HD, page: pg, activeB: aB)
 
         let npBuf = isFull ? num_pages_full : num_pages_slide
         let klBuf = isFull ? k_len_full : k_len_slide
         encAttn(cb, Q: q_out, O: attn_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                 kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                activeChunkIdxs: activeChunkIdxs,
                 kLenBuf: klBuf, H_Q: H, H_KV: KV_H, D: HD,
                 isFull: isFull, activeB: aB)
         if LM_SKIP_ATTN {
@@ -4714,6 +4785,14 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
     let N = B * qLen               // total token rows
     let NS = B * qLen * TOPK       // total MoE slots
 
+    // Per-CB chunk-set narrowing for prefill. Same approach as
+    // buildStepCB, but using the pre_* num_pages buffers since
+    // prefill drives k_len via pre_q_positions.
+    let activeChunkIdxs = activeKVChunkIdxs(
+        blockTable: block_table,
+        numPagesA: pre_num_pages_slide, numPagesB: pre_num_pages_full,
+        activeB: B, kvChunkPages: w.kvChunkPages)
+
     if !skipEmbed {
         // Embed + Gemma-4 sqrt(hidden) scale, now over N = B*qLen tokens.
         encEmbedInto(cb, tokens: pre_input_tokens, embedTable: w.embedTable,
@@ -4794,6 +4873,7 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
         let pg = isFull ? PAGE_FULL : PAGE_SLIDE
         encKVWriteMulti(cb, K: k_out, V: v_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                         kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                        activeChunkIdxs: activeChunkIdxs,
                         q_positions: pre_q_positions,
                         H: KV_H, D: HD, page: pg, qLen: qLen)
 
@@ -4802,11 +4882,13 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
         if isFull {
             encFlexAttnFullPrefill(cb, Q: q_out, O: pre_attn_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                                     kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                                    activeChunkIdxs: activeChunkIdxs,
                                     kLenBuf: klBuf, qPositions: pre_q_positions,
                                     H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
         } else {
             encFlexAttnSlidePrefill(cb, Q: q_out, O: pre_attn_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                                      kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                                     activeChunkIdxs: activeChunkIdxs,
                                      kLenBuf: klBuf, qPositions: pre_q_positions,
                                      H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
         }
@@ -5059,6 +5141,12 @@ func debugPrefillLayerBisect(_ w: LmWeights, qLen: Int, sslot: Int) {
 func encodeOnePrefillLayerSplit(_ w: LmWeights, L: Int, qLen: Int, sslot: Int) {
     let N = B * qLen
     let NS = B * qLen * TOPK
+    // Per-CB chunk narrowing. Diagnostic-path encoder; same narrow as
+    // the non-split version since both use pre_num_pages_*.
+    let activeChunkIdxs = activeKVChunkIdxs(
+        blockTable: block_table,
+        numPagesA: pre_num_pages_slide, numPagesB: pre_num_pages_full,
+        activeB: B, kvChunkPages: w.kvChunkPages)
     let lw = w.layers[L]
     let isFull = lw.isFull
     let H = isFull ? FULL_H : SLIDE_H
@@ -5109,6 +5197,7 @@ func encodeOnePrefillLayerSplit(_ w: LmWeights, L: Int, qLen: Int, sslot: Int) {
     commitAndCheck("kv_write", buf: kChunks[0], count: min(N * KV_H * HD, 4096)) { cb in
         encKVWriteMulti(cb, K: k_out, V: v_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                         kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                        activeChunkIdxs: activeChunkIdxs,
                         q_positions: pre_q_positions,
                         H: KV_H, D: HD, page: pg, qLen: qLen)
     }
@@ -5152,11 +5241,13 @@ func encodeOnePrefillLayerSplit(_ w: LmWeights, L: Int, qLen: Int, sslot: Int) {
         if isFull {
             encFlexAttnFullPrefill(cb, Q: q_out, O: pre_attn_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                                     kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                                    activeChunkIdxs: activeChunkIdxs,
                                     kLenBuf: klBuf, qPositions: pre_q_positions,
                                     H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
         } else {
             encFlexAttnSlidePrefill(cb, Q: q_out, O: pre_attn_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                                      kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                                     activeChunkIdxs: activeChunkIdxs,
                                      kLenBuf: klBuf, qPositions: pre_q_positions,
                                      H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
         }
@@ -5271,6 +5362,11 @@ private func checkNanOne(_ tag: String, _ buf: MTLBuffer, count: Int, sslot: Int
 func encodeOnePrefillLayer(_ cb: MTLCommandBuffer, _ w: LmWeights, L: Int, qLen: Int) {
     let N = B * qLen
     let NS = B * qLen * TOPK
+    // Per-CB chunk narrowing for prefill. See buildStepCB for rationale.
+    let activeChunkIdxs = activeKVChunkIdxs(
+        blockTable: block_table,
+        numPagesA: pre_num_pages_slide, numPagesB: pre_num_pages_full,
+        activeB: B, kvChunkPages: w.kvChunkPages)
     let lw = w.layers[L]
     let isFull = lw.isFull
     let H = isFull ? FULL_H : SLIDE_H
@@ -5308,6 +5404,7 @@ func encodeOnePrefillLayer(_ cb: MTLCommandBuffer, _ w: LmWeights, L: Int, qLen:
     let pg = isFull ? PAGE_FULL : PAGE_SLIDE
     encKVWriteMulti(cb, K: k_out, V: v_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                     kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                    activeChunkIdxs: activeChunkIdxs,
                     q_positions: pre_q_positions,
                     H: KV_H, D: HD, page: pg, qLen: qLen)
     let klBuf = isFull ? pre_k_len_full : pre_k_len_slide
@@ -5315,12 +5412,14 @@ func encodeOnePrefillLayer(_ cb: MTLCommandBuffer, _ w: LmWeights, L: Int, qLen:
         encFlexAttnFullPrefill(cb, Q: q_out, O: pre_attn_out,
                                 kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                                 kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                                activeChunkIdxs: activeChunkIdxs,
                                 kLenBuf: klBuf, qPositions: pre_q_positions,
                                 H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
     } else {
         encFlexAttnSlidePrefill(cb, Q: q_out, O: pre_attn_out,
                                  kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                                  kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                                 activeChunkIdxs: activeChunkIdxs,
                                  kLenBuf: klBuf, qPositions: pre_q_positions,
                                  H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
     }
@@ -5461,6 +5560,10 @@ func scanHalfBuf(_ buf: MTLBuffer, count: Int) -> (nan: Int, inf: Int, mn: Float
 // only embed+scale (no layers).
 func buildPartialStepCB(_ w: LmWeights, stopAfterLayer: Int) -> MTLCommandBuffer {
     let cb = queue.makeCommandBuffer()!
+    let activeChunkIdxs = activeKVChunkIdxs(
+        blockTable: block_table,
+        numPagesA: num_pages_slide, numPagesB: num_pages_full,
+        activeB: B, kvChunkPages: w.kvChunkPages)
     encEmbed(cb, embedTable: w.embedTable)
     encScaleByScalar(cb, x: hidden, scalar: w.embedScaleBuf, N: HIDDEN, numVecs: B)
     if stopAfterLayer < 0 { return cb }
@@ -5496,11 +5599,13 @@ func buildPartialStepCB(_ w: LmWeights, stopAfterLayer: Int) -> MTLCommandBuffer
         let pg = isFull ? PAGE_FULL : PAGE_SLIDE
         encKVWrite(cb, K: k_out, V: v_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                     kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                    activeChunkIdxs: activeChunkIdxs,
                     H: KV_H, D: HD, page: pg)
         let npBuf = isFull ? num_pages_full : num_pages_slide
         let klBuf = isFull ? k_len_full : k_len_slide
         encAttn(cb, Q: q_out, O: attn_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                 kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                activeChunkIdxs: activeChunkIdxs,
                 kLenBuf: klBuf, H_Q: H, H_KV: KV_H, D: HD, isFull: isFull)
         encDenseGemvAR(cb, attn_out, lw.attnOut, format: lw.attnOutFormat, mlp_out,
                         Din: H * HD, Dout: HIDDEN, activeB: B)

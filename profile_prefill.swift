@@ -132,11 +132,16 @@ func runLmPrefillProfile(ggufPath: String) {
                 encRMSNormNoScale(cb, x: v_out, out: v_out, D: HD, numVecs: N * KV_H)
             })
 
+            let activeChunkIdxs = activeKVChunkIdxs(
+                blockTable: block_table,
+                numPagesA: pre_num_pages_slide, numPagesB: pre_num_pages_full,
+                activeB: B, kvChunkPages: w.kvChunkPages)
             stages.append(runStage("kv_attn", layer: L) { cb in
                 let pg = isFull ? PAGE_FULL : PAGE_SLIDE
                 encKVWriteMulti(cb, K: k_out, V: v_out,
                                 kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                                 kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                                activeChunkIdxs: activeChunkIdxs,
                                 q_positions: pre_q_positions,
                                 H: KV_H, D: HD, page: pg, qLen: qLen)
                 let klBuf = isFull ? pre_k_len_full : pre_k_len_slide
@@ -144,12 +149,14 @@ func runLmPrefillProfile(ggufPath: String) {
                     encFlexAttnFullPrefill(cb, Q: q_out, O: pre_attn_out,
                                             kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                                             kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                                            activeChunkIdxs: activeChunkIdxs,
                                             kLenBuf: klBuf, qPositions: pre_q_positions,
                                             H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
                 } else {
                     encFlexAttnSlidePrefill(cb, Q: q_out, O: pre_attn_out,
                                              kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                                              kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                                             activeChunkIdxs: activeChunkIdxs,
                                              kLenBuf: klBuf, qPositions: pre_q_positions,
                                              H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
                 }

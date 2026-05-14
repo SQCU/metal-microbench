@@ -233,16 +233,22 @@ func runLmARProfile(ggufPath: String) {
                 encRMSNormNoScale(cb, x: v_out, out: v_out, D: HD, numVecs: B * KV_H)
             })
 
+            let activeChunkIdxs = activeKVChunkIdxs(
+                blockTable: block_table,
+                numPagesA: num_pages_slide, numPagesB: num_pages_full,
+                activeB: B, kvChunkPages: w.kvChunkPages)
             stages.append(runARStage("kv_attn", layer: L) { cb in
                 let pg = isFull ? PAGE_FULL : PAGE_SLIDE
                 encKVWrite(cb, K: k_out, V: v_out,
                             kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                             kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                            activeChunkIdxs: activeChunkIdxs,
                             H: KV_H, D: HD, page: pg)
                 let klBuf = isFull ? k_len_full : k_len_slide
                 encAttn(cb, Q: q_out, O: attn_out,
                         kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                         kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                        activeChunkIdxs: activeChunkIdxs,
                         kLenBuf: klBuf, H_Q: H, H_KV: KV_H, D: HD,
                         isFull: isFull)
             })
