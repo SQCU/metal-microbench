@@ -105,6 +105,8 @@ func runLmPrefillProfile(ggufPath: String) {
             let v_out = isFull ? pre_v_full_out : pre_v_slide_out
             let Kc = w.K_caches[L]
             let Vc = w.V_caches[L]
+            let KcHi = w.K_caches_hi[L]
+            let VcHi = w.V_caches_hi[L]
 
             // QKV: RMSNorm + 3 simdgroup matmuls (Q, K, V) on v6-swizzled Q8_0.
             stages.append(runStage("qkv", layer: L) { cb in
@@ -133,15 +135,18 @@ func runLmPrefillProfile(ggufPath: String) {
             stages.append(runStage("kv_attn", layer: L) { cb in
                 let pg = isFull ? PAGE_FULL : PAGE_SLIDE
                 encKVWriteMulti(cb, K: k_out, V: v_out, Kc: Kc, Vc: Vc,
+                                KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
                                 q_positions: pre_q_positions,
                                 H: KV_H, D: HD, page: pg, qLen: qLen)
                 let klBuf = isFull ? pre_k_len_full : pre_k_len_slide
                 if isFull {
                     encFlexAttnFullPrefill(cb, Q: q_out, O: pre_attn_out, Kc: Kc, Vc: Vc,
+                                            KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
                                             kLenBuf: klBuf, qPositions: pre_q_positions,
                                             H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
                 } else {
                     encFlexAttnSlidePrefill(cb, Q: q_out, O: pre_attn_out, Kc: Kc, Vc: Vc,
+                                             KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
                                              kLenBuf: klBuf, qPositions: pre_q_positions,
                                              H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
                 }

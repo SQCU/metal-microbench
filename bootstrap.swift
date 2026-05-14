@@ -3160,6 +3160,7 @@ func encRope(_ cb: MTLCommandBuffer, _ x: MTLBuffer, H: Int, D: Int, rotary: Int
 }
 
 func encKVWrite(_ cb: MTLCommandBuffer, K: MTLBuffer, V: MTLBuffer, Kc: MTLBuffer, Vc: MTLBuffer,
+                KcHi: MTLBuffer, VcHi: MTLBuffer, chunkPages: Int,
                 H: Int, D: Int, page: Int, activeB: Int = B) {
     let enc = cb.makeComputeCommandEncoder()!
     enc.setComputePipelineState(kvwPSO)
@@ -3169,6 +3170,9 @@ func encKVWrite(_ cb: MTLCommandBuffer, K: MTLBuffer, V: MTLBuffer, Kc: MTLBuffe
     var hv = UInt32(H), dv = UInt32(D), pv = UInt32(page), mv = UInt32(MAX_PAGES_PER_SLOT)
     enc.setBytes(&hv, length: 4, index: 6); enc.setBytes(&dv, length: 4, index: 7)
     enc.setBytes(&pv, length: 4, index: 8); enc.setBytes(&mv, length: 4, index: 9)
+    enc.setBuffer(KcHi, offset: 0, index: 25); enc.setBuffer(VcHi, offset: 0, index: 26)
+    var cp = UInt32(chunkPages)
+    enc.setBytes(&cp, length: 4, index: 27)
     enc.dispatchThreadgroups(MTLSize(width: B, height: H, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
@@ -3391,8 +3395,12 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
 
 // Prefill attention dispatchers (slide + full). Called from buildPrefillCB;
 // dispatch the flex v1 kernels with (B*H_KV or B*H_Q, q_blocks, N_SPLITS).
+// chunkPages + KcHi/VcHi: virtual-page-table split. See kernels.swift
+// flex_attn_slide_v1_q8 signature comments. Operand-driven (no globals);
+// callers thread weights.kvChunkPages and weights.K_caches_hi[L].
 func encFlexAttnSlidePrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
                               Kc: MTLBuffer, Vc: MTLBuffer,
+                              KcHi: MTLBuffer, VcHi: MTLBuffer, chunkPages: Int,
                               kLenBuf: MTLBuffer, qPositions: MTLBuffer,
                               H_Q: Int, H_KV: Int, D: Int, qLen: Int) {
     let qBlocks = (qLen + 8 - 1) / 8
@@ -3410,12 +3418,15 @@ func encFlexAttnSlidePrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
     enc1.setBuffer(qPositions, offset: 0, index: 11)
     enc1.setBuffer(kLenBuf, offset: 0, index: 12)
     enc1.setBuffer(pre_slide_part_masks, offset: 0, index: 20)
+    enc1.setBuffer(KcHi, offset: 0, index: 25); enc1.setBuffer(VcHi, offset: 0, index: 26)
     var sc: Float = 1.0, mv = UInt32(MAX_PAGES_PER_SLOT), hq = UInt32(H_Q), hkv = UInt32(H_KV)
     var ns = UInt32(ATTN_N_SPLITS), sw = UInt32(SLIDING_WINDOW), ql = UInt32(qLen)
+    var cp = UInt32(chunkPages)
     enc1.setBytes(&sc, length: 4, index: 13); enc1.setBytes(&mv, length: 4, index: 14)
     enc1.setBytes(&hq, length: 4, index: 15); enc1.setBytes(&hkv, length: 4, index: 16)
     enc1.setBytes(&ns, length: 4, index: 17); enc1.setBytes(&sw, length: 4, index: 18)
     enc1.setBytes(&ql, length: 4, index: 19)
+    enc1.setBytes(&cp, length: 4, index: 27)
     // 2026-05-06: x-dim is now B*H_Q (was B*H_KV) after switching
     // flex_attn_slide_v1_q8 to one-q-head-per-TG geometry. Each TG
     // handles a single q_head; previously Q_PER_TG=2 q_heads shared
@@ -3443,6 +3454,7 @@ func encFlexAttnSlidePrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
 
 func encFlexAttnFullPrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
                              Kc: MTLBuffer, Vc: MTLBuffer,
+                             KcHi: MTLBuffer, VcHi: MTLBuffer, chunkPages: Int,
                              kLenBuf: MTLBuffer, qPositions: MTLBuffer,
                              H_Q: Int, H_KV: Int, D: Int, qLen: Int) {
     let qBlocks = (qLen + 8 - 1) / 8
@@ -3460,11 +3472,14 @@ func encFlexAttnFullPrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
     enc1.setBuffer(qPositions, offset: 0, index: 11)
     enc1.setBuffer(kLenBuf, offset: 0, index: 12)
     enc1.setBuffer(flex_full_part_masks, offset: 0, index: 19)
+    enc1.setBuffer(KcHi, offset: 0, index: 25); enc1.setBuffer(VcHi, offset: 0, index: 26)
     var sc: Float = 1.0, mv = UInt32(MAX_PAGES_PER_SLOT), hq = UInt32(H_Q), hkv = UInt32(H_KV)
     var ns = UInt32(ATTN_N_SPLITS), ql = UInt32(qLen)
+    var cp = UInt32(chunkPages)
     enc1.setBytes(&sc, length: 4, index: 13); enc1.setBytes(&mv, length: 4, index: 14)
     enc1.setBytes(&hq, length: 4, index: 15); enc1.setBytes(&hkv, length: 4, index: 16)
     enc1.setBytes(&ns, length: 4, index: 17); enc1.setBytes(&ql, length: 4, index: 18)
+    enc1.setBytes(&cp, length: 4, index: 27)
     enc1.dispatchThreadgroups(MTLSize(width: B * H_Q, height: qBlocks, depth: ATTN_N_SPLITS),
                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc1.endEncoding()
@@ -3485,18 +3500,22 @@ func encFlexAttnFullPrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
 // Multi-position KV write. K/V layout [B, q_len, H, D]. q_positions [B, q_len].
 // Grid: B × q_len × H, 32 lanes each.
 func encKVWriteMulti(_ cb: MTLCommandBuffer, K: MTLBuffer, V: MTLBuffer,
-                      Kc: MTLBuffer, Vc: MTLBuffer, q_positions: MTLBuffer,
+                      Kc: MTLBuffer, Vc: MTLBuffer,
+                      KcHi: MTLBuffer, VcHi: MTLBuffer, chunkPages: Int,
+                      q_positions: MTLBuffer,
                       H: Int, D: Int, page: Int, qLen: Int) {
     let enc = cb.makeComputeCommandEncoder()!
     enc.setComputePipelineState(kvWriteMultiPSO)
     enc.setBuffer(K, offset: 0, index: 0); enc.setBuffer(V, offset: 0, index: 1)
     enc.setBuffer(Kc, offset: 0, index: 2); enc.setBuffer(Vc, offset: 0, index: 3)
     enc.setBuffer(block_table, offset: 0, index: 4); enc.setBuffer(q_positions, offset: 0, index: 5)
+    enc.setBuffer(KcHi, offset: 0, index: 25); enc.setBuffer(VcHi, offset: 0, index: 26)
     var hv = UInt32(H), dv = UInt32(D), pv = UInt32(page)
-    var mv = UInt32(MAX_PAGES_PER_SLOT), qv = UInt32(qLen)
+    var mv = UInt32(MAX_PAGES_PER_SLOT), qv = UInt32(qLen), cp = UInt32(chunkPages)
     enc.setBytes(&hv, length: 4, index: 6); enc.setBytes(&dv, length: 4, index: 7)
     enc.setBytes(&pv, length: 4, index: 8); enc.setBytes(&mv, length: 4, index: 9)
     enc.setBytes(&qv, length: 4, index: 10)
+    enc.setBytes(&cp, length: 4, index: 27)
     enc.dispatchThreadgroups(MTLSize(width: B, height: qLen, depth: H),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
@@ -3559,11 +3578,13 @@ func precomputeFlexBlockMaskFull() {
 func encAttn(_ cb: MTLCommandBuffer,
              Q: MTLBuffer, O: MTLBuffer,
              Kc: MTLBuffer, Vc: MTLBuffer,
+             KcHi: MTLBuffer, VcHi: MTLBuffer, chunkPages: Int,
              kLenBuf: MTLBuffer,
              H_Q: Int, H_KV: Int, D: Int,
              isFull: Bool,
              activeB: Int = B) {
     encFlexAttnV0(cb, Q: Q, O: O, Kc: Kc, Vc: Vc,
+                   KcHi: KcHi, VcHi: VcHi, chunkPages: chunkPages,
                    kLenBuf: kLenBuf, H_Q: H_Q, H_KV: H_KV, D: D,
                    isFull: isFull, activeB: activeB)
 }
@@ -3723,6 +3744,7 @@ func encExtractLogprobs(_ cb: MTLCommandBuffer,
 // should NOT take the shared-prefix broadcast path.
 func encFlexAttnV0(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
                     Kc: MTLBuffer, Vc: MTLBuffer,
+                    KcHi: MTLBuffer, VcHi: MTLBuffer, chunkPages: Int,
                     kLenBuf: MTLBuffer,
                     H_Q: Int, H_KV: Int, D: Int,
                     isFull: Bool,
@@ -3745,18 +3767,20 @@ func encFlexAttnV0(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
     enc1.setBuffer(partOff, offset: 0, index: 9)
     enc1.setBuffer(partIdx, offset: 0, index: 10)
     enc1.setBuffer(kLenBuf, offset: 0, index: 11)
+    enc1.setBuffer(KcHi, offset: 0, index: 25); enc1.setBuffer(VcHi, offset: 0, index: 26)
     var scale: Float = 1.0
     var mv = UInt32(MAX_PAGES_PER_SLOT), hq = UInt32(H_Q), hkv = UInt32(H_KV), ns = UInt32(ATTN_N_SPLITS)
     // sliding_window bound at index 17 in both PSOs — the full-attn PSO's
     // FC_USE_SLIDE=false makes the kernel dead-strip all use of this value.
     // Keeping the binding uniform is a Swift-side convenience.
     var sw: UInt32 = isFull ? 0 : UInt32(SLIDING_WINDOW)
-    var pp: UInt32 = 0, so: UInt32 = 0, tso: UInt32 = 0
+    var pp: UInt32 = 0, so: UInt32 = 0, tso: UInt32 = 0, cp = UInt32(chunkPages)
     enc1.setBytes(&scale, length: 4, index: 12); enc1.setBytes(&mv, length: 4, index: 13)
     enc1.setBytes(&hq, length: 4, index: 14);    enc1.setBytes(&hkv, length: 4, index: 15)
     enc1.setBytes(&ns, length: 4, index: 16);    enc1.setBytes(&sw, length: 4, index: 17)
     enc1.setBytes(&pp, length: 4, index: 18);    enc1.setBytes(&so, length: 4, index: 19)
     enc1.setBytes(&tso, length: 4, index: 20)
+    enc1.setBytes(&cp, length: 4, index: 27)
     enc1.dispatchThreadgroups(MTLSize(width: activeB * H_KV, height: ATTN_N_SPLITS, depth: 1),
                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc1.endEncoding()
@@ -4265,6 +4289,8 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
         let v_out = isFull ? v_full_out : v_slide_out
         let Kc = w.K_caches[L]
         let Vc = w.V_caches[L]
+        let KcHi = w.K_caches_hi[L]
+        let VcHi = w.V_caches_hi[L]
 
         // Fused RMSNorm + Q/K/V projection — kernel-zoo dispatcher picks
         // the OTF b1 specialization for activeB=1 (22% faster than V6 at
@@ -4309,11 +4335,14 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
         }
 
         let pg = isFull ? PAGE_FULL : PAGE_SLIDE
-        encKVWrite(cb, K: k_out, V: v_out, Kc: Kc, Vc: Vc, H: KV_H, D: HD, page: pg, activeB: aB)
+        encKVWrite(cb, K: k_out, V: v_out, Kc: Kc, Vc: Vc,
+                    KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
+                    H: KV_H, D: HD, page: pg, activeB: aB)
 
         let npBuf = isFull ? num_pages_full : num_pages_slide
         let klBuf = isFull ? k_len_full : k_len_slide
         encAttn(cb, Q: q_out, O: attn_out, Kc: Kc, Vc: Vc,
+                KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
                 kLenBuf: klBuf, H_Q: H, H_KV: KV_H, D: HD,
                 isFull: isFull, activeB: aB)
         if LM_SKIP_ATTN {
@@ -4679,6 +4708,8 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
         let v_out = isFull ? pre_v_full_out : pre_v_slide_out
         let Kc = w.K_caches[L]
         let Vc = w.V_caches[L]
+        let KcHi = w.K_caches_hi[L]
+        let VcHi = w.V_caches_hi[L]
 
         // RMSNorm + Q/K/V projection over all N tokens. Unfused (norm into
         // pre_hidden_norm, then 3 separate matmuls) so the projections can
@@ -4732,6 +4763,7 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
         // Multi-position KV write: qLen entries per batch.
         let pg = isFull ? PAGE_FULL : PAGE_SLIDE
         encKVWriteMulti(cb, K: k_out, V: v_out, Kc: Kc, Vc: Vc,
+                        KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
                         q_positions: pre_q_positions,
                         H: KV_H, D: HD, page: pg, qLen: qLen)
 
@@ -4739,10 +4771,12 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
         let klBuf = isFull ? pre_k_len_full : pre_k_len_slide
         if isFull {
             encFlexAttnFullPrefill(cb, Q: q_out, O: pre_attn_out, Kc: Kc, Vc: Vc,
+                                    KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
                                     kLenBuf: klBuf, qPositions: pre_q_positions,
                                     H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
         } else {
             encFlexAttnSlidePrefill(cb, Q: q_out, O: pre_attn_out, Kc: Kc, Vc: Vc,
+                                     KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
                                      kLenBuf: klBuf, qPositions: pre_q_positions,
                                      H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
         }
@@ -5007,6 +5041,8 @@ func encodeOnePrefillLayerSplit(_ w: LmWeights, L: Int, qLen: Int, sslot: Int) {
     let v_out = isFull ? pre_v_full_out : pre_v_slide_out
     let Kc = w.K_caches[L]
     let Vc = w.V_caches[L]
+    let KcHi = w.K_caches_hi[L]
+    let VcHi = w.V_caches_hi[L]
     let Wv = lw.attnV ?? lw.attnK
     let WvFmt = (lw.attnV != nil) ? lw.attnVFormat : lw.attnKFormat
 
@@ -5042,6 +5078,7 @@ func encodeOnePrefillLayerSplit(_ w: LmWeights, L: Int, qLen: Int, sslot: Int) {
     let pg = isFull ? PAGE_FULL : PAGE_SLIDE
     commitAndCheck("kv_write", buf: Kc, count: min(N * KV_H * HD, 4096)) { cb in
         encKVWriteMulti(cb, K: k_out, V: v_out, Kc: Kc, Vc: Vc,
+                        KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
                         q_positions: pre_q_positions,
                         H: KV_H, D: HD, page: pg, qLen: qLen)
     }
@@ -5080,10 +5117,12 @@ func encodeOnePrefillLayerSplit(_ w: LmWeights, L: Int, qLen: Int, sslot: Int) {
     commitAndCheck("attention", buf: pre_attn_out, count: N * H * HD) { cb in
         if isFull {
             encFlexAttnFullPrefill(cb, Q: q_out, O: pre_attn_out, Kc: Kc, Vc: Vc,
+                                    KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
                                     kLenBuf: klBuf, qPositions: pre_q_positions,
                                     H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
         } else {
             encFlexAttnSlidePrefill(cb, Q: q_out, O: pre_attn_out, Kc: Kc, Vc: Vc,
+                                     KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
                                      kLenBuf: klBuf, qPositions: pre_q_positions,
                                      H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
         }
@@ -5210,6 +5249,8 @@ func encodeOnePrefillLayer(_ cb: MTLCommandBuffer, _ w: LmWeights, L: Int, qLen:
     let v_out = isFull ? pre_v_full_out : pre_v_slide_out
     let Kc = w.K_caches[L]
     let Vc = w.V_caches[L]
+    let KcHi = w.K_caches_hi[L]
+    let VcHi = w.V_caches_hi[L]
     // Diagnostic prefill path — type-complete via the same format-aware
     // dispatchers used by buildPrefillCB. RMSNorm is unfused (the simdgroup
     // matmul path doesn't fuse RMSNorm in any format).
@@ -5232,15 +5273,18 @@ func encodeOnePrefillLayer(_ cb: MTLCommandBuffer, _ w: LmWeights, L: Int, qLen:
     encRMSNormNoScale(cb, x: v_out, out: v_out, D: HD, numVecs: N * KV_H)
     let pg = isFull ? PAGE_FULL : PAGE_SLIDE
     encKVWriteMulti(cb, K: k_out, V: v_out, Kc: Kc, Vc: Vc,
+                    KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
                     q_positions: pre_q_positions,
                     H: KV_H, D: HD, page: pg, qLen: qLen)
     let klBuf = isFull ? pre_k_len_full : pre_k_len_slide
     if isFull {
         encFlexAttnFullPrefill(cb, Q: q_out, O: pre_attn_out, Kc: Kc, Vc: Vc,
+                                KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
                                 kLenBuf: klBuf, qPositions: pre_q_positions,
                                 H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
     } else {
         encFlexAttnSlidePrefill(cb, Q: q_out, O: pre_attn_out, Kc: Kc, Vc: Vc,
+                                 KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
                                  kLenBuf: klBuf, qPositions: pre_q_positions,
                                  H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
     }
@@ -5400,8 +5444,19 @@ struct LmWeights {
     let unembedW: MTLBuffer          // fp16 [HIDDEN, VOCAB] transposed tied view
     let outputNorm: MTLBuffer        // fp16 [HIDDEN] final RMSNorm gamma
     let embedScaleBuf: MTLBuffer     // fp32 single scalar = sqrt(HIDDEN)
-    let K_caches: [MTLBuffer]        // per-layer K cache (size depends on isFull)
-    let V_caches: [MTLBuffer]        // per-layer V cache (size depends on isFull)
+    let K_caches: [MTLBuffer]        // per-layer K cache, LO half (chunk 0)
+    let V_caches: [MTLBuffer]        // per-layer V cache, LO half (chunk 0)
+    // Virtual-page-table indirection across two device buffers per layer.
+    // 2026-05-14 buffer-split refactor: the hardware/driver cliff at
+    // ~768 MB per-buffer means we can't allocate a single K (or V)
+    // device buffer large enough for pools beyond ~12K pages. Split
+    // into two buffers per layer, indexed by phys-page-id in the
+    // attention kernels via `is_hi = phys >= kvChunkPages`. When
+    // kvChunkPages > maxPhysPage, _hi is unused and behavior matches
+    // pre-refactor single-buffer K/V.
+    let K_caches_hi: [MTLBuffer]     // per-layer K cache, HI half (chunk 1)
+    let V_caches_hi: [MTLBuffer]     // per-layer V cache, HI half (chunk 1)
+    let kvChunkPages: Int            // phys-page split point (phys >= → _hi buffer)
     let bosTokenId: UInt32
     let eosTokenId: UInt32           // tokenizer.ggml.eos_token_id (Gemma4: 106 = <end_of_turn>)
     let addBosToken: Bool            // tokenizer.ggml.add_bos_token
@@ -5835,43 +5890,73 @@ func loadLmWeights(ggufPath: String) throws -> LmWeights {
     let KV_BUFFER_SAFETY_MARGIN    =  16 * 1024 * 1024     // 16 MB margin
     let KV_BUFFER_ENFORCED_CEILING = KV_BUFFER_HARD_LIMIT_BYTES - KV_BUFFER_SAFETY_MARGIN
 
+    // Split-by-2 virtual page table. Each layer's K (and V) cache lives
+    // in TWO device buffers; kernels index into them based on
+    // `is_hi = phys >= kvChunkPages`. With kvChunkPages set to
+    // (TOTAL_PAGES + 1) / 2 (rounded up), the split is as balanced as
+    // the pool size allows. The kernel's address arithmetic uses
+    // `local_phys = phys - chunk_pages` for the hi-side.
+    //
+    // GUARD: the PER-CHUNK buffer size — not the total per-layer K/V
+    // memory — must stay below the cliff. At pool=20000, split-by-2
+    // → 10000 pages per chunk × 64 KB = 625 MB per buffer. Comfortably
+    // below 752 MB ceiling.
+    let kvChunkPages = (TOTAL_PAGES + 1) / 2
+
     let tCache = Date()
     var K_caches: [MTLBuffer] = []
     var V_caches: [MTLBuffer] = []
+    var K_caches_hi: [MTLBuffer] = []
+    var V_caches_hi: [MTLBuffer] = []
     K_caches.reserveCapacity(NUM_LAYERS)
     V_caches.reserveCapacity(NUM_LAYERS)
+    K_caches_hi.reserveCapacity(NUM_LAYERS)
+    V_caches_hi.reserveCapacity(NUM_LAYERS)
     var kvBytes = 0
     for L in 0..<NUM_LAYERS {
         let lw = layers[L]
         let pg = lw.isFull ? PAGE_FULL : PAGE_SLIDE
-        let cacheElems = TOTAL_PAGES * pg * lw.KV_H * lw.HD
-        let bufBytes = cacheElems * 2
-        if bufBytes > KV_BUFFER_ENFORCED_CEILING {
-            // Compute what TOTAL_PAGES would be at the safe ceiling.
-            let safePages = KV_BUFFER_ENFORCED_CEILING / (pg * lw.KV_H * lw.HD * 2)
-            let maxScratchBase = safePages - SCRATCH_STRIP
+        let hiChunkPages = TOTAL_PAGES - kvChunkPages
+        let loElems = kvChunkPages * pg * lw.KV_H * lw.HD
+        let hiElems = hiChunkPages * pg * lw.KV_H * lw.HD
+        let loBytes = loElems * 2
+        let hiBytes = hiElems * 2
+        let maxChunkBytes = max(loBytes, hiBytes)
+        if maxChunkBytes > KV_BUFFER_ENFORCED_CEILING {
+            // Per-chunk too big even after split-by-2. Either bump
+            // split count (refactor would need per-buffer N>2) or
+            // reduce pool. Compute the safe pool ceiling for this
+            // layer at split-by-2.
+            let safePagesPerChunk = KV_BUFFER_ENFORCED_CEILING / (pg * lw.KV_H * lw.HD * 2)
+            let safePoolPages = safePagesPerChunk * 2 - SCRATCH_STRIP
             fail("""
               KV-pool guard tripped at layer \(L) (\(lw.isFull ? "full" : "slide")):
-                requested per-buffer bytes = \(bufBytes) (\(bufBytes / (1024*1024)) MB)
-                enforced ceiling           = \(KV_BUFFER_ENFORCED_CEILING) (\(KV_BUFFER_ENFORCED_CEILING / (1024*1024)) MB)
-                hardware cliff             = ~768 MB per buffer (empirical 2026-05-14)
-              SCRATCH_PAGE_BASE = \(SCRATCH_PAGE_BASE) is too large. Reduce to
-              ≤ \(maxScratchBase) for safe operation, OR implement the per-layer
-              buffer-split refactor described in the comment trail at
-              bootstrap.swift:SCRATCH_PAGE_BASE.
+                per-chunk bytes (split-by-2) = \(maxChunkBytes) (\(maxChunkBytes / (1024*1024)) MB)
+                enforced ceiling             = \(KV_BUFFER_ENFORCED_CEILING) (\(KV_BUFFER_ENFORCED_CEILING / (1024*1024)) MB)
+                hardware cliff               = ~768 MB per buffer (empirical 2026-05-14)
+              SCRATCH_PAGE_BASE = \(SCRATCH_PAGE_BASE) is too large even for split-by-2.
+              Reduce to ≤ \(safePoolPages) for safe operation at split-by-2,
+              OR extend the buffer-split refactor to N>2 chunks per layer.
               """)
         }
-        let Kbuf = device.makeBuffer(length: bufBytes, options: .storageModeShared)!
-        let Vbuf = device.makeBuffer(length: bufBytes, options: .storageModeShared)!
+        let Kbuf   = device.makeBuffer(length: loBytes, options: .storageModeShared)!
+        let Vbuf   = device.makeBuffer(length: loBytes, options: .storageModeShared)!
+        let KbufHi = device.makeBuffer(length: hiBytes, options: .storageModeShared)!
+        let VbufHi = device.makeBuffer(length: hiBytes, options: .storageModeShared)!
         memset(Kbuf.contents(), 0, Kbuf.length)
         memset(Vbuf.contents(), 0, Vbuf.length)
+        memset(KbufHi.contents(), 0, KbufHi.length)
+        memset(VbufHi.contents(), 0, VbufHi.length)
         K_caches.append(Kbuf)
         V_caches.append(Vbuf)
-        kvBytes += Kbuf.length + Vbuf.length
+        K_caches_hi.append(KbufHi)
+        V_caches_hi.append(VbufHi)
+        kvBytes += Kbuf.length + Vbuf.length + KbufHi.length + VbufHi.length
     }
-    print(String(format: "  per-layer K/V caches allocated: %.1f MB in %.2f sec (per-buffer %d MB / cliff %d MB)",
+    print(String(format: "  per-layer K/V caches allocated: %.1f MB in %.2f sec (split-by-2: lo %d MB + hi %d MB per layer / cliff %d MB)",
                  Double(kvBytes) / (1024*1024), Date().timeIntervalSince(tCache),
                  (K_caches[0].length) / (1024*1024),
+                 (K_caches_hi[0].length) / (1024*1024),
                  KV_BUFFER_HARD_LIMIT_BYTES / (1024*1024)))
 
     // ---------- Gemma-4 embed scale = sqrt(hidden) ----------
@@ -5927,6 +6012,8 @@ func loadLmWeights(ggufPath: String) throws -> LmWeights {
     return LmWeights(layers: layers, embedTable: embedTable, unembedW: unembedW,
                       outputNorm: outputNorm, embedScaleBuf: embedScaleBuf,
                       K_caches: K_caches, V_caches: V_caches,
+                      K_caches_hi: K_caches_hi, V_caches_hi: V_caches_hi,
+                      kvChunkPages: kvChunkPages,
                       bosTokenId: bosTokenId, eosTokenId: eosTokenId,
                       addBosToken: addBosToken, vocabTokens: vocabTokens, merges: merges)
 }
@@ -6024,6 +6111,7 @@ func buildPartialStepCB(_ w: LmWeights, stopAfterLayer: Int) -> MTLCommandBuffer
         let k_out = isFull ? k_full_out : k_slide_out
         let v_out = isFull ? v_full_out : v_slide_out
         let Kc = w.K_caches[L]; let Vc = w.V_caches[L]
+        let KcHi = w.K_caches_hi[L]; let VcHi = w.V_caches_hi[L]
 
         let Wv = lw.attnV ?? lw.attnK
         let WvFmt = (lw.attnV != nil) ? lw.attnVFormat : lw.attnKFormat
@@ -6040,10 +6128,13 @@ func buildPartialStepCB(_ w: LmWeights, stopAfterLayer: Int) -> MTLCommandBuffer
         encRope(cb, k_out, H: KV_H, D: HD, rotary: rotary, theta: theta)
         encRMSNormNoScale(cb, x: v_out, out: v_out, D: HD, numVecs: B * KV_H)
         let pg = isFull ? PAGE_FULL : PAGE_SLIDE
-        encKVWrite(cb, K: k_out, V: v_out, Kc: Kc, Vc: Vc, H: KV_H, D: HD, page: pg)
+        encKVWrite(cb, K: k_out, V: v_out, Kc: Kc, Vc: Vc,
+                    KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
+                    H: KV_H, D: HD, page: pg)
         let npBuf = isFull ? num_pages_full : num_pages_slide
         let klBuf = isFull ? k_len_full : k_len_slide
         encAttn(cb, Q: q_out, O: attn_out, Kc: Kc, Vc: Vc,
+                KcHi: KcHi, VcHi: VcHi, chunkPages: w.kvChunkPages,
                 kLenBuf: klBuf, H_Q: H, H_KV: KV_H, D: HD, isFull: isFull)
         encDenseGemvAR(cb, attn_out, lw.attnOut, format: lw.attnOutFormat, mlp_out,
                         Din: H * HD, Dout: HIDDEN, activeB: B)
