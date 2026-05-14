@@ -609,7 +609,7 @@ let KV_NUM_CHUNKS = 4
 // Bumping from 8192 → 11776 gives us 43% more capacity for free
 // — no refactor, no risk. Worth taking now; the split refactor
 // becomes a "if we need >50% growth" trigger later.
-let SCRATCH_PAGE_BASE = 11776   // narrowing test: known-correct at this pool size pre-narrowing
+let SCRATCH_PAGE_BASE = 33000   // ~108 GB KV via argbuf + lazy-commit + chunk-set narrowing
 let REAL_PAGE_BASE = 0
 let PHYS_POOL_PAGES = SCRATCH_PAGE_BASE
 let TOTAL_PAGES = SCRATCH_PAGE_BASE + SCRATCH_STRIP
@@ -3236,6 +3236,32 @@ func activeKVChunkIdxs(blockTable: MTLBuffer,
     return Array(idxs).sorted()
 }
 
+// Prefill variant: the engine populates `pre_k_len_slide/full` (k_len in
+// tokens) rather than separate num_pages buffers — `pre_num_pages_*` is
+// allocated but unused (verified 2026-05-14: only THIS helper read them
+// before this commit). Derive num_pages from k_len using the same
+// ceiling math the engine uses (ceil(k_len / PAGE)).
+func activeKVChunkIdxsFromKLen(blockTable: MTLBuffer,
+                                kLenSlide: MTLBuffer, kLenFull: MTLBuffer,
+                                activeB: Int, kvChunkPages: Int) -> [Int] {
+    let btP = blockTable.contents().assumingMemoryBound(to: UInt32.self)
+    let klsP = kLenSlide.contents().assumingMemoryBound(to: UInt32.self)
+    let klfP = kLenFull.contents().assumingMemoryBound(to: UInt32.self)
+    var idxs = Set<Int>()
+    for b in 0..<activeB {
+        let kls = Int(klsP[b])
+        let klf = Int(klfP[b])
+        let nSlide = (kls + PAGE_SLIDE - 1) / PAGE_SLIDE
+        let nFull  = (klf + PAGE_FULL  - 1) / PAGE_FULL
+        let n = max(nSlide, nFull)
+        for p in 0..<n {
+            let phys = Int(btP[b * MAX_PAGES_PER_SLOT + p])
+            idxs.insert(phys / kvChunkPages)
+        }
+    }
+    return Array(idxs).sorted()
+}
+
 // Helper to call useResource on the subset of chunks referenced this CB.
 // Passing usage explicitly so write-side dispatchers (kv_write,
 // kv_write_multi) hint .write while read-side attention dispatchers
@@ -3245,17 +3271,17 @@ func useResourceForActiveChunks(_ enc: MTLComputeCommandEncoder,
                                  kChunks: [MTLBuffer], vChunks: [MTLBuffer],
                                  activeChunkIdxs: [Int],
                                  usage: MTLResourceUsage) {
-    // 2026-05-14: activeChunkIdxs narrowing was producing silent KV
-    // corruption (even at pool=11776 which worked pre-narrowing).
-    // Walking block_table[slot][0..num_pages-1] is apparently missing
-    // some chunk the kernels actually access — needs more careful
-    // diagnosis. For correctness, useResource ALL chunks for now.
-    // The activeChunkIdxs parameter is retained in signatures so the
-    // narrowing can be re-enabled trivially when the missed-chunk
-    // case is fixed.
-    _ = activeChunkIdxs
-    for c in kChunks { enc.useResource(c, usage: usage) }
-    for c in vChunks { enc.useResource(c, usage: usage) }
+    // Narrowed mode (re-enabled 2026-05-14 for diagnosis): useResource
+    // only the chunks activeChunkIdxs says are touched. If any kernel
+    // actually accesses a non-listed chunk, the GPU treats it as non-
+    // resident → reads return stale bytes → silent output corruption.
+    if ProcessInfo.processInfo.environment["KV_DEBUG_CHUNKSET"] != nil {
+        print("  [kv-debug] useResource chunks=\(activeChunkIdxs) usage=\(usage == .read ? "read" : "write")")
+    }
+    for idx in activeChunkIdxs {
+        enc.useResource(kChunks[idx], usage: usage)
+        enc.useResource(vChunks[idx], usage: usage)
+    }
 }
 
 
@@ -4788,9 +4814,9 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
     // Per-CB chunk-set narrowing for prefill. Same approach as
     // buildStepCB, but using the pre_* num_pages buffers since
     // prefill drives k_len via pre_q_positions.
-    let activeChunkIdxs = activeKVChunkIdxs(
+    let activeChunkIdxs = activeKVChunkIdxsFromKLen(
         blockTable: block_table,
-        numPagesA: pre_num_pages_slide, numPagesB: pre_num_pages_full,
+        kLenSlide: pre_k_len_slide, kLenFull: pre_k_len_full,
         activeB: B, kvChunkPages: w.kvChunkPages)
 
     if !skipEmbed {
@@ -5143,9 +5169,9 @@ func encodeOnePrefillLayerSplit(_ w: LmWeights, L: Int, qLen: Int, sslot: Int) {
     let NS = B * qLen * TOPK
     // Per-CB chunk narrowing. Diagnostic-path encoder; same narrow as
     // the non-split version since both use pre_num_pages_*.
-    let activeChunkIdxs = activeKVChunkIdxs(
+    let activeChunkIdxs = activeKVChunkIdxsFromKLen(
         blockTable: block_table,
-        numPagesA: pre_num_pages_slide, numPagesB: pre_num_pages_full,
+        kLenSlide: pre_k_len_slide, kLenFull: pre_k_len_full,
         activeB: B, kvChunkPages: w.kvChunkPages)
     let lw = w.layers[L]
     let isFull = lw.isFull
@@ -5363,9 +5389,9 @@ func encodeOnePrefillLayer(_ cb: MTLCommandBuffer, _ w: LmWeights, L: Int, qLen:
     let N = B * qLen
     let NS = B * qLen * TOPK
     // Per-CB chunk narrowing for prefill. See buildStepCB for rationale.
-    let activeChunkIdxs = activeKVChunkIdxs(
+    let activeChunkIdxs = activeKVChunkIdxsFromKLen(
         blockTable: block_table,
-        numPagesA: pre_num_pages_slide, numPagesB: pre_num_pages_full,
+        kLenSlide: pre_k_len_slide, kLenFull: pre_k_len_full,
         activeB: B, kvChunkPages: w.kvChunkPages)
     let lw = w.layers[L]
     let isFull = lw.isFull

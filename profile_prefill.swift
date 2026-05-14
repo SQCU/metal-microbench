@@ -132,9 +132,9 @@ func runLmPrefillProfile(ggufPath: String) {
                 encRMSNormNoScale(cb, x: v_out, out: v_out, D: HD, numVecs: N * KV_H)
             })
 
-            let activeChunkIdxs = activeKVChunkIdxs(
+            let activeChunkIdxs = activeKVChunkIdxsFromKLen(
                 blockTable: block_table,
-                numPagesA: pre_num_pages_slide, numPagesB: pre_num_pages_full,
+                kLenSlide: pre_k_len_slide, kLenFull: pre_k_len_full,
                 activeB: B, kvChunkPages: w.kvChunkPages)
             stages.append(runStage("kv_attn", layer: L) { cb in
                 let pg = isFull ? PAGE_FULL : PAGE_SLIDE
