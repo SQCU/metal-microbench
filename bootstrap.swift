@@ -562,25 +562,44 @@ let logits      = emptyHalf(B * VOCAB)
 // If long-context workloads need more headroom, bump SCRATCH_PAGE_BASE.
 let MAX_RESIDENT_SESSIONS = 64                    // logical users held in KV
 let SCRATCH_STRIP = 256                           // silenced-slot scratch (shared)
-// 2026-05-14 cliff diagnosis result: pool=12288 boots clean (no
-// Metal validation errors with MTL_DEBUG_LAYER=1 MTL_GPU_VALIDATION=1)
-// but produces silent KV corruption — generated text is coherent
-// English unrelated to the prompt (e.g. prompt "What is 2 plus 2?"
-// returned " eyes\n[]\n[]\n[]…"). So the cliff is NOT a Metal limit;
-// it's a kernel-side addressing bug that produces wrong-but-in-bounds
-// reads at larger pool sizes. The bug is therefore harder to find
-// than a bounds violation (Metal can't catch it — the reads are
-// legal, just to the wrong cells). Candidates:
-//   - Hardcoded 8192 in a kernel address calculation
-//   - 32-bit signed overflow in an intermediate offset (768MB buffer
-//     × multiplier could overflow Int32)
-//   - block_table or page-translation table size assumption
-//   - Per-layer K/V buffer stride assumption (cache buffer grew
-//     proportionally, but kernel may use a constant stride somewhere)
-// Until that's pinpointed and fixed, pool stays at 8192. The
-// admission-backpressure path (lm_engine.swift submitRequest) is the
-// correct way to handle pool pressure given the current capacity.
-let SCRATCH_PAGE_BASE = 8192
+// 2026-05-14 cliff diagnosis result.
+//
+// Empirical bisection (with MTL_DEBUG_LAYER=1 MTL_GPU_VALIDATION=1
+// MTL_SHADER_VALIDATION=1; bridge restarted between each test;
+// prompt "What is 2 plus 2?" sweep of 3 seeds):
+//
+//   pool   slide K bytes   buffer-MB   verdict
+//   8192   553M             528 MB     ✓ correct ("2 plus 2 is 4.")
+//   9216   620M             592 MB     ✓ correct
+//   10240  687M             656 MB     ✓ correct
+//   11264  754M             720 MB     ✓ correct
+//   11776  788M             752 MB     ✓ correct
+//   12032  805M             768 MB     ✓ correct (exactly 0x3000_0000)
+//   12288  822M             784 MB     ✗ silent corruption
+//                                         ("'2 plus 2'" → " much as we
+//                                          biology introduces any way…")
+//
+// So the cliff is at a per-buffer size of ~784 MB. The 2026-05-06
+// note guessed "528 MB → 784 MB transition"; bisection nails it
+// down to between 768 MB and 784 MB. Metal validation reports
+// NOTHING in either case — this is a hardware/driver-level coherency
+// or TLB limit that the API surface doesn't expose.
+//
+// Implications:
+//   1. Code-level fix is NOT POSSIBLE within a single buffer per
+//      layer. The cliff is the buffer itself.
+//   2. Per-layer K/V buffer SPLIT is required to go past pool=12032.
+//      That refactor is documented elsewhere; the win past 12032
+//      would be substantial (split-by-2 → cliff doubles to ~1.5GB
+//      effective, allowing pool~24K).
+//   3. WITHOUT the split, pool=11776 is the safe production value
+//      (752 MB per buffer, 16 MB margin below the 768 MB tested-OK
+//      ceiling, 32 MB margin below the 784 MB known-broken floor).
+//
+// Bumping from 8192 → 11776 gives us 43% more capacity for free
+// — no refactor, no risk. Worth taking now; the split refactor
+// becomes a "if we need >50% growth" trigger later.
+let SCRATCH_PAGE_BASE = 11776
 let REAL_PAGE_BASE = 0
 let PHYS_POOL_PAGES = SCRATCH_PAGE_BASE
 let TOTAL_PAGES = SCRATCH_PAGE_BASE + SCRATCH_STRIP
