@@ -159,6 +159,11 @@ let prefillMmIdQ51SwizPSO  = pso("prefill_mm_id_q5_1_swiz")
 let prefillMmIdQ5KSwizPSO  = pso("prefill_mm_id_q5_K_swiz")
 let prefillMmIdQ6KSwizPSO  = pso("prefill_mm_id_q6_K_swiz")
 let prefillMmIdQ80SwizPSO  = pso("prefill_mm_id_q8_0_swiz")
+// Q8_0 moe_up prefill (slot_token-broadcast) — added 2026-05-13 alongside
+// the AR moe_gemv_q8_0_v11_up family. Separate PSO from the down kernel
+// because moe_up needs slot_token at buffer(1); sharing the down kernel
+// would shift every subsequent binding index by 1 and read garbage.
+let prefillMmIdQ80UpSwizPSO = pso("prefill_mm_id_q8_0_up_swiz")
 
 // F16 weight-streaming kernel zoo. F16 is the IEEE half-precision baseline:
 // no block structure, no dequant, plain row-major [Dout, Din] weights. Used
@@ -189,6 +194,16 @@ let moeGemvF16V11UpB1PSO        = pso("moe_gemv_f16_v11_up_b1")
 let moeGemvF16V11UpB2PSO        = pso("moe_gemv_f16_v11_up_b2")
 let moeGemvF16V11UpB4PSO        = pso("moe_gemv_f16_v11_up_b4")
 let moeGemvF16V11UpB8PSO        = pso("moe_gemv_f16_v11_up_b8")
+// Q8_0 MoE-up (slot_token-broadcast convention) PSOs — written 2026-05-13
+// to close the engine's last MoE-quant gap. Mirrors the F16 up dispatcher
+// shape (same buffer bindings, same per-block grid) but uses the swizzled
+// Q8_0 byte layout from the per-slot down kernel. Lets us run uniform
+// Q8_0 builds (dense + MoE up + MoE down all Q8_0) without falling back
+// to F16-slow-dense or Q5_K MoE up.
+let moeGemvQ80V11UpB1PSO        = pso("moe_gemv_q8_0_v11_up_b1")
+let moeGemvQ80V11UpB2PSO        = pso("moe_gemv_q8_0_v11_up_b2")
+let moeGemvQ80V11UpB4PSO        = pso("moe_gemv_q8_0_v11_up_b4")
+let moeGemvQ80V11UpB8PSO        = pso("moe_gemv_q8_0_v11_up_b8")
 let prefillMmF16SwizPSO         = pso("prefill_mm_f16_swiz")
 let prefillMmIdF16SwizPSO       = pso("prefill_mm_id_f16_swiz")
 // F16 moe-up prefill (slot_token-broadcast convention) — separate PSO from
@@ -609,7 +624,7 @@ let KV_NUM_CHUNKS = 4
 // Bumping from 8192 → 11776 gives us 43% more capacity for free
 // — no refactor, no risk. Worth taking now; the split refactor
 // becomes a "if we need >50% growth" trigger later.
-let SCRATCH_PAGE_BASE = 33000   // ~108 GB KV via argbuf + lazy-commit + narrowing
+let SCRATCH_PAGE_BASE = 16000   // ~52 GB KV — sized for Q8_0 (27GB model) on 128GB box. Was 33000 (~108GB KV) for the 17GB Q4_K_M model; uniform-Q8_0 + 108GB KV exceeded physical RAM and triggered AR-step page faults (4s/tok). 16000 pages leaves ~85GB headroom for model + page cache + system.
 let REAL_PAGE_BASE = 0
 let PHYS_POOL_PAGES = SCRATCH_PAGE_BASE
 let TOTAL_PAGES = SCRATCH_PAGE_BASE + SCRATCH_STRIP
@@ -1614,6 +1629,7 @@ func encMoeUpMmPrefill(_ cb: MTLCommandBuffer,
     switch format {
     case .q4_K: psoSel = prefillMmIdQ4KSwizPSO
     case .q5_K: psoSel = prefillMmIdQ5KSwizPSO
+    case .q8_0: psoSel = prefillMmIdQ80UpSwizPSO   // slot_token-broadcast variant
     case .f16:  psoSel = prefillMmIdF16UpSwizPSO   // slot_token-broadcast variant
     default: fail("encMoeUpMmPrefill: unsupported format \(format)")
     }
@@ -2262,6 +2278,14 @@ func encMoeUpGemvAR(_ cb: MTLCommandBuffer,
         // of the source-token row, corrupting the residual stream.
         encMoeGemvF16V11Up(cb, xbuf, W, out,
                             Din: Din, Dout: Dout, numActive: numActive, activeB: activeB)
+    case .q8_0:
+        // Added 2026-05-13. Structurally a hybrid of encMoeGemvQ80V11 (same
+        // swizzled byte layout) and encMoeGemvF16V11Up (same slot_token-
+        // broadcast hidden indirection). Enables uniform-Q8_0 builds so we
+        // can isolate MoE-up precision as a variable in on-policy quant
+        // ablations.
+        encMoeGemvQ80V11Up(cb, xbuf, W, out,
+                            Din: Din, Dout: Dout, numActive: numActive, activeB: activeB)
     default:
         fail("encMoeUpGemvAR: unsupported MoE-up format \(format)")
     }
@@ -2391,6 +2415,34 @@ func encMoeGemvQ80V11(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ Wq80: MTLBuff
     case 2:    psoSel = moeGemvQ80V11B2PSO
     case 3, 4: psoSel = moeGemvQ80V11B4PSO
     default:   psoSel = moeGemvQ80V11B8PSO
+    }
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(psoSel)
+    enc.setBuffer(xbuf, offset: 0, index: 0); enc.setBuffer(slotTokenBuf ?? slot_token, offset: 0, index: 1)
+    enc.setBuffer(Wq80, offset: 0, index: 2); enc.setBuffer(active_exp, offset: 0, index: 3)
+    enc.setBuffer(groupStartBuf ?? group_start, offset: 0, index: 4); enc.setBuffer(out, offset: 0, index: 5)
+    var du = UInt32(Din), dou = UInt32(Dout)
+    enc.setBytes(&du, length: 4, index: 6); enc.setBytes(&dou, length: 4, index: 7)
+    enc.dispatchThreadgroups(MTLSize(width: Dout / 32, height: numActive, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    enc.endEncoding()
+}
+
+// Q8_0 MoE V11 UP dispatcher (slot_token-broadcast convention) — for
+// ffn_gate_up_exps when format is Q8_0. Identical buffer-binding shape
+// to encMoeGemvQ80V11 (the down variant), differs only in which PSO it
+// selects: the up kernels indirect through slot_token[idx] while the
+// down kernels use idx directly. Added 2026-05-13 to enable uniform
+// Q8_0 builds.
+func encMoeGemvQ80V11Up(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ Wq80: MTLBuffer, _ out: MTLBuffer,
+                         Din: Int, Dout: Int, numActive: Int, activeB: Int,
+                         slotTokenBuf: MTLBuffer? = nil, groupStartBuf: MTLBuffer? = nil) {
+    let psoSel: MTLComputePipelineState
+    switch max(1, activeB) {
+    case 1:    psoSel = moeGemvQ80V11UpB1PSO
+    case 2:    psoSel = moeGemvQ80V11UpB2PSO
+    case 3, 4: psoSel = moeGemvQ80V11UpB4PSO
+    default:   psoSel = moeGemvQ80V11UpB8PSO
     }
     let enc = cb.makeComputeCommandEncoder()!
     enc.setComputePipelineState(psoSel)

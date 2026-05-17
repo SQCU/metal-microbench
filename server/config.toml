@@ -15,7 +15,7 @@
 
 [model]
 # LM weights: Q4_K_M GGUF is what the engine's matmul kernels are tuned for.
-gguf_path = "/Users/mdot/models/gemma-4-a4b/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
+gguf_path = "/Users/mdot/models/gemma-4-a4b/gemma-4-26B-A4B-it-Q8.gguf"
 
 # Vision-tower weights: first shard of the bf16 safetensors checkpoint.
 # chat_template.jinja is auto-discovered relative to this dir; if it's
@@ -49,7 +49,7 @@ log_level = "warning"
 # of google/gemma-4-26B-A4B-it (saves the HF-login dance for the happy
 # path; the google repo is gated and requires license acceptance).
 gguf_repo = "unsloth/gemma-4-26B-A4B-it-GGUF"
-gguf_filename = "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
+gguf_filename = "gemma-4-26B-A4B-it-Q8.gguf"
 gguf_local_dir = "models/gemma-4"
 
 safetensors_repo = "unsloth/gemma-4-26B-A4B-it"

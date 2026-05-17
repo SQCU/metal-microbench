@@ -1,0 +1,49 @@
+{
+  "pc_idx": 3,
+  "direction": 1,
+  "n_sigma": 2.0,
+  "target_named": {
+    "curious": 4,
+    "terse": 2,
+    "warm": 2,
+    "deferential": 1,
+    "performative": 4,
+    "in_character": 4,
+    "affective_intensity": 2,
+    "probe_depth": 4,
+    "goal_clarity": 4,
+    "disclosive": 1,
+    "provocative": 2,
+    "register_colloquial": 2,
+    "playful": 2,
+    "structured": 2
+  },
+  "rounds_attempted": 3,
+  "converged_round": null,
+  "history": [
+    {
+      "round": 1,
+      "spec": null,
+      "turn": null,
+      "audit": null,
+      "measured": null,
+      "drift": null
+    },
+    {
+      "round": 2,
+      "spec": null,
+      "turn": null,
+      "audit": null,
+      "measured": null,
+      "drift": null
+    },
+    {
+      "round": 3,
+      "spec": null,
+      "turn": null,
+      "audit": null,
+      "measured": null,
+      "drift": null
+    }
+  ]
+}

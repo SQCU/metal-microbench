@@ -8839,6 +8839,167 @@ kernel void moe_gemv_f16_v11_up_b8_kern(
 }
 
 // =============================================================================
+// MoE Q8_0 v11 UP (slot_token-broadcast convention) — for ffn_gate_up_exps
+// where multiple expert slots may share the same token's hidden vector.
+//
+// Structural intersection of moe_gemv_q8_0_v11_impl (above, per-slot down
+// convention) and moe_gemv_f16_v11_up_impl (above, broadcast up convention):
+//   • Swizzled Q8_0 byte layout + 2-byte half scale + 32 int8 quants per
+//     block — identical to the down kernel; the swizzle is layout-agnostic
+//     between up and down because loadMoESwizzled writes the same pattern
+//     for both tensor classes.
+//   • slot_token[idx]-broadcast hidden-pointer indirection — identical to
+//     the F16 up kernel; required because one source token may be routed
+//     to k experts, so all k slots referring to that token must read the
+//     SAME row of `hidden`.
+//
+// Written 2026-05-13 to close the engine's last MoE-quant gap: previously
+// only Q4_K/Q5_K/Q4_0/Q4_1/F16 were available for ffn_gate_up_exps. Adding
+// Q8_0 lets us run a "Q8_0 dense + Q8_0 MoE up + Q8_0 MoE down" build,
+// which is the highest-precision uniform-Q8_0 the engine can express
+// without the F16 dense slow path. The on-policy LLM-as-judge probe
+// surfaced a precision-vs-completion-rate trend that this kernel makes
+// the next datapoint testable.
+// =============================================================================
+
+template<uint MAX_SLOTS>
+inline void moe_gemv_q8_0_v11_up_impl(
+    device const half* hidden,
+    device const uint* slot_token,    // slot_token-broadcast convention
+    device const uchar* W_sw,
+    device const uint* active_experts,
+    device const uint* group_start,
+    device half* output,
+    constant uint& D_in,
+    constant uint& D_out,
+    uint2 tg,
+    uint2 lid)
+{
+    uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
+    if (expert >= 128u) return;
+    uint n = n_block * 32 + t;
+    if (n >= D_out) return;
+    uint gb = group_start[expert]; uint ge = group_start[expert + 1];
+    if (ge == gb) return;
+
+    constexpr uint BLK = 34;
+    uint nbc = D_in / 32;
+    uint super_bytes = nbc * 32 * BLK;
+    uint expert_bytes = (D_out / 32) * super_bytes;
+    device const uchar* W_super = W_sw + expert * expert_bytes + n_block * super_bytes;
+
+    uint slot_base = gb;
+    while (slot_base < ge) {
+        uint chunk = (ge - slot_base < MAX_SLOTS) ? (ge - slot_base) : MAX_SLOTS;
+        device const half* hid_slots[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            uint idx = (s < chunk) ? (slot_base + s) : slot_base;
+            // slot_token-broadcast: multiple slots may share a token, so
+            // indirect through slot_token[] to find this slot's source row.
+            hid_slots[s] = hidden + slot_token[idx] * D_in;
+        }
+        float accs[MAX_SLOTS];
+        for (uint s = 0; s < MAX_SLOTS; ++s) accs[s] = 0.0f;
+
+        for (uint kb = 0; kb < nbc; ++kb) {
+            device const uchar* blk = W_super + kb * 32 * BLK + t * BLK;
+            float d = float(*(device const half*)(blk + 0));
+            device const char* qs = (device const char*)(blk + 2);
+
+            // Pre-dequant 32 weights to register array W[32].
+            half W[32];
+            for (uint p = 0; p < 32; ++p) {
+                W[p] = half(d * float(qs[p]));
+            }
+            uint base_k = kb * 32;
+
+            // Predicated multi-slot FMA. Mirrors Q5_K up V11 / Q8_0 down V11.
+            for (uint s = 0; s < MAX_SLOTS; ++s) {
+                if (s < chunk) {
+                    device const half* hid = hid_slots[s];
+                    float a = accs[s];
+                    for (uint p = 0; p < 32; ++p) {
+                        a += float(hid[base_k + p]) * float(W[p]);
+                    }
+                    accs[s] = a;
+                }
+            }
+        }
+
+        for (uint s = 0; s < MAX_SLOTS; ++s) {
+            if (s < chunk) {
+                output[(slot_base + s) * D_out + n] = half(accs[s]);
+            }
+        }
+        slot_base += chunk;
+    }
+}
+
+[[host_name("moe_gemv_q8_0_v11_up_b1")]]
+kernel void moe_gemv_q8_0_v11_up_b1_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_q8_0_v11_up_impl<1>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+[[host_name("moe_gemv_q8_0_v11_up_b2")]]
+kernel void moe_gemv_q8_0_v11_up_b2_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_q8_0_v11_up_impl<2>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+[[host_name("moe_gemv_q8_0_v11_up_b4")]]
+kernel void moe_gemv_q8_0_v11_up_b4_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_q8_0_v11_up_impl<4>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+[[host_name("moe_gemv_q8_0_v11_up_b8")]]
+kernel void moe_gemv_q8_0_v11_up_b8_kern(
+    device const half* hidden           [[buffer(0)]],
+    device const uint* slot_token       [[buffer(1)]],
+    device const uchar* W_sw            [[buffer(2)]],
+    device const uint* active_experts   [[buffer(3)]],
+    device const uint* group_start      [[buffer(4)]],
+    device half* output                 [[buffer(5)]],
+    constant uint& D_in                 [[buffer(6)]],
+    constant uint& D_out                [[buffer(7)]],
+    uint2 tg                            [[threadgroup_position_in_grid]],
+    uint2 lid                           [[thread_position_in_threadgroup]])
+{
+    moe_gemv_q8_0_v11_up_impl<8>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid);
+}
+
+// =============================================================================
 // MoE Q6_K v11 (per-slot convention) — structural mirror of Q5_K V11 with
 // Q6_K dequant. Used for ffn_down_exps if a future GGUF puts Q6_K there.
 // 16 sub-tiles × 16 weights via the kmask/shift formula; we pre-dequant
@@ -13736,6 +13897,167 @@ kernel void prefill_mm_id_q8_0_swiz(
     const short iy = 8 * (tiitg % NL1);
     device const half * y = (device const half *) ((device const char *)X
         + nb12 * (ulong)s_flat + sizeof(half) * (ulong)iy);
+
+    simdgroup_half8x8     ma[4];
+    simdgroup_half8x8     mb[2];
+    simdgroup_float8x8    mc[8];
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (int loop_k = 0; loop_k < ne00; loop_k += NK) {
+        {
+            half4x4 temp_a;
+            dequantize_q8_0_llama(x, il, temp_a);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = (tiitg/NL0)%8;
+                const short ly = i%8;
+                const short ib = 8*sx + sy;
+                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+            }
+        }
+
+        {
+            const short sx = (tiitg % NL1);
+            const short sy = (tiitg / NL1) / 8;
+            const short ly = (tiitg / NL1) % 8;
+            const short ib = 4*sx + sy;
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = *((device half2x4 *) y);
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + 32 : x;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float * temp_str = ((threadgroup float *) shmem)
+                                   + 32*(sgitg & 1)
+                                   + (16 * (sgitg >> 1)) * NR0;
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short j = sgitg; j < nr1; j += 4) {
+        const uint s_out = gb + (uint)(r1 + j);
+        device half * D = Y + (int)s_out * ne0 + r0;
+        threadgroup float * C = ((threadgroup float *) shmem) + j * NR0;
+        for (int i = tiisg; i < nr0; i += 32) {
+            D[i] = (half) C[i];
+        }
+    }
+}
+
+// ─── MoE Q8_0 UP prefill: slot_token-broadcast convention ───────────────
+// Mirror of prefill_mm_id_q8_0_swiz with the slot_token-broadcast indirection
+// from prefill_mm_id_f16_up_swiz spliced in. Used for ffn_gate_up_exps when
+// the loaded GGUF puts Q8_0 there — added 2026-05-13 alongside the AR
+// moe_gemv_q8_0_v11_up_b{1,2,4,8} family to close the engine's last
+// MoE-quant gap.
+//
+// Buffer layout matches the Q4_K / Q5_K / F16 moe_up prefill exactly:
+//   (0) X, (1) slot_token, (2) W, (3) active_exp, (4) group_start,
+//   (5) Y, (6) D_in, (7) D_out.
+// X is indexed via t_idx = slot_token[s_flat] (broadcast: multiple slots
+// referring to the same source token read the same X row), while the
+// down kernel above uses s_flat directly (per-slot).
+// ─────────────────────────────────────────────────────────────────────────
+
+kernel void prefill_mm_id_q8_0_up_swiz(
+    device const half*    X            [[buffer(0)]],
+    device const uint*    slot_token   [[buffer(1)]],
+    device const uchar*   W_q80        [[buffer(2)]],
+    device const uint*    active_exp   [[buffer(3)]],
+    device const uint*    group_start  [[buffer(4)]],
+    device half*          Y            [[buffer(5)]],
+    constant uint& D_in                [[buffer(6)]],
+    constant uint& D_out               [[buffer(7)]],
+    threadgroup char*  shmem           [[threadgroup(0)]],
+    uint3 tgpig                        [[threadgroup_position_in_grid]],
+    ushort tiitg                       [[thread_index_in_threadgroup]],
+    ushort tiisg                       [[thread_index_in_simdgroup]],
+    ushort sgitg                       [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+    constexpr short nl = 2;
+
+    const uint ai = tgpig.z;
+    const uint expert = active_exp[ai];
+    if (expert >= 128u) return;
+
+    const int r0 = tgpig.y * NR0;
+    const int r1 = tgpig.x * NR1;
+
+    const uint gb = group_start[expert];
+    const uint ge = group_start[expert + 1];
+    const int neh1 = (int)(ge - gb);
+    if (r1 >= neh1) return;
+
+    const int ne00 = (int)D_in;
+    const int ne0  = (int)D_out;
+    const int nbc  = ne00 / 32;
+    const int blocks_per_expert = ne0 * nbc;
+
+    const ulong nb12 = (ulong)D_in * sizeof(half);
+
+    const short nr0 = (ne0 - r0 < NR0) ? short(ne0 - r0) : NR0;
+    const short nr1 = (neh1 - r1 < NR1) ? short(neh1 - r1) : NR1;
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : (nr0 - 1);
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : (nr1 - 1);
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+
+    const uint s_flat = gb + (uint)(r1 + lr1);
+    // slot_token-broadcast: lookup the source token for this slot.
+    const uint t_idx  = slot_token[s_flat];
+
+    const short offset1 = il0 / nl;
+
+    const short row_g = (short)(r0 + lr0);
+    const short ns    = row_g >> 5;
+    const short col   = row_g & 31;
+    device const block_q8_0_metal * x = ((device const block_q8_0_metal *)W_q80)
+        + (int)expert * blocks_per_expert
+        + (int)ns * nbc * 32
+        + (int)offset1 * 32
+        + col;
+
+    const short iy = 8 * (tiitg % NL1);
+    // Index X by t_idx, not s_flat (multiple slots may share a token).
+    device const half * y = (device const half *) ((device const char *)X
+        + nb12 * (ulong)t_idx + sizeof(half) * (ulong)iy);
 
     simdgroup_half8x8     ma[4];
     simdgroup_half8x8     mb[2];

@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "description": "Single source of truth for the M5 inference engine's kernel-zoo coverage. Both `tools/quant_search/quant_driver.py` (which enumerates valid configs for the search grid) and the Metal engine's auto-loaders (which dispatch the right kernel for each loaded GGUF tensor) read this file. Adding a new (tensor_class, format) cell here is the trigger to add the corresponding kernel to kernels.swift; conversely, the engine validates at boot that every entry here resolves to a real switch case in its dispatchers, so this file and the kernel zoo can never silently drift.",
+
+  "formats": {
+    "Q8_0": { "blk_bytes":  34, "blk_elems":  32, "bpw_eff": 8.5,
+              "notes": "8-bit (signed int8 + half scale). w = d * qs. Reference precision for dense weights." },
+    "Q6_K": { "blk_bytes": 210, "blk_elems": 256, "bpw_eff": 6.5625,
+              "notes": "K-quant 6bpw with (4+2)-bit interleaved packing. w = dl * q - ml. Used for high-importance dense (attn_v, token_embd) in K-quant mixes." },
+    "Q5_K": { "blk_bytes": 176, "blk_elems": 256, "bpw_eff": 5.5,
+              "notes": "K-quant 5bpw with paired sub-block scales + 1-bit qh. w = dl * (lo + qh_val) - ml." },
+    "Q5_1": { "blk_bytes":  24, "blk_elems":  32, "bpw_eff": 6.0,
+              "notes": "Legacy 5bpw with per-block d, m, qh. w = d * (nib | qh_bit << 4) + m. Common for ffn_down_exps in older quants." },
+    "Q4_K": { "blk_bytes": 144, "blk_elems": 256, "bpw_eff": 4.5,
+              "notes": "K-quant 4bpw with paired sub-block scales. w = dl * nib - ml. Canonical for ffn_gate_up_exps in K-quant mixes." },
+    "Q4_1": { "blk_bytes":  20, "blk_elems":  32, "bpw_eff": 5.0,
+              "notes": "Legacy 4bpw with d + additive offset m. w = d * nib + m. Simpler than Q4_K, slightly higher bpw than Q4_0." },
+    "Q4_0": { "blk_bytes":  18, "blk_elems":  32, "bpw_eff": 4.5,
+              "notes": "Legacy 4bpw with d only. w = d * (nib - 8). Simplest 4bpw — minimal dequant ALU; fastest 4bpw on Apple Silicon." },
+    "F16":  { "blk_bytes":   2, "blk_elems":   1, "bpw_eff": 16.0,
+              "notes": "IEEE half precision. Raw element-wise fp16; no block structure. Reference baseline." }
+  },
+
+  "tensor_classes": {
+    "token_embd": {
+      "kind": "embed_dequant",
+      "role": "Embedding lookup table. Dequantized once at load to fp16 (no per-step kernel).",
+      "allowed": ["Q8_0", "Q6_K", "F16"]
+    },
+    "attn_q":      { "kind": "dense", "role": "Attention query projection.",  "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_1", "Q4_0", "F16"] },
+    "attn_k":      { "kind": "dense", "role": "Attention key projection.",    "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_1", "Q4_0", "F16"] },
+    "attn_v":      { "kind": "dense", "role": "Attention value projection.",  "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_1", "Q4_0", "F16"] },
+    "attn_output": { "kind": "dense", "role": "Attention output projection.", "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_1", "Q4_0", "F16"] },
+    "ffn_gate":    { "kind": "dense", "role": "Shared FFN gate projection.",  "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_1", "Q4_0", "F16"] },
+    "ffn_up":      { "kind": "dense", "role": "Shared FFN up projection.",    "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_1", "Q4_0", "F16"] },
+    "ffn_down":    { "kind": "dense", "role": "Shared FFN down projection.",  "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_1", "Q4_0", "F16"] },
+
+    "ffn_gate_up_exps": {
+      "kind": "moe_up",
+      "role": "MoE expert gate+up weights, slot_token-broadcast convention (X[slot_token[s] * D_in]).",
+      "allowed": ["Q4_K", "Q5_K", "Q8_0", "Q4_1", "Q4_0", "F16"]
+    },
+    "ffn_down_exps": {
+      "kind": "moe_down",
+      "role": "MoE expert down-projection weights, per-slot convention (X[s * D_in]).",
+      "allowed": ["Q5_1", "Q6_K", "Q8_0", "Q4_1", "Q4_0", "F16"]
+    }
+  },
+
+  "llama_quantize_mixes": [
+    { "tag": "Q4_0",   "kind": "uniform", "format": "Q4_0" },
+    { "tag": "Q4_1",   "kind": "uniform", "format": "Q4_1" },
+    { "tag": "Q5_0",   "kind": "uniform_unsupported", "format": "Q5_0",
+      "note": "Q5_0 is in llama-quantize but no kernel coverage on this engine; a Q5_0 GGUF would fail loading." },
+    { "tag": "Q5_1",   "kind": "uniform", "format": "Q5_1" },
+    { "tag": "Q6_K",   "kind": "uniform", "format": "Q6_K" },
+    { "tag": "Q8_0",   "kind": "uniform", "format": "Q8_0" },
+    { "tag": "Q4_K_M", "kind": "k_quant_mix",
+      "moe_up": "Q4_K", "moe_down": "Q5_1", "dense_default": "Q8_0",
+      "note": "llama-quantize Q4_K_M canonical: shared dense Q8_0/Q5_K mix, MoE Q4_K up + Q5_1 down. The Q4_K_M GGUF you ship today." },
+    { "tag": "Q5_K_M", "kind": "k_quant_mix",
+      "moe_up": "Q5_K", "moe_down": "Q8_0", "dense_default": "Q5_K",
+      "note": "llama-quantize Q5_K_M canonical: dense Q5_K (with Q6_K for attn_v on some layers, Q8_0 for ffn_down on some layers per llama-quantize's importance heuristics), MoE Q5_K up + Q8_0/Q5_1 down." },
+    { "tag": "F16",    "kind": "uniform", "format": "F16" }
+  ]
+}

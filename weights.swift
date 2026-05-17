@@ -269,7 +269,8 @@ func loadLmWeights(ggufPath: String) throws -> LmWeights {
         }
     }
     // Auto-detecting MoE up loader (slot_token broadcast convention).
-    // Supports Q4_K (Q4_K_M default), Q5_K (Q5_K_M default), Q4_0 (--pure Q4_0).
+    // Supports Q4_K (Q4_K_M default), Q5_K (Q5_K_M default), Q4_0 (--pure Q4_0),
+    // and (since 2026-05-13) Q8_0 for uniform-Q8_0 quant-ablation builds.
     func loadMoEUpAuto(_ name: String) throws -> (MTLBuffer, GGMLType) {
         let info = try g.tensor(name)
         assertCapability(tensorClassFromName(name), info.dtype, tensorName: name)
@@ -282,6 +283,14 @@ func loadLmWeights(ggufPath: String) throws -> LmWeights {
             return (try loadMoESwizzled(name, dtype: .q4_0, blkBytes: 18, blkElems: 32, E: E_EXP), .q4_0)
         case .q4_1:
             return (try loadMoESwizzled(name, dtype: .q4_1, blkBytes: 20, blkElems: 32, E: E_EXP), .q4_1)
+        case .q8_0:
+            // Added 2026-05-13 alongside moe_gemv_q8_0_v11_up_b{1,2,4,8}.
+            // Same block params + swizzle as the q8_0 down loader because
+            // loadMoESwizzled is layout-agnostic between up and down — the
+            // (expert_stride, super_block, col-major-per-block) pattern is
+            // identical, only the dispatcher's hidden-pointer indirection
+            // differs at compute time.
+            return (try loadMoESwizzled(name, dtype: .q8_0, blkBytes: 34, blkElems: 32, E: E_EXP), .q8_0)
         case .f16:
             return (try loadF16Raw(name), .f16)
         default:

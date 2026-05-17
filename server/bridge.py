@@ -306,6 +306,83 @@ def _parse_sampling(body: dict, max_tokens: int) -> g.SamplingParams:
 _TOOL_CALL_OPEN = '<|tool_call>'
 _TOOL_CALL_CLOSE = '<tool_call|>'
 
+# Gemma-4 chat-template turn delimiters in textual form. Gemma-4 (unlike
+# Gemma-3) uses the `<|name>` / `<name|>` open/close convention for turn
+# boundaries — same shape as tool_call markers, different role. These are
+# atomic special tokens in the vocab (ids 105 and 106 respectively) but
+# detokenize() renders them as their literal surface strings. They should
+# never appear in user-facing content: the bridge already stops generation
+# on token 106, but token 106's TEXT can land in the output buffer before
+# the stop check fires, and the model can also spontaneously emit a turn
+# marker mid-stream (a sampling artefact analogous to the tool_call
+# spontaneous emission case).
+_TURN_OPEN_TEXT  = '<|turn>'
+_TURN_CLOSE_TEXT = '<turn|>'
+
+
+def _strip_turn_markers(text: str) -> str:
+    """Strip Gemma-4 turn-delimiter surface strings from user-facing
+    content. Handles three cases:
+
+      1. Full marker emitted as the special token (id 105 or 106): the
+         vocab renders it as the literal string `<|turn>` / `<turn|>`,
+         which we replace verbatim.
+      2. Full marker emitted as ordinary byte-level tokens (the model
+         hallucinates the marker as literal ASCII rather than as the
+         special token — observed when the prompt contains other angle-
+         bracket tags like </likert> that cue the model into a closing-
+         tag mode). Caught by the same substring replace.
+      3. PARTIAL marker emitted as ordinary tokens, then truncated by
+         max_tokens or EOS mid-marker: text ends with e.g. `<tur` or
+         `<turn` (a prefix of `<turn|>`). Caught by the trailing-prefix
+         scan below. We only strip prefixes of length ≥ 2 so we don't
+         eat legitimate trailing `<` characters in normal prose.
+    """
+    if _TURN_OPEN_TEXT in text or _TURN_CLOSE_TEXT in text:
+        text = text.replace(_TURN_OPEN_TEXT, "").replace(_TURN_CLOSE_TEXT, "")
+    # Trailing-prefix strip: walk longest → shortest, stop at first match.
+    for marker in (_TURN_CLOSE_TEXT, _TURN_OPEN_TEXT):
+        for plen in range(len(marker) - 1, 1, -1):
+            if text.endswith(marker[:plen]):
+                return text[:-plen]
+    return text
+
+
+class _StreamTurnMarkerStripper:
+    """Stateful filter that suppresses `<|turn>` and `<turn|>` markers
+    from streamed content deltas.
+
+    Both markers are atomic special tokens (ids 105, 106) — detokenize()
+    yields each as a single full string, so within a single delta they
+    appear in full or not at all. We still keep a small tail buffer of
+    (max_marker_len - 1) chars in case a future detokenize change ever
+    splits a marker across deltas. Drop the literal substring; do NOT
+    drop surrounding text (these are point markers, not span openers).
+    """
+
+    __slots__ = ("tail",)
+
+    def __init__(self):
+        self.tail = ""
+
+    def feed(self, chunk: str) -> str:
+        buf = self.tail + chunk
+        # Strip both markers from the buf as far as we can confidently.
+        # Hold back the last (marker_len - 1) chars in case a marker is
+        # being assembled across delta boundaries.
+        hold = max(len(_TURN_OPEN_TEXT), len(_TURN_CLOSE_TEXT)) - 1
+        safe_end = max(0, len(buf) - hold)
+        safe_part = buf[:safe_end].replace(_TURN_OPEN_TEXT, "").replace(_TURN_CLOSE_TEXT, "")
+        self.tail = buf[safe_end:]
+        return safe_part
+
+    def flush(self) -> str:
+        """Emit the held tail at end-of-stream, stripped of any whole
+        markers that happen to be entirely within it."""
+        t = self.tail.replace(_TURN_OPEN_TEXT, "").replace(_TURN_CLOSE_TEXT, "")
+        self.tail = ""
+        return t
+
 
 class _StreamMarkerStripper:
     """Stateful filter that suppresses `<|tool_call>...<tool_call|>` spans
@@ -719,7 +796,8 @@ async def _startup() -> None:
     global _TURN_END_TOKENS
     _TURN_END_TOKENS = [106]
     print(f"[bridge] chat-template end-of-turn tokens: {_TURN_END_TOKENS} "
-          f"(<end_of_turn>)", flush=True)
+          f"(<turn|> — Gemma-4 turn-close marker; renders as the literal "
+          f"7-char string and is stripped from user-facing content)", flush=True)
 
     _next_stream_id_lock = asyncio.Lock()
 
@@ -1147,6 +1225,13 @@ async def chat_completions(req: Request) -> Any:
                         headers={"Retry-After": "2"})
                 raise HTTPException(500, f"upstream stream errored: {err_msg or 'unspecified engine failure'}")
             text = g.detokenize(all_tokens)
+            # Strip Gemma-4 turn-delimiter surface strings (`<|turn>`,
+            # `<turn|>`) from the final text. These are atomic special
+            # tokens whose text form leaks into the output when the
+            # model emits them — typically a single `<turn|>` at the
+            # very end (immediately before the stop-token detection
+            # fires), but also possible mid-stream as a sampling artefact.
+            text = _strip_turn_markers(text)
             print(f"[bridge] usage: prompt_tokens={usage.get('prompt_tokens')}, "
                   f"completion_tokens={usage.get('completion_tokens')}, "
                   f"cache_hits={usage.get('cache_hits')}, "
@@ -1276,6 +1361,12 @@ async def chat_completions(req: Request) -> Any:
         # accumulated text and supersedes this filter for the structured
         # tool_calls payload. This is purely a content-cleanliness gate.
         marker_stripper = _StreamMarkerStripper()
+        # Same role, different markers: `<|turn>` / `<turn|>` are atomic
+        # special tokens whose text leaks into deltas when the model
+        # emits them. Run BEFORE the tool-call stripper because the
+        # tool-call stripper assumes its input is free of unrelated
+        # special-token surface bytes.
+        turn_stripper = _StreamTurnMarkerStripper()
         try:
             while True:
                 u: g.StreamUpdate = await response_q.get()
@@ -1334,6 +1425,9 @@ async def chat_completions(req: Request) -> Any:
                         # Filter `<|tool_call>...<tool_call|>` spans out
                         # of the visible content stream. Markers are
                         # processed structurally at end-of-stream below.
+                        # Pre-filter `<|turn>` / `<turn|>` first — those
+                        # are point-strips, never wrap tool_call spans.
+                        delta_text = turn_stripper.feed(delta_text)
                         filtered = marker_stripper.feed(delta_text)
                         if filtered:
                             yield ("data: " + json.dumps({
@@ -1382,11 +1476,17 @@ async def chat_completions(req: Request) -> Any:
                         break
                     finish = "stop" if u.done_reason == 1 else (
                         "length" if u.done_reason == 2 else "stop")
-                    # Flush any held-back tail from the marker stripper
-                    # before final extraction. The stripper holds up to
+                    # Flush any held-back tail from the marker strippers
+                    # before final extraction. Each holds up to
                     # (max_marker_len-1) bytes that *might* have been a
                     # marker prefix; at stream end we know they aren't.
-                    final_tail = marker_stripper.flush()
+                    # Run turn-stripper first (point markers, can be inside
+                    # any text), then tool-call stripper (span markers).
+                    turn_tail = turn_stripper.flush()
+                    if turn_tail:
+                        final_tail = marker_stripper.feed(turn_tail) + marker_stripper.flush()
+                    else:
+                        final_tail = marker_stripper.flush()
                     if final_tail:
                         yield ("data: " + json.dumps({
                             "id": completion_id,
@@ -1405,6 +1505,10 @@ async def chat_completions(req: Request) -> Any:
                     # and flip finish to "tool_calls" per OAI spec.
                     if had_tools:
                         full_text = g.detokenize(all_tokens)
+                        # Strip turn markers from the aggregated text used
+                        # for tool-call extraction so a stray `<turn|>`
+                        # doesn't break the tool_call body parser.
+                        full_text = _strip_turn_markers(full_text)
                         _, extracted = _extract_tool_calls(
                             full_text, had_tools=True)
                         if extracted:

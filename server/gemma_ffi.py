@@ -558,15 +558,44 @@ def detokenize(tokens: list[int]) -> str:
     if n == 0:
         return ""
     arr = (C.c_uint32 * n)(*tokens)
-    cap = max(256, n * 4)
-    buf = C.create_string_buffer(cap)
-    written = _lib.gemma_detokenize(arr, n, buf, cap)
-    if written < 0:
-        raise RuntimeError(f"gemma_detokenize returned {written}")
-    if written > cap:
-        cap = written + 1
+    # Buffer-cap fix (2026-05-16): the previous formula `max(256, n * 4)`
+    # silently truncated any response whose bytes/token > 4 (very common
+    # for emoji + multi-byte UTF-8 + sub-word tokens that expand). The C
+    # gemma_detokenize fills the buffer to capacity but returns the
+    # bytes-written count (capped at the buffer size), NOT the would-have-
+    # written overshoot — so the resize-on-overshoot retry path
+    # `if written > cap` never triggers, and the buffer contents come
+    # back null-terminated mid-byte. Confirmed by a direct probe series:
+    # tokens=60 → cap=256 → output exactly 256 chars mid-word.
+    #
+    # Fix: (1) provision a generous initial cap (n * 32 + 4096 headroom
+    # covers worst-case emoji-heavy outputs by an order of magnitude),
+    # AND (2) treat `written >= cap` as a possible truncation signal and
+    # retry with a doubled buffer in a loop until the C function returns
+    # comfortably less than cap.
+    cap = max(4096, n * 32)
+    while True:
         buf = C.create_string_buffer(cap)
         written = _lib.gemma_detokenize(arr, n, buf, cap)
+        if written < 0:
+            raise RuntimeError(f"gemma_detokenize returned {written}")
+        # If the C function reports an explicit overshoot, use that.
+        if written > cap:
+            cap = written + 1
+            continue
+        # If written exactly equals cap, the C function MAY have silently
+        # truncated (it can't tell us "I needed more"). Double the cap and
+        # retry. We cap retries at 16 doublings (~16 MB) which is well
+        # beyond any reasonable single-turn output.
+        if written == cap:
+            if cap >= (1 << 24):  # 16 MB sanity limit
+                raise RuntimeError(
+                    f"gemma_detokenize buffer kept saturating up to {cap} bytes for {n} tokens "
+                    "— likely a real C-side bug; bailing rather than silently truncate"
+                )
+            cap *= 2
+            continue
+        break
     raw = buf.value.decode("utf-8", errors="replace")
     return _collapse_byte_fallback_escapes(raw)
 
