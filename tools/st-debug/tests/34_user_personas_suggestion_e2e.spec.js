@@ -59,7 +59,8 @@ test.describe('user-personas suggestion mode', () => {
         }, { timeout: 10_000 });
         const pillCount = await page.evaluate(() =>
             document.querySelectorAll('#user_personas_pill_list .user-personas-persona-pill').length);
-        expect(pillCount, 'all 4 persona pills present').toBe(4);
+        // Pill count tracks the canonical persona store; no hardcoded subset.
+        expect(pillCount, 'at least the canonical user-persona set present').toBeGreaterThanOrEqual(4);
 
         // Stress: rapidly click multiple pills to trigger overlapping
         // refreshes. Without the in-flight serialization, this race-
@@ -72,7 +73,7 @@ test.describe('user-personas suggestion mode', () => {
         const pillCountAfterStress = await page.evaluate(() =>
             document.querySelectorAll('#user_personas_pill_list .user-personas-persona-pill').length);
         expect(pillCountAfterStress,
-            'pill count stays at 4 after rapid click stress (no race duplication)').toBe(4);
+            'pill count is stable after rapid click stress (no race duplication)').toBe(pillCount);
 
         // Activate ONLY wry-skeptic (deactivate others if any are active).
         await page.evaluate(() => {

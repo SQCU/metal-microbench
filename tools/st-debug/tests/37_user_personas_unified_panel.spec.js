@@ -55,54 +55,88 @@ test.describe('user-personas unified panel (phase 4)', () => {
 
         const cardCount = await page.evaluate(() =>
             document.querySelectorAll('#user_personas_panel .user-personas-card').length);
-        expect(cardCount, '4 persona cards present').toBe(4);
+        // Card count is bounded by the yapper-seed K (2 top + 2 side = 4
+        // tuples), reduced if Gemma dedups overlapping bio_ids across the
+        // two calls. Assert sensible floor (Gemma returned at least one
+        // tuple per call) rather than exact 4.
+        expect(cardCount, 'yapper-seed returned at least 2 cards').toBeGreaterThanOrEqual(2);
         await page.screenshot({ path: testInfo.outputPath('02_panel_expanded.png'), fullPage: true });
 
-        // (3) Each card has a mode <select> with three options.
-        const firstCardModeOpts = await page.evaluate(() => {
-            const sel = document.querySelector(
-                '#user_personas_panel .user-personas-card[data-persona-id="wry-skeptic"] .user-personas-card-mode');
-            if (!sel) return null;
-            return Array.from(sel.options).map(o => o.value);
+        // (3) Pick an arbitrary populated card and assert it has a mode
+        // button + a swap button. Yapper-seed picks which personas show
+        // up; test asserts SHAPE, not specific id.
+        const firstCardId = await page.evaluate(() => {
+            const card = document.querySelector(
+                '#user_personas_panel .user-personas-card[data-persona-id]');
+            return card ? card.dataset.personaId : null;
         });
-        expect(firstCardModeOpts, 'wry-skeptic card has three mode options').toEqual(['off', 'suggest', 'autonomous']);
+        expect(firstCardId, 'at least one populated card rendered').toBeTruthy();
+        const cardShape = await page.evaluate((pid) => {
+            const card = document.querySelector(
+                `#user_personas_panel .user-personas-card[data-persona-id="${pid}"]`);
+            if (!card) return null;
+            return {
+                has_mode_btn: !!card.querySelector('.user-personas-card-mode-btn'),
+                has_swap_btn: !!card.querySelector('.user-personas-card-swap-btn'),
+                mode_btn_text: card.querySelector('.user-personas-card-mode-btn')?.textContent,
+            };
+        }, firstCardId);
+        expect(cardShape.has_mode_btn, `${firstCardId} has mode-cycle button`).toBe(true);
+        expect(cardShape.has_swap_btn, `${firstCardId} has swap button`).toBe(true);
+        // Yapper-seed top cards default to 'suggest' mode; side cards to 'off'.
+        // The first card in the panel is from the top set so it's 'suggest'.
+        expect(['off', '✓ suggest', '⚡ auto']).toContain(cardShape.mode_btn_text);
 
-        // (4) Set wry-skeptic to 'suggest' via the dropdown → triggers /poll
+        // Empty placeholder cards: assert they're rendered (drawer should
+        // always show TARGET_SLOTS=8 cells total).
+        const emptyCount = await page.evaluate(() =>
+            document.querySelectorAll('#user_personas_panel .user-personas-card-empty').length);
+        expect(emptyCount, 'empty placeholder cards rendered to fill slate').toBeGreaterThanOrEqual(1);
+
+        // (4) Cycle the mode button to 'suggest' (if not already) and
+        // verify /poll fires when it enters suggest/autonomous mode.
         const pollsBefore = pluginRequests.filter(r => r.endpoint === 'poll').length;
-        await page.evaluate(() => {
-            const sel = document.querySelector(
-                '#user_personas_panel .user-personas-card[data-persona-id="wry-skeptic"] .user-personas-card-mode');
-            sel.value = 'suggest';
-            sel.dispatchEvent(new Event('change', { bubbles: true }));
-        });
-        // Wait for the preview to land (or error). The pollAndCachePreview
-        // call fires immediately on mode change.
-        await page.waitForFunction(() => {
+        const startedAt = cardShape.mode_btn_text;
+        // If we start at 'off', one cycle gets to 'suggest'. Otherwise
+        // cycle through the full loop until we land back at 'suggest'.
+        const cyclesNeeded = startedAt === 'off' ? 1
+            : startedAt === '✓ suggest' ? 3
+            : 2;  // '⚡ auto' → off → suggest
+        for (let i = 0; i < cyclesNeeded; i++) {
+            await page.locator(
+                `#user_personas_panel .user-personas-card[data-persona-id="${firstCardId}"] .user-personas-card-mode-btn`
+            ).click();
+            await page.waitForTimeout(100);
+        }
+        // Wait for the preview to land (or error).
+        await page.waitForFunction((pid) => {
             const slot = document.querySelector(
-                '#user_personas_panel .user-personas-card[data-persona-id="wry-skeptic"] .user-personas-card-preview-slot');
+                `#user_personas_panel .user-personas-card[data-persona-id="${pid}"] .user-personas-card-preview-slot`);
             if (!slot) return false;
             const preview = slot.querySelector('.user-personas-card-preview');
             return preview && !preview.classList.contains('is-loading');
-        }, { timeout: 90_000 });
+        }, firstCardId, { timeout: 90_000 });
         await page.waitForTimeout(300);
 
         const pollsAfter = pluginRequests.filter(r => r.endpoint === 'poll').length;
-        expect(pollsAfter, 'one /poll fired on mode-change to suggest').toBe(pollsBefore + 1);
+        expect(pollsAfter, 'one /poll fired on mode-change to suggest').toBeGreaterThan(pollsBefore);
 
         // Preview is rendered with text.
-        const previewText = await page.evaluate(() => {
+        const previewText = await page.evaluate((pid) => {
             const preview = document.querySelector(
-                '#user_personas_panel .user-personas-card[data-persona-id="wry-skeptic"] .user-personas-card-preview');
+                `#user_personas_panel .user-personas-card[data-persona-id="${pid}"] .user-personas-card-preview`);
             return preview ? preview.innerText.trim() : null;
-        });
+        }, firstCardId);
         expect(previewText, 'preview slot contains generated text').toBeTruthy();
-        expect(previewText.length, 'preview is non-empty').toBeGreaterThan(20);
-        console.log(`[preview text head] ${previewText.slice(0, 120)}`);
-        await page.screenshot({ path: testInfo.outputPath('03_wry_suggest_preview.png'), fullPage: true });
+        // Some bios legitimately produce short outputs (e.g. 'minimalist'
+        // returns "?" or "." by design). Assert any text, not a length floor.
+        expect(previewText.length, 'preview is non-empty').toBeGreaterThan(0);
+        console.log(`[${firstCardId} preview head] ${previewText.slice(0, 120)}`);
+        await page.screenshot({ path: testInfo.outputPath('03_suggest_preview.png'), fullPage: true });
 
         // (5) Click the preview → text lands in #send_textarea.
         await page.locator(
-            '#user_personas_panel .user-personas-card[data-persona-id="wry-skeptic"] .user-personas-card-preview'
+            `#user_personas_panel .user-personas-card[data-persona-id="${firstCardId}"] .user-personas-card-preview`
         ).click();
         await page.waitForTimeout(200);
         const taValue = await page.evaluate(() =>
