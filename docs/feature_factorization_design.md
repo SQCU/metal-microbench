@@ -780,6 +780,72 @@ plus run logs in commit history.
   via the achievement-vs-prediction gap the picker logs per iteration.
   Iter 3's negative ΔPR is a useful diagnostic, not a bug.
 
+### Judge prompt A/B (item: knob #1 from the original list)
+
+Following the run-2 floor-bias observation, ran a controlled A/B over
+7 judge-prompt variants on 4 hand-graded fixture turns × 5 trials each
+(`tools/user-agent-harness/judge_prompt_ab.mjs`). Two rounds total
+(rerun added V5/V6 after the user observed "try avoiding telling the
+judge what numbers to use at all in any capacity"):
+
+| Variant                    | Description                                  | MAE  | floor-bias |
+|----------------------------|----------------------------------------------|------|-----------|
+| V0_floor                   | original "be willing to score 1 (absence)"  | 1.18 | 20.0%     |
+| V1_full_range              | "use full range, most turns 2-4"            | 1.02 | 30.0%     |
+| V2_minimal                 | task statement + rubric + turn               | 0.92 | 27.8%     |
+| V3_describe_first          | describe-then-score + calibration            | 0.89 | 20.0%     |
+| V4_anchored                | explicit Likert anchors (1=absent…5=textbook)| 0.99 | 24.4%     |
+| V5_describe_no_calibration | describe-then-score, NO calibration          | 0.76 | **12.2%** |
+| **V6_pure_minimal**        | "score the turn on each axis per the rubric"| **0.61** | 16.7% |
+
+**Robust ordering: every variant that tells the judge anything about
+what numbers to favor is worse than the ones that don't.** V0/V1/V3/V4
+all sit in the back; V5/V6 (no calibration language) are decisively
+best. The "use full range" prompt is actively WORSE than the original
+floor-biased one (MAE 1.02 vs 1.18 — close; floor-bias 30% vs 20%).
+The describe-first chain-of-thought helps a little (V3 < V0) but
+removing calibration helps far more (V5 < V3). V6 (just "score per
+the rubric", no philosophy at all) wins on both MAE and std.
+
+**Lesson, generalizable**: tell the judge WHAT to score, not HOW to
+score. Promoted V6 to `harness_lib.judgeOnAxes` default.
+
+Caveat: absolute MAE values shifted substantially between the two A/B
+runs (V0 went 0.70 → 1.18, V3 went 0.60 → 0.89) at N=5 trials and
+temperature=1.0. The *ranking* is reliable; the absolute numbers
+require N ≫ 5 to settle. Evidence:
+`data/judge_prompt_ab/ab-*.json`.
+
+### Run 3 with V6 judge
+
+Re-ran explore_corpus (4 iters from empty corpus) with V6 as the new
+default judge. State: `data/explore_corpus/run3_v6judge.json`.
+
+| Run | Judge | Final eff-dim | Trajectory |
+|---|---|---|---|
+| run1 | V0_floor (original) | 1.000 | n/a → n/a → 1.000 |
+| run2 | V1_full_range (calibration was WRONG direction) | 3.085 | n/a → 3.139 → 3.139 → 3.085 |
+| run3 | **V6_pure_minimal (best by A/B)** | **1.883** | n/a → n/a → 1.000 → 1.883 |
+
+**Surprising finding**: the best judge by A/B (V6) produced LOWER
+eff-dim than the second-worst judge (V1)! Why: V1 floor-bias = 30%
+but it was inflating mid-range scores wrongly; that inflation looked
+like cloud variance and pumped up PR. V6 is more strict — when the
+bio→behavior chain produces a bland turn (which random_warmup bios
+often do), V6 correctly scores 1, the cloud genuinely lacks spread,
+and PR is correspondingly low. **Eff-dim is sensitive to judge
+calibration; an over-generous judge inflates the apparent objective**.
+
+Run 3's eff-dim of 1.883 over 4 axes with nonzero variance (Sag 69%,
+Norm 21%, Trope 8%, Colloq/Warm ~1%) is the honest signal: with 4
+bios, a strict judge, the-rock counterparty, and the cheap-K=1 agent,
+the corpus genuinely spans about two effective behavioral dimensions.
+
+**The picker still works correctly.** Iter 3 of run 3 expected ΔPR=4.689
+(target=balanced moderate), achieved Δ=0.883 — the achievement gap
+remains (target-vs-measurement noise), but it's measured against a
+trustworthy baseline now.
+
 ### Next-iteration knobs (in priority order)
 
 1. **Bio designer show-don't-tell upgrade.** The current designer

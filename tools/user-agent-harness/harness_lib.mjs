@@ -141,18 +141,19 @@ export async function judgeOnAxis(turn, axisName, axisDef) {
 // multi-axis judging when ≤ ~14 axes fit comfortably in one prompt.
 
 export async function judgeOnAxes(turn, axes) {
+    // V6_pure_minimal prompt: best variant from the A/B characterization
+    // in judge_prompt_ab.mjs (run-2). Aggregate MAE=0.61, std=0.08, the
+    // best on both axes among 7 variants. Every variant that TOLD the
+    // judge what numbers to favor (V0 "score 1 when absent", V1 "use full
+    // range / most turns 2-4", V3 "describe + use full range", V4 explicit
+    // anchors) sat in the middle or back of the pack. Stripping calibration
+    // nudges entirely beats prompt-engineering them. The lesson: tell the
+    // judge what to score, not how to score.
     const rubric = axes.map(a => `- **${a.name}** — ${a.def}`).join('\n');
     const template = axes.map(a => `${a.name}: ?`).join('\n');
     const sys =
-        'You are a behavioural-axis judge. You read ONE user-side chat ' +
-        'turn and score it on the listed axes (integer 1-5 each). The ' +
-        'turn is the only ground truth. USE THE FULL 1-5 RANGE. A turn ' +
-        'that moderately expresses an axis should score 3, not 1. Score ' +
-        '1 only when the axis is genuinely absent from this turn; score ' +
-        '5 when the turn is a textbook example of the high pole. Most ' +
-        'real turns sit between 2 and 4. Output ONLY the axis lines ' +
-        'below — one axis per line, each as "axis_name: <integer 1-5>". ' +
-        'No preamble, no commentary, no markdown.';
+        'Score the turn on each axis. Output one line per axis: ' +
+        '"axis_name: N" where N is an integer 1-5 per the rubric.';
     const usr =
         '## Axes (each 1-5)\n\n' + rubric + '\n\n' +
         '## Turn to score\n\n' +
