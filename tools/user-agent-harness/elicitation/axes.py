@@ -22,6 +22,17 @@ LIKERT_AXES = [
     ("register_colloquial", "1: formal / standard English · 5: colloquial / slang / vernacular"),
     ("playful",             "1: serious throughout · 5: humour / wordplay / levity"),
     ("structured",          "1: flowing prose · 5: organised / numbered / bulleted"),
+    ("trope_density",       "1: novel / specific / texture-this-writer-couldn't-have-anticipated · 5: fully tropey / anonymous-genre-material / no individuating texture"),
+    # ── "Plays nicely with others" triplet (added 2026-05-17) ────────────
+    # DESCRIPTIVE, NOT NORMATIVE. We usually want most agents median or
+    # above on these — but some agents are intentionally floor-low and
+    # that's a feature (and often funny). The Rock as a USER-agent in
+    # a multi-user chat would score floor on all three by design and
+    # that radical-bio-adherence IS the comedic point. Score what's
+    # there; don't push toward 5.
+    ("ludic_engagement",    "1: bio-anchored / self-presentation regardless of scene cues (the rock-as-user-agent would be hilariously low) · 5: scene-coupled / actively engages with environmental cues, objects, partner's frame"),
+    ("user_multipolarity",  "1: dyadic-only / addresses one partner (often the assistant) regardless of who else is in the room · 5: multi-pole / treats each participant as a separately-addressable counterparty with own stakes"),
+    ("other_awareness",     "1: porous / mirrors-or-becomes the partner's frame, bio, or motivation (a feature for some designs, a bug for others) · 5: anchored / stays in own bio + own motivation while still acknowledging the partner's frame"),
 ]
 AXIS_NAMES = [a for a, _ in LIKERT_AXES]
 N_AXES = len(LIKERT_AXES)
