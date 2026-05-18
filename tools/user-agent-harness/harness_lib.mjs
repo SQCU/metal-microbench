@@ -40,19 +40,57 @@ export async function bridgeCall(messages, { max_tokens = null, temperature = 1.
 
 // ── persistence ──────────────────────────────────────────────────────
 
+// Lazy import: axis_registry is the source of truth for what axes to
+// extract. Passed to /signature-extract on every saveBio/saveAgent call.
+async function _loadAxisRegistry() {
+    const mod = await import('./axis_registry.mjs');
+    return mod.allAxes().map(a => ({ name: a.name, def: a.def }));
+}
+
+/**
+ * Save a bio. HARD REQUIREMENT: computes a signature via /signature-extract
+ * BEFORE POST so the bio is born with metadata complete. Plugin's POST
+ * /personas rejects unsigned writes. The axes for extraction come from
+ * the harness's axis_registry.mjs — single source of truth, grows over
+ * time as the splitter/disambiguator add derived axes.
+ */
 export async function saveBio({ canonical_key, name, prose }) {
+    const system_prompt = `You are ${name}. ${prose}`;
+    const proseForSig = `Bio (user-side persona):\n${prose}\n\nVoice clauses:\n${system_prompt}`;
+    const axes = await _loadAxisRegistry();
+    const sig = await http('POST', `${PLUGIN}/signature-extract`, { prose: proseForSig, axes });
+    if (!sig || !sig.signature || typeof sig.signature !== 'object') {
+        throw new Error(`saveBio: /signature-extract returned no signature for ${canonical_key}`);
+    }
     await http('POST', `${PLUGIN}/personas/${encodeURIComponent(canonical_key)}`, {
-        name, bio: prose,
-        system_prompt: `You are ${name}. ${prose}`,
+        name, bio: prose, system_prompt,
+        signature: sig.signature,
     });
 }
 
+/**
+ * Save an agent. Same hard rule + same axis source as saveBio.
+ */
 export async function saveAgent(agent_id, name, agent_text, designed_for_bio_id) {
+    const personasResp = await http('GET', `${PLUGIN}/personas`);
+    const bio = (personasResp.personas || []).find(p => p.id === designed_for_bio_id);
+    const bioProse = bio?.bio || '';
+    const bioVoice = bio?.system_prompt || '';
+    const compositionProse =
+        `Bio (user-side persona):\n${bioProse}\n\n` +
+        `Bio voice clauses:\n${bioVoice}\n\n` +
+        `Agent voice clauses (injected at depth 1):\n${agent_text}`;
+    const axes = await _loadAxisRegistry();
+    const sig = await http('POST', `${PLUGIN}/signature-extract`, { prose: compositionProse, axes });
+    if (!sig || !sig.signature || typeof sig.signature !== 'object') {
+        throw new Error(`saveAgent: /signature-extract returned no signature for ${agent_id}`);
+    }
     await http('POST', `${PLUGIN}/agents/${encodeURIComponent(agent_id)}`, {
         name, agent_text,
         designed_for_bio_id,
         injection_mode: 'authors_note',
         injection_depth: 1,
+        signature: sig.signature,
     });
 }
 
