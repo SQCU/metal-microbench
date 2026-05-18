@@ -868,3 +868,95 @@ trustworthy baseline now.
 5. **Noise-aware objective.** Model the bio→achievement noise per axis
    (the gap between target and measured), and pick candidates that
    maximize E[ΔPR | noise-model] instead of assuming exact hits.
+
+## 8. Context-suggester (Phase A shipped)
+
+### Problem
+
+As the harness procedurally generates more bios, the suggester sidebar
+becomes unusable — scrolling through every persona by default is bad
+UX, and the "activate suggest for all" button becomes dangerous /
+expensive at scale. Necessary UX shift to filter the drawer to a small
+contextually-appropriate selection.
+
+### Algorithm (Phase A — `tools/user-agent-harness/context_suggester.mjs`)
+
+```
+inputs:  chat context (recent messages), K_active (e.g. 2), K_disabled (e.g. 2)
+1. Load persona-signature manifest from data/ run files.
+2. Compute per-axis coverage across the manifest.
+3. Call ContextJudge ONCE:
+     prompt = (axis registry with coverage tags + chat context)
+     output = K_active+K_disabled SPARSE target vectors
+              (each = {label, rationale, axes: {axis_name: int, ...}})
+   IMPORTANT: bios/agents NEVER enter the prompt — cost stays O(1) in
+   corpus size.
+4. For each target: sparse Euclidean distance to every persona;
+   pick the nearest. Skip personas already picked (no duplicates).
+5. First K_active picks would auto-trigger /poll in the UI;
+   next K_disabled render as click-to-enable.
+output:  {active: [persona_ids], disabled: [persona_ids], targets, evidence}
+```
+
+The judge is told which axes are well-covered (≥30% of manifest)
+and instructed to prefer them — otherwise it proposes targets the
+NN can't match (early A/B run had this failure mode).
+
+### Phase A results
+
+Manifest: 19 personas from explore_corpus, cluster_disambig, and
+lock_in_iterative runs. Coverage skew (axes with ≥30%): astrology_sagittarian
+68%, normative_directionality 32%, warm 58%, register_colloquial 58%,
+trope_density 58%, plus a long tail of sparse axes.
+
+Ran on 3 fixture contexts:
+
+| Target type the judge proposed | Grief context | Tech-debate context | Rock-intro context |
+|---|---|---|---|
+| Directive / blunt / philosophical | **Moral Preacher** (Norm=5) | **Moral Preacher** (Norm=5) | **Moral Preacher** (Norm=5) |
+| Sentimental / Cancer-coded | **RPG Rogue Cancer** | — | **RPG Rogue Cancer** |
+| Casual / warm | Sag Paraphrase 3 | **Sag Paraphrase 3** | Sag Paraphrase 1 |
+| Tech-bro / oversensitive engineer | — | **RPG Wizard Sagittarius** + Physical Explorer | — |
+| Trope-y melodrama | Physical Explorer | — | Physical Explorer |
+
+Evidence: `data/context_suggester/chat_*-*.json`.
+
+### Findings
+
+1. **The pipeline works end-to-end.** Each context produces a
+   distinct set of K_active+K_disabled picks; the picks correlate
+   with the proposed target types in sensible ways.
+2. **Coverage-aware prompting is necessary.** Without telling the judge
+   which axes the manifest covers, it proposed axes that no persona had
+   measured → no-match outcomes. Adding the coverage hint reduced
+   no-matches from 2/12 → 0/12 across the three fixtures.
+3. **Moral Preacher dominates** because it's the only persona with
+   normative_directionality ≥ 5, and the judge keeps proposing
+   "directive / blunt / opinionated" target archetypes for many
+   contexts. **This is a feature, not a bug**: it correctly identifies
+   that the Preacher fills a niche the rest of the corpus doesn't
+   cover. With more bio diversity, the picks would spread.
+4. **Bland bios are correctly de-prioritized.** The mostly-1s
+   `explore-iter*` bios from random_warmup iterations almost never get
+   picked — they don't differentiate from each other or the baseline.
+   The harness's measured per-axis variation drives the selection.
+5. **Cost is O(1) in corpus size** for the LLM call. One ContextJudge
+   per chat-context, regardless of N_personas. NN lookup is trivial.
+   Compare per-persona LLM judging: would be O(N_personas) calls per
+   suggestion refresh.
+
+### Phase B (not yet started)
+
+Port the algorithm to the diegetic UI:
+
+- `POST /suggest-personas` plugin endpoint wrapping the algorithm.
+- Suggester sidebar default = filtered view with K_active+K_disabled
+  picks; K_active auto-triggers /poll, K_disabled = click-to-enable.
+- "Show all" toggle to drop back to the current full-list behavior.
+- Persona signatures need to be persisted alongside bios — either
+  extend `POST /personas/<key>` to accept a `signature` parameter, or
+  build a live aggregator endpoint that reads `data/` files at query
+  time. The Phase A script's `loadManifest()` is a reference impl.
+- Optional refinement: per-axis backfill so every persona has
+  measurements on the same canonical bio_axes set (improves NN
+  match quality across the corpus uniformly).

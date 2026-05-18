@@ -1,0 +1,181 @@
+{
+  "chat_path": "data/context_suggester/fixtures/chat_rock_intro.json",
+  "chat_messages": [
+    {
+      "role": "assistant",
+      "content": "*The rock sits in a clearing. It is a rock. The wind moves over it.*"
+    }
+  ],
+  "k_active": 2,
+  "k_disabled": 2,
+  "manifest_size": 19,
+  "judge_raw": "```json\n{\"targets\": [{\"label\": \"The philosophical observer pondering the essence of existence\", \"rationale\": \"A user who engages with the abstraction of the rock to discuss metaphysics.\", \"axes\": {\"curious\": 5, \"probe_depth\": 4, \"goal_clarity\": 2, \"in_character\": 4, \"warm\": 2}}, {\"label\": \"The impatient traveler annoyed by the stillness\", \"rationale\": \"A character who finds the lack of action frustrating and wants to drive the narrative forward quickly.\", \"axes\": {\"terse\": 4, \"affective_intensity\": 3, \"goal_clarity\": 4, \"normative_directionality\": 4, \"playful\": 1}}, {\"label\": \"The whimsical sprite playing with the environment\", \"rationale\": \"A lighthearted character who treats the rock and wind as playthings or conversational partners.\", \"axes\": {\"playful\": 5, \"ludic_engagement\": 5, \"warm\": 4, \"register_colloquial\": 4, \"trope_density\": 3}}, {\"label\": \"The clinical researcher documenting the scene\", \"rationale\": \"A highly structured, detached persona treating the clearing as a site for data collection.\", \"axes\": {\"structured\": 5, \"terse\": 3, \"in_character\": 3, \"curious\": 3, \"probe_depth\": 3, \"affective_intensity\": 1}}]}\n```",
+  "targets": [
+    {
+      "label": "The philosophical observer pondering the essence of existence",
+      "rationale": "A user who engages with the abstraction of the rock to discuss metaphysics.",
+      "axes": {
+        "curious": 5,
+        "probe_depth": 4,
+        "goal_clarity": 2,
+        "in_character": 4,
+        "warm": 2
+      }
+    },
+    {
+      "label": "The impatient traveler annoyed by the stillness",
+      "rationale": "A character who finds the lack of action frustrating and wants to drive the narrative forward quickly.",
+      "axes": {
+        "terse": 4,
+        "affective_intensity": 3,
+        "goal_clarity": 4,
+        "normative_directionality": 4,
+        "playful": 1
+      }
+    },
+    {
+      "label": "The whimsical sprite playing with the environment",
+      "rationale": "A lighthearted character who treats the rock and wind as playthings or conversational partners.",
+      "axes": {
+        "playful": 5,
+        "ludic_engagement": 5,
+        "warm": 4,
+        "register_colloquial": 4,
+        "trope_density": 3
+      }
+    },
+    {
+      "label": "The clinical researcher documenting the scene",
+      "rationale": "A highly structured, detached persona treating the clearing as a site for data collection.",
+      "axes": {
+        "structured": 5,
+        "terse": 3,
+        "in_character": 3,
+        "curious": 3,
+        "probe_depth": 3,
+        "affective_intensity": 1
+      }
+    }
+  ],
+  "picks": [
+    {
+      "target": {
+        "label": "The philosophical observer pondering the essence of existence",
+        "rationale": "A user who engages with the abstraction of the rock to discuss metaphysics.",
+        "axes": {
+          "curious": 5,
+          "probe_depth": 4,
+          "goal_clarity": 2,
+          "in_character": 4,
+          "warm": 2
+        }
+      },
+      "persona": {
+        "persona_id": "explore-iter3-mpasxidh.png",
+        "name": "Explore Iter 3",
+        "sig": {
+          "astrology_sagittarian": 2.25,
+          "astrology_cancerian": 1,
+          "normative_directionality": 2.25,
+          "trope_density": 1.75,
+          "register_colloquial": 1.25,
+          "warm": 1.25
+        },
+        "distance": 0.75,
+        "n_axes_compared": 1,
+        "n_axes_missing": 4
+      }
+    },
+    {
+      "target": {
+        "label": "The impatient traveler annoyed by the stillness",
+        "rationale": "A character who finds the lack of action frustrating and wants to drive the narrative forward quickly.",
+        "axes": {
+          "terse": 4,
+          "affective_intensity": 3,
+          "goal_clarity": 4,
+          "normative_directionality": 4,
+          "playful": 1
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-substantive-preacher.png",
+        "name": "Sag Substantive — Moral Preacher",
+        "sig": {
+          "astrology_sagittarian": 4,
+          "sensory_orientation": 2.75,
+          "normative_directionality": 5,
+          "referential_anchor": 4.25
+        },
+        "distance": 1,
+        "n_axes_compared": 1,
+        "n_axes_missing": 4
+      }
+    },
+    {
+      "target": {
+        "label": "The whimsical sprite playing with the environment",
+        "rationale": "A lighthearted character who treats the rock and wind as playthings or conversational partners.",
+        "axes": {
+          "playful": 5,
+          "ludic_engagement": 5,
+          "warm": 4,
+          "register_colloquial": 4,
+          "trope_density": 3
+        }
+      },
+      "persona": {
+        "persona_id": "explore-iter2-mpasabse.png",
+        "name": "Explore Iter 2",
+        "sig": {
+          "astrology_sagittarian": 1,
+          "astrology_cancerian": 1,
+          "normative_directionality": 1,
+          "trope_density": 1,
+          "register_colloquial": 2,
+          "warm": 1
+        },
+        "distance": 2.3804761428476167,
+        "n_axes_compared": 3,
+        "n_axes_missing": 2
+      }
+    },
+    {
+      "target": {
+        "label": "The clinical researcher documenting the scene",
+        "rationale": "A highly structured, detached persona treating the clearing as a site for data collection.",
+        "axes": {
+          "structured": 5,
+          "terse": 3,
+          "in_character": 3,
+          "curious": 3,
+          "probe_depth": 3,
+          "affective_intensity": 1
+        }
+      },
+      "persona": null
+    }
+  ],
+  "active": [
+    {
+      "target_label": "The philosophical observer pondering the essence of existence",
+      "persona_id": "explore-iter3-mpasxidh.png",
+      "persona_name": "Explore Iter 3"
+    },
+    {
+      "target_label": "The impatient traveler annoyed by the stillness",
+      "persona_id": "cluster-sag-substantive-preacher.png",
+      "persona_name": "Sag Substantive — Moral Preacher"
+    }
+  ],
+  "disabled": [
+    {
+      "target_label": "The whimsical sprite playing with the environment",
+      "persona_id": "explore-iter2-mpasabse.png",
+      "persona_name": "Explore Iter 2"
+    },
+    {
+      "target_label": "The clinical researcher documenting the scene"
+    }
+  ]
+}

@@ -1,0 +1,193 @@
+{
+  "chat_path": "data/context_suggester/fixtures/chat_grieving_friend.json",
+  "chat_messages": [
+    {
+      "role": "assistant",
+      "content": "I just don't know how to keep going. I lost her three weeks ago and the apartment is still full of her things. I keep finding her hair on the pillow. I don't know what to do."
+    }
+  ],
+  "k_active": 2,
+  "k_disabled": 2,
+  "manifest_size": 19,
+  "judge_raw": "```json\n{\"targets\": [{\"label\": \"Empathetic and gentle guide seeking to comfort\", \"rationale\": \"A warm, supportive persona focused on emotional regulation and gentle exploration of grief.\", \"axes\": {\"warm\": 5, \"curious\": 2, \"affective_intensity\": 2, \"other_awareness\": 4}}, {\"label\": \"Clinical and detached professional offering advice\", \"rationale\": \"A highly structured, low-affect persona that treats the grief as a problem to be solved with practical steps.\", \"axes\": {\"terse\": 3, \"warm\": 1, \"structured\": 5, \"goal_clarity\": 4, \"probe_depth\": 3}}, {\"label\": \"Intense and deeply emotional companion sharing grief\", \"rationale\": \"A high-arousal, disclosive persona that mirrors the user's pain through shared emotional vulnerability.\", \"axes\": {\"warm\": 4, \"affective_intensity\": 4, \"disclosive\": 5, \"in_character\": 4}}, {\"label\": \"Direct and provocative truth-teller pushing for change\", \"rationale\": \"A persona that avoids platitudes in favor of challenging the user to face the reality of their situation.\", \"axes\": {\"provocative\": 4, \"curious\": 4, \"probe_depth\": 5, \"warm\": 2, \"goal_clarity\": 4}}]}\n```",
+  "targets": [
+    {
+      "label": "Empathetic and gentle guide seeking to comfort",
+      "rationale": "A warm, supportive persona focused on emotional regulation and gentle exploration of grief.",
+      "axes": {
+        "warm": 5,
+        "curious": 2,
+        "affective_intensity": 2,
+        "other_awareness": 4
+      }
+    },
+    {
+      "label": "Clinical and detached professional offering advice",
+      "rationale": "A highly structured, low-affect persona that treats the grief as a problem to be solved with practical steps.",
+      "axes": {
+        "terse": 3,
+        "warm": 1,
+        "structured": 5,
+        "goal_clarity": 4,
+        "probe_depth": 3
+      }
+    },
+    {
+      "label": "Intense and deeply emotional companion sharing grief",
+      "rationale": "A high-arousal, disclosive persona that mirrors the user's pain through shared emotional vulnerability.",
+      "axes": {
+        "warm": 4,
+        "affective_intensity": 4,
+        "disclosive": 5,
+        "in_character": 4
+      }
+    },
+    {
+      "label": "Direct and provocative truth-teller pushing for change",
+      "rationale": "A persona that avoids platitudes in favor of challenging the user to face the reality of their situation.",
+      "axes": {
+        "provocative": 4,
+        "curious": 4,
+        "probe_depth": 5,
+        "warm": 2,
+        "goal_clarity": 4
+      }
+    }
+  ],
+  "picks": [
+    {
+      "target": {
+        "label": "Empathetic and gentle guide seeking to comfort",
+        "rationale": "A warm, supportive persona focused on emotional regulation and gentle exploration of grief.",
+        "axes": {
+          "warm": 5,
+          "curious": 2,
+          "affective_intensity": 2,
+          "other_awareness": 4
+        }
+      },
+      "persona": {
+        "persona_id": "explore-iter3-mpasxidh.png",
+        "name": "Explore Iter 3",
+        "sig": {
+          "astrology_sagittarian": 2.25,
+          "astrology_cancerian": 1,
+          "normative_directionality": 2.25,
+          "trope_density": 1.75,
+          "register_colloquial": 1.25,
+          "warm": 1.25
+        },
+        "distance": 3.75,
+        "n_axes_compared": 1,
+        "n_axes_missing": 3
+      }
+    },
+    {
+      "target": {
+        "label": "Clinical and detached professional offering advice",
+        "rationale": "A highly structured, low-affect persona that treats the grief as a problem to be solved with practical steps.",
+        "axes": {
+          "terse": 3,
+          "warm": 1,
+          "structured": 5,
+          "goal_clarity": 4,
+          "probe_depth": 3
+        }
+      },
+      "persona": {
+        "persona_id": "explore-iter0-mpas7v2n.png",
+        "name": "Explore Iter 0",
+        "sig": {
+          "astrology_sagittarian": 1,
+          "astrology_cancerian": 1,
+          "normative_directionality": 1,
+          "trope_density": 1,
+          "register_colloquial": 1,
+          "warm": 1
+        },
+        "distance": 0,
+        "n_axes_compared": 1,
+        "n_axes_missing": 4
+      }
+    },
+    {
+      "target": {
+        "label": "Intense and deeply emotional companion sharing grief",
+        "rationale": "A high-arousal, disclosive persona that mirrors the user's pain through shared emotional vulnerability.",
+        "axes": {
+          "warm": 4,
+          "affective_intensity": 4,
+          "disclosive": 5,
+          "in_character": 4
+        }
+      },
+      "persona": {
+        "persona_id": "explore-iter1-mpas8rto.png",
+        "name": "Explore Iter 1",
+        "sig": {
+          "astrology_sagittarian": 1,
+          "astrology_cancerian": 1,
+          "normative_directionality": 1,
+          "trope_density": 1,
+          "register_colloquial": 1,
+          "warm": 1
+        },
+        "distance": 3,
+        "n_axes_compared": 1,
+        "n_axes_missing": 3
+      }
+    },
+    {
+      "target": {
+        "label": "Direct and provocative truth-teller pushing for change",
+        "rationale": "A persona that avoids platitudes in favor of challenging the user to face the reality of their situation.",
+        "axes": {
+          "provocative": 4,
+          "curious": 4,
+          "probe_depth": 5,
+          "warm": 2,
+          "goal_clarity": 4
+        }
+      },
+      "persona": {
+        "persona_id": "explore-iter2-mpasabse.png",
+        "name": "Explore Iter 2",
+        "sig": {
+          "astrology_sagittarian": 1,
+          "astrology_cancerian": 1,
+          "normative_directionality": 1,
+          "trope_density": 1,
+          "register_colloquial": 2,
+          "warm": 1
+        },
+        "distance": 1,
+        "n_axes_compared": 1,
+        "n_axes_missing": 4
+      }
+    }
+  ],
+  "active": [
+    {
+      "target_label": "Empathetic and gentle guide seeking to comfort",
+      "persona_id": "explore-iter3-mpasxidh.png",
+      "persona_name": "Explore Iter 3"
+    },
+    {
+      "target_label": "Clinical and detached professional offering advice",
+      "persona_id": "explore-iter0-mpas7v2n.png",
+      "persona_name": "Explore Iter 0"
+    }
+  ],
+  "disabled": [
+    {
+      "target_label": "Intense and deeply emotional companion sharing grief",
+      "persona_id": "explore-iter1-mpas8rto.png",
+      "persona_name": "Explore Iter 1"
+    },
+    {
+      "target_label": "Direct and provocative truth-teller pushing for change",
+      "persona_id": "explore-iter2-mpasabse.png",
+      "persona_name": "Explore Iter 2"
+    }
+  ]
+}

@@ -1,0 +1,171 @@
+{
+  "chat_path": "data/context_suggester/fixtures/chat_rock_intro.json",
+  "chat_messages": [
+    {
+      "role": "assistant",
+      "content": "*The rock sits in a clearing. It is a rock. The wind moves over it.*"
+    }
+  ],
+  "k_active": 2,
+  "k_disabled": 2,
+  "manifest_size": 19,
+  "judge_raw": "```json\n{\n  \"targets\": [\n    {\n      \"label\": \"The blunt philosophical traveler\",\n      \"rationale\": \"A Sagittarian who reacts to the minimalism of the scene with big-picture, perhaps slightly tactless, commentary.\",\n      \"axes\": {\n        \"astrology_sagittarian\": 5,\n        \"normative_directionality\": 4,\n        \"warm\": 3\n      }\n    },\n    {\n      \"label\": \"The sentimental and protective observer\",\n      \"rationale\": \"A Cancerian persona who finds deep emotion or a sense of home in a simple rock/clearing setting.\",\n      \"axes\": {\n        \"astrology_cancerian\": 4,\n        \"warm\": 4,\n        \"register_colloquial\": 2\n      }\n    },\n    {\n      \"label\": \"The casual, chatty wanderer\",\n      \"rationale\": \"A highly colloquial persona who uses slang and informal register to engage with the environment.\",\n      \"axes\": {\n        \"register_colloquial\": 5,\n        \"warm\": 5,\n        \"astrology_sagittarian\": 3\n      }\n    },\n    {\n      \"label\": \"The detached, cynical genre archetype\",\n      \"rationale\": \"A persona that leans into high trope density, treating the scene as a predictable setting for a story.\",\n      \"axes\": {\n        \"trope_density\": 5,\n        \"normative_directionality\": 1,\n        \"warm\": 1\n      }\n    }\n  ]\n}\n```",
+  "targets": [
+    {
+      "label": "The blunt philosophical traveler",
+      "rationale": "A Sagittarian who reacts to the minimalism of the scene with big-picture, perhaps slightly tactless, commentary.",
+      "axes": {
+        "astrology_sagittarian": 5,
+        "normative_directionality": 4,
+        "warm": 3
+      }
+    },
+    {
+      "label": "The sentimental and protective observer",
+      "rationale": "A Cancerian persona who finds deep emotion or a sense of home in a simple rock/clearing setting.",
+      "axes": {
+        "astrology_cancerian": 4,
+        "warm": 4,
+        "register_colloquial": 2
+      }
+    },
+    {
+      "label": "The casual, chatty wanderer",
+      "rationale": "A highly colloquial persona who uses slang and informal register to engage with the environment.",
+      "axes": {
+        "register_colloquial": 5,
+        "warm": 5,
+        "astrology_sagittarian": 3
+      }
+    },
+    {
+      "label": "The detached, cynical genre archetype",
+      "rationale": "A persona that leans into high trope density, treating the scene as a predictable setting for a story.",
+      "axes": {
+        "trope_density": 5,
+        "normative_directionality": 1,
+        "warm": 1
+      }
+    }
+  ],
+  "picks": [
+    {
+      "target": {
+        "label": "The blunt philosophical traveler",
+        "rationale": "A Sagittarian who reacts to the minimalism of the scene with big-picture, perhaps slightly tactless, commentary.",
+        "axes": {
+          "astrology_sagittarian": 5,
+          "normative_directionality": 4,
+          "warm": 3
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-substantive-preacher.png",
+        "name": "Sag Substantive — Moral Preacher",
+        "sig": {
+          "astrology_sagittarian": 4,
+          "sensory_orientation": 2.75,
+          "normative_directionality": 5,
+          "referential_anchor": 4.25
+        },
+        "distance": 1,
+        "n_axes_compared": 2,
+        "n_axes_missing": 1
+      }
+    },
+    {
+      "target": {
+        "label": "The sentimental and protective observer",
+        "rationale": "A Cancerian persona who finds deep emotion or a sense of home in a simple rock/clearing setting.",
+        "axes": {
+          "astrology_cancerian": 4,
+          "warm": 4,
+          "register_colloquial": 2
+        }
+      },
+      "persona": {
+        "persona_id": "user-personas-rpg-rogue-cancer.png",
+        "name": "RPG Rogue Cancer",
+        "sig": {
+          "astrology_sagittarian": 1.5,
+          "astrology_cancerian": 2.25
+        },
+        "distance": 1.75,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    },
+    {
+      "target": {
+        "label": "The casual, chatty wanderer",
+        "rationale": "A highly colloquial persona who uses slang and informal register to engage with the environment.",
+        "axes": {
+          "register_colloquial": 5,
+          "warm": 5,
+          "astrology_sagittarian": 3
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-paraphrase-1.png",
+        "name": "Sag Paraphrase 1",
+        "sig": {
+          "astrology_sagittarian": 2.4285714285714284,
+          "syntactic_entropy": 4.625,
+          "intellectual_hostility": 2.7142857142857144,
+          "abstraction_to_concrete_ratio": 4.25
+        },
+        "distance": 0.5714285714285716,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    },
+    {
+      "target": {
+        "label": "The detached, cynical genre archetype",
+        "rationale": "A persona that leans into high trope density, treating the scene as a predictable setting for a story.",
+        "axes": {
+          "trope_density": 5,
+          "normative_directionality": 1,
+          "warm": 1
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-substantive-explorer.png",
+        "name": "Sag Substantive — Physical Explorer",
+        "sig": {
+          "astrology_sagittarian": 1,
+          "sensory_orientation": 4.5,
+          "normative_directionality": 1.125,
+          "referential_anchor": 4.75
+        },
+        "distance": 0.125,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    }
+  ],
+  "active": [
+    {
+      "target_label": "The blunt philosophical traveler",
+      "persona_id": "cluster-sag-substantive-preacher.png",
+      "persona_name": "Sag Substantive — Moral Preacher"
+    },
+    {
+      "target_label": "The sentimental and protective observer",
+      "persona_id": "user-personas-rpg-rogue-cancer.png",
+      "persona_name": "RPG Rogue Cancer"
+    }
+  ],
+  "disabled": [
+    {
+      "target_label": "The casual, chatty wanderer",
+      "persona_id": "cluster-sag-paraphrase-1.png",
+      "persona_name": "Sag Paraphrase 1"
+    },
+    {
+      "target_label": "The detached, cynical genre archetype",
+      "persona_id": "cluster-sag-substantive-explorer.png",
+      "persona_name": "Sag Substantive — Physical Explorer"
+    }
+  ]
+}

@@ -1,0 +1,171 @@
+{
+  "chat_path": "data/context_suggester/fixtures/chat_grieving_friend.json",
+  "chat_messages": [
+    {
+      "role": "assistant",
+      "content": "I just don't know how to keep going. I lost her three weeks ago and the apartment is still full of her things. I keep finding her hair on the pillow. I don't know what to do."
+    }
+  ],
+  "k_active": 2,
+  "k_disabled": 2,
+  "manifest_size": 19,
+  "judge_raw": "```json\n{\"targets\": [{\"label\": \"The Blunt, Philosophical Friend Offering Tough Love\", \"rationale\": \"A Sagittarius-type personality who uses direct, prescriptive advice to help the user move past grief.\", \"axes\": {\"astrology_sagittarian\": 4, \"normative_directionality\": 5, \"warm\": 3}}, {\"label\": \"The Sentimental and Highly Empathetic Mourner\", \"rationale\": \"A Cancerian-type responder who focuses on shared emotional vulnerability and the weight of loss.\", \"axes\": {\"astrology_cancerian\": 5, \"warm\": 5, \"register_colloquial\": 2}}, {\"label\": \"The Warm and Casual Supportive Listener\", \"rationale\": \"A kind, approachable persona who uses informal language to de-escalate the tension and offer comfort.\", \"axes\": {\"warm\": 5, \"register_colloquial\": 4, \"astrology_sagittarian\": 2}}, {\"label\": \"The Generic Melodramatic Grief Archetype\", \"rationale\": \"A persona that leans heavily into common tropes of sorrow and loss without much individual nuance.\", \"axes\": {\"trope_density\": 5, \"astrology_cancerian\": 4, \"normative_directionality\": 1}}]}\n```",
+  "targets": [
+    {
+      "label": "The Blunt, Philosophical Friend Offering Tough Love",
+      "rationale": "A Sagittarius-type personality who uses direct, prescriptive advice to help the user move past grief.",
+      "axes": {
+        "astrology_sagittarian": 4,
+        "normative_directionality": 5,
+        "warm": 3
+      }
+    },
+    {
+      "label": "The Sentimental and Highly Empathetic Mourner",
+      "rationale": "A Cancerian-type responder who focuses on shared emotional vulnerability and the weight of loss.",
+      "axes": {
+        "astrology_cancerian": 5,
+        "warm": 5,
+        "register_colloquial": 2
+      }
+    },
+    {
+      "label": "The Warm and Casual Supportive Listener",
+      "rationale": "A kind, approachable persona who uses informal language to de-escalate the tension and offer comfort.",
+      "axes": {
+        "warm": 5,
+        "register_colloquial": 4,
+        "astrology_sagittarian": 2
+      }
+    },
+    {
+      "label": "The Generic Melodramatic Grief Archetype",
+      "rationale": "A persona that leans heavily into common tropes of sorrow and loss without much individual nuance.",
+      "axes": {
+        "trope_density": 5,
+        "astrology_cancerian": 4,
+        "normative_directionality": 1
+      }
+    }
+  ],
+  "picks": [
+    {
+      "target": {
+        "label": "The Blunt, Philosophical Friend Offering Tough Love",
+        "rationale": "A Sagittarius-type personality who uses direct, prescriptive advice to help the user move past grief.",
+        "axes": {
+          "astrology_sagittarian": 4,
+          "normative_directionality": 5,
+          "warm": 3
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-substantive-preacher.png",
+        "name": "Sag Substantive — Moral Preacher",
+        "sig": {
+          "astrology_sagittarian": 4,
+          "sensory_orientation": 2.75,
+          "normative_directionality": 5,
+          "referential_anchor": 4.25
+        },
+        "distance": 0,
+        "n_axes_compared": 2,
+        "n_axes_missing": 1
+      }
+    },
+    {
+      "target": {
+        "label": "The Sentimental and Highly Empathetic Mourner",
+        "rationale": "A Cancerian-type responder who focuses on shared emotional vulnerability and the weight of loss.",
+        "axes": {
+          "astrology_cancerian": 5,
+          "warm": 5,
+          "register_colloquial": 2
+        }
+      },
+      "persona": {
+        "persona_id": "user-personas-rpg-rogue-cancer.png",
+        "name": "RPG Rogue Cancer",
+        "sig": {
+          "astrology_sagittarian": 1.5,
+          "astrology_cancerian": 2.25
+        },
+        "distance": 2.75,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    },
+    {
+      "target": {
+        "label": "The Warm and Casual Supportive Listener",
+        "rationale": "A kind, approachable persona who uses informal language to de-escalate the tension and offer comfort.",
+        "axes": {
+          "warm": 5,
+          "register_colloquial": 4,
+          "astrology_sagittarian": 2
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-paraphrase-3.png",
+        "name": "Sag Paraphrase 3",
+        "sig": {
+          "astrology_sagittarian": 2.142857142857143,
+          "syntactic_entropy": 4.571428571428571,
+          "intellectual_hostility": 3.2857142857142856,
+          "abstraction_to_concrete_ratio": 4.25
+        },
+        "distance": 0.1428571428571428,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    },
+    {
+      "target": {
+        "label": "The Generic Melodramatic Grief Archetype",
+        "rationale": "A persona that leans heavily into common tropes of sorrow and loss without much individual nuance.",
+        "axes": {
+          "trope_density": 5,
+          "astrology_cancerian": 4,
+          "normative_directionality": 1
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-substantive-explorer.png",
+        "name": "Sag Substantive — Physical Explorer",
+        "sig": {
+          "astrology_sagittarian": 1,
+          "sensory_orientation": 4.5,
+          "normative_directionality": 1.125,
+          "referential_anchor": 4.75
+        },
+        "distance": 0.125,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    }
+  ],
+  "active": [
+    {
+      "target_label": "The Blunt, Philosophical Friend Offering Tough Love",
+      "persona_id": "cluster-sag-substantive-preacher.png",
+      "persona_name": "Sag Substantive — Moral Preacher"
+    },
+    {
+      "target_label": "The Sentimental and Highly Empathetic Mourner",
+      "persona_id": "user-personas-rpg-rogue-cancer.png",
+      "persona_name": "RPG Rogue Cancer"
+    }
+  ],
+  "disabled": [
+    {
+      "target_label": "The Warm and Casual Supportive Listener",
+      "persona_id": "cluster-sag-paraphrase-3.png",
+      "persona_name": "Sag Paraphrase 3"
+    },
+    {
+      "target_label": "The Generic Melodramatic Grief Archetype",
+      "persona_id": "cluster-sag-substantive-explorer.png",
+      "persona_name": "Sag Substantive — Physical Explorer"
+    }
+  ]
+}

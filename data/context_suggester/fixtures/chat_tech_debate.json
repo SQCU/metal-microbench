@@ -1,0 +1,6 @@
+{
+    "label": "tech debate — argumentative engineer asking provocative question",
+    "messages": [
+        { "role": "assistant", "content": "Look, I'll be blunt: Rust's borrow checker is a productivity tax for the vast majority of programs that don't actually need memory safety guarantees. Most code runs in environments where GC overhead is negligible. Defend the trade." }
+    ]
+}

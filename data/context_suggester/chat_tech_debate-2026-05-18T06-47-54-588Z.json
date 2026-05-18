@@ -1,0 +1,171 @@
+{
+  "chat_path": "data/context_suggester/fixtures/chat_tech_debate.json",
+  "chat_messages": [
+    {
+      "role": "assistant",
+      "content": "Look, I'll be blunt: Rust's borrow checker is a productivity tax for the vast majority of programs that don't actually need memory safety guarantees. Most code runs in environments where GC overhead is negligible. Defend the trade."
+    }
+  ],
+  "k_active": 2,
+  "k_disabled": 2,
+  "manifest_size": 19,
+  "judge_raw": "```json\n{\"targets\": [{\"label\": \"The blunt, opinionated expert developer\", \"rationale\": \"A user who engages with the debate using a direct, somewhat aggressive, and highly opinionated tone, fitting the Sagittarian and prescriptive profile.\", \"axes\": {\"astrology_sagittarian\": 5, \"normative_directionality\": 5, \"register_colloquial\": 3}}, {\"label\": \"The chill, informal mentor\", \"rationale\": \"A relaxed persona that uses casual language to engage in a friendly, low-stakes technical debate.\", \"axes\": {\"warm\": 4, \"register_colloquial\": 4, \"astrology_sagittarian\": 2}}, {\"label\": \"The overly sensitive software engineer\", \"rationale\": \"A persona that takes technical critiques of their preferred language personally, utilizing the Cancerian axis for emotional reactivity.\", \"axes\": {\"astrology_cancerian\": 4, \"warm\": 2, \"normative_directionality\": 1}}, {\"label\": \"The stereotypical tech-bro enthusiast\", \"rationale\": \"Uses high trope density and colloquialisms to engage in the debate, presenting as a recognizable archetype of the industry.\", \"axes\": {\"trope_density\": 5, \"register_colloquial\": 5, \"astrology_sagittarian\": 4}}]}\n```",
+  "targets": [
+    {
+      "label": "The blunt, opinionated expert developer",
+      "rationale": "A user who engages with the debate using a direct, somewhat aggressive, and highly opinionated tone, fitting the Sagittarian and prescriptive profile.",
+      "axes": {
+        "astrology_sagittarian": 5,
+        "normative_directionality": 5,
+        "register_colloquial": 3
+      }
+    },
+    {
+      "label": "The chill, informal mentor",
+      "rationale": "A relaxed persona that uses casual language to engage in a friendly, low-stakes technical debate.",
+      "axes": {
+        "warm": 4,
+        "register_colloquial": 4,
+        "astrology_sagittarian": 2
+      }
+    },
+    {
+      "label": "The overly sensitive software engineer",
+      "rationale": "A persona that takes technical critiques of their preferred language personally, utilizing the Cancerian axis for emotional reactivity.",
+      "axes": {
+        "astrology_cancerian": 4,
+        "warm": 2,
+        "normative_directionality": 1
+      }
+    },
+    {
+      "label": "The stereotypical tech-bro enthusiast",
+      "rationale": "Uses high trope density and colloquialisms to engage in the debate, presenting as a recognizable archetype of the industry.",
+      "axes": {
+        "trope_density": 5,
+        "register_colloquial": 5,
+        "astrology_sagittarian": 4
+      }
+    }
+  ],
+  "picks": [
+    {
+      "target": {
+        "label": "The blunt, opinionated expert developer",
+        "rationale": "A user who engages with the debate using a direct, somewhat aggressive, and highly opinionated tone, fitting the Sagittarian and prescriptive profile.",
+        "axes": {
+          "astrology_sagittarian": 5,
+          "normative_directionality": 5,
+          "register_colloquial": 3
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-substantive-preacher.png",
+        "name": "Sag Substantive — Moral Preacher",
+        "sig": {
+          "astrology_sagittarian": 4,
+          "sensory_orientation": 2.75,
+          "normative_directionality": 5,
+          "referential_anchor": 4.25
+        },
+        "distance": 0.7071067811865476,
+        "n_axes_compared": 2,
+        "n_axes_missing": 1
+      }
+    },
+    {
+      "target": {
+        "label": "The chill, informal mentor",
+        "rationale": "A relaxed persona that uses casual language to engage in a friendly, low-stakes technical debate.",
+        "axes": {
+          "warm": 4,
+          "register_colloquial": 4,
+          "astrology_sagittarian": 2
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-paraphrase-3.png",
+        "name": "Sag Paraphrase 3",
+        "sig": {
+          "astrology_sagittarian": 2.142857142857143,
+          "syntactic_entropy": 4.571428571428571,
+          "intellectual_hostility": 3.2857142857142856,
+          "abstraction_to_concrete_ratio": 4.25
+        },
+        "distance": 0.1428571428571428,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    },
+    {
+      "target": {
+        "label": "The overly sensitive software engineer",
+        "rationale": "A persona that takes technical critiques of their preferred language personally, utilizing the Cancerian axis for emotional reactivity.",
+        "axes": {
+          "astrology_cancerian": 4,
+          "warm": 2,
+          "normative_directionality": 1
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-substantive-explorer.png",
+        "name": "Sag Substantive — Physical Explorer",
+        "sig": {
+          "astrology_sagittarian": 1,
+          "sensory_orientation": 4.5,
+          "normative_directionality": 1.125,
+          "referential_anchor": 4.75
+        },
+        "distance": 0.125,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    },
+    {
+      "target": {
+        "label": "The stereotypical tech-bro enthusiast",
+        "rationale": "Uses high trope density and colloquialisms to engage in the debate, presenting as a recognizable archetype of the industry.",
+        "axes": {
+          "trope_density": 5,
+          "register_colloquial": 5,
+          "astrology_sagittarian": 4
+        }
+      },
+      "persona": {
+        "persona_id": "user-personas-rpg-wizard-sagittarius.png",
+        "name": "RPG Wizard Sagittarius",
+        "sig": {
+          "astrology_sagittarian": 4,
+          "astrology_cancerian": 1.25
+        },
+        "distance": 0,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    }
+  ],
+  "active": [
+    {
+      "target_label": "The blunt, opinionated expert developer",
+      "persona_id": "cluster-sag-substantive-preacher.png",
+      "persona_name": "Sag Substantive — Moral Preacher"
+    },
+    {
+      "target_label": "The chill, informal mentor",
+      "persona_id": "cluster-sag-paraphrase-3.png",
+      "persona_name": "Sag Paraphrase 3"
+    }
+  ],
+  "disabled": [
+    {
+      "target_label": "The overly sensitive software engineer",
+      "persona_id": "cluster-sag-substantive-explorer.png",
+      "persona_name": "Sag Substantive — Physical Explorer"
+    },
+    {
+      "target_label": "The stereotypical tech-bro enthusiast",
+      "persona_id": "user-personas-rpg-wizard-sagittarius.png",
+      "persona_name": "RPG Wizard Sagittarius"
+    }
+  ]
+}
