@@ -945,14 +945,50 @@ Evidence: `data/context_suggester/chat_*-*.json`.
    Compare per-persona LLM judging: would be O(N_personas) calls per
    suggestion refresh.
 
-### Phase B (not yet started)
+### Phase A refinements (after user review)
+
+Two refinements applied to Phase A based on the design review:
+
+**Uniform-prior fallback on missing axes.** Original `sparseDistance`
+returned Infinity for personas with no overlap on target axes, which
+EXCLUDED them entirely. Replaced with a `MISSING_AXIS_PENALTY = 2.0`
+contribution per missing axis (half the Likert range, in axis units).
+Now every persona gets a finite distance:
+
+- No selectivity (target axes all uncovered): every persona is at
+  baseline distance ≈ MISSING_AXIS_PENALTY → ~uniform prior over picks.
+- Selective: personas with actual matches outscore the missing-axis
+  baseline → biased sampling that peaks on the selected features.
+
+Re-ran the 3 fixtures: Moral Preacher dominance dropped from 3/3 to
+2/3 contexts; previously-unmatched personas now compete. This is also
+the foundation for optional softmax sampling in a future refinement
+(temperature-controlled stochastic picking instead of argmin).
+
+**Why does Moral Preacher dominate at all?** Two effects:
+
+1. **Corpus coverage skew**: the Preacher is the only persona with
+   `normative_directionality` ≥ 5. Any target the judge proposes with
+   a high-Norm component lands on Preacher by huge margin.
+2. **Rubric framing**: the Norm axis rubric is "1: descriptive/
+   observational; 5: prescriptive/directive". The "5 = prescriptive"
+   pole reads to the judge as the active/helpful direction, biasing
+   target generation toward high-Norm archetypes.
+
+Fix is corpus diversity (generate more bios that span the Norm axis),
+not algorithm changes. Optional secondary fix: rewrite the rubric to
+neutralize the pole-value loading.
+
+### Phase B (queued)
 
 Port the algorithm to the diegetic UI:
 
 - `POST /suggest-personas` plugin endpoint wrapping the algorithm.
-- Suggester sidebar default = filtered view with K_active+K_disabled
-  picks; K_active auto-triggers /poll, K_disabled = click-to-enable.
-- "Show all" toggle to drop back to the current full-list behavior.
+- Suggester sidebar = filtered view with K_active+K_disabled picks,
+  always. No "show all" toggle (weapon-wheel UX: bounded slots, not
+  a phonebook — scaling-out is precisely the point).
+- K_active auto-triggers /poll on suggestion-refresh; K_disabled =
+  click-to-enable in the drawer.
 - Persona signatures need to be persisted alongside bios — either
   extend `POST /personas/<key>` to accept a `signature` parameter, or
   build a live aggregator endpoint that reads `data/` files at query

@@ -188,11 +188,27 @@ async function judgeContext(messages, kTotal, manifest) {
 
 // ── nearest-neighbor on sparse targets ───────────────────────────────
 
+// Penalty per missing axis: equivalent to "we have no information about
+// this persona on this axis, so assume it's at neutral Likert mid (=3),
+// expected sqdiff to any target value is bounded by (5-1)/2 = 2".
+// Implementing as a fixed contribution of MISSING_AXIS_PENALTY² to the
+// summed squared distance per missing axis means:
+//   - If a target requests N axes and a persona has 0 of them:
+//     distance = sqrt(N · P²/N) = P  (uniform baseline)
+//   - If the persona has some of them: distance drops below baseline
+//     proportional to how well-matched the covered axes are.
+//   - Personas are never EXCLUDED from picks — they all get a finite
+//     distance. Selectivity comes from the persona that actually
+//     matches target axes well having the lowest distance.
+//
+// Sets uniform-prior fallback (no selectivity → ~equal distances →
+// argmin essentially uniform-random) and biased-sampling-when-selective
+// (real matches outscore the missing-axis penalty floor).
+const MISSING_AXIS_PENALTY = 2.0;  // half the Likert range, in "axis units"
+
 /**
- * Sparse Euclidean distance from target to persona's sig.
- * Only over axes that target sets AND persona has measured.
- * Returns { distance, n_axes_compared, n_axes_missing } —
- * personas with no overlap on target axes return { distance: Infinity }.
+ * Sparse Euclidean distance with uniform-prior fallback for missing axes.
+ * Every persona gets a finite distance; none are excluded.
  */
 function sparseDistance(target, sig) {
     let sumSq = 0, compared = 0, missing = 0;
@@ -201,11 +217,13 @@ function sparseDistance(target, sig) {
             sumSq += (t - sig[axis]) ** 2;
             compared++;
         } else {
+            sumSq += MISSING_AXIS_PENALTY ** 2;
             missing++;
         }
     }
-    if (compared === 0) return { distance: Infinity, n_axes_compared: 0, n_axes_missing: missing };
-    return { distance: Math.sqrt(sumSq / compared), n_axes_compared: compared, n_axes_missing: missing };
+    const totalAxes = compared + missing;
+    if (totalAxes === 0) return { distance: MISSING_AXIS_PENALTY, n_axes_compared: 0, n_axes_missing: 0 };
+    return { distance: Math.sqrt(sumSq / totalAxes), n_axes_compared: compared, n_axes_missing: missing };
 }
 
 function pickNearestForTarget(target, manifest, exclude = new Set()) {
@@ -257,8 +275,8 @@ async function runSuggester(chatPath, kActive, kDisabled) {
     for (let i = 0; i < targets.length; i++) {
         const t = targets[i];
         const pick = pickNearestForTarget(t, manifest, used);
-        if (!pick || !Number.isFinite(pick.distance)) {
-            console.log(`  T${i+1} → NO MATCH (no persona has measurements on the target's axes)`);
+        if (!pick) {
+            console.log(`  T${i+1} → NO PERSONAS AVAILABLE`);
             picks.push({ target: t, persona: null });
             continue;
         }
