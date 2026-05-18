@@ -32,8 +32,19 @@ export async function loadAndConnect(page) {
     await page.locator('#API-status-top').click();
     await expect(page.locator('#api_button_openai')).toBeVisible();
     await page.locator('#api_button_openai').click();
-    await expect(page.locator('#send_textarea')).toHaveAttribute(
-        'placeholder', 'Type a message, or /? for help', { timeout: 30_000 });
+    // Wait for the API connection to actually become Valid — the textarea
+    // placeholder transitions earlier than the connection completes, so
+    // waiting on placeholder alone races. Verified 2026-05-17 by
+    // browser_evaluate: online_status reads "no_connection" right when
+    // the placeholder turns to "Type a message…", then "Valid" ~2s
+    // later after the bridge handshake. Tests that send a message
+    // before this point hit Generate's silent !hasBackendConnection
+    // bail and the chat sits forever waiting for a reply that never
+    // gets requested.
+    await page.waitForFunction(() => {
+        const ctx = window.SillyTavern?.getContext?.();
+        return ctx?.onlineStatus === 'Valid';
+    }, { timeout: 30_000 });
 
     // Toggle the drawer closed so it doesn't cover the chat in any
     // recorded video. (Click the same status indicator again.)
