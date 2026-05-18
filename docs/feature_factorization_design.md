@@ -200,6 +200,7 @@ modifying it.
 | 3   | Outer-outer w/ eff-dim objective   | 2-3d  | not yet started                                   |
 | 4   | Entanglement detector + splitter   | 3d    | starter shipped — `tools/user-agent-harness/axis_splitter.mjs`; first run NO_SPLIT_FOUND (§5) |
 | 5   | Velocity-stall convergence         | 30min | shipped in lock_in_iterative.mjs (`isStalled`)    |
+| 6   | Cluster disambiguator              | 2-3d  | spec drafted (§6); no code yet                   |
 
 ### Missing — easy, just-not-composed
 
@@ -298,3 +299,284 @@ axes that don't measure what their names claim.
   and outer loops accept "stalled" as a stop reason distinct from
   "converged" so the run records WHICH stop-reason hit. Next iterative
   run will produce richer evidence for the splitter.
+
+## 6. Cluster disambiguator (item 6 — spec)
+
+### What problem this solves
+
+The splitter (§5, item 4) requires an **existing-axis gap across chat
+contexts** to fire — given parent axis `a` and contexts `{X, Y}` where
+`mean(a | X) ≠ mean(a | Y)`, decompose `a` into sub-axes that explain
+the variance. Tight clusters in B-space (e.g. several Sagittarius bios
+that all measure identically on the registry's existing axes) **lack
+that gap by construction** and are invisible to the splitter.
+
+The dual problem:
+
+```
+Given a cluster {bio_1, …, bio_k} with
+    ‖signature(bio_i) − signature(bio_j)‖_existing-axes  small  ∀ i,j
+find a NEW axis a_new (or discover that none exists) such that
+    Var({mean(a_new | trajectories(bio_i))}_i)  is large.
+```
+
+Different bucketing (over bios, not contexts), different objective
+(spread the cluster, not explain a parent), different prompt to the
+designer. This is **item 6: cluster disambiguator** — a sibling of the
+splitter, not a generalization.
+
+### Three honest verdicts
+
+The disambiguator either finds a spreading axis or it doesn't.
+When it doesn't, the harness should distinguish **why**:
+
+- **`SPREAD_AXIS_FOUND`** — at least one candidate axis spreads the
+  cluster with between-bio variance significantly above within-bio
+  variance, AND spread magnitude ≥ ~1.5 Likert points. Register the
+  axis (kind=`bio` typically) and the cluster's per-bio coordinates
+  on it.
+- **`CLUSTER_IS_PARAPHRASE_DEGENERATE`** — no proposed axis spreads
+  the cluster, AND pairwise prose-similarity (LLM-judged) is HIGH
+  (≥ 4/5). The bios are different *wordings* of the same content;
+  there's nothing behavioral to factor. Harness records the verdict
+  and stops attempting to grow this corner of B.
+- **`CLUSTER_IS_BEHAVIORALLY_DEGENERATE`** — no axis spreads, prose
+  is dissimilar (≤ 3/5), behavior is identical. The bios are
+  substantively distinct *as prose* but project identically into the
+  behavior-space the judge can score. Either the judge's axis
+  vocabulary is too thin to catch the difference (which the harness
+  could attempt to address by feeding the bios back to the
+  designer-LLM with explicit instructions to expand vocabulary), or
+  the differences are genuinely non-behavioral (taste, register,
+  surface ornament). Either way, recording the verdict is honest.
+
+### Algorithm
+
+```
+clusterDisambiguator(bios: [BioId], cp: Counterparty) :
+    # 1. Pre-flight: confirm the cluster is tight on existing axes.
+    sigs = {b: existing_signature(b)  for b in bios}
+    if max_pairwise_distance(sigs) > TIGHTNESS_THRESHOLD:
+        raise NotATightCluster
+
+    # 2. Cheap-agent pairing (mandatory). Every bio gets a paired agent_text
+    #    via a SINGLE-PASS (K_max_inner=1) agent designer call against a
+    #    neutral target ("be your character vividly"). This is foundational:
+    #    we never measure bios in the asking-the-LM-to-play-both-roles
+    #    degenerate mode. The agent_text may be weak — that's fine, it's a
+    #    constant across the cluster, so cluster-internal variance still
+    #    reflects bio variance.
+    agents = {b: designCheapAgent(b)  for b in bios}
+
+    # 3. Collect trajectories per bio. We prefer TURN-DEPTH (n_turns=4)
+    #    over trajectory-count (N_TRAJ=1-2) — longer chats catch trailing-off
+    #    and boring-fixed-point signals that 2-turn measurements miss.
+    trajs = {b: [runChat(b, agents[b], cp, n_turns=4) for _ in range(N_TRAJ_PER_BIO)]
+             for b in bios}
+
+    # 3. DESIGNER_C: propose N_HYPOTHESES candidate axes that should spread
+    #    the cluster. Designer sees ALL bio prose + sample turns + the fact
+    #    that they currently measure identically on existing axes.
+    hypotheses = proposeSpreadAxes(bios, sigs, trajs)
+
+    # 4. JUDGE_C: re-score every user turn of every trajectory under each
+    #    candidate axis, aggregate to per-bio means.
+    evaluations = []
+    for h in hypotheses:
+        per_turn = {b: [judgeOnAxis(turn, h) for turn in userTurns(trajs[b])] for b in bios}
+        per_bio  = {b: mean(per_turn[b])     for b in bios}
+        within   = pooled_within_bio_variance(per_turn)
+        between  = variance(per_bio.values())
+        spread   = max(per_bio.values()) - min(per_bio.values())
+        f_ratio  = between / max(within, EPSILON)
+        evaluations.append(Eval(h, per_bio, within, between, spread, f_ratio))
+
+    # 5. Pick winner under strict criteria:
+    qualified = [e for e in evaluations
+                 if e.f_ratio >= F_RATIO_THRESHOLD
+                 and e.spread >= SPREAD_THRESHOLD]
+    if qualified:
+        top = max(qualified, key=lambda e: e.f_ratio)
+        register_derived_axis(top.h.name, kind='bio', def=top.h.def,
+                              derived_from={'cluster_members': bios,
+                                            'sibling': None,
+                                            'reason': 'spread_axis'})
+        return SpreadAxisFound(top)
+
+    # 6. No axis spread the cluster — distinguish paraphrase vs behavioral.
+    prose_sim    = pairwiseProseSimilarity(bios)        # LLM-judged 1-5
+    behavior_sim = pairwiseBehavioralSimilarity(trajs)  # LLM-judged 1-5
+    if prose_sim >= PARAPHRASE_THRESHOLD:    # high prose similarity
+        return ParaphraseDegenerate(prose_sim, behavior_sim, hypotheses)
+    else:
+        return BehaviorallyDegenerate(prose_sim, behavior_sim, hypotheses)
+```
+
+### Information presented to DESIGNER_C
+
+In contrast to the splitter (which today sees only 3 sample turns +
+the parent rubric — see §2 of this doc's followups for the splitter's
+information-starvation problem), the disambiguator gives the designer:
+
+| Surface                                  | Why                                                        |
+|------------------------------------------|------------------------------------------------------------|
+| All k bio prose blocks, full text        | The differences ARE in here; the designer needs them       |
+| Per-bio: 2-3 sample user turns           | How each bio actually behaves dynamically                  |
+| Existing signature per bio + tightness   | The negative space — "what these bios DON'T differ on"     |
+| Existing axis registry (names + rubrics) | Avoid proposing axes that already exist                    |
+| Explicit objective                       | "Propose axes that SPREAD these bios on a 1-5 scale"      |
+
+### Acceptance thresholds (defaults, tunable)
+
+- `TIGHTNESS_THRESHOLD = 1.0` (Likert) — max pairwise existing-axis
+  distance for the cluster to qualify as "tight" (cheap pre-flight,
+  measured only on the cluster's nominal-tight axis to bound cost)
+- `F_RATIO_THRESHOLD` — use the actual F-distribution critical value
+  at α=0.05 for (k−1, k·N_TRAJ·N_TURNS − k) df. For the demo defaults
+  (k=3, N_TRAJ=2, N_TURNS=4) this is F(2, 21) ≈ 3.47. Hardcoding
+  ≥3.5 is a pragmatic starting point.
+- `SPREAD_THRESHOLD = 1.5` — per-bio mean spread (max − min) on the
+  proposed axis must reach ≥ 1.5 Likert points (otherwise it's a
+  technicality, not a useful axis)
+- `PARAPHRASE_THRESHOLD = 4.0` — pairwise prose-similarity ≥ 4/5 to
+  call the cluster paraphrase-degenerate
+- `N_TRAJ_PER_BIO = 2`, `N_TURNS_PER_TRAJ = 4`. Rationale: turn-depth
+  matters more than trajectory-count for this measurement — a 4-turn
+  chat catches **trailing-off / boring-fixed-point** behavior (a real
+  cluster-distinguishing signal: some Sagittarius bios may stay
+  expressive across 4 turns while others run out of distinctive moves
+  by turn 3). Per-bio wallclock: ~2 chats × ~7s/turn × 4 turns ≈ 1
+  minute, plus ~16 judge calls per hypothesis × 3 hypotheses ≈
+  parallelizable in ~30s. Total ~3-4 min for a k=3 cluster.
+
+### BehaviorallyDegenerate is provisional
+
+A `BehaviorallyDegenerate` verdict means "given the current axis
+registry, the judge cannot find a behavioral dimension that
+distinguishes these bios". This may change as the registry grows
+(via successful splits/disambiguations elsewhere). The right
+re-check pattern is **lazy and sparse**, not a big batch:
+
+- Persist BehaviorallyDegenerate clusters with their verdict timestamp
+  and the registry-snapshot used.
+- A future outer-outer pass that adds N new axes to the registry can
+  schedule a re-check for these clusters at low priority — judge each
+  cluster's existing trajectories under only the *new* axes, not the
+  whole registry. ~k × N judge calls per stale cluster, amortized
+  over time.
+- Never auto-rerun all stale clusters as a dense batch — that would
+  choke the live test budget. Trickle.
+
+### Pairwise similarity helpers (LLM-as-judge, no embedding infra needed)
+
+```
+pairwiseProseSimilarity(bios) :
+    pairs = combinations(bios, 2)
+    scores = [judgeBridge('Score prose similarity (vocabulary, sentence '
+                          'structure, word choice) on 1-5: '
+                          '\n\nBio A:\n{a}\n\nBio B:\n{b}', a, b)
+              for (a, b) in pairs]
+    return mean(scores)
+
+pairwiseBehavioralSimilarity(trajs) :
+    pairs = combinations(trajs.keys(), 2)
+    scores = [judgeBridge('Score behavioral similarity on 1-5: how '
+                          'similar are the strategies, moves, and '
+                          'observable behaviors of these two users in '
+                          'comparable chat turns?\n\nUser A turns:\n{a}'
+                          '\n\nUser B turns:\n{b}',
+                          sample_turns(trajs[a]), sample_turns(trajs[b]))
+              for (a, b) in pairs]
+    return mean(scores)
+```
+
+Reuses the existing bridge — no new dependencies.
+
+### Pseudohaskell
+
+```haskell
+data ClusterVerdict
+  = SpreadAxisFound
+      { axis       :: Axis
+      , perBio     :: Map BioId Double    -- means
+      , fRatio     :: Double
+      , spread     :: Double
+      }
+  | ParaphraseDegenerate
+      { proseSim    :: Double
+      , behaviorSim :: Double
+      , tried       :: [Axis]
+      }
+  | BehaviorallyDegenerate
+      { proseSim    :: Double
+      , behaviorSim :: Double
+      , tried       :: [Axis]
+      }
+
+clusterDisambiguator :: [BioId] -> Counterparty -> IO ClusterVerdict
+clusterDisambiguator bios cp = do
+  sigs   <- forM bios existingSignature
+  unless (isTight sigs) (throw NotATightCluster)
+  trajs  <- forM bios (\b -> replicateM nTrajPerBio (runChat b Nothing cp nTurns))
+  hyps   <- proposeSpreadAxes bios sigs trajs            -- DESIGNER_C
+  scored <- forM hyps (evalSpread bios trajs)            -- JUDGE_C
+  case filter passes scored of
+    (top:_) -> do registerDerivedAxis (axisOf top) "bio" (derivedFromCluster bios)
+                  pure (SpreadAxisFound top)
+    []      -> do proseSim    <- pairwiseProseSim bios
+                  behaviorSim <- pairwiseBehavioralSim trajs
+                  pure $ if proseSim >= paraphraseThreshold
+                            then ParaphraseDegenerate proseSim behaviorSim hyps
+                            else BehaviorallyDegenerate proseSim behaviorSim hyps
+```
+
+### Demo plan (what we'd run to resolve the guarantees question)
+
+To exercise all three verdicts and verify the diagnostic actually
+distinguishes the cases, construct **three Sagittarius clusters by
+hand** and feed each to the disambiguator:
+
+- **Cluster A — paraphrases (target: ParaphraseDegenerate).**
+  Same bio rewritten 3 ways: same content (fire-sign, philosophical,
+  blunt, big-idea), different wording per bio.
+- **Cluster B — substantively different (target: SpreadAxisFound).**
+  3 Sagittarius bios differing in some other behavioral dimension —
+  e.g. one is a philosopher-Sagittarius (high `probe_depth`), one is
+  an adventurer-Sagittarius (high `affective_intensity`), one is a
+  blunt-truth-teller (high `provocative`). These DO project to high
+  Sagittarian on existing axes but should spread on the registry's
+  *other* axes — so a well-designed proposeSpreadAxes should pick up
+  one of those existing-axis directions.
+- **Cluster C — genuinely identical-on-behavior (target:
+  BehaviorallyDegenerate or SpreadAxisFound depending on whether the
+  designer can find anything).** 3 Sagittarius bios that are
+  *prose-different* but pin to the same behavioral mode — e.g. all
+  three describe the same wizard-style adventurer in different
+  vocabulary. Hard to construct cleanly; if the disambiguator finds
+  an axis, the cluster wasn't actually behaviorally degenerate;
+  that's a useful corrective signal.
+
+The demo SUCCEEDS in the same sense the splitter's first run did:
+not by finding a split, but by **correctly characterizing what kind
+of cluster we have**. The harness's job is to be a truthful witness
+about the structure of B, not to always declare a productive answer.
+
+### What this DOES and DOES NOT guarantee
+
+- **Does**: assuming the designer-LLM proposes the right axis in
+  its top-K candidates, and within-bio variance is below judge noise,
+  the disambiguator will find it. Modulo case (a)/(c) degeneracies,
+  it characterizes them honestly.
+- **Does not**: guarantee that the designer-LLM's top-K covers the
+  axis. The hypothesis-generation step is bounded by the designer's
+  vocabulary of plausible axes; for non-obvious dimensions
+  (idiosyncratic combinations, novel jargon), it may fail to propose
+  the right axis even when one exists. Mitigations: larger K,
+  multiple designer calls with different seedings, explicit
+  prompt-side hints to consider specific axis families.
+- **Does not**: handle cases where the cluster's distinguishing
+  dimension is *non-monotonic* on a 1-5 scale (e.g. "three bios that
+  differ by being three discrete archetypes that don't lie on a
+  spectrum"). For these, the right tool is a categorical disambiguator
+  (item 7? not yet specced) that asks the designer for a discrete
+  classification rather than a Likert axis.
