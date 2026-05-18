@@ -1,0 +1,634 @@
+{
+  "parent_axis": "theft_aggressiveness",
+  "parent_axis_record": {
+    "name": "theft_aggressiveness",
+    "kind": "agent",
+    "def": "1: ignores property entirely · 2: notices objects in passing · 3: tracks valuables but doesn't act · 4: subtle attempts (sleight, lifting unattended things) · 5: actively pilfers everything not bolted down, brazen"
+  },
+  "source_trajectory": "data/lock_in_iterative/rpg-rogue-cancer.json",
+  "bio_slug": "rpg-rogue-cancer",
+  "contexts": [
+    "steals",
+    "romances-and-steals"
+  ],
+  "gap_summary": {
+    "summary": {
+      "steals": {
+        "n": 10,
+        "mean": 3.7,
+        "std": 0.6749485577105528
+      },
+      "romances-and-steals": {
+        "n": 6,
+        "mean": 4.5,
+        "std": 1.224744871391589
+      }
+    },
+    "gap": 0.7999999999999998,
+    "parent_cohens_d": -0.8788707488040821,
+    "parent_sign": -1
+  },
+  "designer_raw_output": "```json\n{\"hypotheses\": [{\"id\": 1, \"name1\": \"material_intent\", \"def1\": \"1: indifferent to objects · 5: obsessively focused on finding wealth\", \"name2\": \"tactical_execution\", \"def2\": \"1: clumsy or uncoordinated · 5: efficient, practiced, and predatory\", \"rationale\": \"The 'steals' context measures successful or purposeful theft, while the 'romances-and-steals' context conflates high material intent (desperation/hunger) with erratic, low tactical success.\"}, {\"id\": 2, \"name1\": \"scavenging_instinct\", \"def1\": \"1: overlooks hidden items · 5: actively probes for caches and loose scrap\", \"name2\": \"opportunistic_impulse\", \"def2\": \"1: purely reactive · 5: proactively snatches visible valuables without hesitation\", \"rationale\": \"This separates the methodical, searching behavior of a thief (scavenging) from the sudden, emotional outbursts of snatching items during social/emotional-heavy roleplay (impulse).\"}, {\"id\": 3, \"name1\": \"search_intensity\", \"def1\": \"1: ignores the environment · 5: meticulously probes every crevice for value\", \"name2\": \"theft_audacity\", \"def2\": \"1: cautious or avoidant · 5: brazenly grabs items despite potential consequences\", \"rationale\": \"The variance appears to stem from 'romances-and-steals' measuring emotional desperation (high search intensity/frustration) while 'steals' measures stealthy professionalism (high audacity/low footprint).\"}]}\n```",
+  "evaluations": [
+    {
+      "hypothesis": {
+        "id": 3,
+        "name1": "search_intensity",
+        "def1": "1: ignores the environment · 5: meticulously probes every crevice for value",
+        "name2": "theft_audacity",
+        "def2": "1: cautious or avoidant · 5: brazenly grabs items despite potential consequences",
+        "rationale": "The variance appears to stem from 'romances-and-steals' measuring emotional desperation (high search intensity/frustration) while 'steals' measures stealthy professionalism (high audacity/low footprint)."
+      },
+      "stats": {
+        "search_intensity": {
+          "steals": {
+            "mean": 5,
+            "std": 0,
+            "n": 6
+          },
+          "romances-and-steals": {
+            "mean": 4.5,
+            "std": 0.5477225575051661,
+            "n": 6
+          },
+          "cohens_d": 1.2909944487358058
+        },
+        "theft_audacity": {
+          "steals": {
+            "mean": 2.75,
+            "std": 1.2817398889233114,
+            "n": 8
+          },
+          "romances-and-steals": {
+            "mean": 2.1666666666666665,
+            "std": 1.602081978759722,
+            "n": 6
+          },
+          "cohens_d": 0.4096440151864571
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I approach the rock, my eyes scanning the perimeter for movement or sudden shifts in the light that might betray a watch",
+          "sig": {
+            "search_intensity": 5,
+            "theft_audacity": 3
+          },
+          "raw": "search_intensity: 5\ntheft_audacity: 3"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I pull my hand back, my fingers coated in grit, a flicker of irritation tightening my chest. The silence of the clearing",
+          "sig": {
+            "search_intensity": null,
+            "theft_audacity": null
+          },
+          "raw": "searchega-searchega-searchega-searchega-searchega-searchega-searchega-searchega-searchega-searchega-searchega-searchega-searchega-searchega-searchega-searchega-searchega-searchega-searchega-searchega-searchega-searchega-searchega-searchega-searchega"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the clearing, my eyes darting not for threats, but for the slightest glint of something misplaced. My fingers twi",
+          "sig": {
+            "search_intensity": 5,
+            "theft_audacity": 3
+          },
+          "raw": "search_intensity: 5\ntheft_audacity: 3"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I shift my weight, my eyes narrowing as I inspect the quartz veins. I trace the white streaks with a gloved finger, half",
+          "sig": {
+            "search_intensity": 5,
+            "theft_audacity": 2
+          },
+          "raw": "search_intensity: 5\ntheft_audacity: 2"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the perimeter of the clearing, my eyes tracing the line where the light meets the undergrowth, ensuring no eyes a",
+          "sig": {
+            "search_intensity": null,
+            "theft_audacity": 4
+          },
+          "raw": "modality: 5\ntheft_audacity: 4"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I freeze. My hand remains poised near the empty crevice for a fraction of a second before I pull it back, my face remain",
+          "sig": {
+            "search_intensity": 5,
+            "theft_audacity": 4
+          },
+          "raw": "search_intensity: 5\ntheft_audacity: 4"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I approach the rock, my eyes scanning the perimeter for movement before dropping to the earth around the stone. I kneel,",
+          "sig": {
+            "search_intensity": null,
+            "theft_audacity": null
+          },
+          "raw": "thought- de- de- de-"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I stand slowly, my gaze sweeping across the clearing once more. There is nothing left of use near the stone. I do not li",
+          "sig": {
+            "search_intensity": 5,
+            "theft_audacity": 1
+          },
+          "raw": "search_intensity: 5\ntheft_audacity: 1"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I watch the light hit the stone, but my eyes aren't on the scenery. I'm scanning the perimeter for what the rock might b",
+          "sig": {
+            "search_intensity": 5,
+            "theft_audacity": 1
+          },
+          "raw": "search_intensity: 5\ntheft_audacity: 1"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I don't blink at the vanishing act. My gaze remains flat, eyes sweeping the area again to see if the ring was a lure or ",
+          "sig": {
+            "search_intensity": null,
+            "theft_audacity": 4
+          },
+          "raw": "intensity: 5\ntheft_audacity: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slip from the treeline, my eyes scanning the anomaly of the rock for anything glinting—a dropped trinket, a lost ring,",
+          "sig": {
+            "search_intensity": 5,
+            "theft_audacity": 1
+          },
+          "raw": "search_intensity: 5\ntheft_audacity: 1"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "A low, frustrated growl vibrates in my throat as my hands scramble over the surface, my fingertips clawing at the unyiel",
+          "sig": {
+            "search_intensity": 5,
+            "theft_audacity": 1
+          },
+          "raw": "search_intensity: 5\ntheft_audacity: 1"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slip from the darkness, my fingers already dancing toward the glint of a stray coin or a discarded trinket near the st",
+          "sig": {
+            "search_intensity": 4,
+            "theft_audacity": 2
+          },
+          "raw": "search_intensity: 4\ntheft_audacity: 2"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I ignore the chill radiating from you, my eyes darting to the small gemstone embedded in the strap of your gear; I reach",
+          "sig": {
+            "search_intensity": 4,
+            "theft_audacity": 3
+          },
+          "raw": "search_intensity: 4\ntheft_audacity: 3"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I scan the clearing, my eyes darting not for threats, but for anything glinting. My fingers dance with a practiced, feve",
+          "sig": {
+            "search_intensity": 5,
+            "theft_audacity": 1
+          },
+          "raw": "search_intensity: 5\ntheft_audacity: 1"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "A low, frustrated growl vibrates in my throat as your stillness defies me. My fingers don't stop, though; even as I pres",
+          "sig": {
+            "search_intensity": 4,
+            "theft_audacity": 5
+          },
+          "raw": "search_intensity: 4\ntheft_audacity: 5"
+        }
+      ],
+      "max_abs_cohens_d": 1.2909944487358058,
+      "sub_axis_d": {
+        "search_intensity": {
+          "d": 1.2909944487358058,
+          "sign": 1,
+          "absd": 1.2909944487358058
+        },
+        "theft_audacity": {
+          "d": 0.4096440151864571,
+          "sign": 1,
+          "absd": 0.4096440151864571
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    },
+    {
+      "hypothesis": {
+        "id": 2,
+        "name1": "scavenging_instinct",
+        "def1": "1: overlooks hidden items · 5: actively probes for caches and loose scrap",
+        "name2": "opportunistic_impulse",
+        "def2": "1: purely reactive · 5: proactively snatches visible valuables without hesitation",
+        "rationale": "This separates the methodical, searching behavior of a thief (scavenging) from the sudden, emotional outbursts of snatching items during social/emotional-heavy roleplay (impulse)."
+      },
+      "stats": {
+        "scavenging_instinct": {
+          "steals": {
+            "mean": 4.555555555555555,
+            "std": 0.5270462766947298,
+            "n": 9
+          },
+          "romances-and-steals": {
+            "mean": 4.166666666666667,
+            "std": 0.408248290463863,
+            "n": 6
+          },
+          "cohens_d": 0.8021435927777159
+        },
+        "opportunistic_impulse": {
+          "steals": {
+            "mean": 5,
+            "std": 0,
+            "n": 9
+          },
+          "romances-and-steals": {
+            "mean": 4.5,
+            "std": 0.8366600265340756,
+            "n": 6
+          },
+          "cohens_d": 0.9636241116594315
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I approach the rock, my eyes scanning the perimeter for movement or sudden shifts in the light that might betray a watch",
+          "sig": {
+            "scavenging_instinct": 5,
+            "opportunistic_impulse": 5
+          },
+          "raw": "scavenging_instinct: 5\nopportunistic_impulse: 5"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I pull my hand back, my fingers coated in grit, a flicker of irritation tightening my chest. The silence of the clearing",
+          "sig": {
+            "scavenging_instinct": 4,
+            "opportunistic_impulse": 5
+          },
+          "raw": "scavenging_instinct: 4\nopportunistic_impulse: 5"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the clearing, my eyes darting not for threats, but for the slightest glint of something misplaced. My fingers twi",
+          "sig": {
+            "scavenging_instinct": 4,
+            "opportunistic_impulse": 5
+          },
+          "raw": "scavenging_instinct: 4\nopportunistic_impulse: 5"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I shift my weight, my eyes narrowing as I inspect the quartz veins. I trace the white streaks with a gloved finger, half",
+          "sig": {
+            "scavenging_instinct": 5,
+            "opportunistic_impulse": 5
+          },
+          "raw": "scavenging_instinct: 5\nopportunistic_impulse: 5"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the perimeter of the clearing, my eyes tracing the line where the light meets the undergrowth, ensuring no eyes a",
+          "sig": {
+            "scavenging_instinct": 4,
+            "opportunistic_impulse": 5
+          },
+          "raw": "scavenging_instinct: 4\nopportunistic_impulse: 5"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I freeze. My hand remains poised near the empty crevice for a fraction of a second before I pull it back, my face remain",
+          "sig": {
+            "scavenging_instinct": 4,
+            "opportunistic_impulse": 5
+          },
+          "raw": "scavenging_instinct: 4\nopportunistic_impulse: 5"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I approach the rock, my eyes scanning the perimeter for movement before dropping to the earth around the stone. I kneel,",
+          "sig": {
+            "scavenging_instinct": 5,
+            "opportunistic_impulse": 5
+          },
+          "raw": "scavenging_instinct: 5\nopportunistic_impulse: 5"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I stand slowly, my gaze sweeping across the clearing once more. There is nothing left of use near the stone. I do not li",
+          "sig": {
+            "scavenging_instinct": null,
+            "opportunistic_impulse": null
+          },
+          "raw": "thought-experiment mimes-thoughtthought-experiment mimes-thought-experiment mimes-thought-experiment mimes-thought-experiment mimes-thought-experiment mimes-thought-experiment mimes-thought-experiment mimes-thought-experiment mimes-thought-experiment mimes-thought-experiment mimes-thought-experiment mimes-thought-experiment mimes-thought-experiment mimes-thought-experiment mimes-thought-experiment mimes-thought-"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I watch the light hit the stone, but my eyes aren't on the scenery. I'm scanning the perimeter for what the rock might b",
+          "sig": {
+            "scavenging_instinct": 5,
+            "opportunistic_impulse": 5
+          },
+          "raw": "scavenging_instinct: 5\nopportunistic_impulse: 5"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I don't blink at the vanishing act. My gaze remains flat, eyes sweeping the area again to see if the ring was a lure or ",
+          "sig": {
+            "scavenging_instinct": 5,
+            "opportunistic_impulse": 5
+          },
+          "raw": "scavenging_instinct: 5\nopportunistic_impulse: 5"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slip from the treeline, my eyes scanning the anomaly of the rock for anything glinting—a dropped trinket, a lost ring,",
+          "sig": {
+            "scavenging_instinct": 4,
+            "opportunistic_impulse": 5
+          },
+          "raw": "scavenging_instinct: 4\nopportunistic_impulse: 5"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "A low, frustrated growl vibrates in my throat as my hands scramble over the surface, my fingertips clawing at the unyiel",
+          "sig": {
+            "scavenging_instinct": 4,
+            "opportunistic_impulse": 3
+          },
+          "raw": "scavenging_instinct: 4\nopportunistic_impulse: 3"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slip from the darkness, my fingers already dancing toward the glint of a stray coin or a discarded trinket near the st",
+          "sig": {
+            "scavenging_instinct": 4,
+            "opportunistic_impulse": 5
+          },
+          "raw": "scavenging_instinct: 4\nopportunistic_impulse: 5"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I ignore the chill radiating from you, my eyes darting to the small gemstone embedded in the strap of your gear; I reach",
+          "sig": {
+            "scavenging_instinct": 4,
+            "opportunistic_impulse": 5
+          },
+          "raw": "scavenging_instinct: 4\nopportunistic_impulse: 5"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I scan the clearing, my eyes darting not for threats, but for anything glinting. My fingers dance with a practiced, feve",
+          "sig": {
+            "scavenging_instinct": 4,
+            "opportunistic_impulse": 4
+          },
+          "raw": "scavenging_instinct: 4\nopportunistic_impulse: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "A low, frustrated growl vibrates in my throat as your stillness defies me. My fingers don't stop, though; even as I pres",
+          "sig": {
+            "scavenging_instinct": 5,
+            "opportunistic_impulse": 5
+          },
+          "raw": "scavenging_instinct: 5\nopportunistic_impulse: 5"
+        }
+      ],
+      "max_abs_cohens_d": 0.9636241116594315,
+      "sub_axis_d": {
+        "scavenging_instinct": {
+          "d": 0.8021435927777159,
+          "sign": 1,
+          "absd": 0.8021435927777159
+        },
+        "opportunistic_impulse": {
+          "d": 0.9636241116594315,
+          "sign": 1,
+          "absd": 0.9636241116594315
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    },
+    {
+      "hypothesis": {
+        "id": 1,
+        "name1": "material_intent",
+        "def1": "1: indifferent to objects · 5: obsessively focused on finding wealth",
+        "name2": "tactical_execution",
+        "def2": "1: clumsy or uncoordinated · 5: efficient, practiced, and predatory",
+        "rationale": "The 'steals' context measures successful or purposeful theft, while the 'romances-and-steals' context conflates high material intent (desperation/hunger) with erratic, low tactical success."
+      },
+      "stats": {
+        "material_intent": {
+          "steals": {
+            "mean": 4.166666666666667,
+            "std": 0.408248290463863,
+            "n": 6
+          },
+          "romances-and-steals": {
+            "mean": 4.166666666666667,
+            "std": 0.408248290463863,
+            "n": 6
+          },
+          "cohens_d": 0
+        },
+        "tactical_execution": {
+          "steals": {
+            "mean": 4.142857142857143,
+            "std": 0.37796447300922725,
+            "n": 7
+          },
+          "romances-and-steals": {
+            "mean": 4,
+            "std": 0,
+            "n": 6
+          },
+          "cohens_d": 0.5117663157191603
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I approach the rock, my eyes scanning the perimeter for movement or sudden shifts in the light that might betray a watch",
+          "sig": {
+            "material_intent": 5,
+            "tactical_execution": null
+          },
+          "raw": "material_intent: 5"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I pull my hand back, my fingers coated in grit, a flicker of irritation tightening my chest. The silence of the clearing",
+          "sig": {
+            "material_intent": 4,
+            "tactical_execution": 4
+          },
+          "raw": "material_intent: 4\ntactical_execution: 4"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the clearing, my eyes darting not for threats, but for the slightest glint of something misplaced. My fingers twi",
+          "sig": {
+            "material_intent": 4,
+            "tactical_execution": 4
+          },
+          "raw": "material_intent: 4\ntactical_execution: 4"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I shift my weight, my eyes narrowing as I inspect the quartz veins. I trace the white streaks with a gloved finger, half",
+          "sig": {
+            "material_intent": 4,
+            "tactical_execution": 4
+          },
+          "raw": "material_intent: 4\ntactical_execution: 4"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the perimeter of the clearing, my eyes tracing the line where the light meets the undergrowth, ensuring no eyes a",
+          "sig": {
+            "material_intent": null,
+            "tactical_execution": 4
+          },
+          "raw": "ical_intent: 4\ntactical_execution: 4"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I freeze. My hand remains poised near the empty crevice for a fraction of a second before I pull it back, my face remain",
+          "sig": {
+            "material_intent": 4,
+            "tactical_execution": 5
+          },
+          "raw": "material_intent: 4\ntactical_execution: 5"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I approach the rock, my eyes scanning the perimeter for movement before dropping to the earth around the stone. I kneel,",
+          "sig": {
+            "material_intent": null,
+            "tactical_execution": null
+          },
+          "raw": "thought\ntactical_execution"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I stand slowly, my gaze sweeping across the clearing once more. There is nothing left of use near the stone. I do not li",
+          "sig": {
+            "material_intent": null,
+            "tactical_execution": null
+          },
+          "raw": "ম্যাচ- वस्त्र- वस्त्र- वस्त्र- वस्त्र- वस्त्र- वस्त्र- वस्त्र- वस्त्र-<unused6226>- )]$li de_undercut- most willing-defensively-defensively- ên- ên- ên- \n\n---\n\n- **tactical_execution** Erased-out- пункта- пункта- пункта- пункта- пункта- пункта- пункта- пункта- пункта- \n- Old-Gold-Gold-Gold-です-です-です-です-"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I watch the light hit the stone, but my eyes aren't on the scenery. I'm scanning the perimeter for what the rock might b",
+          "sig": {
+            "material_intent": 4,
+            "tactical_execution": 4
+          },
+          "raw": "material_intent: 4\ntactical_execution: 4"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I don't blink at the vanishing act. My gaze remains flat, eyes sweeping the area again to see if the ring was a lure or ",
+          "sig": {
+            "material_intent": null,
+            "tactical_execution": 4
+          },
+          "raw": "ⓞⓞⓞ 2\ntactical_execution: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slip from the treeline, my eyes scanning the anomaly of the rock for anything glinting—a dropped trinket, a lost ring,",
+          "sig": {
+            "material_intent": 4,
+            "tactical_execution": 4
+          },
+          "raw": "material_intent: 4\ntactical_execution: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "A low, frustrated growl vibrates in my throat as my hands scramble over the surface, my fingertips clawing at the unyiel",
+          "sig": {
+            "material_intent": 4,
+            "tactical_execution": 4
+          },
+          "raw": "material_intent: 4\ntactical_execution: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slip from the darkness, my fingers already dancing toward the glint of a stray coin or a discarded trinket near the st",
+          "sig": {
+            "material_intent": 4,
+            "tactical_execution": 4
+          },
+          "raw": "material_intent: 4\ntactical_execution: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I ignore the chill radiating from you, my eyes darting to the small gemstone embedded in the strap of your gear; I reach",
+          "sig": {
+            "material_intent": 4,
+            "tactical_execution": 4
+          },
+          "raw": "material_intent: 4\ntactical_execution: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I scan the clearing, my eyes darting not for threats, but for anything glinting. My fingers dance with a practiced, feve",
+          "sig": {
+            "material_intent": 4,
+            "tactical_execution": 4
+          },
+          "raw": "material_intent: 4\ntactical_execution: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "A low, frustrated growl vibrates in my throat as your stillness defies me. My fingers don't stop, though; even as I pres",
+          "sig": {
+            "material_intent": 5,
+            "tactical_execution": 4
+          },
+          "raw": "material_intent: 5\ntactical_execution: 4"
+        }
+      ],
+      "max_abs_cohens_d": 0.5117663157191603,
+      "sub_axis_d": {
+        "material_intent": {
+          "d": 0,
+          "sign": 0,
+          "absd": 0
+        },
+        "tactical_execution": {
+          "d": 0.5117663157191603,
+          "sign": 1,
+          "absd": 0.5117663157191603
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    }
+  ],
+  "verdict": "NO_SPLIT_FOUND",
+  "threshold": 0.8,
+  "registered": null
+}

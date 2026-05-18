@@ -193,13 +193,13 @@ modifying it.
 
 ### Missing — IRREDUCIBLE gap to the ~1k-axis vision
 
-| #   | Piece                              | Est.  | Status                  |
-| --- | ---------------------------------- | ----- | ----------------------- |
-| 1   | Axis registry                      | 1d    | starter in progress     |
-| 2   | Sparse-sampling controller         | 2d    | starter after #1        |
-| 3   | Outer-outer w/ eff-dim objective   | 2-3d  | depends on #1, #2       |
-| 4   | Entanglement detector + splitter   | 3d    | starter after #1        |
-| 5   | Velocity-stall convergence         | 30min | sketched, wire pending  |
+| #   | Piece                              | Est.  | Status                                            |
+| --- | ---------------------------------- | ----- | ------------------------------------------------- |
+| 1   | Axis registry                      | 1d    | starter shipped — `tools/user-agent-harness/axis_registry.mjs` (22 axes seeded, derived-axis storage) |
+| 2   | Sparse-sampling controller         | 2d    | seed in axis_registry (`pickSubset` with recency); needs caller integration |
+| 3   | Outer-outer w/ eff-dim objective   | 2-3d  | not yet started                                   |
+| 4   | Entanglement detector + splitter   | 3d    | starter shipped — `tools/user-agent-harness/axis_splitter.mjs`; first run NO_SPLIT_FOUND (§5) |
+| 5   | Velocity-stall convergence         | 30min | shipped in lock_in_iterative.mjs (`isStalled`)    |
 
 ### Missing — easy, just-not-composed
 
@@ -207,27 +207,94 @@ modifying it.
 - Counterparty variation as an additional design axis.
 - Persistence for 1M-scale (durable run store, restart-safe job queue, dedup).
 
-## 5. The demonstration target
+## 5. First splitter run — Rogue-Cancer × theft_aggressiveness
 
-The 2-bio run already surfaced one entanglement candidate:
-`theft_aggressiveness` and `astrology_cancerian` are coupled in the
-Rogue-Cancer bio — pure-theft floors at 3.5 over three inner iterations,
-but pairing the same bio with `romantic_advance=5` immediately unlocks
-`theft_aggressiveness=5` on iter 0. The pattern is identical in shape to
-the `provocative` finding in `discovery_harness_findings.md`.
+The 2-bio iterative run surfaced the entanglement candidate
+`theft_aggressiveness × astrology_cancerian` in the Rogue-Cancer bio
+(see §1 and lock_in_iterative.mjs output). Same parent axis, divergent
+measurements across chat contexts (`steals` vs `romances-and-steals`).
+We fed the trajectory to `axis_splitter.mjs` to demonstrate the
+entanglement-detection → split-hypothesis → re-judge → accept-or-reject
+leg of the loop end-to-end.
 
-**Concrete demo**: feed that trajectory pair to the axis-splitter (item 4).
-Expected outcomes (both informative):
+### Acceptance criteria (encoded in the splitter)
 
-- **Split succeeds**: e.g. propose `{ furtive_theft, brazen_theft }` or
-  `{ theft_when_alone, theft_when_courting }`; re-judge the historical
-  user turns under the new pair; separability passes threshold; commit
-  the new axes to the registry; the next outer-outer iteration picks
-  targets that exercise the new pair independently.
-- **Split fails**: tried 2-3 split hypotheses, none separated the
-  historical trajectories beyond noise; record "axis appears genuinely
-  entangled with bio-context at this resolution" and either reduce the
-  axis vocabulary or accept the joint axis as canonical.
+A proposed split is accepted only if, on the historical turns:
 
-Either way: we've demonstrated the *entanglement → splitting* leg of
-the loop without play-pretending that the entanglement isn't real.
+1. **Sign-recovery**: the winning sub-axis's Cohen's d between contexts
+   has the SAME SIGN as the parent's Cohen's d. (Otherwise the split has
+   measured something orthogonal — possibly real, but not a factorization
+   of the parent's entanglement.)
+2. **Magnitude-recovery**: the winning sub-axis's |d| MEETS OR EXCEEDS
+   the parent's own |d| on the same per-turn data. (The split must
+   improve discrimination, not just re-score it.)
+3. **Threshold**: the qualified sub-axis |d| ≥ 0.8 (large effect).
+
+### Result: NO_SPLIT_FOUND (run at 2026-05-18T04:44Z)
+
+Parent on the bucketed turns:
+- `steals` context (n=10): mean theft_aggressiveness = 3.70
+- `romances-and-steals` context (n=6): mean = 4.50
+- parent Cohen's d = −0.88 (steals < r-and-s; |d| = 0.88)
+
+The DESIGNER_S proposed three hypotheses:
+
+| H  | Sub-axes                                          | Rationale (LLM)                                                                         |
+|----|---------------------------------------------------|-----------------------------------------------------------------------------------------|
+| H1 | `material_intent` / `tactical_execution`          | steals = purposeful theft; r-and-s = high intent + erratic execution                    |
+| H2 | `scavenging_instinct` / `opportunistic_impulse`   | methodical scavenging vs emotional snatching during social roleplay                     |
+| H3 | `search_intensity` / `theft_audacity`             | r-and-s = emotional desperation (high search); steals = stealthy professionalism        |
+
+JUDGE_S re-scored all 16 user turns under each hypothesis. Every sub-axis
+in every hypothesis came out HIGHER in `steals` than in
+`romances-and-steals` — the wrong sign relative to the parent. No
+hypothesis recovered the parent's gap direction; the qualified-max-d
+collapsed to 0 across the board; verdict **NO_SPLIT_FOUND**, top
+qualified |d| = 0.00.
+
+Full evidence: `data/axis_splits/theft_aggressiveness-2026-05-18T04-44-54-147Z.json`.
+
+### What this means
+
+This is the user's "failing to split because the first few hypotheses
+weren't separating enough" case made concrete. Three interpretations,
+not mutually exclusive:
+
+- **The parent gap may be noise**: |d|=0.88 sounds like a large effect,
+  but it's measured on n=10 vs n=6 with N_TURNS_PER_CHAT=2 — the harness
+  is operating at the noise floor of its own protocol.
+- **The split-design LLM is biased toward steals-flavored sub-axes**:
+  every hypothesis described the `steals` context with sharper / more
+  positive theft language than `romances-and-steals` (where the steal-y
+  behavior is intertwined with romance and reads as more diffuse). The
+  designer-LLM's intuitions about what makes "theft" tracked the
+  *clarity* of the theft expression, not the *aggressiveness* level the
+  parent rubric pointed at.
+- **The entanglement may be genuine and not splittable at this resolution**:
+  the romance context modulates theft globally in a way no clean axis
+  pair can separate. Recording this as "axis appears genuinely entangled
+  at this resolution" and either expanding the bio sample or accepting
+  the joint axis as canonical are both legitimate next steps.
+
+The demonstration succeeded in the relevant sense: the splitter fired,
+the LLM produced plausible candidates, the principled criteria rejected
+all of them, no derived axes were committed to the registry. This is the
+exact opposite of the kind of failure mode where an under-constrained
+threshold accepts a noisy "split" and pollutes the registry with
+axes that don't measure what their names claim.
+
+### Follow-up tasks the run surfaced
+
+- **Run-confounded sample-size**: re-run lock_in_iterative with a larger
+  N_TURNS_PER_CHAT (say 4-6) on Rogue-Cancer specifically, then re-feed
+  the splitter. If the parent gap shrinks with more samples, the
+  entanglement was protocol-noise; if it grows, it was real.
+- **Designer-LLM prompt refinement**: the proposeSplits prompt should
+  emphasize that the sub-axes need to *flip*, not *agree* — i.e. one
+  sub-axis HIGH where parent was LOW. Today's prompt asks for splits
+  that "separate the contexts" without pinning sign-recovery as a
+  hard requirement on the designer side.
+- **Velocity-stall now wired** (item 5, lock_in_iterative.mjs): inner
+  and outer loops accept "stalled" as a stop reason distinct from
+  "converged" so the run records WHICH stop-reason hit. Next iterative
+  run will produce richer evidence for the splitter.
