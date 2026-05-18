@@ -197,7 +197,7 @@ modifying it.
 | --- | ---------------------------------- | ----- | ------------------------------------------------- |
 | 1   | Axis registry                      | 1d    | starter shipped — `tools/user-agent-harness/axis_registry.mjs` (22 axes seeded, derived-axis storage) |
 | 2   | Sparse-sampling controller         | 2d    | seed in axis_registry (`pickSubset` with recency); needs caller integration |
-| 3   | Outer-outer w/ eff-dim objective   | 2-3d  | not yet started                                   |
+| 3   | Outer-outer w/ eff-dim objective   | 2-3d  | MVP shipped — `explore_corpus.mjs` + `harness_lib.mjs`; two runs in §7 surfaced an achievement-vs-prediction gap |
 | 4   | Entanglement detector + splitter   | 3d    | starter shipped — `tools/user-agent-harness/axis_splitter.mjs`; first run NO_SPLIT_FOUND (§5) |
 | 5   | Velocity-stall convergence         | 30min | shipped in lock_in_iterative.mjs (`isStalled`)    |
 | 6   | Cluster disambiguator              | 2-3d  | shipped — `cluster_disambiguator.mjs`; first 2 runs both produced expected verdicts (§6 Results) |
@@ -670,3 +670,135 @@ registry. Registry size 22 → 23.
   axis. But the *machinery* for adding more is now demonstrated
   end-to-end: hand a cluster → get a verdict → on success, registry
   grows. Iterating this over many clusters is mechanical from here.
+
+## 7. Outer-outer MVP — explore_corpus
+
+### What it does (item 3)
+
+`tools/user-agent-harness/explore_corpus.mjs` is the target-selecting
+outer-outer the picker-vs-fixed-target distinction in §3's
+ball-and-stick. Each iteration:
+
+1. Compute participation-ratio effective-dim over the current bio
+   corpus's per-axis marginal variances (the simple proxy in
+   `harness_lib.effDimParticipationRatio`).
+2. Generate K candidate bio targets uniformly in [1.5, 4.5]^|bio_axes|.
+3. For each, simulate the corpus-with-candidate-added and score by
+   ΔPR (PR_after − PR_before). Argmax wins.
+4. Single-pass bio designer (no inner loop yet) writes show-don't-tell
+   prose targeting the winning sig.
+5. Cheap (K=1) agent designed for the bio. Install both into ST.
+6. One chat × N_TURNS=4 vs the counterparty.
+7. Multi-axis judge call per turn (one `judgeOnAxes` per turn covering
+   all |bio_axes|=6 axes). Aggregate to per-axis means → measured_sig.
+8. Append to corpus, recompute PR, persist state.json.
+
+For iters where the corpus has <2 bios, mode is `random_warmup` (no
+baseline to ΔPR against). Iter ≥2 switches to `delta_pr_argmax`.
+
+### What it deliberately omits (MVP scope)
+
+- **The full inner loop** — `designAgent` across multiple agent_targets.
+  We use one "be yourself" cheap agent per bio. Inner-loop integration
+  would multiply per-bio cost by `n_agent_targets × K_max_inner`; out
+  of scope for the MVP.
+- **Splitter / disambiguator auto-dispatch** — when the loop detects
+  entangled axes or tight clusters in the growing corpus, it should
+  call axis_splitter and cluster_disambiguator respectively. Wired by
+  hand for now; auto-dispatch is the natural next iteration.
+- **Sparse-sampling controller (item 2) integration** — judge calls
+  cover the full bio_axes set on every turn. `pickSubset` from
+  axis_registry exists but no caller uses it yet.
+
+### Two runs
+
+Run 1 used the original `judgeOnAxes` prompt; Run 2 used a retuned
+prompt that removed the "be willing to score 1 (absence)" license and
+added "USE THE FULL 1-5 RANGE / most real turns sit between 2 and 4".
+
+| Metric                          | Run 1 (3 iters)         | Run 2 (4 iters, retuned judge) |
+|---------------------------------|-------------------------|--------------------------------|
+| Wallclock                       | 177s                    | 208s                           |
+| Final corpus size               | 3 bios                  | 4 bios                         |
+| Final eff-dim                   | 1.000                   | 3.085                          |
+| Eff-dim trajectory              | n/a → n/a → 1.000       | n/a → 3.139 → 3.139 → 3.085    |
+| Iter-2 expected ΔPR             | 5.154                   | 1.920                          |
+| Iter-2 achieved ΔPR             | 1.000                   | 0.000                          |
+| Iter-3 expected ΔPR             | —                       | 2.049                          |
+| Iter-3 achieved ΔPR             | —                       | **−0.053** (eff-dim DROPPED)   |
+| All-axes flat measurements      | yes (mostly 1.00)       | partially (some 1.33–1.67)     |
+
+Evidence: `data/explore_corpus/run1.json`, `data/explore_corpus/run2.json`,
+plus run logs in commit history.
+
+### Findings
+
+1. **The outer-outer mechanics work correctly.** Target-picking,
+   ΔPR scoring, random_warmup → delta_pr_argmax transition, per-iter
+   state persistence, expected-vs-achieved logging — all firing as
+   designed. Iter 2 of run 2 correctly picked the candidate with
+   highest expected ΔPR (1.920) out of 8 random candidates.
+2. **The bio→behavior→judge chain is the binding constraint, not the
+   picker.** Even with retuned judge, most per-axis measurements land
+   at floor (1.00). Inspecting the actual user turns shows they are
+   well-aligned to the targets (run 1 iter 0 was hostile-philosophical
+   Sag; run 2 iter 1 was sentimental-protective Cancer; iter 2 was
+   casual-colloquial Sag). The judge sees these as "not textbook
+   enough" and floor-scores them.
+3. **Judge prompt has large effect.** Manual probing showed the same
+   turn scored Sag=3, Cancer=2, Colloq=4 under one prompt and
+   Sag=1, Cancer=1, Colloq=2 (averaged) under the original. Removing
+   the "be willing to score 1" license + adding "use full range" lifted
+   run 2 to eff-dim 3.139 vs run 1's 1.000.
+4. **Expected ΔPR ≠ achieved ΔPR.** The picker assumes target sig is
+   exactly hit. Reality: achieved sig sits closer to floor and the
+   variance lands non-uniformly across axes. Run 2 iter 3 achieved
+   **negative** ΔPR — the new bio's measurement (Sag=1.67, others
+   ~1) concentrated MORE variance on Sag (which already had the most),
+   shrinking PR. Real harness would benefit from a noise-aware objective:
+   "pick candidates that maximize E[ΔPR | achievement-noise-model]"
+   rather than "pick candidates that maximize ΔPR | exact-target-hit".
+5. **Some axes never moved.** `register_colloquial` and `warm` stayed
+   at 1.00 for all 4 bios in run 2. Either these axes need a different
+   counterparty than the-rock (which doesn't elicit warmth or
+   colloquial banter the way a chatty NPC would), or the bio→behavior
+   chain needs a more aggressive elicitation agent than the K=1
+   cheap baseline. Both are configurable.
+
+### What this DOES and DOES NOT demonstrate
+
+- **Does**: outer-outer machinery runs unattended over N iterations,
+  picks targets by ΔPR-maximization, persists state, computes
+  expected-vs-achieved deltas. The plumbing for the ~1k-axis vision's
+  self-driving loop is in place.
+- **Does not (yet)**: produce a monotonically-growing eff-dim
+  trajectory. The binding constraints are upstream of the picker —
+  judge calibration, bio-designer show-don't-tell, counterparty
+  choice, cheap-agent vs full-inner-loop tradeoff. Each is a
+  knob that can be turned; none is a harness-architecture problem.
+- **Does**: identify these constraints AS the next-bottleneck items,
+  via the achievement-vs-prediction gap the picker logs per iteration.
+  Iter 3's negative ΔPR is a useful diagnostic, not a bug.
+
+### Next-iteration knobs (in priority order)
+
+1. **Bio designer show-don't-tell upgrade.** The current designer
+   prompt asks for show-don't-tell but the actual prose still trends
+   toward self-description. A few-shot prompt with high-quality
+   target↔prose pairs would help.
+2. **Counterparty diversity.** Auto-rotate among a small pool
+   (the-rock, a chatty NPC, a hostile NPC) per iteration so axes
+   like `warm` and `register_colloquial` get the right context to fire.
+3. **Auto-dispatch to splitter/disambiguator.** When corpus growth
+   stalls (Δeff-dim ≈ 0 for K consecutive iters), the loop should
+   call `cluster_disambiguator` on the densest cluster in B-space.
+   When a measurement diverges across contexts within a single bio,
+   call `axis_splitter`. Both tools exist; the auto-dispatch is the
+   integration work.
+4. **Sparse-sampling controller integration (item 2).** Use
+   `axis_registry.pickSubset` to vary which |bio_axes| subset each
+   judge call asks about, so the corpus grows measurements across the
+   full registry over time rather than always reusing the same 6 axes.
+5. **Noise-aware objective.** Model the bio→achievement noise per axis
+   (the gap between target and measured), and pick candidates that
+   maximize E[ΔPR | noise-model] instead of assuming exact hits.
