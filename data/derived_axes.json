@@ -1,1 +1,20 @@
-[]
+[
+  {
+    "name": "normative_directionality",
+    "kind": "bio",
+    "def": "1: descriptive/observational; 5: prescriptive/directive.",
+    "derived_from": {
+      "cluster_members": [
+        "cluster-sag-substantive-metaphys.png",
+        "cluster-sag-substantive-explorer.png",
+        "cluster-sag-substantive-preacher.png"
+      ],
+      "cluster_id": "sag-substantive",
+      "reason": "spread_axis",
+      "F": 35.93,
+      "spread": 3.88,
+      "evidence_file": "data/cluster_disambig/sag-substantive-2026-05-18T05-31-06-363Z.json"
+    },
+    "created_at": "2026-05-18T05:31:34.223Z"
+  }
+]

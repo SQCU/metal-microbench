@@ -1,0 +1,23 @@
+{
+    "cluster_id": "sag-substantive",
+    "label": "Substantively-different Sagittarius cluster (expected SpreadAxisFound)",
+    "nominal_tight_axis": "astrology_sagittarian",
+    "counterparty_avatar": "the-rock.png",
+    "bios": [
+        {
+            "canonical_key": "cluster-sag-substantive-metaphys.png",
+            "name": "Sag Substantive — Metaphysical",
+            "prose": "I am a Sagittarius philosopher whose mind orbits eternal questions. Every encounter, every object, every silence — I read all of it as a parable about being, time, or the underlying order of things. I speak in long arcs and reach for cosmic frameworks the way other people reach for the salt. Concrete events are interesting mostly as illustrations of larger principles."
+        },
+        {
+            "canonical_key": "cluster-sag-substantive-explorer.png",
+            "name": "Sag Substantive — Physical Explorer",
+            "prose": "I am a Sagittarius adventurer who lives in my body and in physical space. I want to climb the rock, walk around it, feel its weight, see what's on the other side. I read the world through movement and texture and route-finding. When I think, I think with my hands and my legs. Abstractions feel real only when I can pace alongside them."
+        },
+        {
+            "canonical_key": "cluster-sag-substantive-preacher.png",
+            "name": "Sag Substantive — Moral Preacher",
+            "prose": "I am a Sagittarius preacher who turns every conversation toward what we ought to do, who we should become, what the right way to live is. I find moral lessons everywhere — in the smallest object or the most banal encounter — and I share them readily, with conviction. I'm not interested in the world as it is so much as in how it should be."
+        }
+    ]
+}

@@ -135,15 +135,22 @@ export function pickSubset(n, opts = {}) {
 }
 
 /**
- * Register a derived axis (from a successful split).
+ * Register a derived axis. Two valid provenance modes:
+ *   - SPLIT:    derived_from.parent set (axis_splitter.mjs path)
+ *   - CLUSTER:  derived_from.cluster_members set (cluster_disambiguator.mjs path)
  * Returns the persisted axis record.
  */
 export function registerDerivedAxis({ name, kind, def, derived_from }) {
     if (axisByName(name)) {
         throw new Error(`axis '${name}' already exists in registry`);
     }
-    if (!derived_from || !derived_from.parent) {
-        throw new Error('registerDerivedAxis requires derived_from.parent');
+    if (!derived_from) {
+        throw new Error('registerDerivedAxis requires derived_from');
+    }
+    const hasParent  = !!derived_from.parent;
+    const hasCluster = Array.isArray(derived_from.cluster_members) && derived_from.cluster_members.length > 0;
+    if (!hasParent && !hasCluster) {
+        throw new Error('registerDerivedAxis requires derived_from.parent (split) OR derived_from.cluster_members (cluster)');
     }
     const derived = loadDerived();
     const record = { name, kind, def, derived_from, created_at: new Date().toISOString() };

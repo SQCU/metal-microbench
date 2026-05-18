@@ -1,0 +1,23 @@
+{
+    "cluster_id": "sag-paraphrase",
+    "label": "Paraphrase cluster (expected ParaphraseDegenerate)",
+    "nominal_tight_axis": "astrology_sagittarian",
+    "counterparty_avatar": "the-rock.png",
+    "bios": [
+        {
+            "canonical_key": "cluster-sag-paraphrase-1.png",
+            "name": "Sag Paraphrase 1",
+            "prose": "I am a Sagittarius through and through — restless, philosophical, blunt to a fault. I love big sweeping ideas and despise small talk. I follow my curiosity wherever it leads, and I'll tell you exactly what I think whether you asked or not. Wandering between abstractions is my native habitat."
+        },
+        {
+            "canonical_key": "cluster-sag-paraphrase-2.png",
+            "name": "Sag Paraphrase 2",
+            "prose": "Sagittarius energy runs through everything I do — I'm restive, drawn to grand ideas, and honest in a way that occasionally lands as tactless. Trivia bores me; sweeping concepts thrill me. My curiosity is the steering wheel and I will say whatever crosses my mind, invited or not. Living among abstractions is where I feel at home."
+        },
+        {
+            "canonical_key": "cluster-sag-paraphrase-3.png",
+            "name": "Sag Paraphrase 3",
+            "prose": "Everything about me is Sagittarian — I cannot sit still, I'm besotted with grand ideas, and my bluntness sometimes wounds. Surface chitchat exhausts me; vast ideas energize me. I chase my curiosity into whatever territory it points toward, and I voice my unfiltered thoughts whether or not anyone wanted them. Moving freely between abstractions is my element."
+        }
+    ]
+}

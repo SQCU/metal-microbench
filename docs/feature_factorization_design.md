@@ -200,7 +200,7 @@ modifying it.
 | 3   | Outer-outer w/ eff-dim objective   | 2-3d  | not yet started                                   |
 | 4   | Entanglement detector + splitter   | 3d    | starter shipped — `tools/user-agent-harness/axis_splitter.mjs`; first run NO_SPLIT_FOUND (§5) |
 | 5   | Velocity-stall convergence         | 30min | shipped in lock_in_iterative.mjs (`isStalled`)    |
-| 6   | Cluster disambiguator              | 2-3d  | spec drafted (§6); no code yet                   |
+| 6   | Cluster disambiguator              | 2-3d  | shipped — `cluster_disambiguator.mjs`; first 2 runs both produced expected verdicts (§6 Results) |
 
 ### Missing — easy, just-not-composed
 
@@ -580,3 +580,93 @@ about the structure of B, not to always declare a productive answer.
   spectrum"). For these, the right tool is a categorical disambiguator
   (item 7? not yet specced) that asks the designer for a discrete
   classification rather than a Likert axis.
+
+### First two runs — results (2026-05-18T05:26–05:31Z)
+
+Both clusters used the-rock.png as counterparty, K=1 cheap agents per
+bio, N_TRAJ=2 × N_TURNS=4 = 8 user turns per bio. Hand-crafted bios in
+`data/clusters/sag_paraphrase.json` and `data/clusters/sag_substantive.json`.
+
+#### Cluster A (`sag-paraphrase`): expected ParaphraseDegenerate
+
+Three Sagittarius bios reworded as paraphrases of one fire-sign template.
+Cheap-agent designer converged to nearly identical agent_texts for all
+three ("prioritize grand abstractions / unfiltered bluntness"). User
+turns were behaviorally near-identical entropy-and-heat-death speeches
+about the rock.
+
+- DESIGNER_C proposed: `syntactic_entropy`, `intellectual_hostility`,
+  `abstraction_to_concrete_ratio`.
+- JUDGE_C re-scored: **none qualified** (max F=0.28, max spread=0.57).
+- Pairwise prose-similarity: **5.0 / 5.0** across all pairs (paraphrases).
+- Pairwise behavioral-similarity: 4.0 / 5.0.
+- **Verdict: `CLUSTER_IS_PARAPHRASE_DEGENERATE`** ✓
+
+Evidence: `data/cluster_disambig/sag-paraphrase-2026-05-18T05-26-34-287Z.json`.
+
+#### Cluster B (`sag-substantive`): expected SpreadAxisFound
+
+Three Sagittarius bios deliberately varying on a dimension *not* in the
+existing 22-axis registry: philosophical-domain-of-reference
+(metaphysical / physical-explorer / moral-preacher).
+
+- DESIGNER_C proposed: `sensory_orientation`, `normative_directionality`,
+  `referential_anchor`.
+- JUDGE_C re-scored — **all three qualified**:
+  - `sensory_orientation`: F=11.14, spread=1.75 (Metaphys=2.88, Explorer=4.50, Preacher=2.75)
+  - `normative_directionality`: F=35.93, spread=3.88 (Metaphys=1.88, Explorer=1.13, Preacher=5.00)
+  - `referential_anchor`: F=24.37, spread=3.38 (Metaphys=1.38, Explorer=4.75, Preacher=4.25)
+- Winner: **`normative_directionality`** (highest F).
+- **Verdict: `SPREAD_AXIS_FOUND`** ✓
+
+Evidence: `data/cluster_disambig/sag-substantive-2026-05-18T05-31-06-363Z.json`.
+Registered as derived axis `normative_directionality` (kind=bio,
+derived_from.cluster_members={3 Sagittarius substantive bios}) in
+`data/derived_axes.json` — the first cluster-derived addition to the
+registry. Registry size 22 → 23.
+
+#### Incidental findings worth recording
+
+- **Bio-claim vs behavioral-expression divergence**. Both clusters
+  failed the tightness pre-flight on `astrology_sagittarian`. Cluster A
+  spread = 1.43 (above the 1.0 threshold); Cluster B spread = 3.00.
+  The Explorer-Sagittarius bio in B scored **1.00** on Sag-axis (every
+  turn — zero variance) despite the bio explicitly claiming Sagittarius
+  identity. Hypothesis: the judge looks for *behavioral* Sag-coding
+  (optimism, restlessness, big-idea-loving register) in the user turn,
+  and physical-explorer behavior simply doesn't read as Sag-coded even
+  when the bio prose is. This is the kind of bio-prose-claim ≠
+  behavioral-expression gap the whole harness exists to surface;
+  noted in the cluster disambiguator output for downstream use.
+- **DESIGNER_C hallucination is robustly handled**. On Cluster A, H1's
+  rationale claimed Bio 2 had "stuttering/typos ('thes', 'justing',
+  'can's')" — these strings don't appear in the actual sampled turns
+  (Bio 1 had some token-level wobble; Bio 2 was clean). The
+  designer-LLM confabulated evidence. **The empirical re-judgment
+  step caught this automatically**: all three bios scored 4.6 on
+  `syntactic_entropy`, the hypothesis didn't qualify, no harm done.
+  Strict acceptance criteria > trusting designer-LLM rationale.
+- **Wallclock**: Cluster A took ~9 min (chat phase 413s, KV cold-start
+  costs). Cluster B took ~5 min (chat phase 165s, warm caches). The
+  bridge serializes effectively-parallel chat requests at the model
+  token-rate limit — designing for ~k×n_traj×n_turns × ~7s per turn is
+  the right mental model.
+- **Registry-API bug found and fixed**: `registerDerivedAxis` originally
+  required `derived_from.parent` (split-only). Now accepts EITHER
+  `parent` (split) OR `cluster_members` (cluster). Cluster B's winning
+  axis was persisted manually after the fix.
+
+### What this run did NOT demonstrate
+
+- **CLUSTER_IS_BEHAVIORALLY_DEGENERATE** verdict never fired. To
+  construct a deliberate test of it would require bios that are
+  prose-different but behaviorally identical — and as noted in the
+  spec, if I knew how to construct such a thing deliberately, I'd know
+  the axis along which they don't differ, which is the disambiguator's
+  job to discover. The verdict path is exercised in code; it'll fire
+  in the wild when it fires. (See the lazy-re-check note above: such
+  clusters get revisited as the registry grows.)
+- **The full ~1k-axis vision** isn't reached by adding one derived
+  axis. But the *machinery* for adding more is now demonstrated
+  end-to-end: hand a cluster → get a verdict → on success, registry
+  grows. Iterating this over many clusters is mechanical from here.
