@@ -282,7 +282,6 @@ def launch_bridge(gguf_path: str | Path,
             for line in proc.stdout:
                 # Strip trailing newline; we add our own with the prefix.
                 line = line.rstrip("\n")
-                # LINT-OK-PREFIX-SAFE: log timestamp, never enters a prompt.
                 ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
                 log_fh.write(f"[{ts}Z] {line}\n")
                 log_fh.flush()                  # explicit flush per line

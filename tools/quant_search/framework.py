@@ -707,7 +707,6 @@ async def run_benchmarks_pooled(
                 fh.close()
 
     print(f"[pool] done. wrote {completed}/{total} records across "
-          # LINT-OK-PREFIX-SAFE: wall-clock duration for the operator log.
           f"{len(benchmarks)} benchmarks in {time.time()-wall_t0:.1f}s",
           flush=True)
 
