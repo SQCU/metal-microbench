@@ -63,6 +63,22 @@ export async function fetchAxes(kind = null) {
     return list;
 }
 
+// Fetch one experiment-spec card by id. Returns the full card as
+// validated/stored by the plugin (bios, agent_targets, axis lists,
+// counterparty, loop_control). Orchestration scripts use this to
+// configure themselves from disk rather than inlining the tetrad
+// (or whatever N-tuple their experiment defines) as JS source.
+export async function fetchExperiment(id) {
+    return await http('GET', `${PLUGIN}/experiments/${encodeURIComponent(id)}`);
+}
+
+// List every experiment-spec card. Used by the "Fixed-point iteration"
+// client tab to populate its picker.
+export async function fetchExperiments() {
+    const r = await http('GET', `${PLUGIN}/experiments`);
+    return r.experiments || [];
+}
+
 /**
  * Save a bio. Bios alone aren't signed — the ontological closure says
  * only compositions (bio+agent) carry signatures. This helper just

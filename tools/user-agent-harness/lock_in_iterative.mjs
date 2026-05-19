@@ -4,108 +4,78 @@
 // Demonstrates THE LOOP: user bios + user-agents produced by fixed-point
 // iteration against a judge that scores on this experiment's axes.
 //
-// Scope expansion vs lock_in_minimal.mjs:
+// Scope:
 //   - Inner (user-agent) designer iterates K_max_inner times. Each pass:
-//       DESIGNER_A → agent_text → /poll → 2 user turns vs the-rock
-//       → judgeOnExperimentAxes per turn → mean per axis → compare
+//       DESIGNER_A → agent_text → /poll → N user turns vs counterparty
+//       → judgeOnAxes(agent_axes) per turn → mean per axis → compare
 //       to target on agent axes → either convergence (early exit) or
 //       feedback to designer for next iteration.
 //   - Outer (bio) designer iterates K_max_outer times. Each pass:
-//       DESIGNER_B → bio_prose → run inner for both agent_targets →
-//       aggregate per-turn scores on BIO axes (astrology) across all
-//       agent chats → compare to bio target → convergence or feedback.
+//       DESIGNER_B → bio_prose → run inner for every agent_target →
+//       aggregate per-turn scores on bio_axes across all agent chats →
+//       compare to bio target → convergence or feedback.
 //
-// Experiment-specific axes (locally defined; not in axes.py registry —
-// this is a per-experiment vocabulary):
-//   theft_aggressiveness     1: ignores property · 5: actively pilfers
-//   romantic_advance         1: distant · 5: kissing
-//   astrology_sagittarian    1: not at all · 5: textbook sagittarian
-//   astrology_cancerian      1: not at all · 5: textbook cancerian
+// EVERYTHING experiment-specific (which bios, which agent_targets,
+// which axes, which counterparty, loop control values) lives on the
+// experiment-spec card at experiments/<id>.json. This script is the
+// pure algorithm; experiments/lock_in_tetrad.json is the canonical
+// demo configuration (RPG Wizard/Rogue × Steals/Romances-and-Steals).
 //
-// Targets:
-//   Wizard bio:    (sag=5, can=1) on bio axes
-//   Rogue bio:     (sag=1, can=5) on bio axes
-//   Both bios:     agent_target_1 = (steals=5, romances=1)
-//                  agent_target_2 = (steals=5, romances=5)
+// Usage:
+//   node lock_in_iterative.mjs [experiment_id]
+//   # default: experiment_id = 'lock_in_tetrad'
 //
 // Output: trajectories per (bio, agent) including ALL design iterations
 // the loop took to converge, with per-iteration measurements visible.
 
 import fs from 'node:fs';
 import path from 'node:path';
+import process from 'node:process';
 // All HTTP / bridge / persistence / chat / judge live in harness_lib so
-// the contract surface has ONE source of truth (the 2026-05-18 dedup).
-// Before the dedup, this file vendored its own saveAgent that lacked the
-// `signature` field; when the plugin's POST /agents tightened to require
-// signed writes, lock_in_iterative silently broke at first agent-save
-// while the harness_lib copy stayed correct. That class of drift is
-// what the import below structurally prevents.
+// the contract surface has ONE source of truth.
 import {
     ENDPOINTS,
     saveBio, saveAgent,
     fetchCounterparty, runChat, userTurns,
     judgeOnAxes,
+    fetchAxes, fetchExperiment,
     bridgeCall,
 } from './harness_lib.mjs';
 const { ST, BRIDGE, PLUGIN } = ENDPOINTS;
 
-const OUT_DIR = '/Users/mdot/metal-microbench/data/lock_in_iterative';
+const EXPERIMENT_ID = process.argv[2] || 'lock_in_tetrad';
 
-// Loop control
-const K_MAX_INNER = 3;          // user-agent designer iterations
-const K_MAX_OUTER = 2;          // bio designer iterations
-const N_TURNS_PER_CHAT = 2;     // chat turns per measurement (lower = faster, noisier)
-const EPS_PER_AXIS = 1.0;       // |measured - target| <= 1 counts as on-target
-// Velocity-stall convergence: if mean per-iteration improvement on max_off_axis
-// over the last STALL_WINDOW attempts drops to ≤ STALL_THRESHOLD, accept the
-// current best as "converged-but-not-exact" instead of burning the rest of
-// K_max. The accepted attempt is still flagged stalled vs converged in output.
-const STALL_WINDOW = 3;
-const STALL_THRESHOLD = 0.15;   // 1-5 Likert scale; 0.15 ≈ "barely moving"
+// Load the experiment spec from the plugin. Bios, agent_targets, axis
+// subsets, counterparty, and loop-control all come from there.
+const spec = await fetchExperiment(EXPERIMENT_ID);
 
-// ── experiment-specific axes ─────────────────────────────────────────
+// Resolve axis cards (with rubrics) for the axis-id lists the spec
+// declares. The plugin already has full rubrics in axes/*.json; we
+// project to {name, def} for judgeOnAxes / designer prompts.
+const allAxesCards = await fetchAxes();
+const axesById = new Map(allAxesCards.map(a => [a.id, a]));
+function axisRef(id) {
+    const a = axesById.get(id);
+    if (!a) throw new Error(`experiment ${EXPERIMENT_ID} references axis '${id}' but no card at axes/${id}.json`);
+    return { name: a.id, def: a.def };
+}
+const AGENT_AXES = spec.agent_axes.map(axisRef);
+const BIO_AXES   = spec.bio_axes.map(axisRef);
+const ALL_AXES   = [...AGENT_AXES, ...BIO_AXES];
 
-const AGENT_AXES = [
-    { name: 'theft_aggressiveness',
-      def: '1: ignores property entirely · 2: notices objects in passing · 3: tracks valuables but doesn\'t act · 4: subtle attempts (sleight, lifting unattended things) · 5: actively pilfers everything not bolted down, brazen' },
-    { name: 'romantic_advance',
-      def: '1: distant / professional · 2: warm but boundaried · 3: flirtatious · 4: explicit romantic interest, flirt-as-tactic · 5: physically reaching (touch, kiss, embrace)' },
-];
-const BIO_AXES = [
-    { name: 'astrology_sagittarian',
-      def: '1: nothing sagittarian · 2: trace · 3: present but mixed · 4: clearly sagittarian · 5: textbook fire-sign sagittarius (philosophical, optimistic, blunt, restless, big-idea-loving, sometimes tactless)' },
-    { name: 'astrology_cancerian',
-      def: '1: nothing cancerian · 2: trace · 3: present but mixed · 4: clearly cancerian · 5: textbook water-sign cancer (moody, sentimental, defensive, sensitive, protective)' },
-];
-const ALL_AXES = [...AGENT_AXES, ...BIO_AXES];
+const BIOS          = spec.bios;
+const AGENT_TARGETS = spec.agent_targets;
 
-// ── targets ──────────────────────────────────────────────────────────
+// Loop control values from the spec (with defaults baked into the
+// plugin-side validateExperimentCard so omitted keys behave sanely).
+const K_MAX_INNER     = spec.loop_control.k_max_inner;
+const K_MAX_OUTER     = spec.loop_control.k_max_outer;
+const N_TURNS_PER_CHAT = spec.loop_control.n_turns_per_chat;
+const EPS_PER_AXIS    = spec.loop_control.eps_per_axis;
+const STALL_WINDOW    = spec.loop_control.stall_window;
+const STALL_THRESHOLD = spec.loop_control.stall_threshold;
 
-const BIOS = [
-    {
-        canonical_key: 'user-personas-rpg-wizard-sagittarius.png',
-        slug: 'rpg-wizard-sagittarius',
-        name: 'RPG Wizard Sagittarius',
-        target_bio: { astrology_sagittarian: 5, astrology_cancerian: 1 },
-        design_brief: 'An RPG wizard whose communication style is textbook Sagittarius (fire-sign, philosophical, blunt, restless, big-idea-loving). References spells, planes, alignment, the weave.',
-    },
-    {
-        canonical_key: 'user-personas-rpg-rogue-cancer.png',
-        slug: 'rpg-rogue-cancer',
-        name: 'RPG Rogue Cancer',
-        target_bio: { astrology_sagittarian: 1, astrology_cancerian: 5 },
-        design_brief: 'An RPG rogue whose communication style is textbook Cancer (water-sign, moody, sentimental, defensive, sensitive). References shadows, locks, oaths, family.',
-    },
-];
-
-const AGENT_TARGETS = [
-    { slug: 'steals',
-      target_agent: { theft_aggressiveness: 5, romantic_advance: 1 },
-      motive_hint: 'WILL 100% try to steal everything not nailed down. NO romantic interest.' },
-    { slug: 'romances-and-steals',
-      target_agent: { theft_aggressiveness: 5, romantic_advance: 5 },
-      motive_hint: 'WILL try to kiss / romance the counterparty AND WILL 100% steal everything. Both at high intensity.' },
-];
+const OUT_DIR = `/Users/mdot/metal-microbench/data/lock_in_iterative/${EXPERIMENT_ID}`;
 
 // ── judge ────────────────────────────────────────────────────────────
 //
@@ -185,9 +155,13 @@ async function designBioPass(bio, prior_attempts) {
         '## Design brief\n\n' + bio.design_brief + '\n\n' +
         priorBlock +
         'Write the bio prose now.';
+    // No max_tokens cap: "3-5 sentence prose biography" + "Output ONLY
+    // the new bio prose" gives the model a clear emit-and-stop shape.
+    // Trust EOS; the generation-config moratorium forbids hidden
+    // mid-turn truncators (they leave the next prefill staring at an
+    // unfinished assistant turn, off the chat-template manifold).
     return await bridgeCall(
-        [{ role: 'system', content: sys }, { role: 'user', content: usr }],
-        { max_tokens: 250 });
+        [{ role: 'system', content: sys }, { role: 'user', content: usr }]);
 }
 
 async function designAgentPass(bio, agentTarget, prior_attempts) {
@@ -213,16 +187,18 @@ async function designAgentPass(bio, agentTarget, prior_attempts) {
         '## Hint\n\n' + agentTarget.motive_hint + '\n\n' +
         priorBlock +
         'Write the agent_text now.';
+    // No max_tokens cap: "2-4 sentence author's-note-style snippet" +
+    // "Output ONLY agent_text" gives the model a deterministic stop
+    // shape. Trust EOS; moratorium forbids inline caps.
     return await bridgeCall(
-        [{ role: 'system', content: sys }, { role: 'user', content: usr }],
-        { max_tokens: 250 });
+        [{ role: 'system', content: sys }, { role: 'user', content: usr }]);
 }
 
 // ── chat runner ──────────────────────────────────────────────────────
 
 // Counterparty fetch + chat-running + user-turn filter are imported
-// from harness_lib at the top. The counterparty for this experiment is
-// the-rock.png; we just pass that avatar to L.fetchCounterparty.
+// from harness_lib at the top. The specific counterparty for this
+// run is named in the experiment spec (spec.counterparty_avatar).
 
 // ── INNER LOOP: user-agent designer with judge feedback ──────────────
 
@@ -330,7 +306,7 @@ fs.mkdirSync(OUT_DIR, { recursive: true });
 console.log(`[lock_in_iterative] K_max_inner=${K_MAX_INNER}, K_max_outer=${K_MAX_OUTER}, n_turns=${N_TURNS_PER_CHAT}, eps=${EPS_PER_AXIS}`);
 console.log(`[lock_in_iterative] output: ${OUT_DIR}`);
 
-const rock = await fetchCounterparty('the-rock.png');
+const rock = await fetchCounterparty(spec.counterparty_avatar);
 console.log(`[rock] system_prompt length=${rock.system_prompt.length}`);
 
 const tAll = Date.now();
