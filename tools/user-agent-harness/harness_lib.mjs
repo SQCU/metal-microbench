@@ -55,16 +55,12 @@ async function _loadAxisRegistry() {
  * time as the splitter/disambiguator add derived axes.
  */
 export async function saveBio({ canonical_key, name, prose }) {
+    // No signature at bio-level. The closure: bios alone aren't
+    // executable; the act of synthesizing an agent for a bio creates
+    // the composition signature. Bios are just prose + voice clauses.
     const system_prompt = `You are ${name}. ${prose}`;
-    const proseForSig = `Bio (user-side persona):\n${prose}\n\nVoice clauses:\n${system_prompt}`;
-    const axes = await _loadAxisRegistry();
-    const sig = await http('POST', `${PLUGIN}/signature-extract`, { prose: proseForSig, axes });
-    if (!sig || !sig.signature || typeof sig.signature !== 'object') {
-        throw new Error(`saveBio: /signature-extract returned no signature for ${canonical_key}`);
-    }
     await http('POST', `${PLUGIN}/personas/${encodeURIComponent(canonical_key)}`, {
         name, bio: prose, system_prompt,
-        signature: sig.signature,
     });
 }
 
@@ -119,7 +115,11 @@ export async function runChat(bio, agent_id, cp, n_turns) {
             { role: 'system', content: cp.system_prompt },
             ...chat.map(m => ({ role: m.is_user ? 'user' : 'assistant', content: m.mes })),
         ];
-        const cpText = await bridgeCall(cpMessages, { max_tokens: 200 });
+        // No max_tokens cap: the counterparty plays a chat turn ending
+        // at EOS / chat-template <turn|> stop-sequence. A 200-token cap
+        // here used to truncate mid-utterance, leaving the next prefill
+        // looking at an unfinished assistant turn — off-manifold.
+        const cpText = await bridgeCall(cpMessages);
         chat.push({ name: cp.name, is_user: false, mes: cpText.trim() });
     }
     return chat;
@@ -143,9 +143,14 @@ export async function designCheapAgent(bio) {
         '## Bio (the user-persona this agent will overlay)\n\n' +
         bio.prose + '\n\n' +
         'Write the agent_text now (2-3 sentences, neutral "be vividly yourself" target).';
+    // No max_tokens cap: "2-3 sentences" + "Output ONLY the agent_text"
+    // gives the model a clear emit-and-stop shape. The model EOSes
+    // naturally; capping at 200 used to silently truncate the third
+    // sentence and leave the prompt's next turn looking at unfinished
+    // assistant text. Generation-config moratorium: no caller-side
+    // caps.
     return await bridgeCall(
-        [{ role: 'system', content: sys }, { role: 'user', content: usr }],
-        { max_tokens: 200 });
+        [{ role: 'system', content: sys }, { role: 'user', content: usr }]);
 }
 
 // ── judge: single axis on one turn ───────────────────────────────────
@@ -162,9 +167,12 @@ export async function judgeOnAxis(turn, axisName, axisDef) {
         `## Axis (1-5)\n\n- **${axisName}** — ${axisDef}\n\n` +
         '## Turn to score\n\n> ' + turn.replace(/\n/g, '\n> ') + '\n\n' +
         `## Emit\n\n${axisName}: ?\n`;
+    // No max_tokens cap: prompt shape ("Output ONLY the axis line")
+    // gives a deterministic single-line emit + EOS. A 50-token cap
+    // would truncate any judge that emitted any preamble before the
+    // line — silent failure rather than visible parse error.
     const raw = await bridgeCall(
-        [{ role: 'system', content: sys }, { role: 'user', content: usr }],
-        { max_tokens: 50 });
+        [{ role: 'system', content: sys }, { role: 'user', content: usr }]);
     const escName = axisName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const re = new RegExp('^\\s*[-*]?\\s*\\**["\']?' + escName +
                           '["\']?\\**\\s*[:=]\\s*([1-5])', 'im');
@@ -197,9 +205,13 @@ export async function judgeOnAxes(turn, axes) {
         '## Turn to score\n\n' +
         '> ' + turn.replace(/\n/g, '\n> ') + '\n\n' +
         '## Emit\n\n' + template + '\n';
+    // No max_tokens cap: the rubric + template emit-shape constrains
+    // the model to one line per axis with explicit termination. A
+    // formula-derived cap was still a cap and could truncate when the
+    // model emitted any unexpected preamble — silent half-signature
+    // rather than visible parse error.
     const raw = await bridgeCall(
-        [{ role: 'system', content: sys }, { role: 'user', content: usr }],
-        { max_tokens: 50 + axes.length * 20 });
+        [{ role: 'system', content: sys }, { role: 'user', content: usr }]);
     const sig = {};
     for (const a of axes) sig[a.name] = null;
     for (const line of raw.split('\n')) {
