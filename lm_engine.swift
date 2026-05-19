@@ -880,6 +880,38 @@ final class Session {
     var logprobsQueue: [LogprobRecord] = []
     var lastReportedOutputCount: Int = 0
 
+    // Forward-progress liveness pair. The engine-side backstop in the
+    // 2026-05-18 lifecycle-safety triple:
+    //   (1) bridge bounded response_q + overflow-cancel (P5)
+    //   (2) bridge request.is_disconnected() poll in
+    //       _consume_engine_stream (P1)
+    //   (3) ← this engine-side liveness deadline (P3)
+    // Each layer alone is sufficient under typical failure modes. All
+    // three together guarantee that a dead-consumer stream cannot run
+    // for longer than consumerLivenessDeadline seconds, ever — even if
+    // the bridge is alive-but-hung, even if asyncio fails to propagate
+    // cancellation, even if queue-overflow detection is defeated.
+    //
+    // Signal: `position` strictly increases during BOTH prefill (every
+    // chunk consumed advances by chunk size) AND AR generation (every
+    // sampled token advances by 1). If position hasn't advanced for
+    // consumerLivenessDeadline seconds AND the session is in .priming
+    // or .generating, the session is stuck and gets transitioned to
+    // .done with doneReason=3 + an explanatory errMsg.
+    //
+    // Chose position-advance over "tokens drained by FFI pump" because
+    // it handles long prefills correctly: the pump's drainSession
+    // returns [] during prefill (no AR tokens emit) but position is
+    // advancing chunk by chunk. A fanout-based signal would falsely
+    // expire those sessions.
+    //
+    // Maintained entirely by expireAbandonedSessions (called from
+    // gemma_poll's drive loop); no other call site touches these
+    // fields. bindStream initializes both at request-time so a brand-
+    // new session gets ≥1 deadline window of grace.
+    var lastSeenPosition: Int = 0
+    var lastForwardProgressAt: Date = Date()
+
     fileprivate init(id: Int, eosId: UInt32, maxNewTokens: Int, engine: LmEngine) {
         self.id = id; self.slot = nil
         self.eosId = eosId; self.maxNewTokens = maxNewTokens
@@ -1333,12 +1365,78 @@ final class LmEngine {
     private(set) var requestForStream: [UInt64: Session] = [:]
     func bindStream(_ s: Session, streamId sid: UInt64) {
         s.streamId = sid
+        // Reset liveness clock on bind so a freshly-submitted session
+        // gets ≥1 full consumerLivenessDeadline of grace before
+        // expireAbandonedSessions could ever sample its position.
+        s.lastSeenPosition = s.position
+        s.lastForwardProgressAt = Date()
         requestForStream[sid] = s
     }
     func unbindStream(_ s: Session) {
         if s.streamId != 0 {
             requestForStream.removeValue(forKey: s.streamId)
             s.streamId = 0
+        }
+    }
+
+    // Consumer-liveness deadline for the abandoned-session reaper.
+    // 60s is generous: a healthy session advances position at AR-tick
+    // speed (~25ms per token) or prefill-chunk speed (multiple tokens
+    // per chunk). 60s with no position advance means the session is
+    // either (a) a dead-consumer stream still running because the
+    // bridge's disconnect-detection failed (the RCA scenario), or (b)
+    // an admission-backpressure stream that hasn't seen a slot in over
+    // a minute (operationally indistinguishable from "stuck"). Both
+    // deserve termination. See Session.lastForwardProgressAt for the
+    // full RCA reference.
+    static let consumerLivenessDeadline: TimeInterval = 60.0
+
+    /// Reap sessions whose forward progress has stalled. A session is
+    /// abandoned when it is in .priming or .generating AND its
+    /// `position` hasn't advanced for `consumerLivenessDeadline`
+    /// seconds. We transition each such session to .done with
+    /// doneReason=3 (engine error) and an explanatory errMsg; the FFI
+    /// pump's cleanup pass (`for u in updates where u.state == 2 {
+    /// closeSession(u) }`) then runs and releases pages + unbinds the
+    /// streamId on the very same gemma_poll iteration.
+    ///
+    /// Position-advance is the signal because it's monotonically
+    /// increasing during both prefill (chunk consumption) and AR
+    /// (token generation). A token-drained-by-pump signal would
+    /// falsely expire long-prefill sessions whose chunks aren't yet
+    /// producing AR tokens.
+    ///
+    /// Called from gemma_poll's drive loop before each work step. The
+    /// O(active_streams) iteration cost is negligible against the AR-
+    /// tick budget — there are typically ≤ 16 active streams.
+    func expireAbandonedSessions() {
+        let now = Date()
+        let deadline = LmEngine.consumerLivenessDeadline
+        for s in requestForStream.values {
+            // Only reap sessions actively asking for slot time. .done
+            // sessions are already on their way out via the regular
+            // cleanup path.
+            guard s.state.wantsSlot else { continue }
+            if s.position > s.lastSeenPosition {
+                // Forward progress — refresh snapshot.
+                s.lastSeenPosition = s.position
+                s.lastForwardProgressAt = now
+                continue
+            }
+            let stalled = now.timeIntervalSince(s.lastForwardProgressAt)
+            if stalled > deadline {
+                print("[engine] expireAbandonedSessions: "
+                    + "sid=\(s.streamId) state=\(s.state) "
+                    + "stalled=\(Int(stalled))s position=\(s.position) "
+                    + "numGenerated=\(s.numGenerated) "
+                    + "→ .done(consumer abandoned)")
+                s.state = .done
+                s.doneReason = 3   // engine error (surfaces as 500 / SSE error)
+                s.errMsg = "consumer abandoned: position stalled at "
+                    + "\(s.position) for \(Int(stalled))s "
+                    + "(deadline=\(Int(deadline))s, "
+                    + "stream_id=\(s.streamId))"
+            }
         }
     }
     // 2026-05-07 (M:K): slotAssignment removed. With the per-CB picker

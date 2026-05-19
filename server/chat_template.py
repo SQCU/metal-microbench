@@ -178,6 +178,7 @@ _IMAGE_PLACEHOLDER = "<|image|>"
 
 def render_chat(messages: list[dict], *,
                 add_generation_prompt: bool = True,
+                continue_final_message: bool = False,
                 enable_thinking: bool = False,
                 tools: list | None = None,
                 bos_token: str = "",
@@ -193,6 +194,24 @@ def render_chat(messages: list[dict], *,
         scaffolding so the model knows it's its turn to reply. Default
         True (OpenAI-style). Pass False for completions-style prompts
         that already include a model turn.
+      - continue_final_message: resume AR inside the existing final
+        assistant message instead of opening a fresh one. The last
+        message in `messages` must have role='assistant'; we strip
+        the trailing `<turn|>\\n` closer that the template emits at
+        end-of-message AND force add_generation_prompt=False (which
+        would otherwise add a NEW `<|turn>model\\n` after our partial).
+        Result: prefill ends mid-turn, the very next sampled token
+        naturally continues the partial assistant text. This is the
+        OpenAI/vLLM-compat partial-resume mode (vLLM ships the same
+        body field under the same name).
+
+        Caveat: if the partial assistant content contains an open
+        `<|channel>thought` block with no `<channel|>` close, the
+        resumed AR will NOT route subsequent tokens to thinkingQueue —
+        inChannelBlock flips on SAMPLING the open token, not on
+        PREFILLING it. Resuming mid-thinking is an unsupported edge
+        case; clients should buffer reasoning_content separately and
+        avoid putting unclosed thinking markers into resume payloads.
       - enable_thinking: enable Gemma-4's thinking-channel prelude.
       - tools: optional list of tool function declarations.
       - bos_token: emitted literally by the template at the very top.
@@ -202,6 +221,19 @@ def render_chat(messages: list[dict], *,
       - template_path: override for the jinja source. Defaults to the
         location resolved from env vars.
     """
+    if continue_final_message:
+        # Validate: the last message must be assistant. The whole point
+        # is to continue ITS turn, not to randomly truncate someone
+        # else's. Raise ValueError so the bridge can re-raise as 400.
+        if not messages or messages[-1].get("role") != "assistant":
+            raise ValueError(
+                "continue_final_message=True requires messages[-1].role"
+                f"='assistant'; got role="
+                f"{messages[-1].get('role') if messages else None!r}")
+        # Force off — generation continues inside the existing turn.
+        # Setting True here would emit a fresh `<|turn>model\\n` AFTER
+        # our partial content, opening a new turn (wrong).
+        add_generation_prompt = False
     norm_msgs, payloads = _normalize_messages(messages)
     path = template_path or _default_template_path()
     rendered: str = _load_template(path).render(
@@ -211,6 +243,22 @@ def render_chat(messages: list[dict], *,
         tools=tools,
         bos_token=bos_token,
     )
+    if continue_final_message:
+        # The jinja template emits `<turn|>\\n` after every message
+        # (chat_template.jinja line 384). For partial-resume we want
+        # the rendered context to end MID-TURN — strip the trailing
+        # turn-close marker so the next sampled token continues the
+        # assistant's text rather than starting a new turn.
+        TURN_CLOSE = '<turn|>\n'
+        if not rendered.endswith(TURN_CLOSE):
+            raise RuntimeError(
+                "render_chat: continue_final_message expected the "
+                f"rendered output to end with {TURN_CLOSE!r} (the "
+                "per-message turn closer the template emits); got "
+                f"...{rendered[-32:]!r}. Either the template was "
+                "modified to suppress trailing turn closers, or the "
+                "last message rendered into an unexpected shape.")
+        rendered = rendered[: -len(TURN_CLOSE)]
     parts = rendered.split(_IMAGE_PLACEHOLDER)
     if len(parts) != len(payloads) + 1:
         raise RuntimeError(

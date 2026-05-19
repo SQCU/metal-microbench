@@ -144,6 +144,32 @@ _TURN_END_TOKENS: list[int] = []         # set at startup; chat-template end-of-
 # to-back regardless of the deadline.
 _DRIVER_POLL_DEADLINE_MS = 1000
 
+# 2026-05-18: response-queue depth high-water mark and disconnect-poll
+# cadence — the lifecycle-safety pair that prevents the "stream
+# pretending to autoregress at 100× slowdown forever" failure mode.
+# Root-cause analysis lived as commit message in this same change; in
+# brief: the non-streaming chat_completions handler used to await
+# response_q.get() with no client-disconnect detection. When the HTTP
+# client died, the handler awaited forever, the engine kept generating
+# into a dead queue, and engine.requestForStream[sid] leaked. Fix is
+# three-way defense-in-depth:
+#   (1) HIGH_WATER bound: driver thread checks qsize() before pushing.
+#       When qsize > HIGH_WATER, consumer is presumed dead — submit
+#       opcode-2 cancel and stop pushing. Catches dead handlers without
+#       requiring asyncio to detect them.
+#   (2) DISCONNECT_POLL: in _consume_engine_stream, race response_q.get()
+#       against request.is_disconnected(). Catches TCP RST / cancel /
+#       client kill within at most _DISCONNECT_POLL_INTERVAL_S.
+#   (3) Engine-side consumer-liveness deadline (lm_engine.swift):
+#       Session.lastForwardProgressAt + expireAbandonedSessions. The ultimate
+#       backstop: even if both bridge mechanisms fail, the engine
+#       self-cleans after T_STALE seconds of no productive fanout.
+# 256 is generous: a healthy SSE consumer drains ~1 update per AR tick
+# (~25ms canonical, ~100ms throttled). qsize > 256 means the handler
+# has been silent for 6-25 seconds — long enough to call "dead".
+_RESPONSE_Q_HIGH_WATER = 256
+_DISCONNECT_POLL_INTERVAL_S = 0.25
+
 # 2026-05-07: deleted _conv_cache. The bridge is now stateless across
 # chat-completion requests — no warm-path adoption, no
 # message-hash-keyed memory, no LRU. Engine-side content-hash KV page
@@ -166,15 +192,160 @@ def _push_update_threadsafe(loop: asyncio.AbstractEventLoop,
     """Schedule `response_q.put_nowait(update)` on the asyncio loop from
     the native driver thread. asyncio.Queue.put_nowait is itself
     thread-safe against the get-side; call_soon_threadsafe handles the
-    cross-thread loop wakeup. No await chain, no to_thread."""
+    cross-thread loop wakeup. No await chain, no to_thread.
+
+    Overflow protection (P5 of the 2026-05-18 RCA): qsize() crossing
+    _RESPONSE_Q_HIGH_WATER means the handler consumer hasn't drained in
+    many seconds — presumed dead. Submit opcode-2 cancel and drop the
+    update. Engine ignores cancel on already-.done sessions, so
+    repeated overflow events are idempotent. This catches the case
+    where the handler is alive but stuck (e.g. blocked on a downstream
+    HTTP write to a half-dead socket that uvicorn hasn't yet detected),
+    which the in-handler is_disconnected() poll alone wouldn't see.
+    """
     rq = _response_qs.get(update.stream_id)
     if rq is None:
+        return
+    # qsize() reads a plain int field in CPython; safe cross-thread, at
+    # most one update stale. False positive of "single tick of overflow"
+    # is harmless: the cancel is idempotent and the handler exits its
+    # own loop cleanly on the resulting state==2 yield.
+    if rq.qsize() > _RESPONSE_Q_HIGH_WATER:
+        print(f"[bridge] response_q overflow on sid={update.stream_id} "
+              f"(qsize={rq.qsize()} > {_RESPONSE_Q_HIGH_WATER}) — "
+              f"consumer presumed dead, submitting cancel", flush=True)
+        try:
+            g.submit([g.StreamSpec(stream_id=update.stream_id, action=2)])
+        except Exception as e:
+            print(f"[bridge] overflow-cancel submit failed: {e}", flush=True)
         return
     try:
         loop.call_soon_threadsafe(rq.put_nowait, update)
     except RuntimeError:
         # Loop closed during shutdown — drop the update silently.
         pass
+
+
+async def _wait_until_disconnected(request: Request) -> None:
+    """Block until the client TCP-disconnects. Cancellable.
+
+    `Request.is_disconnected()` reads the ASGI receive channel for an
+    http.disconnect message. It's a cheap non-blocking check — we poll
+    it on a short cadence rather than awaiting a single receive event
+    so that handler-level cancellation propagates cleanly through
+    asyncio.wait. Returns silently on disconnect; exceptions
+    (uvicorn going away mid-poll) propagate so the caller can decide.
+    """
+    while True:
+        if await request.is_disconnected():
+            return
+        await asyncio.sleep(_DISCONNECT_POLL_INTERVAL_S)
+
+
+async def _consume_engine_stream(stream_id: int, request: Request):
+    """Single shared coroutine that owns engine-stream lifecycle.
+
+    Yields each StreamUpdate as it arrives from the engine. Guarantees:
+      - Races response_q.get() against client disconnect; bails out
+        within _DISCONNECT_POLL_INTERVAL_S of the client going away.
+      - On ANY non-clean exit (disconnect, exception, asyncio cancel),
+        submits opcode-2 cancel to the engine so the session is reaped.
+        "Clean exit" means the caller observed an update with
+        u.state == 2 — the engine signaled natural termination.
+      - Always pops _response_qs[stream_id] on exit.
+      - Logs (DISCONNECT) usage when the client gave up mid-stream so
+        the silent-cache-hits-on-cancel observability gap stays closed.
+
+    Used by BOTH the aggregate (non-streaming) and SSE branches of
+    chat_completions. The branches differ only in what they do with
+    each yielded update — accumulate-then-respond, or serialize as an
+    SSE frame. This function owns the cross-cutting concerns: disconnect
+    detection, cancel-on-exit, response_q cleanup, usage logging.
+    Before this refactor those concerns were inlined separately in each
+    branch (and the non-streaming branch was missing disconnect
+    detection entirely — the bug that motivated this RCA).
+
+    Caller pattern:
+        async for u in _consume_engine_stream(stream_id, req):
+            # render u as the caller's response format
+            if u.state == 2:
+                ...  # render final state, then loop will end
+        # if we get here without ever seeing u.state == 2, the
+        # client disconnected and the cancel has been submitted
+    """
+    response_q = _response_qs[stream_id]
+    last_update: g.StreamUpdate | None = None
+    clean_close = False
+    try:
+        while True:
+            # Race response_q.get() against client disconnect. Both are
+            # cancellable; FIRST_COMPLETED returns the winner. We cancel
+            # the loser. asyncio.wait does NOT propagate exceptions —
+            # we read .result() or .cancelled() explicitly below.
+            get_task = asyncio.create_task(response_q.get())
+            disc_task = asyncio.create_task(
+                _wait_until_disconnected(request))
+            try:
+                done, pending = await asyncio.wait(
+                    {get_task, disc_task},
+                    return_when=asyncio.FIRST_COMPLETED)
+            except asyncio.CancelledError:
+                # Handler task cancelled (uvicorn shutdown, timeout,
+                # etc.). Cancel both child tasks and re-raise so the
+                # finally still runs cancel-submit.
+                get_task.cancel(); disc_task.cancel()
+                raise
+            for t in pending:
+                t.cancel()
+            if disc_task in done:
+                # Client disconnected. Drain disc_task's exception (if
+                # any) silently — we're exiting either way.
+                try: disc_task.result()
+                except Exception: pass
+                break
+            u: g.StreamUpdate = get_task.result()
+            last_update = u
+            # Set clean_close BEFORE yield. If we set it after, a caller
+            # that `break`s out of `async for` after consuming the
+            # state==2 update would leave clean_close=False at the
+            # moment GeneratorExit propagates into this generator's
+            # frame — the finally would then submit a spurious cancel
+            # to an already-.done engine session. Setting before yield
+            # makes both "iterate to natural end" and "break after
+            # observing state==2" safe for the caller.
+            if u.state == 2:
+                clean_close = True
+            yield u
+            if clean_close:
+                break
+    finally:
+        if not clean_close:
+            # Cancel-on-non-clean-exit. Fires on:
+            #   - client disconnect (disc_task won the race)
+            #   - asyncio cancellation (uvicorn / handler timeout)
+            #   - caller-side exception during `yield u` (raises
+            #     through the generator's frame to this finally)
+            if last_update is not None:
+                u = last_update
+                print(f"[bridge] usage (DISCONNECT): "
+                      f"stream_id={stream_id}, "
+                      f"prompt_tokens={u.prompt_tokens_seen}, "
+                      f"completion_tokens={u.completion_tokens_emitted}, "
+                      f"cache_hits={u.cache_hits}, "
+                      f"cache_misses={u.cache_misses}, "
+                      f"vision_cache_hits={u.vision_cache_hits}, "
+                      f"state={u.state}, "
+                      f"done_reason={u.done_reason}", flush=True)
+            else:
+                print(f"[bridge] disconnect before first update "
+                      f"(stream_id={stream_id}); submitting cancel",
+                      flush=True)
+            try:
+                g.submit([g.StreamSpec(stream_id=stream_id, action=2)])
+            except Exception as e:
+                print(f"[bridge] cancel-on-disconnect submit failed "
+                      f"(stream_id={stream_id}): {e}", flush=True)
+        _response_qs.pop(stream_id, None)
 
 
 def _engine_driver_thread(loop: asyncio.AbstractEventLoop) -> None:
@@ -619,7 +790,8 @@ def _build_stream_spec(stream_id: int,
                        tools: list | None = None,
                        enable_thinking: bool = False,
                        capture_cvec_activations: bool = False,
-                       control_vectors: list | None = None) -> tuple[g.StreamSpec, list[StoredSegment]]:
+                       control_vectors: list | None = None,
+                       continue_final_message: bool = False) -> tuple[g.StreamSpec, list[StoredSegment]]:
     """OpenAI messages → (StreamSpec, delta_segments).
 
     Bridge is stateless across chat completions: each request renders
@@ -642,13 +814,20 @@ def _build_stream_spec(stream_id: int,
 
     try:
         delta_chunks = render_chat(
-            messages, add_generation_prompt=True, tools=tools,
+            messages,
+            add_generation_prompt=not continue_final_message,
+            continue_final_message=continue_final_message,
+            tools=tools,
             enable_thinking=enable_thinking)
     except ValueError as e:
         # image_url that isn't a data: URI is a client-shape error,
-        # not a server fault.
-        if "image_url" in str(e):
-            raise HTTPException(400, str(e)) from None
+        # not a server fault. continue_final_message also raises
+        # ValueError when the last message isn't role='assistant';
+        # surface that as a 400 too.
+        msg = str(e)
+        if ("image_url" in msg
+                or "continue_final_message" in msg):
+            raise HTTPException(400, msg) from None
         raise
 
     delta_segments = _chunks_to_segments(delta_chunks, add_bos=True)
@@ -961,11 +1140,23 @@ async def chat_completions(req: Request) -> Any:
     messages = body.get("messages", [])
     if not messages:
         raise HTTPException(400, "messages is required")
-    # Default bumped 256 → 4096 on 2026-05-07. The 256 default came from
-    # before the engine could sustain long contexts; Gemma-4 rates 128k and
-    # the engine kernel-side handles 64k+ full-cache cleanly. Clients that
-    # want shorter responses pass max_tokens explicitly.
-    max_tokens = int(body.get("max_tokens", body.get("max_completion_tokens", 4096)))
+    # max_tokens propagation: caller's body wins, with a conservative
+    # default when omitted. 2026-05-18 RCA P6: the previous 4096 default
+    # (set 2026-05-07 when there was no consumer-liveness backstop) meant
+    # a single misbehaving generation could pin a slot for many minutes.
+    # With the bounded-queue + disconnect-poll + engine-side liveness
+    # deadline triple now in place, the value matters less for safety,
+    # but a high default is still poor hygiene — callers should declare
+    # their intent. 1024 is plenty for any "give me a sentence" call
+    # (the median chat turn is a few hundred tokens) and forces real
+    # long-form callers to be explicit. A WARN log fires when omitted
+    # so the failure mode "I forgot to set max_tokens and got truncated"
+    # is observable rather than silent.
+    if body.get("max_tokens") is None and body.get("max_completion_tokens") is None:
+        print(f"[bridge] WARN: max_tokens omitted by caller; "
+              f"defaulting to 1024. Callers should set max_tokens "
+              f"explicitly to make their intent visible.", flush=True)
+    max_tokens = int(body.get("max_tokens", body.get("max_completion_tokens", 1024)))
     stream = bool(body.get("stream", False))
 
     # Research-feature body fields that don't yet have unified-FFI
@@ -1143,18 +1334,54 @@ async def chat_completions(req: Request) -> Any:
     # just don't get queued. Off-path bit-identity verified by
     # tools/cvec_validation/baseline_logprobs.py.
     capture_cvec = bool(body.get("capture_cvec_activations", False))
+    # `continue_final_message` (OpenAI/vLLM-compat extension): resume
+    # generation INSIDE the existing final assistant message instead of
+    # opening a fresh turn. The last message in `messages` must be
+    # role='assistant'; the bridge renders the chat history with the
+    # trailing `<turn|>\n` closer stripped and add_generation_prompt
+    # off, so the very next sampled token continues the partial
+    # assistant text. This is the canonical client-side resume path
+    # paired with the engine's content-hash KV cache: a client whose
+    # SSE socket dropped mid-stream simply resubmits with the partial
+    # tokens it received appended to the assistant message and
+    # continue_final_message=true; the cache makes the re-prefill
+    # nearly free up to the resume point.
+    continue_final_message = bool(body.get("continue_final_message", False))
+    if continue_final_message:
+        # 400-class validation: enforce the precondition before
+        # touching the engine. render_chat raises ValueError too but
+        # surfacing it from here gives a cleaner error for plain
+        # config mistakes (e.g. forgetting to append the partial).
+        if not messages or messages[-1].get("role") != "assistant":
+            raise HTTPException(
+                400,
+                "continue_final_message=true requires messages[-1].role"
+                "='assistant'; pass the partial content the client "
+                "already received as the final assistant message and "
+                "the engine will continue from where the previous "
+                "request was cut off (content-cache makes the "
+                "re-prefill cheap).")
     print(f"[bridge] chat_completions: tools={len(tools) if tools else 0}, "
           f"tool_choice={body.get('tool_choice')!r}, "
           f"messages={len(messages)}, stream={stream}, "
           f"stop_seqs={len(sampling.stop_sequences)}, "
-          f"reasoning_effort={re_raw!r}, capture_cvec={capture_cvec}")
+          f"reasoning_effort={re_raw!r}, capture_cvec={capture_cvec}, "
+          f"continue_final_message={continue_final_message}")
     stream_id = await _next_stream_id_alloc()
     spec, _ = _build_stream_spec(
         stream_id, messages, sampling, capture_logits, tools=tools,
         enable_thinking=enable_thinking,
         capture_cvec_activations=capture_cvec,
-        control_vectors=request_controls)
-    response_q: asyncio.Queue = asyncio.Queue()
+        control_vectors=request_controls,
+        continue_final_message=continue_final_message)
+    # Bounded queue (2026-05-18 RCA P5): a dead consumer would otherwise
+    # let the driver thread push unbounded updates with no signal back.
+    # _push_update_threadsafe checks qsize() against _RESPONSE_Q_HIGH_WATER
+    # and submits opcode-2 cancel when crossed. maxsize is set slightly
+    # above the high-water so put_nowait doesn't QueueFull on a healthy
+    # bursty consumer that just hit the boundary by one item.
+    response_q: asyncio.Queue = asyncio.Queue(
+        maxsize=_RESPONSE_Q_HIGH_WATER + 64)
     _response_qs[stream_id] = response_q
 
     # 2026-05-07: removed conversation-state recording. Bridge is
@@ -1173,157 +1400,150 @@ async def chat_completions(req: Request) -> Any:
         raise HTTPException(500, f"engine submit failed: rc={rc}")
 
     if not stream:
-        # Aggregate path: handler awaits the entire response, so handler-
-        # level finally is correct.
-        clean_close_aggregate = False
-        try:
-            all_tokens: list[int] = []
-            all_thinking_tokens: list[int] = []
-            usage: dict[str, int] = {}
-            done_reason = 0
-            collected_logprobs: list[g.TokenLogprob] = []
-            while True:
-                u: g.StreamUpdate = await response_q.get()
-                all_tokens.extend(u.new_tokens)
-                all_thinking_tokens.extend(u.new_thinking_tokens)
-                if u.logprobs:
-                    collected_logprobs.extend(u.logprobs)
-                # The engine now self-terminates on the <tool_call|>
-                # token sequence (see SamplingParams.stop_sequences,
-                # populated above when tools are present). No bridge-
-                # side break-early needed: state==2 fires naturally with
-                # done_reason=1.
-                if u.state == 2:
-                    usage = {
-                        "prompt_tokens": u.prompt_tokens_seen,
-                        "completion_tokens": u.completion_tokens_emitted,
-                        "total_tokens": u.prompt_tokens_seen + u.completion_tokens_emitted,
-                        "cache_hits": u.cache_hits,
-                        "cache_misses": u.cache_misses,
-                        "vision_cache_hits": u.vision_cache_hits,
-                    }
-                    done_reason = u.done_reason
-                    err_msg = u.err_msg or ""
-                    break
-            # done_reason=3 is the engine-side error code. Two flavors:
-            #   - Admission backpressure (engine refused new session
-            #     because pool was below the free-page floor or the
-            #     residency cap was hit). errMsg starts with "admission
-            #     backpressure:". Surface as HTTP 503 + Retry-After so
-            #     clients back off and retry. This is the right status
-            #     for week-long ops where many clients open and close
-            #     sessions on their own cadence.
-            #   - Other engine failures (vision tower returned 0 soft
-            #     tokens, etc.). Surface as HTTP 500.
-            # In both cases, errMsg carries the human-readable cause.
-            if done_reason == 3:
-                print(f"[bridge] stream errored: done_reason=3 err_msg={err_msg!r}")
-                if err_msg.startswith("admission backpressure"):
-                    raise HTTPException(
-                        503,
-                        f"engine admission backpressure: {err_msg}",
-                        headers={"Retry-After": "2"})
-                raise HTTPException(500, f"upstream stream errored: {err_msg or 'unspecified engine failure'}")
-            text = g.detokenize(all_tokens)
-            # Strip Gemma-4 turn-delimiter surface strings (`<|turn>`,
-            # `<turn|>`) from the final text. These are atomic special
-            # tokens whose text form leaks into the output when the
-            # model emits them — typically a single `<turn|>` at the
-            # very end (immediately before the stop-token detection
-            # fires), but also possible mid-stream as a sampling artefact.
-            text = _strip_turn_markers(text)
-            print(f"[bridge] usage: prompt_tokens={usage.get('prompt_tokens')}, "
-                  f"completion_tokens={usage.get('completion_tokens')}, "
-                  f"cache_hits={usage.get('cache_hits')}, "
-                  f"cache_misses={usage.get('cache_misses')}, "
-                  f"vision_cache_hits={usage.get('vision_cache_hits')}, "
-                  f"done_reason={done_reason}")
-            finish = "stop" if done_reason == 1 else (
-                "length" if done_reason == 2 else "stop")
-            # 2026-05-07: server-side tool-call extraction. When tools
-            # were in the request and the model emitted
-            # `<|tool_call>...<tool_call|>` markers, parse them out of
-            # `text` and surface as OpenAI-shape `message.tool_calls[]`.
-            # Markers are stripped from `content` so clients see a clean
-            # response; finish_reason flips to "tool_calls" per OAI spec.
-            # Models that emit malformed blocks have their bytes left
-            # verbatim (parse-failure fallback) so debugging stays
-            # affordant.
-            cleaned_text, extracted_tool_calls = _extract_tool_calls(
-                text, had_tools=tools is not None)
-            message: dict[str, Any] = {"role": "assistant",
-                                        "content": cleaned_text}
-            if all_thinking_tokens:
-                # The engine routes every token between CHANNEL_OPEN_ID
-                # and CHANNEL_CLOSE_ID into thinkingQueue verbatim,
-                # which includes the channel-name preamble that gemma's
-                # tokenizer-grammar puts there ("thought\n" terminated
-                # by the first newline). The OAI o1-shape
-                # `reasoning_content` field is supposed to carry the
-                # user-visible thinking body, not the format-internal
-                # channel header — so we strip the preamble here at the
-                # bridge layer. This is api-side translation work, not
-                # client-side rendering work: clients never need to
-                # know that gemma calls its thinking channel "thought".
-                raw = g.detokenize(all_thinking_tokens)
-                nl = raw.find("\n")
-                message["reasoning_content"] = raw[nl + 1:] if nl >= 0 else raw
-            if extracted_tool_calls:
-                message["tool_calls"] = extracted_tool_calls
-                finish = "tool_calls"
-                print(f"[bridge] extracted {len(extracted_tool_calls)} "
-                      f"tool_call(s); names="
-                      f"{[tc['function']['name'] for tc in extracted_tool_calls]}")
-            # 2026-05-07: no conversation-state recording. Stateless
-            # bridge per the NO REMOTE LOCKS principle.
-            choice: dict[str, Any] = {
-                "index": 0,
-                "message": message,
-                "finish_reason": finish,
+        # Aggregate (non-streaming) path. Iterates the shared consumer
+        # coroutine — all cross-cutting concerns (disconnect detection,
+        # opcode-2 cancel on non-clean exit, response_q cleanup, usage
+        # logging) live inside _consume_engine_stream. This branch
+        # owns ONLY response-shape construction.
+        all_tokens: list[int] = []
+        all_thinking_tokens: list[int] = []
+        collected_logprobs: list[g.TokenLogprob] = []
+        terminal: g.StreamUpdate | None = None
+        async for u in _consume_engine_stream(stream_id, req):
+            all_tokens.extend(u.new_tokens)
+            all_thinking_tokens.extend(u.new_thinking_tokens)
+            if u.logprobs:
+                collected_logprobs.extend(u.logprobs)
+            # The engine self-terminates on stop_sequences (chat-template
+            # end-of-turn, plus <tool_call|> when tools are present).
+            # state==2 is the natural completion signal; consumer keeps
+            # iterating and exits the loop on the next pass.
+            if u.state == 2:
+                terminal = u
+        if terminal is None:
+            # Consumer exited without ever observing state==2 → client
+            # disconnected mid-stream. The shared coroutine already
+            # submitted opcode-2 cancel + logged usage; nothing else
+            # to do here. 499 is the conventional "client closed
+            # request" status (nginx-originated, widely understood).
+            # uvicorn drops the response if the socket is gone.
+            raise HTTPException(499, "client closed request "
+                                      "before engine completed; "
+                                      "engine session cancelled")
+        # Terminal update observed. Map done_reason and build response.
+        usage = {
+            "prompt_tokens": terminal.prompt_tokens_seen,
+            "completion_tokens": terminal.completion_tokens_emitted,
+            "total_tokens": terminal.prompt_tokens_seen + terminal.completion_tokens_emitted,
+            "cache_hits": terminal.cache_hits,
+            "cache_misses": terminal.cache_misses,
+            "vision_cache_hits": terminal.vision_cache_hits,
+        }
+        done_reason = terminal.done_reason
+        err_msg = terminal.err_msg or ""
+        # done_reason=3 is the engine-side error code. Two flavors:
+        #   - Admission backpressure (engine refused new session
+        #     because pool was below the free-page floor or the
+        #     residency cap was hit). errMsg starts with "admission
+        #     backpressure:". Surface as HTTP 503 + Retry-After so
+        #     clients back off and retry. This is the right status
+        #     for week-long ops where many clients open and close
+        #     sessions on their own cadence.
+        #   - Other engine failures (vision tower returned 0 soft
+        #     tokens, consumer-abandonment, etc.). Surface as HTTP 500.
+        # In both cases, errMsg carries the human-readable cause.
+        if done_reason == 3:
+            print(f"[bridge] stream errored: done_reason=3 err_msg={err_msg!r}")
+            if err_msg.startswith("admission backpressure"):
+                raise HTTPException(
+                    503,
+                    f"engine admission backpressure: {err_msg}",
+                    headers={"Retry-After": "2"})
+            raise HTTPException(500, f"upstream stream errored: {err_msg or 'unspecified engine failure'}")
+        text = g.detokenize(all_tokens)
+        # Strip Gemma-4 turn-delimiter surface strings (`<|turn>`,
+        # `<turn|>`) from the final text. These are atomic special
+        # tokens whose text form leaks into the output when the
+        # model emits them — typically a single `<turn|>` at the
+        # very end (immediately before the stop-token detection
+        # fires), but also possible mid-stream as a sampling artefact.
+        text = _strip_turn_markers(text)
+        print(f"[bridge] usage: prompt_tokens={usage.get('prompt_tokens')}, "
+              f"completion_tokens={usage.get('completion_tokens')}, "
+              f"cache_hits={usage.get('cache_hits')}, "
+              f"cache_misses={usage.get('cache_misses')}, "
+              f"vision_cache_hits={usage.get('vision_cache_hits')}, "
+              f"done_reason={done_reason}")
+        finish = "stop" if done_reason == 1 else (
+            "length" if done_reason == 2 else "stop")
+        # 2026-05-07: server-side tool-call extraction. When tools
+        # were in the request and the model emitted
+        # `<|tool_call>...<tool_call|>` markers, parse them out of
+        # `text` and surface as OpenAI-shape `message.tool_calls[]`.
+        # Markers are stripped from `content` so clients see a clean
+        # response; finish_reason flips to "tool_calls" per OAI spec.
+        # Models that emit malformed blocks have their bytes left
+        # verbatim (parse-failure fallback) so debugging stays
+        # affordant.
+        cleaned_text, extracted_tool_calls = _extract_tool_calls(
+            text, had_tools=tools is not None)
+        message: dict[str, Any] = {"role": "assistant",
+                                    "content": cleaned_text}
+        if all_thinking_tokens:
+            # The engine routes every token between CHANNEL_OPEN_ID
+            # and CHANNEL_CLOSE_ID into thinkingQueue verbatim,
+            # which includes the channel-name preamble that gemma's
+            # tokenizer-grammar puts there ("thought\n" terminated
+            # by the first newline). The OAI o1-shape
+            # `reasoning_content` field is supposed to carry the
+            # user-visible thinking body, not the format-internal
+            # channel header — so we strip the preamble here at the
+            # bridge layer. This is api-side translation work, not
+            # client-side rendering work: clients never need to
+            # know that gemma calls its thinking channel "thought".
+            raw = g.detokenize(all_thinking_tokens)
+            nl = raw.find("\n")
+            message["reasoning_content"] = raw[nl + 1:] if nl >= 0 else raw
+        if extracted_tool_calls:
+            message["tool_calls"] = extracted_tool_calls
+            finish = "tool_calls"
+            print(f"[bridge] extracted {len(extracted_tool_calls)} "
+                  f"tool_call(s); names="
+                  f"{[tc['function']['name'] for tc in extracted_tool_calls]}")
+        # 2026-05-07: no conversation-state recording. Stateless
+        # bridge per the NO REMOTE LOCKS principle.
+        choice: dict[str, Any] = {
+            "index": 0,
+            "message": message,
+            "finish_reason": finish,
+        }
+        if capture_logits:
+            choice["logprobs"] = {
+                "content": [{
+                    "token": g.detokenize([lp.token]),
+                    "logprob": lp.sampled_logprob,
+                    "top_logprobs": [
+                        {"token": g.detokenize([t]), "logprob": p}
+                        for t, p in lp.top_logprobs
+                    ],
+                } for lp in collected_logprobs]
             }
-            if capture_logits:
-                choice["logprobs"] = {
-                    "content": [{
-                        "token": g.detokenize([lp.token]),
-                        "logprob": lp.sampled_logprob,
-                        "top_logprobs": [
-                            {"token": g.detokenize([t]), "logprob": p}
-                            for t, p in lp.top_logprobs
-                        ],
-                    } for lp in collected_logprobs]
-                }
-            response = JSONResponse({
-                "id": f"chatcmpl-{uuid.uuid4().hex[:16]}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": MODEL_NAME,
-                "choices": [choice],
-                "usage": usage,
-            })
-            clean_close_aggregate = True
-            return response
-        finally:
-            # 2026-05-07: cancel-on-disconnect. If we did not reach
-            # state==2 (done_reason set), the client almost certainly
-            # gave up on the request — TCP reset / asyncio cancel /
-            # exception. Without enqueueing a cancel here, the engine
-            # would keep running this stream's prefill+AR until natural
-            # EOS, holding a slot away from other clients. The principle
-            # is 'a dead client must NOT delay work for live ones'.
-            if not clean_close_aggregate:
-                cancel_spec = g.StreamSpec(stream_id=stream_id, action=2)
-                try:
-                    g.submit([cancel_spec])
-                except Exception:
-                    pass
-            _response_qs.pop(stream_id, None)
+        return JSONResponse({
+            "id": f"chatcmpl-{uuid.uuid4().hex[:16]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": MODEL_NAME,
+            "choices": [choice],
+            "usage": usage,
+        })
 
-    # SSE streaming. Cleanup MUST be inside the generator's own finally;
-    # the handler returns immediately after constructing StreamingResponse,
-    # before the generator iterates. A handler-level finally would pop
-    # the response_q while the generator is still trying to read from it,
-    # causing every coordinator update to be silently dropped and the
-    # generator to block on response_q.get() forever.
+    # SSE streaming. The shared _consume_engine_stream coroutine owns
+    # all the cross-cutting concerns: client-disconnect detection,
+    # opcode-2 cancel on non-clean exit, response_q cleanup, DISCONNECT
+    # usage logging. The gen() body below owns ONLY the SSE-frame
+    # rendering — symmetric with the aggregate path which owns ONLY
+    # the JSON-response construction. Before this refactor the two
+    # paths had separately-implemented (and divergent) lifecycle code.
     async def gen():
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
         created = int(time.time())
@@ -1339,8 +1559,6 @@ async def chat_completions(req: Request) -> Any:
         # clients that don't will see the raw markers as content.
         had_tools = tools is not None
         all_tokens: list[int] = []
-        last_update: g.StreamUpdate | None = None
-        clean_close = False
         # Per-generator state for stripping the channel-name preamble
         # from streamed reasoning_content. Gemma's thinking channel
         # opens with `<|channel>NAME\n...` and the engine routes every
@@ -1367,42 +1585,22 @@ async def chat_completions(req: Request) -> Any:
         # tool-call stripper assumes its input is free of unrelated
         # special-token surface bytes.
         turn_stripper = _StreamTurnMarkerStripper()
-        try:
-            while True:
-                u: g.StreamUpdate = await response_q.get()
-                last_update = u
-                if u.new_thinking_tokens:
-                    raw_delta = g.detokenize(u.new_thinking_tokens)
-                    if not thinking_header_consumed:
-                        thinking_header_buffer += raw_delta
-                        nl = thinking_header_buffer.find("\n")
-                        if nl < 0:
-                            # Still in the header bytes; nothing to emit yet.
-                            thinking_delta = ""
-                        else:
-                            thinking_delta = thinking_header_buffer[nl + 1:]
-                            thinking_header_consumed = True
-                            thinking_header_buffer = ""
+        async for u in _consume_engine_stream(stream_id, req):
+            if u.new_thinking_tokens:
+                raw_delta = g.detokenize(u.new_thinking_tokens)
+                if not thinking_header_consumed:
+                    thinking_header_buffer += raw_delta
+                    nl = thinking_header_buffer.find("\n")
+                    if nl < 0:
+                        # Still in the header bytes; nothing to emit yet.
+                        thinking_delta = ""
                     else:
-                        thinking_delta = raw_delta
-                    if thinking_delta:
-                        yield ("data: " + json.dumps({
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": MODEL_NAME,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"reasoning_content": thinking_delta},
-                                "finish_reason": None,
-                            }],
-                        }) + "\n\n")
-                if u.new_cvec_activations:
-                    # Vendor extension: per-(ActiveControl, AR-step)
-                    # records. Each tuple is (token_position, layer,
-                    # magnitude). See server/static/steering.html for
-                    # the consumer; off-path bit-identity guard is at
-                    # tools/cvec_validation/baseline_logprobs.py.
+                        thinking_delta = thinking_header_buffer[nl + 1:]
+                        thinking_header_consumed = True
+                        thinking_header_buffer = ""
+                else:
+                    thinking_delta = raw_delta
+                if thinking_delta:
                     yield ("data: " + json.dumps({
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -1410,55 +1608,43 @@ async def chat_completions(req: Request) -> Any:
                         "model": MODEL_NAME,
                         "choices": [{
                             "index": 0,
-                            "delta": {"cvec_activations": [
-                                {"token_position": tp, "layer": ly,
-                                 "magnitude": mg}
-                                for (tp, ly, mg) in u.new_cvec_activations
-                            ]},
+                            "delta": {"reasoning_content": thinking_delta},
                             "finish_reason": None,
                         }],
                     }) + "\n\n")
-                if u.new_tokens:
-                    all_tokens.extend(u.new_tokens)
-                    delta_text = g.detokenize(u.new_tokens)
-                    if delta_text:
-                        # Filter `<|tool_call>...<tool_call|>` spans out
-                        # of the visible content stream. Markers are
-                        # processed structurally at end-of-stream below.
-                        # Pre-filter `<|turn>` / `<turn|>` first — those
-                        # are point-strips, never wrap tool_call spans.
-                        delta_text = turn_stripper.feed(delta_text)
-                        filtered = marker_stripper.feed(delta_text)
-                        if filtered:
-                            yield ("data: " + json.dumps({
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": MODEL_NAME,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": filtered},
-                                    "finish_reason": None,
-                                }],
-                            }) + "\n\n")
-                if u.state == 2:
-                    # Engine-side error path: done_reason=3 + err_msg.
-                    # Same handling as non-streaming aggregate path above.
-                    # SSE has no clean "error after partial response"
-                    # shape, so we yield a final delta carrying an
-                    # OpenAI-shape error event then break — the client
-                    # sees finish_reason="error" with the message.
-                    if u.done_reason == 3:
-                        err_msg = u.err_msg or "unspecified engine failure"
-                        # Distinguish admission backpressure (transient,
-                        # client should retry) from genuine engine
-                        # failure (likely persistent). Both yield as
-                        # SSE error events but with different error
-                        # types so clients can react differently.
-                        is_backpressure = err_msg.startswith("admission backpressure")
-                        err_type = ("admission_backpressure"
-                                    if is_backpressure else "engine_error")
-                        print(f"[bridge] (SSE) stream errored: done_reason=3 type={err_type} err_msg={err_msg!r}")
+            if u.new_cvec_activations:
+                # Vendor extension: per-(ActiveControl, AR-step)
+                # records. Each tuple is (token_position, layer,
+                # magnitude). See server/static/steering.html for
+                # the consumer; off-path bit-identity guard is at
+                # tools/cvec_validation/baseline_logprobs.py.
+                yield ("data: " + json.dumps({
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": MODEL_NAME,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"cvec_activations": [
+                            {"token_position": tp, "layer": ly,
+                             "magnitude": mg}
+                            for (tp, ly, mg) in u.new_cvec_activations
+                        ]},
+                        "finish_reason": None,
+                    }],
+                }) + "\n\n")
+            if u.new_tokens:
+                all_tokens.extend(u.new_tokens)
+                delta_text = g.detokenize(u.new_tokens)
+                if delta_text:
+                    # Filter `<|tool_call>...<tool_call|>` spans out
+                    # of the visible content stream. Markers are
+                    # processed structurally at end-of-stream below.
+                    # Pre-filter `<|turn>` / `<turn|>` first — those
+                    # are point-strips, never wrap tool_call spans.
+                    delta_text = turn_stripper.feed(delta_text)
+                    filtered = marker_stripper.feed(delta_text)
+                    if filtered:
                         yield ("data: " + json.dumps({
                             "id": completion_id,
                             "object": "chat.completion.chunk",
@@ -1466,73 +1652,27 @@ async def chat_completions(req: Request) -> Any:
                             "model": MODEL_NAME,
                             "choices": [{
                                 "index": 0,
-                                "delta": {"content": ""},
-                                "finish_reason": "error",
-                            }],
-                            "error": {"message": err_msg, "type": err_type},
-                        }) + "\n\n")
-                        yield "data: [DONE]\n\n"
-                        clean_close = True
-                        break
-                    finish = "stop" if u.done_reason == 1 else (
-                        "length" if u.done_reason == 2 else "stop")
-                    # Flush any held-back tail from the marker strippers
-                    # before final extraction. Each holds up to
-                    # (max_marker_len-1) bytes that *might* have been a
-                    # marker prefix; at stream end we know they aren't.
-                    # Run turn-stripper first (point markers, can be inside
-                    # any text), then tool-call stripper (span markers).
-                    turn_tail = turn_stripper.flush()
-                    if turn_tail:
-                        final_tail = marker_stripper.feed(turn_tail) + marker_stripper.flush()
-                    else:
-                        final_tail = marker_stripper.flush()
-                    if final_tail:
-                        yield ("data: " + json.dumps({
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": MODEL_NAME,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"content": final_tail},
+                                "delta": {"content": filtered},
                                 "finish_reason": None,
                             }],
                         }) + "\n\n")
-                    # End-of-generation tool-call extraction. The marker
-                    # spans were stripped mid-stream; if any parsed
-                    # cleanly here, emit a structured tool_calls delta
-                    # and flip finish to "tool_calls" per OAI spec.
-                    if had_tools:
-                        full_text = g.detokenize(all_tokens)
-                        # Strip turn markers from the aggregated text used
-                        # for tool-call extraction so a stray `<turn|>`
-                        # doesn't break the tool_call body parser.
-                        full_text = _strip_turn_markers(full_text)
-                        _, extracted = _extract_tool_calls(
-                            full_text, had_tools=True)
-                        if extracted:
-                            finish = "tool_calls"
-                            print(f"[bridge] (SSE) extracted "
-                                  f"{len(extracted)} tool_call(s); names="
-                                  f"{[tc['function']['name'] for tc in extracted]}")
-                            tc_deltas = [{
-                                "index": i,
-                                "id": tc["id"],
-                                "type": tc["type"],
-                                "function": tc["function"],
-                            } for i, tc in enumerate(extracted)]
-                            yield ("data: " + json.dumps({
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": MODEL_NAME,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"tool_calls": tc_deltas},
-                                    "finish_reason": None,
-                                }],
-                            }) + "\n\n")
+            if u.state == 2:
+                # Engine-side error path: done_reason=3 + err_msg. SSE
+                # has no clean "error after partial response" shape, so
+                # we yield a final delta carrying an OpenAI-shape error
+                # event then return — the client sees
+                # finish_reason="error" with the message.
+                if u.done_reason == 3:
+                    err_msg = u.err_msg or "unspecified engine failure"
+                    # Distinguish admission backpressure (transient,
+                    # client should retry) from genuine engine failure
+                    # (likely persistent). Both yield as SSE error
+                    # events but with different error types so clients
+                    # can react differently.
+                    is_backpressure = err_msg.startswith("admission backpressure")
+                    err_type = ("admission_backpressure"
+                                if is_backpressure else "engine_error")
+                    print(f"[bridge] (SSE) stream errored: done_reason=3 type={err_type} err_msg={err_msg!r}")
                     yield ("data: " + json.dumps({
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -1540,55 +1680,104 @@ async def chat_completions(req: Request) -> Any:
                         "model": MODEL_NAME,
                         "choices": [{
                             "index": 0,
-                            "delta": {},
-                            "finish_reason": finish,
+                            "delta": {"content": ""},
+                            "finish_reason": "error",
                         }],
-                        "usage": {
-                            "prompt_tokens": u.prompt_tokens_seen,
-                            "completion_tokens": u.completion_tokens_emitted,
-                            "total_tokens": u.prompt_tokens_seen + u.completion_tokens_emitted,
-                            "cache_hits": u.cache_hits,
-                            "cache_misses": u.cache_misses,
-                            "vision_cache_hits": u.vision_cache_hits,
-                        },
+                        "error": {"message": err_msg, "type": err_type},
                     }) + "\n\n")
                     yield "data: [DONE]\n\n"
-                    print(f"[bridge] usage (SSE): "
-                          f"prompt_tokens={u.prompt_tokens_seen}, "
-                          f"completion_tokens={u.completion_tokens_emitted}, "
-                          f"cache_hits={u.cache_hits}, "
-                          f"cache_misses={u.cache_misses}, "
-                          f"vision_cache_hits={u.vision_cache_hits}, "
-                          f"done_reason={u.done_reason}")
-                    clean_close = True
-                    break
-        finally:
-            # Log usage regardless of how we exited the loop. Clean
-            # close (state==2) reaches the dedicated print earlier;
-            # disconnect / cancellation lands here with `last_update`
-            # holding the most recent StreamUpdate. This prevents the
-            # silent-cache-hits-on-cancel observability gap that bit
-            # us when Zed cancels SSE on tool-mode prose.
-            if not clean_close and last_update is not None:
-                u = last_update
-                print(f"[bridge] usage (DISCONNECT): "
+                    return
+                finish = "stop" if u.done_reason == 1 else (
+                    "length" if u.done_reason == 2 else "stop")
+                # Flush any held-back tail from the marker strippers
+                # before final extraction. Each holds up to
+                # (max_marker_len-1) bytes that *might* have been a
+                # marker prefix; at stream end we know they aren't.
+                # Run turn-stripper first (point markers, can be inside
+                # any text), then tool-call stripper (span markers).
+                turn_tail = turn_stripper.flush()
+                if turn_tail:
+                    final_tail = marker_stripper.feed(turn_tail) + marker_stripper.flush()
+                else:
+                    final_tail = marker_stripper.flush()
+                if final_tail:
+                    yield ("data: " + json.dumps({
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": MODEL_NAME,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": final_tail},
+                            "finish_reason": None,
+                        }],
+                    }) + "\n\n")
+                # End-of-generation tool-call extraction. The marker
+                # spans were stripped mid-stream; if any parsed cleanly
+                # here, emit a structured tool_calls delta and flip
+                # finish to "tool_calls" per OAI spec.
+                if had_tools:
+                    full_text = g.detokenize(all_tokens)
+                    # Strip turn markers from the aggregated text used
+                    # for tool-call extraction so a stray `<turn|>`
+                    # doesn't break the tool_call body parser.
+                    full_text = _strip_turn_markers(full_text)
+                    _, extracted = _extract_tool_calls(
+                        full_text, had_tools=True)
+                    if extracted:
+                        finish = "tool_calls"
+                        print(f"[bridge] (SSE) extracted "
+                              f"{len(extracted)} tool_call(s); names="
+                              f"{[tc['function']['name'] for tc in extracted]}")
+                        tc_deltas = [{
+                            "index": i,
+                            "id": tc["id"],
+                            "type": tc["type"],
+                            "function": tc["function"],
+                        } for i, tc in enumerate(extracted)]
+                        yield ("data: " + json.dumps({
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": MODEL_NAME,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"tool_calls": tc_deltas},
+                                "finish_reason": None,
+                            }],
+                        }) + "\n\n")
+                yield ("data: " + json.dumps({
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": MODEL_NAME,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": finish,
+                    }],
+                    "usage": {
+                        "prompt_tokens": u.prompt_tokens_seen,
+                        "completion_tokens": u.completion_tokens_emitted,
+                        "total_tokens": u.prompt_tokens_seen + u.completion_tokens_emitted,
+                        "cache_hits": u.cache_hits,
+                        "cache_misses": u.cache_misses,
+                        "vision_cache_hits": u.vision_cache_hits,
+                    },
+                }) + "\n\n")
+                yield "data: [DONE]\n\n"
+                print(f"[bridge] usage (SSE): "
                       f"prompt_tokens={u.prompt_tokens_seen}, "
                       f"completion_tokens={u.completion_tokens_emitted}, "
                       f"cache_hits={u.cache_hits}, "
                       f"cache_misses={u.cache_misses}, "
                       f"vision_cache_hits={u.vision_cache_hits}, "
-                      f"state={u.state}, "
                       f"done_reason={u.done_reason}")
-            # 2026-05-07: cancel-on-disconnect (SSE path). If the
-            # client gave up before we hit state==2, free the engine
-            # slot now rather than leaving it pinned until natural EOS.
-            if not clean_close:
-                cancel_spec = g.StreamSpec(stream_id=stream_id, action=2)
-                try:
-                    g.submit([cancel_spec])
-                except Exception:
-                    pass
-            _response_qs.pop(stream_id, None)
+                return
+        # If the async-for exits without hitting state==2, the client
+        # disconnected and _consume_engine_stream already submitted
+        # opcode-2 cancel + logged the DISCONNECT usage line. Nothing
+        # else to do; falling off the generator closes the SSE response.
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 

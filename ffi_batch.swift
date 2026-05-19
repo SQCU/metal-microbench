@@ -1085,6 +1085,17 @@ public func gemma_poll(_ timeoutMs: Int32,
         //    NO REMOTE LOCKS principle forbids; engine-side page-cache
         //    handles prefix reuse passively at the page_manager layer.
 
+        // 2026-05-18 (post-RCA): expire sessions whose bridge consumer
+        // appears dead. Runs BEFORE the work step so no scheduler
+        // ticks are wasted on abandoned streams (the freshly-marked
+        // .done sessions drop out of .wantsSlot immediately, so
+        // tick()'s admission pass sees the slot as free for live
+        // work). The cleanup pass at the bottom of this poll then
+        // closeSession's them, releasing pages.
+        //
+        // O(n_active) per drive iteration; negligible.
+        engine.expireAbandonedSessions()
+
         // 3. Drive one chunk if there's work.
         // 2026-05-07: populate per-slot GPU capture buffers BEFORE
         // syncTickStep. The buildStepCB now encodes extract_logprobs
