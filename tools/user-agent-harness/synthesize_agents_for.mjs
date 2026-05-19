@@ -5,8 +5,9 @@
 // inventory but have no agent yet. For each, designs an agent_text
 // (the depth-1 author's-note overlay) via the cheap agent designer
 // and POSTs it. saveAgent computes the composition signature via
-// /signature-extract using axes from axis_registry.mjs — same path
-// the on-policy synthesis harness uses, so vectors are commensurable.
+// /signature-extract using axes from the axes/*.json cards — same
+// path the on-policy synthesis harness uses, so vectors are
+// commensurable.
 //
 // The ontological closure: a bio is usable iff it has at least one
 // synthesized agent. Synthesizing an agent is the ONLY operation that
@@ -26,15 +27,16 @@
 
 import process from 'node:process';
 import * as L from './harness_lib.mjs';
-import { allAxes } from './axis_registry.mjs';
 
 const FORCE_ALL = process.argv.includes('--all');
 // All HTTP + persistence goes through L.http / L.saveBio / L.saveAgent
 // so the contract with the plugin lives in ONE place (harness_lib.mjs).
-// Vendored helpers used to drift the moment the plugin's POST shape
-// tightened — see the 2026-05-18 dedup commit message for the audit.
+// Axes are queried from the plugin (axes/*.json cards) — single source
+// of truth, durable across script restarts, includes any derived axes
+// from prior splitter/disambiguator runs.
 
-console.error(`[synthesize_agents_for] ST=${L.ENDPOINTS.ST} force_all=${FORCE_ALL} axes_in_registry=${allAxes().length}`);
+const axesAvailable = await L.fetchAxes();
+console.error(`[synthesize_agents_for] ST=${L.ENDPOINTS.ST} force_all=${FORCE_ALL} axes_available=${axesAvailable.length}`);
 
 const { personas } = await L.http('GET', `${L.ENDPOINTS.PLUGIN}/personas`);
 console.error(`[synthesize_agents_for] ${personas.length} bios loaded`);
@@ -54,8 +56,8 @@ for (const p of personas) {
         // could later swap this for an interactive design loop.
         const agent_text = await L.designCheapAgent({ prose: p.bio || '', name: p.name });
         // Step 2: POST the agent. saveAgent computes the composition
-        // signature via /signature-extract (axes from axis_registry)
-        // and includes it in the body.
+        // signature via /signature-extract (axes default to the plugin's
+        // axes/*.json card set) and includes it in the body.
         const slug = p.id.replace(/\.png$/, '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
         const agent_id = `${slug}-default`;
         await L.saveAgent(agent_id, `${p.name} — default agent`, agent_text, p.id);

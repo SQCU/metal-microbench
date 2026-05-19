@@ -40,19 +40,34 @@ export async function bridgeCall(messages, { max_tokens = null, temperature = 1.
 
 // ── persistence ──────────────────────────────────────────────────────
 
-// Lazy import: axis_registry is the source of truth for what axes to
-// extract. Passed to /signature-extract on every saveBio/saveAgent call.
-async function _loadAxisRegistry() {
-    const mod = await import('./axis_registry.mjs');
-    return mod.allAxes().map(a => ({ name: a.name, def: a.def }));
+// Fetch the current axis card set from the plugin. Axes used to be
+// inlined as JS source in axis_registry.mjs; they now live as cards
+// under plugins/user-personas/axes/ — same storage paradigm as bios,
+// agents, characters, tools. The plugin returns whatever axes are
+// currently on disk, including any that synthesis added via POST /axes
+// (e.g. axis_splitter's derived axes). One source of truth, durable
+// across script runs.
+//
+// Returns the full axis cards as the plugin stores them:
+//   [{ axis_schema, id, name, def, kind, scale_min, scale_max,
+//      derived_from, created_at }, ...]
+// Optionally a kind filter restricts to bio / agent / either / meta —
+// 'either' is included whenever a specific kind is requested.
+//
+// Callers that need the {name, def} pair for /signature-extract should
+// map down themselves: `(await fetchAxes()).map(a => ({name: a.id, def: a.def}))`
+export async function fetchAxes(kind = null) {
+    const r = await http('GET', `${PLUGIN}/axes`);
+    let list = (r.axes || []);
+    if (kind) list = list.filter(a => a.kind === kind || a.kind === 'either');
+    return list;
 }
 
 /**
- * Save a bio. HARD REQUIREMENT: computes a signature via /signature-extract
- * BEFORE POST so the bio is born with metadata complete. Plugin's POST
- * /personas rejects unsigned writes. The axes for extraction come from
- * the harness's axis_registry.mjs — single source of truth, grows over
- * time as the splitter/disambiguator add derived axes.
+ * Save a bio. Bios alone aren't signed — the ontological closure says
+ * only compositions (bio+agent) carry signatures. This helper just
+ * persists the prose + name + system_prompt; the signature lands on
+ * the agent that gets designed for this bio.
  */
 export async function saveBio({ canonical_key, name, prose }) {
     // No signature at bio-level. The closure: bios alone aren't
@@ -76,8 +91,14 @@ export async function saveAgent(agent_id, name, agent_text, designed_for_bio_id)
         `Bio (user-side persona):\n${bioProse}\n\n` +
         `Bio voice clauses:\n${bioVoice}\n\n` +
         `Agent voice clauses (injected at depth 1):\n${agent_text}`;
-    const axes = await _loadAxisRegistry();
-    const sig = await http('POST', `${PLUGIN}/signature-extract`, { prose: compositionProse, axes });
+    // axes omitted: the plugin's /signature-extract defaults to the
+    // current axes/*.json card set, which IS the source of truth.
+    // Passing axes explicitly would override that — used to be necessary
+    // when axes lived in axis_registry.mjs, no longer is. The signature
+    // produced uses the same rubrics /yapper-seed will use to extract
+    // target signatures at query time, so the candidate and target
+    // vectors share the exact same metric space by construction.
+    const sig = await http('POST', `${PLUGIN}/signature-extract`, { prose: compositionProse });
     if (!sig || !sig.signature || typeof sig.signature !== 'object') {
         throw new Error(`saveAgent: /signature-extract returned no signature for ${agent_id}`);
     }

@@ -28,7 +28,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import * as L from './harness_lib.mjs';
-import { allAxes } from './axis_registry.mjs';
+
+// Project id → name to keep compatibility with code that uses `.name`.
+const _AXES_CACHE = (await L.fetchAxes()).map(a => ({
+    name: a.id, def: a.def, kind: a.kind,
+}));
+function allAxes() { return _AXES_CACHE; }
 
 // ── config ───────────────────────────────────────────────────────────
 

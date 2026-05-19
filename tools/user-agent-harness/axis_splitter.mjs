@@ -27,10 +27,28 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { allAxes, axisByName, registerDerivedAxis } from './axis_registry.mjs';
 // All HTTP / bridge plumbing + shared stats live in harness_lib so the
 // contract surface has ONE source of truth (the 2026-05-18 dedup).
+// Axes are queried from the plugin (axes/*.json cards) — single source
+// of truth, durable across runs. The splitter REGISTERS derived axes
+// by POSTing new axis cards (axis_splitter's contribution to the
+// growing schema is durable from one run to the next).
+import * as L from './harness_lib.mjs';
 import { bridgeCall, meanStd } from './harness_lib.mjs';
+
+// Project id → name to keep compatibility with code that uses `.name`.
+const _AXES_CACHE = (await L.fetchAxes()).map(a => ({
+    name: a.id, def: a.def, kind: a.kind,
+}));
+const _AXES_BY_ID = new Map(_AXES_CACHE.map(a => [a.name, a]));
+function allAxes() { return _AXES_CACHE; }
+function axisByName(name) { return _AXES_BY_ID.get(name) || null; }
+async function registerDerivedAxis({ name, kind, def, derived_from }) {
+    const card = await L.http('POST', `${L.ENDPOINTS.PLUGIN}/axes/${encodeURIComponent(name)}`, {
+        name, kind, def, derived_from,
+    });
+    return card.axis || card;
+}
 
 const OUT_DIR = '/Users/mdot/metal-microbench/data/axis_splits';
 
@@ -332,11 +350,11 @@ async function runSplitter(trajFile, parentAxisName) {
     if (verdict === 'SPLIT_ACCEPTED') {
         const h = top.hypothesis;
         try {
-            const r1 = registerDerivedAxis({
+            const r1 = await registerDerivedAxis({
                 name: h.name1, kind: parentAxis.kind, def: h.def1,
                 derived_from: { parent: parentAxisName, contexts: contexts.join(' vs '), hypothesis_id: h.id, sibling: h.name2 },
             });
-            const r2 = registerDerivedAxis({
+            const r2 = await registerDerivedAxis({
                 name: h.name2, kind: parentAxis.kind, def: h.def2,
                 derived_from: { parent: parentAxisName, contexts: contexts.join(' vs '), hypothesis_id: h.id, sibling: h.name1 },
             });

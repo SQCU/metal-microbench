@@ -22,11 +22,13 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { allAxes, registerDerivedAxis } from './axis_registry.mjs';
 // All HTTP / bridge / persistence / chat / judge / statistics live in
 // harness_lib so the contract surface has ONE source of truth (the
-// 2026-05-18 dedup). This file owns ONLY the cluster-disambiguation
-// algorithm — proposing spread axes, ANOVA F-ratio acceptance, the
+// 2026-05-18 dedup). Axes are queried from the plugin (axes/*.json
+// cards). registerDerivedAxis POSTs a new axis card so disambiguator
+// findings are durable across runs. This file owns ONLY the
+// cluster-disambiguation algorithm — proposing spread axes, ANOVA
+// F-ratio acceptance, the
 // paraphrase-vs-behaviorally-degenerate fork.
 import {
     ENDPOINTS,
@@ -36,8 +38,21 @@ import {
     fetchCounterparty, runChat, userTurns,
     judgeOnAxis,
     meanStd,
+    fetchAxes,
 } from './harness_lib.mjs';
 const { ST, BRIDGE, PLUGIN } = ENDPOINTS;
+
+// Project id → name to keep compatibility with code that uses `.name`.
+const _AXES_CACHE = (await fetchAxes()).map(a => ({
+    name: a.id, def: a.def, kind: a.kind,
+}));
+function allAxes() { return _AXES_CACHE; }
+async function registerDerivedAxis({ name, kind, def, derived_from }) {
+    const card = await http('POST', `${PLUGIN}/axes/${encodeURIComponent(name)}`, {
+        name, kind, def, derived_from,
+    });
+    return card.axis || card;
+}
 
 const OUT_DIR = '/Users/mdot/metal-microbench/data/cluster_disambig';
 
@@ -305,9 +320,9 @@ async function runDisambiguator(specPath) {
         console.log(`            winning axis: ${top.hypothesis.name}`);
         console.log(`            F=${top.F.toFixed(2)} (threshold ${F_RATIO_THRESHOLD}), spread=${top.spread.toFixed(2)} (threshold ${SPREAD_THRESHOLD})`);
         try {
-            registered = registerDerivedAxis({
+            registered = await registerDerivedAxis({
                 name: top.hypothesis.name, kind: 'bio', def: top.hypothesis.def,
-                derived_from: { parent: null, contexts: `cluster:${spec.cluster_id}`,
+                derived_from: { contexts: `cluster:${spec.cluster_id}`,
                                 cluster_members: spec.bios.map(b => b.canonical_key),
                                 reason: 'spread_axis' },
             });

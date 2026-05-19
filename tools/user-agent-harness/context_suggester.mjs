@@ -28,7 +28,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import * as L from './harness_lib.mjs';
-import { allAxes } from './axis_registry.mjs';
+
+// Fetch the axis card set ONCE at module load — axes don't change
+// mid-script. The plugin returns full cards; downstream call sites in
+// this script use `.name` so we project id → name to keep them
+// compatible without touching every reference.
+const _AXES_CACHE = (await L.fetchAxes()).map(a => ({
+    name: a.id, def: a.def, kind: a.kind,
+}));
+function allAxes() { return _AXES_CACHE; }
 
 const DEFAULT_K_ACTIVE = 2;
 const DEFAULT_K_DISABLED = 2;

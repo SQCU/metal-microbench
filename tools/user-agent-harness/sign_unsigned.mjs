@@ -20,10 +20,13 @@
 
 import process from 'node:process';
 import * as L from './harness_lib.mjs';
-import { allAxes } from './axis_registry.mjs';
 
 const FORCE = process.argv.includes('--force');
-const axes = allAxes().map(a => ({ name: a.name, def: a.def }));
+// Axes come from the plugin's axes/*.json card set (single source of
+// truth). The plugin's /signature-extract also defaults to this set
+// when caller omits body.axes, so we could pass nothing — we pass
+// explicitly here only for the operator-log line below.
+const axes = await L.fetchAxes();
 console.log(`[sign_unsigned] ST=${L.ENDPOINTS.ST} force=${FORCE} axes=${axes.length}`);
 
 const { personas } = await L.http('GET', `${L.ENDPOINTS.PLUGIN}/personas`);
