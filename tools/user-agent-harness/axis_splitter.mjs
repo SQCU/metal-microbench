@@ -28,9 +28,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { allAxes, axisByName, registerDerivedAxis } from './axis_registry.mjs';
+// All HTTP / bridge plumbing + shared stats live in harness_lib so the
+// contract surface has ONE source of truth (the 2026-05-18 dedup).
+import { bridgeCall, meanStd } from './harness_lib.mjs';
 
-const BRIDGE = 'http://127.0.0.1:8001';
-const MODEL  = 'gemma-4-a4b';
 const OUT_DIR = '/Users/mdot/metal-microbench/data/axis_splits';
 
 const SEPARATION_THRESHOLD = 0.8;   // Cohen's d ≥ 0.8 = "large effect"
@@ -43,32 +44,6 @@ const N_HYPOTHESES = 3;
 //   (b) the winning sub-axis's |Cohen's d| must EXCEED the parent's own
 //       |Cohen's d| on the same per-turn data — i.e. the split improves
 //       discrimination, not just re-scores it.
-
-// ── http / bridge ────────────────────────────────────────────────────
-
-async function http(method, url, body) {
-    const r = await fetch(url, {
-        method,
-        headers: { 'Content-Type': 'application/json' },
-        body: body ? JSON.stringify(body) : undefined,
-    });
-    const text = await r.text();
-    let parsed;
-    try { parsed = JSON.parse(text); } catch { parsed = text; }
-    if (!r.ok) {
-        const detail = typeof parsed === 'string' ? parsed.slice(0, 300)
-                                                   : JSON.stringify(parsed).slice(0, 300);
-        throw new Error(`${method} ${url} → ${r.status}: ${detail}`);
-    }
-    return parsed;
-}
-
-async function bridgeCall(messages, { max_tokens = null } = {}) {
-    const body = { model: MODEL, messages, stream: false, temperature: 1.0 };
-    if (max_tokens) body.max_tokens = max_tokens;
-    const r = await http('POST', `${BRIDGE}/v1/chat/completions`, body);
-    return (r.choices?.[0]?.message?.content || '').trim();
-}
 
 // ── trajectory traversal ─────────────────────────────────────────────
 
@@ -217,14 +192,8 @@ async function judgeOnPair(turn, pair) {
 }
 
 // ── statistics ───────────────────────────────────────────────────────
-
-function meanStd(arr) {
-    const filt = arr.filter(Number.isFinite);
-    if (!filt.length) return { mean: null, std: null, n: 0 };
-    const mean = filt.reduce((a, b) => a + b, 0) / filt.length;
-    const variance = filt.reduce((s, v) => s + (v - mean) ** 2, 0) / Math.max(1, filt.length - 1);
-    return { mean, std: Math.sqrt(variance), n: filt.length };
-}
+// `meanStd` is imported from harness_lib at the top of this file. Local
+// helpers below build on it (Cohen's d, etc.).
 
 function cohensD(arrA, arrB) {
     const a = meanStd(arrA);

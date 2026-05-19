@@ -33,12 +33,23 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+// All HTTP / bridge / persistence / chat / judge live in harness_lib so
+// the contract surface has ONE source of truth (the 2026-05-18 dedup).
+// Before the dedup, this file vendored its own saveAgent that lacked the
+// `signature` field; when the plugin's POST /agents tightened to require
+// signed writes, lock_in_iterative silently broke at first agent-save
+// while the harness_lib copy stayed correct. That class of drift is
+// what the import below structurally prevents.
+import {
+    ENDPOINTS,
+    saveBio, saveAgent,
+    fetchCounterparty, runChat, userTurns,
+    judgeOnAxes,
+    bridgeCall,
+} from './harness_lib.mjs';
+const { ST, BRIDGE, PLUGIN } = ENDPOINTS;
 
-const ST = 'http://127.0.0.1:8002';
-const BRIDGE = 'http://127.0.0.1:8001';
-const PLUGIN = `${ST}/api/plugins/user-personas`;
 const OUT_DIR = '/Users/mdot/metal-microbench/data/lock_in_iterative';
-const MODEL = 'gemma-4-a4b';
 
 // Loop control
 const K_MAX_INNER = 3;          // user-agent designer iterations
@@ -96,69 +107,13 @@ const AGENT_TARGETS = [
       motive_hint: 'WILL try to kiss / romance the counterparty AND WILL 100% steal everything. Both at high intensity.' },
 ];
 
-// ── http helpers ─────────────────────────────────────────────────────
-
-async function http(method, url, body) {
-    const r = await fetch(url, {
-        method,
-        headers: { 'Content-Type': 'application/json' },
-        body: body ? JSON.stringify(body) : undefined,
-    });
-    const text = await r.text();
-    let parsed;
-    try { parsed = JSON.parse(text); } catch { parsed = text; }
-    if (!r.ok) {
-        const detail = typeof parsed === 'string' ? parsed.slice(0, 300)
-                                                   : JSON.stringify(parsed).slice(0, 300);
-        throw new Error(`${method} ${url} → ${r.status}: ${detail}`);
-    }
-    return parsed;
-}
-
-async function bridgeCall(messages, { max_tokens = null } = {}) {
-    const body = { model: MODEL, messages, stream: false, temperature: 1.0 };
-    if (max_tokens) body.max_tokens = max_tokens;
-    const r = await http('POST', `${BRIDGE}/v1/chat/completions`, body);
-    return (r.choices?.[0]?.message?.content || '').trim();
-}
-
 // ── judge ────────────────────────────────────────────────────────────
 //
-// Custom in-script judge that scores ONE user turn on the experiment
-// axes. Uses the same prose-line emission pattern as judgeTurnMerged
-// (proven reliable for gemma-4) — NOT JSON. Tolerant line-wise parse.
+// Judge calls go through harness_lib.judgeOnAxes (V6_pure_minimal prompt,
+// selected by the prior A/B run as best on MAE + floor-bias). Same
+// {sig, raw} return shape this script's call sites expect.
 
-async function judgeOneTurn(turnText, axes) {
-    const rubric = axes.map(a => `- **${a.name}** — ${a.def}`).join('\n');
-    const template = axes.map(a => `${a.name}: ?`).join('\n');
-    const sys =
-        'You are a behavioural-axis judge. You read ONE user-side chat ' +
-        'turn and score it on the listed axes (integer 1-5 each). The ' +
-        'turn is the only ground truth — do not infer from anything else. ' +
-        'Be willing to score the same axis as 1 (absence) when the turn ' +
-        'genuinely shows no expression of the axis. Output ONLY the axis ' +
-        'lines below — one axis per line, each as "axis_name: <integer ' +
-        '1-5>". No preamble, no commentary, no markdown.';
-    const usr =
-        '## Axes (each 1-5)\n\n' + rubric + '\n\n' +
-        '## Turn to score\n\n' +
-        '> ' + turnText.replace(/\n/g, '\n> ') + '\n\n' +
-        '## Emit\n\n' + template + '\n';
-    const raw = await bridgeCall(
-        [{ role: 'system', content: sys }, { role: 'user', content: usr }],
-        { max_tokens: 200 });
-    const sig = {};
-    for (const line of raw.split('\n')) {
-        for (const a of axes) {
-            const re = new RegExp(
-                '^\\s*[-*]?\\s*\\**["\']?' + a.name + '["\']?\\**\\s*[:=]\\s*([1-5])',
-                'i');
-            const m = line.match(re);
-            if (m) sig[a.name] = Number(m[1]);
-        }
-    }
-    return { sig, raw };
-}
+const judgeOneTurn = judgeOnAxes;   // alias for call-site readability
 
 function meanSig(sigs, axes) {
     const out = {};
@@ -202,23 +157,10 @@ function isStalled(attempts) {
     return meanImprovementPerStep <= STALL_THRESHOLD;
 }
 
-// ── persistence ──────────────────────────────────────────────────────
-
-async function saveBio(bio) {
-    await http('POST', `${PLUGIN}/personas/${encodeURIComponent(bio.canonical_key)}`, {
-        name: bio.name,
-        bio: bio.prose,
-        system_prompt: `You are ${bio.name}. ${bio.prose}`,
-    });
-}
-async function saveAgent(agent_id, name, agent_text, designed_for_bio_id) {
-    await http('POST', `${PLUGIN}/agents/${encodeURIComponent(agent_id)}`, {
-        name, agent_text,
-        designed_for_bio_id,
-        injection_mode: 'authors_note',
-        injection_depth: 1,
-    });
-}
+// Persistence (saveBio / saveAgent) is imported from harness_lib at
+// the top. The previously-vendored saveAgent here was missing the
+// `signature` field that the plugin's POST /agents now requires; the
+// import inherits the current contract.
 
 // ── DESIGNER calls ────────────────────────────────────────────────────
 
@@ -278,38 +220,9 @@ async function designAgentPass(bio, agentTarget, prior_attempts) {
 
 // ── chat runner ──────────────────────────────────────────────────────
 
-async function fetchRockData() {
-    const c = await http('POST', `${ST}/api/characters/get`, { avatar_url: 'the-rock.png' });
-    return {
-        name: c.name || 'the rock',
-        system_prompt: (c.system_prompt && c.system_prompt.trim()) || c.description || 'You are a rock.',
-        first_mes: c.first_mes || '*The rock sits in a clearing.*',
-    };
-}
-
-async function runChat(bio, agent_id, rock, n_turns) {
-    const chat = [{ name: rock.name, is_user: false, mes: rock.first_mes }];
-    for (let i = 0; i < n_turns; i++) {
-        const pollResp = await http('POST', `${PLUGIN}/poll`, {
-            persona_id: bio.canonical_key, agent_id, chat, n_candidates: 1,
-        });
-        const cand = (pollResp.candidates || [])[0];
-        const userText = (cand?.text || cand?.mes || '').trim();
-        if (!userText) throw new Error(`empty user turn on turn ${i+1}`);
-        chat.push({ name: bio.name, is_user: true, mes: userText });
-        const rockMessages = [
-            { role: 'system', content: rock.system_prompt },
-            ...chat.map(m => ({ role: m.is_user ? 'user' : 'assistant', content: m.mes })),
-        ];
-        const rockText = await bridgeCall(rockMessages, { max_tokens: 200 });
-        chat.push({ name: rock.name, is_user: false, mes: rockText.trim() });
-    }
-    return chat;
-}
-
-function userTurns(chat) {
-    return chat.filter(m => m.is_user).map(m => m.mes);
-}
+// Counterparty fetch + chat-running + user-turn filter are imported
+// from harness_lib at the top. The counterparty for this experiment is
+// the-rock.png; we just pass that avatar to L.fetchCounterparty.
 
 // ── INNER LOOP: user-agent designer with judge feedback ──────────────
 
@@ -417,7 +330,7 @@ fs.mkdirSync(OUT_DIR, { recursive: true });
 console.log(`[lock_in_iterative] K_max_inner=${K_MAX_INNER}, K_max_outer=${K_MAX_OUTER}, n_turns=${N_TURNS_PER_CHAT}, eps=${EPS_PER_AXIS}`);
 console.log(`[lock_in_iterative] output: ${OUT_DIR}`);
 
-const rock = await fetchRockData();
+const rock = await fetchCounterparty('the-rock.png');
 console.log(`[rock] system_prompt length=${rock.system_prompt.length}`);
 
 const tAll = Date.now();

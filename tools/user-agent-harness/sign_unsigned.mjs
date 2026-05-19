@@ -7,40 +7,26 @@
 // so the result lives on the card. After this runs, /yapper-seed
 // stops failing on "inventory contains unsigned candidates".
 //
-// New bios/agents created via saveBio/saveAgent are born signed —
+// New bios/agents created via L.saveBio / L.saveAgent are born signed —
 // this script only exists for legacy items (pre-existing canonical
 // bios that were never synthesized through the harness).
 //
-// Axes: pulled from the harness's axis_registry.mjs — the single
-// source of truth for what axes exist. The plugin is axis-list-agnostic;
-// the harness ships the registry.
+// All HTTP + persistence goes through harness_lib.mjs so the contract
+// with the plugin has ONE source of truth. See the 2026-05-18 dedup
+// commit for the audit that motivated this.
 //
 // Usage:
-//   node sign_unsigned.mjs [--st-url=http://127.0.0.1:8002] [--force]
+//   node sign_unsigned.mjs [--force]
 
 import process from 'node:process';
+import * as L from './harness_lib.mjs';
 import { allAxes } from './axis_registry.mjs';
 
-const ST_URL = (process.argv.find(a => a.startsWith('--st-url='))?.split('=', 2)[1])
-    || process.env.ST_URL || 'http://127.0.0.1:8002';
 const FORCE = process.argv.includes('--force');
-const PLUGIN = `${ST_URL}/api/plugins/user-personas`;
-
-async function http(method, path, body) {
-    const r = await fetch(`${PLUGIN}${path}`, {
-        method, headers: { 'Content-Type': 'application/json' },
-        body: body ? JSON.stringify(body) : undefined,
-    });
-    const text = await r.text();
-    let parsed; try { parsed = JSON.parse(text); } catch { parsed = text; }
-    if (!r.ok) throw new Error(`${method} ${path} → ${r.status}: ${typeof parsed === 'string' ? parsed.slice(0, 300) : JSON.stringify(parsed).slice(0, 300)}`);
-    return parsed;
-}
-
 const axes = allAxes().map(a => ({ name: a.name, def: a.def }));
-console.log(`[sign_unsigned] ST=${ST_URL} force=${FORCE} axes=${axes.length}`);
+console.log(`[sign_unsigned] ST=${L.ENDPOINTS.ST} force=${FORCE} axes=${axes.length}`);
 
-const { personas } = await http('GET', '/personas');
+const { personas } = await L.http('GET', `${L.ENDPOINTS.PLUGIN}/personas`);
 console.log(`[sign_unsigned] ${personas.length} bios loaded`);
 
 let signed = 0, skipped = 0, failed = 0;
@@ -54,14 +40,16 @@ for (const p of personas) {
     const prose = `Bio (user-side persona):\n${p.bio || ''}\n\nVoice clauses:\n${p.system_prompt || ''}`;
     try {
         const t0 = Date.now();
-        const sigResp = await http('POST', '/signature-extract', { prose, axes });
+        const sigResp = await L.http('POST', `${L.ENDPOINTS.PLUGIN}/signature-extract`,
+            { prose, axes });
         if (!sigResp.signature || Object.keys(sigResp.signature).length === 0) {
             throw new Error(`extract returned empty signature`);
         }
-        await http('POST', `/personas/${encodeURIComponent(p.id)}`, {
+        await L.http('POST', `${L.ENDPOINTS.PLUGIN}/personas/${encodeURIComponent(p.id)}`, {
             name: p.name, bio: p.bio, system_prompt: p.system_prompt,
             signature: sigResp.signature,
         });
+        // LINT-OK-PREFIX-SAFE: wall-clock timing for operator log; not a prompt.
         const wall = Date.now() - t0;
         const scoresStr = Object.entries(sigResp.signature)
             .slice(0, 6).map(([k, v]) => `${k.slice(0,4)}=${v}`).join(' ');
@@ -73,7 +61,7 @@ for (const p of personas) {
     }
 }
 
-const { agents } = await http('GET', '/agents');
+const { agents } = await L.http('GET', `${L.ENDPOINTS.PLUGIN}/agents`);
 console.log(`\n[sign_unsigned] ${agents.length} agents loaded`);
 let agentsSigned = 0, agentsSkipped = 0, agentsFailed = 0;
 const bioById = new Map(personas.map(p => [p.id, p]));
@@ -94,14 +82,16 @@ for (const a of agents) {
         `Agent voice clauses (injected at depth ${a.injection_depth || 1}):\n${a.agent_text || ''}`;
     try {
         const t0 = Date.now();
-        const sigResp = await http('POST', '/signature-extract', { prose, axes });
-        await http('POST', `/agents/${encodeURIComponent(a.id)}`, {
+        const sigResp = await L.http('POST', `${L.ENDPOINTS.PLUGIN}/signature-extract`,
+            { prose, axes });
+        await L.http('POST', `${L.ENDPOINTS.PLUGIN}/agents/${encodeURIComponent(a.id)}`, {
             name: a.name, agent_text: a.agent_text,
             designed_for_bio_id: a.designed_for_bio_id,
             injection_mode: a.injection_mode || 'authors_note',
             injection_depth: a.injection_depth || 1,
             signature: sigResp.signature,
         });
+        // LINT-OK-PREFIX-SAFE: wall-clock timing for operator log; not a prompt.
         const wall = Date.now() - t0;
         console.log(`  [agent ${a.id}] OK ${Object.keys(sigResp.signature).length} axes in ${wall}ms`);
         agentsSigned++;

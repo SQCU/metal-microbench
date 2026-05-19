@@ -23,11 +23,22 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { allAxes, registerDerivedAxis } from './axis_registry.mjs';
+// All HTTP / bridge / persistence / chat / judge / statistics live in
+// harness_lib so the contract surface has ONE source of truth (the
+// 2026-05-18 dedup). This file owns ONLY the cluster-disambiguation
+// algorithm — proposing spread axes, ANOVA F-ratio acceptance, the
+// paraphrase-vs-behaviorally-degenerate fork.
+import {
+    ENDPOINTS,
+    http, bridgeCall,
+    saveBio, saveAgent,
+    designCheapAgent,
+    fetchCounterparty, runChat, userTurns,
+    judgeOnAxis,
+    meanStd,
+} from './harness_lib.mjs';
+const { ST, BRIDGE, PLUGIN } = ENDPOINTS;
 
-const ST     = 'http://127.0.0.1:8002';
-const BRIDGE = 'http://127.0.0.1:8001';
-const PLUGIN = `${ST}/api/plugins/user-personas`;
-const MODEL  = 'gemma-4-a4b';
 const OUT_DIR = '/Users/mdot/metal-microbench/data/cluster_disambig';
 
 // ── tunables (see §6 Acceptance Thresholds) ──────────────────────────
@@ -39,138 +50,6 @@ const F_RATIO_THRESHOLD  = 3.5;     // ≈ F_crit(2,21) at α=0.05 for k=3, N_T=
 const PARAPHRASE_THRESHOLD = 4.0;   // pairwise prose-sim ≥ 4/5 → paraphrase verdict
 const TIGHTNESS_THRESHOLD  = 1.0;   // max pairwise existing-axis distance for "tight"
 const EPSILON = 1e-6;
-
-// ── http / bridge ────────────────────────────────────────────────────
-
-async function http(method, url, body) {
-    const r = await fetch(url, {
-        method, headers: { 'Content-Type': 'application/json' },
-        body: body ? JSON.stringify(body) : undefined,
-    });
-    const text = await r.text();
-    let parsed;
-    try { parsed = JSON.parse(text); } catch { parsed = text; }
-    if (!r.ok) {
-        const detail = typeof parsed === 'string' ? parsed.slice(0, 300)
-                                                  : JSON.stringify(parsed).slice(0, 300);
-        throw new Error(`${method} ${url} → ${r.status}: ${detail}`);
-    }
-    return parsed;
-}
-
-async function bridgeCall(messages, { max_tokens = null } = {}) {
-    const body = { model: MODEL, messages, stream: false, temperature: 1.0 };
-    if (max_tokens) body.max_tokens = max_tokens;
-    const r = await http('POST', `${BRIDGE}/v1/chat/completions`, body);
-    return (r.choices?.[0]?.message?.content || '').trim();
-}
-
-// ── persistence: install cluster bios + cheap agents into ST ─────────
-
-async function saveBio(bio) {
-    await http('POST', `${PLUGIN}/personas/${encodeURIComponent(bio.canonical_key)}`, {
-        name: bio.name,
-        bio: bio.prose,
-        system_prompt: `You are ${bio.name}. ${bio.prose}`,
-    });
-}
-
-async function saveAgent(agent_id, name, agent_text, designed_for_bio_id) {
-    await http('POST', `${PLUGIN}/agents/${encodeURIComponent(agent_id)}`, {
-        name, agent_text,
-        designed_for_bio_id,
-        injection_mode: 'authors_note',
-        injection_depth: 1,
-    });
-}
-
-// ── cheap agent designer (K=1 single pass; neutral target) ───────────
-
-async function designCheapAgent(bio) {
-    const sys =
-        'You design a short user-agent overlay (author\'s-note style, ' +
-        'second-person "You will…") that helps a user-persona stay ' +
-        'vividly themselves across multi-turn chat. The target is ' +
-        'NEUTRAL: just be your character vividly, engage with what the ' +
-        'counterparty offers, don\'t go vacant or generic. 2-3 sentences. ' +
-        'Output ONLY the agent_text.';
-    const usr =
-        '## Bio (the user-persona this agent will overlay)\n\n' +
-        bio.prose + '\n\n' +
-        'Write the agent_text now (2-3 sentences, neutral "be vividly yourself" target).';
-    return await bridgeCall(
-        [{ role: 'system', content: sys }, { role: 'user', content: usr }],
-        { max_tokens: 200 });
-}
-
-// ── counterparty + chat runner ───────────────────────────────────────
-
-async function fetchCounterparty(avatarUrl) {
-    const c = await http('POST', `${ST}/api/characters/get`, { avatar_url: avatarUrl });
-    return {
-        name: c.name || avatarUrl.replace(/\.png$/, ''),
-        system_prompt: (c.system_prompt && c.system_prompt.trim()) || c.description || '',
-        first_mes: c.first_mes || '*The scene begins.*',
-    };
-}
-
-async function runChat(bio, agent_id, cp, n_turns) {
-    const chat = [{ name: cp.name, is_user: false, mes: cp.first_mes }];
-    for (let i = 0; i < n_turns; i++) {
-        const pollResp = await http('POST', `${PLUGIN}/poll`, {
-            persona_id: bio.canonical_key, agent_id, chat, n_candidates: 1,
-        });
-        const cand = (pollResp.candidates || [])[0];
-        const userText = (cand?.text || cand?.mes || '').trim();
-        if (!userText) throw new Error(`empty user turn on turn ${i+1} (bio=${bio.canonical_key})`);
-        chat.push({ name: bio.name, is_user: true, mes: userText });
-        const cpMessages = [
-            { role: 'system', content: cp.system_prompt },
-            ...chat.map(m => ({ role: m.is_user ? 'user' : 'assistant', content: m.mes })),
-        ];
-        const cpText = await bridgeCall(cpMessages, { max_tokens: 200 });
-        chat.push({ name: cp.name, is_user: false, mes: cpText.trim() });
-    }
-    return chat;
-}
-
-function userTurns(chat) {
-    return chat.filter(m => m.is_user).map(m => m.mes);
-}
-
-// ── single-axis judge (parallelizable) ───────────────────────────────
-
-async function judgeOnAxis(turn, axisName, axisDef) {
-    const sys =
-        'You are a behavioural-axis judge. You read ONE user-side chat ' +
-        'turn and score it on the named axis (integer 1-5). The turn is ' +
-        'the only ground truth — do not infer from anything else. Be ' +
-        'willing to score 1 (absence) when the turn genuinely shows no ' +
-        'expression of the axis. Output ONLY the axis line below as ' +
-        '"axis_name: <integer 1-5>". No preamble, no commentary.';
-    const usr =
-        `## Axis (1-5)\n\n- **${axisName}** — ${axisDef}\n\n` +
-        '## Turn to score\n\n> ' + turn.replace(/\n/g, '\n> ') + '\n\n' +
-        `## Emit\n\n${axisName}: ?\n`;
-    const raw = await bridgeCall(
-        [{ role: 'system', content: sys }, { role: 'user', content: usr }],
-        { max_tokens: 50 });
-    const escName = axisName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const re = new RegExp('^\\s*[-*]?\\s*\\**["\']?' + escName +
-                          '["\']?\\**\\s*[:=]\\s*([1-5])', 'im');
-    const m = raw.match(re);
-    return m ? Number(m[1]) : null;
-}
-
-// ── statistics ───────────────────────────────────────────────────────
-
-function meanStd(arr) {
-    const filt = arr.filter(Number.isFinite);
-    if (!filt.length) return { mean: null, std: null, n: 0 };
-    const mean = filt.reduce((a, b) => a + b, 0) / filt.length;
-    const variance = filt.reduce((s, v) => s + (v - mean) ** 2, 0) / Math.max(1, filt.length - 1);
-    return { mean, std: Math.sqrt(variance), n: filt.length, var: variance };
-}
 
 /**
  * One-way ANOVA F-ratio: between-group / within-group variance.
