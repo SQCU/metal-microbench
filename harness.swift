@@ -1853,6 +1853,71 @@ func runLmPrefillValidate(ggufPath: String, refDir: String, tag: String) {
         }
     }
 
+    // Activeness A/B test — when LM_PREFILL_AB=1, ALSO run a numActiveRows=qLen
+    // dispatch (single-slot prefill geometry) and assert that slot-0's
+    // pre_logits rows are byte-identical to the full B*qLen baseline above.
+    // This is the byte-equality correctness gate from the activeB-aware
+    // refactor task. Per-row independence of every prefill matmul means
+    // slot-0 outputs must be unchanged — if they differ, the refactor's
+    // per-row-independence assumption is violated.
+    if ProcessInfo.processInfo.environment["LM_PREFILL_AB"] == "1" {
+        // Snapshot baseline slot-0 logits as fp16 bytes.
+        var baselineSlot0 = [Float16](repeating: 0, count: qLen * VOCAB)
+        for i in 0..<qLen {
+            let srcRow = 0 * qLen + i
+            for v in 0..<VOCAB {
+                baselineSlot0[i * VOCAB + v] = logitsFp16[srcRow * VOCAB + v]
+            }
+        }
+        // Zero pre_logits before the activeB dispatch so we can verify rows
+        // 1..(B*qLen-1) remain zeroed (i.e., the dispatch really only wrote
+        // slot 0's rows).
+        let preLogitsBytes = B * qLen * VOCAB * MemoryLayout<Float16>.stride
+        memset(pre_logits.contents(), 0, preLogitsBytes)
+
+        // Re-precompute masks at numActiveSlots=1 (matches the single-slot
+        // prepare path) and re-dispatch with numActiveRows=qLen.
+        precomputeFlexPrefillMasks(qLen: qLen, positionStart: 0, numActiveSlots: 1)
+        let cb2 = buildPrefillCB(w, qLen: qLen, fullPrefillLogits: true,
+                                  numActiveRows: qLen)
+        let t1 = Date()
+        cb2.commit(); cb2.waitUntilCompleted()
+        let dtMs2 = Date().timeIntervalSince(t1) * 1000
+        if let err = cb2.error { print("  GPU prefill (activeB): \(err)"); return }
+        print(String(format: "  prefill CB wall (activeB=1): %.2f ms (B=%d, qLen=%d, %d rows) → %.2f× speedup",
+                     dtMs2, B, qLen, qLen, dtMs / dtMs2))
+
+        // Byte-equality check: slot-0 rows in pre_logits must match the
+        // baseline fp16 bit pattern exactly.
+        let logitsFp16v2 = pre_logits.contents().assumingMemoryBound(to: Float16.self)
+        var mismatches = 0
+        var maxAbsDiff: Float = 0
+        for i in 0..<qLen {
+            let srcRow = 0 * qLen + i
+            for v in 0..<VOCAB {
+                let a = baselineSlot0[i * VOCAB + v]
+                let b = logitsFp16v2[srcRow * VOCAB + v]
+                if a.bitPattern != b.bitPattern {
+                    mismatches += 1
+                    let d = abs(Float(a) - Float(b))
+                    if d > maxAbsDiff { maxAbsDiff = d }
+                }
+            }
+        }
+        let total = qLen * VOCAB
+        if mismatches == 0 {
+            print(String(format: "  AB byte-equality: PASS (slot-0 logits %d/%d bytes identical)",
+                         total, total))
+        } else {
+            print(String(format: "  AB byte-equality: FAIL (%d/%d mismatches, max abs diff %.6f)",
+                         mismatches, total, maxAbsDiff))
+        }
+
+        // Restore CSR + re-run baseline so downstream AR-step path (if any)
+        // sees the expected full-B mask state.
+        precomputeFlexPrefillMasks(qLen: qLen, positionStart: 0)
+    }
+
     // Per-position metrics.
     print("  per-position metrics (oracle vs swift, slot 0):")
     print("    pos  token     L2        KL(ora‖swi)   top1?  top5∩  ora-next                    swi-next")

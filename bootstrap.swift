@@ -3423,11 +3423,17 @@ enum MaskMod {
 // any mask_mod by changing the policy passed to this function.
 func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
                                  slideMask: MaskMod = .causalSliding(SLIDING_WINDOW),
-                                 fullMask: MaskMod = .causal) {
+                                 fullMask: MaskMod = .causal,
+                                 numActiveSlots: Int = B) {
     // v2: emit one CSR entry per (slot, q_block_idx) so qLen > 8 actually
     // works. Kernel-side csr_idx = slot * q_blocks_per_slot + q_block_idx
     // is already in place (`flex_attn_full_prefill`, `flex_attn_slide_v1_q8`),
     // it was just waiting for the host-side widened CSR.
+    //
+    // numActiveSlots <= B: only the first numActiveSlots' CSR entries are
+    // built. The attention dispatchers downstream are sized to dispatch
+    // only numActiveSlots*H_Q threadgroups along the slot axis, so silenced
+    // slot CSR rows are unread (their old contents are harmless).
     let qBlock = 8
     let qBlocks = (qLen + qBlock - 1) / qBlock
     let qPosP = pre_q_positions.contents().assumingMemoryBound(to: UInt32.self)
@@ -3441,7 +3447,7 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
         let partMask = pre_slide_part_masks.contents().assumingMemoryBound(to: UInt32.self)
         var fc = 0, pc = 0
         fullOff[0] = 0; partOff[0] = 0
-        for b in 0..<B {
+        for b in 0..<numActiveSlots {
             let k_len = Int(pre_k_len_slide.contents().assumingMemoryBound(to: UInt32.self)[b])
             // Slot's first q position. Fallback to positionStart for the
             // single-slot path that doesn't populate silenced slots.
@@ -3500,7 +3506,7 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
         let partMask = flex_full_part_masks.contents().assumingMemoryBound(to: UInt32.self)
         var fc = 0, pc = 0
         fullOff[0] = 0; partOff[0] = 0
-        for b in 0..<B {
+        for b in 0..<numActiveSlots {
             let k_len = Int(pre_k_len_full.contents().assumingMemoryBound(to: UInt32.self)[b])
             let slotPos = Int(qPosP[b * qLen])
             let slotFirst = (slotPos != 0 || positionStart == 0) ? slotPos : positionStart
@@ -3557,7 +3563,8 @@ func encFlexAttnSlidePrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
                               kChunks: [MTLBuffer], vChunks: [MTLBuffer], chunkPages: Int,
                               activeChunkIdxs: [Int],
                               kLenBuf: MTLBuffer, qPositions: MTLBuffer,
-                              H_Q: Int, H_KV: Int, D: Int, qLen: Int) {
+                              H_Q: Int, H_KV: Int, D: Int, qLen: Int,
+                              numActiveSlots: Int = B) {
     let qBlocks = (qLen + 8 - 1) / 8
     let enc1 = cb.makeComputeCommandEncoder()!
     enc1.setComputePipelineState(flexAttnSlideV1Q8PSO)
@@ -3590,11 +3597,11 @@ func encFlexAttnSlidePrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
     // threadgroup-memory rationale (drops static usage from 25,312
     // to 12,672 bytes — under the 32 KB Metal hardware limit even
     // accounting for compiler-side simdgroup-matrix doubling).
-    enc1.dispatchThreadgroups(MTLSize(width: B * H_Q, height: qBlocks, depth: ATTN_N_SPLITS),
+    enc1.dispatchThreadgroups(MTLSize(width: numActiveSlots * H_Q, height: qBlocks, depth: ATTN_N_SPLITS),
                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc1.endEncoding()
 
-    // Reduce per (slot, q_pos, q_head). Grid: B*qLen*H_Q.
+    // Reduce per (slot, q_pos, q_head). Grid: numActiveSlots*qLen*H_Q.
     let enc2 = cb.makeComputeCommandEncoder()!
     enc2.setComputePipelineState(pagedSplitReducePSO)
     enc2.setBuffer(pre_m_partials, offset: 0, index: 0)
@@ -3603,7 +3610,7 @@ func encFlexAttnSlidePrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
     enc2.setBuffer(O, offset: 0, index: 3)
     var Dv = UInt32(D)
     enc2.setBytes(&Dv, length: 4, index: 4); enc2.setBytes(&ns, length: 4, index: 5)
-    enc2.dispatchThreadgroups(MTLSize(width: B * qLen * H_Q, height: 1, depth: 1),
+    enc2.dispatchThreadgroups(MTLSize(width: numActiveSlots * qLen * H_Q, height: 1, depth: 1),
                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc2.endEncoding()
 }
@@ -3613,7 +3620,8 @@ func encFlexAttnFullPrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
                              kChunks: [MTLBuffer], vChunks: [MTLBuffer], chunkPages: Int,
                              activeChunkIdxs: [Int],
                              kLenBuf: MTLBuffer, qPositions: MTLBuffer,
-                             H_Q: Int, H_KV: Int, D: Int, qLen: Int) {
+                             H_Q: Int, H_KV: Int, D: Int, qLen: Int,
+                             numActiveSlots: Int = B) {
     let qBlocks = (qLen + 8 - 1) / 8
     let enc1 = cb.makeComputeCommandEncoder()!
     enc1.setComputePipelineState(flexAttnFullPrefillPSO)
@@ -3638,7 +3646,9 @@ func encFlexAttnFullPrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
     enc1.setBytes(&cp, length: 4, index: 27)
     useResourceForActiveChunks(enc1, kChunks: kChunks, vChunks: vChunks,
                                  activeChunkIdxs: activeChunkIdxs, usage: .read)
-    enc1.dispatchThreadgroups(MTLSize(width: B * H_Q, height: qBlocks, depth: ATTN_N_SPLITS),
+    // 2026-05-23 (activeB-aware prefill): grid width is numActiveSlots
+    // (defaults to B for multi-slot prefill; collapses to 1 for single-slot).
+    enc1.dispatchThreadgroups(MTLSize(width: numActiveSlots * H_Q, height: qBlocks, depth: ATTN_N_SPLITS),
                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc1.endEncoding()
 
@@ -3650,19 +3660,25 @@ func encFlexAttnFullPrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
     enc2.setBuffer(O, offset: 0, index: 3)
     var Dv = UInt32(D)
     enc2.setBytes(&Dv, length: 4, index: 4); enc2.setBytes(&ns, length: 4, index: 5)
-    enc2.dispatchThreadgroups(MTLSize(width: B * qLen * H_Q, height: 1, depth: 1),
+    enc2.dispatchThreadgroups(MTLSize(width: numActiveSlots * qLen * H_Q, height: 1, depth: 1),
                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc2.endEncoding()
 }
 
 // Multi-position KV write. K/V layout [B, q_len, H, D]. q_positions [B, q_len].
-// Grid: B × q_len × H, 32 lanes each.
+// Grid: numActiveSlots × q_len × H, 32 lanes each. `numActiveSlots` defaults
+// to B (legacy behavior). For single-slot prefill (numActiveSlots=1), only
+// slot 0's K/V rows are written — silenced-slot K/V outputs aren't computed
+// in the upstream matmul (numActiveRows=qLen) and would be uninitialized,
+// so writing them would push garbage into scratch pages. With numActiveSlots
+// matching the upstream matmul's row count / qLen, only real KV is written.
 func encKVWriteMulti(_ cb: MTLCommandBuffer, K: MTLBuffer, V: MTLBuffer,
                       kArgBuf: MTLBuffer, vArgBuf: MTLBuffer,
                       kChunks: [MTLBuffer], vChunks: [MTLBuffer], chunkPages: Int,
                       activeChunkIdxs: [Int],
                       q_positions: MTLBuffer,
-                      H: Int, D: Int, page: Int, qLen: Int) {
+                      H: Int, D: Int, page: Int, qLen: Int,
+                      numActiveSlots: Int = B) {
     let enc = cb.makeComputeCommandEncoder()!
     enc.setComputePipelineState(kvWriteMultiPSO)
     enc.setBuffer(K, offset: 0, index: 0); enc.setBuffer(V, offset: 0, index: 1)
@@ -3676,7 +3692,11 @@ func encKVWriteMulti(_ cb: MTLCommandBuffer, K: MTLBuffer, V: MTLBuffer,
     enc.setBytes(&cp, length: 4, index: 27)
     useResourceForActiveChunks(enc, kChunks: kChunks, vChunks: vChunks,
                                  activeChunkIdxs: activeChunkIdxs, usage: .write)
-    enc.dispatchThreadgroups(MTLSize(width: B, height: qLen, depth: H),
+    // 2026-05-23 (activeB-aware prefill): width is numActiveSlots
+    // (defaults to B). Single-slot prefill collapses to width=1 so
+    // only slot 0's KV gets written; silenced slots' garbage doesn't
+    // pollute any pages.
+    enc.dispatchThreadgroups(MTLSize(width: numActiveSlots, height: qLen, depth: H),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
 }
@@ -4855,10 +4875,20 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
 func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
                             qLen: Int, skipEmbed: Bool = false,
                             skipUnembed: Bool = false,
-                            fullPrefillLogits: Bool = false) {
+                            fullPrefillLogits: Bool = false,
+                            numActiveRows: Int = -1) {
     precondition(qLen <= MAX_Q_LEN, "qLen \(qLen) exceeds MAX_Q_LEN=\(MAX_Q_LEN)")
-    let N = B * qLen               // total token rows
-    let NS = B * qLen * TOPK       // total MoE slots
+    // numActiveRows defaults to B*qLen (legacy: every slot's qLen tokens
+    // computed). For single-slot prefill the caller passes numActiveRows=qLen
+    // so we only compute slot 0's rows. Per-row independence of the prefill
+    // matmuls and per-(slot,position) independence of attention/KV writes
+    // means slot-0 outputs are byte-identical to the full B*qLen dispatch.
+    let activeRows = (numActiveRows < 0) ? (B * qLen) : numActiveRows
+    precondition(activeRows >= 1 && activeRows <= B * qLen && activeRows % qLen == 0,
+                  "numActiveRows=\(activeRows) must be a multiple of qLen=\(qLen) in [qLen, B*qLen]")
+    let activeSlots = activeRows / qLen
+    let N = activeRows             // total token rows (was B*qLen)
+    let NS = activeRows * TOPK     // total MoE slots (was B*qLen*TOPK)
 
     // Per-CB chunk-set narrowing for prefill. Same approach as
     // buildStepCB, but using the pre_* num_pages buffers since
@@ -4869,7 +4899,7 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
         activeB: B, kvChunkPages: w.kvChunkPages)
 
     if !skipEmbed {
-        // Embed + Gemma-4 sqrt(hidden) scale, now over N = B*qLen tokens.
+        // Embed + Gemma-4 sqrt(hidden) scale, now over N = activeRows tokens.
         encEmbedInto(cb, tokens: pre_input_tokens, embedTable: w.embedTable,
                      out: pre_hidden, numVecs: N)
         encScaleByScalar(cb, x: pre_hidden, scalar: w.embedScaleBuf, N: HIDDEN, numVecs: N)
@@ -4950,7 +4980,8 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
                         kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                         activeChunkIdxs: activeChunkIdxs,
                         q_positions: pre_q_positions,
-                        H: KV_H, D: HD, page: pg, qLen: qLen)
+                        H: KV_H, D: HD, page: pg, qLen: qLen,
+                        numActiveSlots: activeSlots)
 
         // Attention — flex v1 (Q_BLOCK=8).
         let klBuf = isFull ? pre_k_len_full : pre_k_len_slide
@@ -4959,13 +4990,15 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
                                     kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                                     activeChunkIdxs: activeChunkIdxs,
                                     kLenBuf: klBuf, qPositions: pre_q_positions,
-                                    H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
+                                    H_Q: H, H_KV: KV_H, D: HD, qLen: qLen,
+                                    numActiveSlots: activeSlots)
         } else {
             encFlexAttnSlidePrefill(cb, Q: q_out, O: pre_attn_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                                      kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                                      activeChunkIdxs: activeChunkIdxs,
                                      kLenBuf: klBuf, qPositions: pre_q_positions,
-                                     H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
+                                     H_Q: H, H_KV: KV_H, D: HD, qLen: qLen,
+                                     numActiveSlots: activeSlots)
         }
 
         // o_proj (simdgroup matmul) → pre_mlp_out; fused post-attn norm + residual add.
@@ -5107,7 +5140,7 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
                       Din: HIDDEN, Dout: VOCAB, numVecs: N)
             encSoftcapInto(cb, buf: pre_logits, N: VOCAB, numVecs: N, cap: 30.0)
             let blit = cb.makeBlitCommandEncoder()!
-            for slot in 0..<B {
+            for slot in 0..<activeSlots {
                 let srcOff = (slot * qLen + (qLen - 1)) * VOCAB * 2
                 let dstOff = slot * VOCAB * 2
                 blit.copy(from: pre_logits, sourceOffset: srcOff,
@@ -5117,7 +5150,7 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
             blit.endEncoding()
         } else {
             let gatherBlit = cb.makeBlitCommandEncoder()!
-            for slot in 0..<B {
+            for slot in 0..<activeSlots {
                 let srcOff = (slot * qLen + (qLen - 1)) * HIDDEN * 2
                 let dstOff = slot * HIDDEN * 2
                 gatherBlit.copy(from: pre_hidden, sourceOffset: srcOff,
@@ -5125,10 +5158,13 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
                                  size: HIDDEN * 2)
             }
             gatherBlit.endEncoding()
+            // numVecs/activeB = activeSlots: silenced rows of hidden are not
+            // touched by the gather above, so passing activeSlots avoids
+            // running RMSNorm + ~120 ms unembed over stale/silenced rows.
             encRMSNormG(cb, x: hidden, gammaBuf: w.outputNorm, out: hidden_norm,
-                        D: HIDDEN, numVecs: B)
+                        D: HIDDEN, numVecs: activeSlots)
             encGemvV4Softcap(cb, hidden_norm, w.unembedW, logits,
-                              Din: HIDDEN, Dout: VOCAB, cap: 30.0)
+                              Din: HIDDEN, Dout: VOCAB, cap: 30.0, activeB: activeSlots)
         }
 
         // GPU-side sampling at the end of prefill — same kernel, same
@@ -5175,11 +5211,13 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
 // pure waste when the logits won't be sampled.
 func buildPrefillCB(_ w: LmWeights, qLen: Int, skipEmbed: Bool = false,
                      skipUnembed: Bool = false,
-                     fullPrefillLogits: Bool = false) -> MTLCommandBuffer {
+                     fullPrefillLogits: Bool = false,
+                     numActiveRows: Int = -1) -> MTLCommandBuffer {
     let cb = queue.makeCommandBuffer()!
     encodePrefillTileInto(cb, w, qLen: qLen, skipEmbed: skipEmbed,
                             skipUnembed: skipUnembed,
-                            fullPrefillLogits: fullPrefillLogits)
+                            fullPrefillLogits: fullPrefillLogits,
+                            numActiveRows: numActiveRows)
     return cb
 }
 

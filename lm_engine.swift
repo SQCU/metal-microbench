@@ -2611,10 +2611,20 @@ final class LmEngine {
             if let s = arMapping[slot], s.state.isBusy {
                 // Track A fold-in: .primed sessions get a recover tick.
                 // Input is the LAST consumed prompt token; position is
-                // the LAST cached position. The K/V write at that
-                // position is the "benign overwrite" — same input +
-                // same KV[0..k-2] + same cvecs → bit-identical bytes.
+                // the LAST cached position.
+                //
+                // 2026-05-23 (kernel-pair fix): .primed sessions are now
+                // routed to prepareRecoverPrefill via pickChainPath's
+                // .recoverPrefill path, which dispatches the prefill
+                // kernel (same as producer) for bit-identical K/V. If
+                // a .primed session reaches HERE, the routing has
+                // regressed — log it loudly. The AR-kernel branch below
+                // is kept for defense-in-depth but should never fire.
                 if s.state == .primed {
+                    fputs("[recover-step] WARNING: .primed session sid=\(s.id) "
+                          + "reached prepareARStep — pickChainPath routing "
+                          + "regression. Falling back to AR-kernel recover "
+                          + "(will re-trigger KV-overwrite drift).\n", stderr)
                     let recoverPos = s.position - 1
                     guard recoverPos >= 0,
                           recoverPos < s.consumedTokens.count else {
@@ -3241,7 +3251,11 @@ final class LmEngine {
             skipEmbed = true
         }
 
-        precomputeFlexPrefillMasks(qLen: thisTile, positionStart: positionStart)
+        // Single-slot prefill: only slot 0 is active, so the flex-attention
+        // CSR only needs to be built for slot 0 (numActiveSlots=1). The mask
+        // dispatchers below also restrict their slot-axis dispatch to slot 0.
+        precomputeFlexPrefillMasks(qLen: thisTile, positionStart: positionStart,
+                                    numActiveSlots: 1)
         // Prefill-time cvec staging. Mirrors the AR-side evaluation in
         // step(): for every ActiveControl on this session, allocate a
         // [B*thisTile] mag buffer, evaluate the envelope at each
@@ -3326,8 +3340,16 @@ final class LmEngine {
         // == comparison is exact, so safe.
         let isLastPrefillTick = s.pendingPrimingTokenCount == thisTile
         let t0 = Date()
+        // activeB-aware dispatch: single-slot prefill computes ONLY slot 0's
+        // qLen real rows (numActiveRows=thisTile) rather than the full
+        // B*qLen=2048 rows. Per-row independence of prefill matmuls means
+        // slot-0 outputs are byte-identical to the legacy dispatch; the
+        // 7-of-8 silenced rows of the legacy path were pure waste (writing
+        // garbage to scratch pages that got discarded). At qLen=256, B=8
+        // this collapses every matmul stage's M-axis dispatch 8×.
         let cb = buildPrefillCB(weights, qLen: thisTile, skipEmbed: skipEmbed,
-                                 skipUnembed: !isLastPrefillTick)
+                                 skipUnembed: !isLastPrefillTick,
+                                 numActiveRows: thisTile)
         return PreparedSinglePrefill(cb: cb, t0: t0, session: s, sslot: sslot,
                                       thisTile: thisTile, remaining: remaining,
                                       head: head)
@@ -3398,6 +3420,261 @@ final class LmEngine {
         return true
     }
 
+    // Snapshot for the .primed → .generating recover-step prefill. Mirrors
+    // PreparedSinglePrefill but carries the fact that this is a recover
+    // dispatch (thisTile=1, no chunk to pop, position must NOT advance,
+    // sampled token is the first generated token).
+    struct PreparedRecoverPrefill {
+        let cb: MTLCommandBuffer
+        let t0: Date
+        let session: Session
+        let sslot: Int
+        // KV byte-hash captured pre-step at the recover position. Used by
+        // LM_KV_OVERWRITE_CHECK to verify the prefill kernel re-writes
+        // bit-identical K/V bytes (same-kernel-as-producer invariant).
+        let preKvHash: UInt64?
+        let recoverPos: Int
+    }
+
+    // 2026-05-23 (.primed recover-step kernel-pair fix):
+    //
+    // The .primed → .generating transition needs ONE GPU dispatch to
+    // produce the first generated token's logit. Previously this ran via
+    // prepareARStep's special-case branch which dispatched the
+    // dense_gemv_q8_0_btile_qkv_otf_b1 AR kernel (fused QKV+RMSNorm,
+    // serial accumulation) and re-wrote K/V at the prompt's last
+    // position. But the cached prefix's producer had written that same
+    // position via the prefill_mm_q8_0_swiz kernel (simdgroup matmul,
+    // separate RMSNorm dispatch). Same input bits, different fp16 bytes
+    // by reduction order alone — LM_KV_OVERWRITE_CHECK reported
+    // [recover-step] KV BYTES CHANGED across all 30 layers.
+    //
+    // Fix: dispatch the prefill kernel at qLen=1 for the recover step.
+    // Same kernel as producer → bit-identical K/V → no overwrite.
+    //
+    // This mirrors prepareSinglePrefill but:
+    //   - no primingQueue head requirement (synthesizes the 1-token
+    //     "chunk" from consumedTokens[position-1])
+    //   - thisTile = 1 (single-position prefill)
+    //   - positionStart = s.position - 1 (the recover position, already
+    //     covered by adopted K/V from the producer)
+    //   - kls/klf set to recoverPos + 1 (the inclusive cached length)
+    //   - DOES NOT pop primingQueue (it's empty by .primed contract)
+    //   - DOES NOT advance s.position (the recover overwrite is at an
+    //     existing position; the sampled token IS the first generated
+    //     token that subsequent AR steps consume)
+    //
+    // Cost: one prefill CB at qLen=1 has B-dim utilization ~3%
+    // (NR1=32 tile × 1 row), roughly 2-3× an AR step wall-time. Happens
+    // ONCE per adopted-prefix session at admission; trivially amortized.
+    func prepareRecoverPrefill(_ s: Session) -> PreparedRecoverPrefill? {
+        guard s.state == .primed else { return nil }
+        let recoverPos = s.position - 1
+        guard recoverPos >= 0,
+              recoverPos < s.consumedTokens.count else { return nil }
+        // 2026-05-07 (M:K): single-slot prefill puts THIS session at
+        // kpos 0, silences the rest. Mirror prepareSinglePrefill.
+        runAdmissionPass()    // ensure pages allocated
+        for other in residentSessions.values where other.id != s.id { other.slot = nil }
+        s.slot = 0
+        let sslot = 0
+        let thisTile = 1
+        // recoverPos is already covered by adopted K/V. Defensive: ensure
+        // pages exist for [0..recoverPos] (no growth needed in practice).
+        if !ensurePages(s, forKLen: recoverPos + 2) { return nil }
+        let positionStart = recoverPos
+        installBlockTable(s, slot: sslot)
+
+        // Save block_table; redirect non-target slots to scratch strip.
+        // Restoration runs in finalize after the GPU CB completes.
+        let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
+        memcpy(_savedBTScratch, btP, _savedBTScratchByteCount)
+        for slot in 0..<B where slot != sslot {
+            for p in 0..<MAX_PAGES_PER_SLOT {
+                btP[slot * MAX_PAGES_PER_SLOT + p] =
+                    UInt32(SCRATCH_PAGE_BASE + (p % SCRATCH_STRIP))
+            }
+        }
+
+        // Populate prefill scratch. Only sslot carries real data.
+        let tokP = pre_input_tokens.contents().bindMemory(to: UInt32.self, capacity: B * MAX_Q_LEN)
+        let posP = pre_q_positions.contents().bindMemory(to: UInt32.self, capacity: B * MAX_Q_LEN)
+        for b in 0..<B {
+            for i in 0..<thisTile {
+                posP[b * thisTile + i] = UInt32(positionStart + i)
+                tokP[b * thisTile + i] = weights.bosTokenId  // silenced-slot filler
+            }
+        }
+        // Real token in sslot's row: the LAST consumed prompt token.
+        // This is the same token the producer's prefill wrote at this
+        // position; re-dispatching with the same upstream K/V (cached)
+        // and same cvecs (adoption invariant) produces bit-identical
+        // K/V bytes at recoverPos.
+        tokP[sslot * thisTile + 0] = s.consumedTokens[recoverPos]
+
+        let klsP = pre_k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
+        let klfP = pre_k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
+        // kLen = positionStart + thisTile = recoverPos + 1 (the inclusive
+        // cached length INCLUDING the recover position itself, which is
+        // what the prefill kernel expects — same shape as a single-tile
+        // prefill that filled positions [0..recoverPos]).
+        for b in 0..<B {
+            klsP[b] = UInt32(positionStart + thisTile)
+            klfP[b] = UInt32(positionStart + thisTile)
+        }
+
+        precomputeFlexPrefillMasks(qLen: thisTile, positionStart: positionStart)
+
+        // Cvec staging. By the adoption invariant a .primed session's
+        // active controls produce the SAME magnitudes at recoverPos as
+        // the producer used (otherwise the adoption would have missed),
+        // so the recover prefill sees the same cvec inputs as the
+        // producer did. Stage them identically to prepareSinglePrefill
+        // (one-row case).
+        gPrefillControls.removeAll(keepingCapacity: true)
+        let prefillRows = B * thisTile
+        for (pcIdx, c) in s.activeControls.enumerated() {
+            let magsBuf = acquirePrefillMagBuf(pcIdx * 5 + 0)
+            let targetsBuf = acquirePrefillMagBuf(pcIdx * 5 + 1)
+            let measuresBuf = acquirePrefillMagBuf(pcIdx * 5 + 2)
+            let scalesBuf = acquirePrefillMagBuf(pcIdx * 5 + 3)
+            let offsetsBuf = acquirePrefillMagBuf(pcIdx * 5 + 4)
+            let magsP = magsBuf.contents().bindMemory(to: Float.self, capacity: prefillRows)
+            let targP = targetsBuf.contents().bindMemory(to: Float.self, capacity: prefillRows)
+            let scaleP = scalesBuf.contents().bindMemory(to: Float.self, capacity: prefillRows)
+            let offP = offsetsBuf.contents().bindMemory(to: Float.self, capacity: prefillRows)
+            for r in 0..<prefillRows {
+                magsP[r] = 0
+                targP[r] = Float.nan
+                scaleP[r] = Float.nan
+                offP[r] = 0
+            }
+            let pos = positionStart
+            let m = c.magnitudeAt(position: pos, turn: s.turnIndex)
+            switch c.mode {
+            case .additive:
+                magsP[sslot * thisTile + 0] = m
+            case .project:
+                if let t = c.target {
+                    targP[sslot * thisTile + 0] = (m != 0) ? t : Float.nan
+                } else {
+                    targP[sslot * thisTile + 0] = m
+                }
+            case .transport:
+                if m != 0 {
+                    scaleP[sslot * thisTile + 0] = c.transportScale
+                    offP[sslot * thisTile + 0] = c.transportOffset
+                }
+            }
+            gPrefillControls.append(PrefillControl(
+                buffer: c.buffer, layer: c.layer, mode: c.mode,
+                magsBuf: magsBuf, targetsBuf: targetsBuf,
+                projectMeasuresBuf: measuresBuf,
+                transportScalesBuf: scalesBuf,
+                transportOffsetsBuf: offsetsBuf))
+        }
+        defer { gPrefillControls.removeAll(keepingCapacity: true) }
+
+        // Sampling params — only sslot is active; this IS the last
+        // prefill tick for the .primed session, so we want the unembed
+        // + sample_token dispatch to run and write gpu_sampled_tokens[sslot].
+        var prefillSlotSession: [Session?] = Array(repeating: nil, count: B)
+        prefillSlotSession[sslot] = s
+        populateSamplingParams(prefillSlotSession)
+
+        // LM_KV_OVERWRITE_CHECK: pre-step K/V hash so finalize can
+        // verify bit-identicality (the whole point of this fix).
+        let kvCheckEnabled = ProcessInfo.processInfo.environment["LM_KV_OVERWRITE_CHECK"] != nil
+        let preH: UInt64? = kvCheckEnabled
+            ? hashSessionKVAtPosition(s, position: recoverPos)
+            : nil
+
+        let t0 = Date()
+        // Always unembed: the recover step's sampled token IS the first
+        // generated token for the .primed session.
+        // numActiveRows=thisTile (i.e. 1) — recover-prefill is single-slot
+        // single-token; activeB-aware dispatch collapses every matmul stage
+        // to 1 row instead of B*qLen=2048. (Per the activeB refactor; see
+        // bootstrap.swift::encodePrefillTileInto numActiveRows threading.)
+        let cb = buildPrefillCB(weights, qLen: thisTile, skipEmbed: false,
+                                 skipUnembed: false, numActiveRows: thisTile)
+        return PreparedRecoverPrefill(cb: cb, t0: t0, session: s, sslot: sslot,
+                                       preKvHash: preH, recoverPos: recoverPos)
+    }
+
+    @discardableResult
+    func finalizeRecoverPrefill(_ p: PreparedRecoverPrefill) -> Bool {
+        lastStepMs = Date().timeIntervalSince(p.t0) * 1000
+        totalSteps += 1
+        if let err = p.cb.error { print("  GPU recover-prefill error: \(err)"); return false }
+
+        // Restore block_table.
+        let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
+        memcpy(btP, _savedBTScratch, _savedBTScratchByteCount)
+
+        let s = p.session
+
+        // LM_KV_OVERWRITE_CHECK: post-step K/V hash. With the fix
+        // (same kernel as producer), these MUST match.
+        if let preH = p.preKvHash {
+            let postH = hashSessionKVAtPosition(s, position: p.recoverPos)
+            if postH != preH {
+                let abortOnMismatch = ProcessInfo.processInfo.environment["LM_KV_OVERWRITE_ABORT"] != nil
+                let preHex = String(preH, radix: 16, uppercase: false)
+                let postHex = String(postH, radix: 16, uppercase: false)
+                fputs("[recover-prefill] KV BYTES CHANGED at position=\(p.recoverPos) "
+                      + "slot=\(p.sslot) sid=\(s.id) "
+                      + "pre=\(preHex) post=\(postHex)"
+                      + (abortOnMismatch ? " — aborting session" : " (warn-only)") + "\n",
+                      stderr)
+                if abortOnMismatch {
+                    s.state = .done
+                    s.doneReason = 3
+                    return true
+                }
+            }
+        }
+
+        // .primed contract: position does NOT advance (the recover write
+        // is at an EXISTING position). promoteFinishedPages still safe
+        // (no new pages crossed any boundary).
+        promoteFinishedPages(s)
+
+        // Read GPU-sampled first generated token and transition to
+        // .generating. Mirrors finalizeSinglePrefill's drained-queue path
+        // exactly — no consumedTokens append for the recover position
+        // (that token is already there from the prompt); only append the
+        // newly sampled token.
+        let gpuTokP = gpu_sampled_tokens.contents()
+            .bindMemory(to: UInt32.self, capacity: B)
+        let sampled = gpuTokP[p.sslot]
+        s.state = .generating
+        s.maybeAppendOutput(sampled)
+        s.consumedTokens.append(sampled)
+        s.nextGeneratedInput = sampled
+        s.numGenerated += 1; totalTokensGenerated += 1
+        // s.position += 1 — the prompt-end was at s.position; the first
+        // generated token now lives at s.position, and subsequent AR
+        // steps will write at s.position + 1, s.position + 2, ... Mirror
+        // the .primed → .generating advance from prepareARStep's old path.
+        s.position += 1
+        if sampled == s.eosId {
+            s.state = .done
+            s.doneReason = 1
+        } else if s.numGenerated >= s.maxNewTokens {
+            s.state = .done
+            s.doneReason = 2
+        }
+        return true
+    }
+
+    @discardableResult
+    func stepRecoverPrefillForSession(_ s: Session) -> Bool {
+        guard let p = prepareRecoverPrefill(s) else { return false }
+        p.cb.commit(); p.cb.waitUntilCompleted()
+        return finalizeRecoverPrefill(p)
+    }
+
     // Unified scheduler tick. Picks between fast prefill and AR batch each
     // call. Path priority (rewritten 2026-05-07 — the prior "max wins"
     // rule was sched_sim_token-falsified, see pickChainPath body):
@@ -3422,6 +3699,14 @@ final class LmEngine {
         case softSinglePrefill(Session)
         case textMultiPrefill([Session])
         case textSinglePrefill(Session)
+        // 2026-05-23 (.primed kernel-pair fix): single-slot prefill at
+        // qLen=1 that re-runs the producer's prefill kernel on the
+        // recover position, producing bit-identical K/V bytes and the
+        // first generated token's logit. Routed BEFORE arStep so .primed
+        // sessions don't fall into prepareARStep's AR-kernel branch
+        // (whose different reduction order causes the KV-overwrite
+        // mismatch that this fix exists to eliminate).
+        case recoverPrefill(Session)
         case arStep
     }
 
@@ -3444,14 +3729,27 @@ final class LmEngine {
     var sched_textMultiCount: Int = 0
     var sched_textSingleCount: Int = 0
     var sched_arCount: Int = 0
+    // 2026-05-23 (.primed kernel-pair fix): count of recover-prefill
+    // dispatches scheduled. Should equal the number of adopted-prefix
+    // sessions admitted; trivially small.
+    var sched_recoverPrefillCount: Int = 0
     private func pickChainPath() -> ChainPath {
         let busy = activeSessions.filter { $0.state.isBusy }
         if busy.isEmpty { return .idle }
 
         var softBusy: [Session] = []
         var textPrefillBusy: [Session] = []
+        var primedBusy: [Session] = []
         var nAR = 0
         for s in busy {
+            // 2026-05-23 fix: .primed sessions need a 1-token prefill-
+            // kernel dispatch (NOT the AR kernel) to recover the first
+            // generated token's logit while leaving K/V bit-identical.
+            // Peel them off here so they bypass arStep's AR-kernel path.
+            if s.state == .primed {
+                primedBusy.append(s)
+                continue
+            }
             switch s.primingQueue.first {
             case .some(.softTokens):
                 softBusy.append(s)
@@ -3487,6 +3785,19 @@ final class LmEngine {
         // Order: soft > text > AR. Within soft/text, multi if ≥ 2
         // priming, else single.
 
+        // .primed recover-prefill: single-slot, qLen=1, prefill kernel.
+        // Highest priority because (a) it's at-most-one-per-tick (a
+        // .primed session transitions to .generating on its first tick),
+        // (b) it unblocks the session for AR participation on the next
+        // tick, and (c) running it before any other prefill avoids ever
+        // dispatching the AR kernel on a .primed slot (the whole point
+        // of the kernel-pair fix). Sort by sid for determinism if more
+        // than one is primed concurrently.
+        if !primedBusy.isEmpty {
+            let pick = primedBusy.min(by: { $0.id < $1.id })!
+            sched_recoverPrefillCount += 1
+            return .recoverPrefill(pick)
+        }
         // Soft (image) prefill takes priority — image tokens can't
         // be AR-primed, so any soft chunk MUST go through prefill.
         if nSoft >= 2 { sched_softMultiCount += 1; return .softMultiPrefill(softBusy) }
@@ -3549,6 +3860,10 @@ final class LmEngine {
             let beforeCounts = sessions.map { $0.outputQueue.count }
             _ = stepMultiSlotPrefill(sessions)
             return zip(sessions, beforeCounts).reduce(0) { $0 + ($1.0.outputQueue.count - $1.1) }
+        case .recoverPrefill(let s):
+            let before = s.outputQueue.count
+            _ = stepRecoverPrefillForSession(s)
+            return s.outputQueue.count - before
         case .arStep:
             return step()
         }
@@ -3599,6 +3914,11 @@ final class LmEngine {
             p.cb.commit()
             p.cb.waitUntilCompleted()
             _ = finalizeMultiSlotPrefill(p)
+        case .recoverPrefill(let s):
+            guard let p = prepareRecoverPrefill(s) else { return }
+            p.cb.commit()
+            p.cb.waitUntilCompleted()
+            _ = finalizeRecoverPrefill(p)
         case .arStep:
             // Bridge-vs-engine 10ms/step gap investigation (2026-04-29).
             // Attribute prep (mask precompute, block_table install,

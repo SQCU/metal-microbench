@@ -52,7 +52,11 @@ func runLmPrefillProfile(ggufPath: String) {
     let qLen = min(qLenEnv ?? MAX_Q_LEN, MAX_Q_LEN)
     let repsEnv = ProcessInfo.processInfo.environment["LM_PROFILE_REPS"].flatMap { Int($0) }
     let reps = max(1, repsEnv ?? 1)
-    print("  qLen=\(qLen)  B=\(B)  N=B*qLen=\(B*qLen)  reps=\(reps) (+1 warmup)")
+    // LM_PROFILE_ACTIVEB=1 (default 0): set numActiveRows=qLen (single-slot
+    // prefill geometry) and numActiveSlots=1 across every dispatch.
+    let activeBProfile = ProcessInfo.processInfo.environment["LM_PROFILE_ACTIVEB"] == "1"
+    let activeSlots = activeBProfile ? 1 : B
+    print("  qLen=\(qLen)  B=\(B)  numActiveSlots=\(activeSlots)  N=numActive*qLen=\(activeSlots*qLen)  reps=\(reps) (+1 warmup)")
 
     let w: LmWeights
     do { w = try loadLmWeights(ggufPath: ggufPath) }
@@ -77,10 +81,10 @@ func runLmPrefillProfile(ggufPath: String) {
             btP[b * MAX_PAGES_PER_SLOT + p] = UInt32(b * MAX_PAGES_PER_SLOT + p) % UInt32(TOTAL_PAGES)
         }
     }
-    precomputeFlexPrefillMasks(qLen: qLen, positionStart: 0)
+    precomputeFlexPrefillMasks(qLen: qLen, positionStart: 0, numActiveSlots: activeSlots)
 
-    let N = B * qLen
-    let NS = B * qLen * TOPK
+    let N = activeSlots * qLen
+    let NS = activeSlots * qLen * TOPK
 
     // One pass of profiled forward. Returns the stages collected.
     func onePass() -> [PrefillStage] {
@@ -143,7 +147,8 @@ func runLmPrefillProfile(ggufPath: String) {
                                 kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                                 activeChunkIdxs: activeChunkIdxs,
                                 q_positions: pre_q_positions,
-                                H: KV_H, D: HD, page: pg, qLen: qLen)
+                                H: KV_H, D: HD, page: pg, qLen: qLen,
+                                numActiveSlots: activeSlots)
                 let klBuf = isFull ? pre_k_len_full : pre_k_len_slide
                 if isFull {
                     encFlexAttnFullPrefill(cb, Q: q_out, O: pre_attn_out,
@@ -151,14 +156,16 @@ func runLmPrefillProfile(ggufPath: String) {
                                             kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                                             activeChunkIdxs: activeChunkIdxs,
                                             kLenBuf: klBuf, qPositions: pre_q_positions,
-                                            H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
+                                            H_Q: H, H_KV: KV_H, D: HD, qLen: qLen,
+                                            numActiveSlots: activeSlots)
                 } else {
                     encFlexAttnSlidePrefill(cb, Q: q_out, O: pre_attn_out,
                                              kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                                              kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                                              activeChunkIdxs: activeChunkIdxs,
                                              kLenBuf: klBuf, qPositions: pre_q_positions,
-                                             H_Q: H, H_KV: KV_H, D: HD, qLen: qLen)
+                                             H_Q: H, H_KV: KV_H, D: HD, qLen: qLen,
+                                             numActiveSlots: activeSlots)
                 }
             })
 
@@ -237,10 +244,10 @@ func runLmPrefillProfile(ggufPath: String) {
         }
 
         stages.append(runStage("unembed_fast", layer: -1) { cb in
-            // gather B last-rows + RMSNorm + V4Softcap → logits[B, VOCAB]
+            // gather activeSlots last-rows + RMSNorm + V4Softcap → logits[activeSlots, VOCAB]
             // matches encodePrefillTileInto's fast-path unembed branch
             let blit = cb.makeBlitCommandEncoder()!
-            for slot in 0..<B {
+            for slot in 0..<activeSlots {
                 let srcOff = (slot * qLen + (qLen - 1)) * HIDDEN * 2
                 let dstOff = slot * HIDDEN * 2
                 blit.copy(from: pre_hidden, sourceOffset: srcOff,
@@ -248,9 +255,9 @@ func runLmPrefillProfile(ggufPath: String) {
             }
             blit.endEncoding()
             encRMSNormG(cb, x: hidden, gammaBuf: w.outputNorm, out: hidden_norm,
-                        D: HIDDEN, numVecs: B)
+                        D: HIDDEN, numVecs: activeSlots)
             encGemvV4Softcap(cb, hidden_norm, w.unembedW, logits,
-                              Din: HIDDEN, Dout: VOCAB, cap: 30.0)
+                              Din: HIDDEN, Dout: VOCAB, cap: 30.0, activeB: activeSlots)
         })
 
         return stages
@@ -304,7 +311,7 @@ func runLmPrefillProfile(ggufPath: String) {
                        "qkv", "qkn_rope", "kv_attn",
                        "oproj_norm", "shrd_ffn",
                        "router",
-                       "moe_q4k", "moe_gelu", "moe_q51", "moe_tail",
+                       "moe_up", "moe_gelu", "moe_down", "moe_tail",
                        "resid",
                        "unembed_fast"]
     print("")
