@@ -162,8 +162,13 @@ test.describe('B4 axis registry — desktop only', () => {
                 await expect(dCard).toBeVisible();
                 await expect(dCard).toHaveAttribute('data-depth', '1');
                 await expect(dCard).toHaveClass(/derived/);
+                // derived_from is an axis-v1 object { parent, sibling, … };
+                // the .lineage-note renders the parent id string.
+                const parentId = typeof d.derived_from === 'object'
+                    ? d.derived_from.parent
+                    : String(d.derived_from);
                 await expect(dCard.locator('.lineage-note'))
-                    .toContainText(`derived from ${d.derived_from}`);
+                    .toContainText(`derived from ${parentId}`);
             }
         }
 
