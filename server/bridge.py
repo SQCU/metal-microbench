@@ -1489,7 +1489,12 @@ def health() -> JSONResponse:
         "aggregate_tok_per_sec": _compute_aggregate_tok_per_sec(),
         "active_stream_count": s.active_streams,
         "capabilities": {
-            "max_q_len": g.max_q_len(),
+            # Renamed from max_q_len (2026-05-24): this is the GPU prefill
+            # CHUNK size (256 tokens per kernel dispatch), NOT the context
+            # window.  The old name caused clients that scraped /health to
+            # cap their context budget at 256.
+            "prefill_chunk_size": g.max_q_len(),
+            "context_length": 131072,
         },
     })
 
@@ -1546,6 +1551,10 @@ async def tokenize_endpoint(req: Request) -> JSONResponse:
 
 
 def _models_payload() -> dict:
+    # context_length must be present so that clients (e.g. SillyTavern) do not
+    # fall through to their hard-coded legacy default (max_4k = 4095).  The
+    # true per-session budget is MAX_PAGES_PER_SLOT(8192) × PAGE_SLIDE(16) =
+    # 131 072 tokens (slide-attention layers) which is the binding limit.
     return {
         "object": "list",
         "data": [{
@@ -1553,6 +1562,7 @@ def _models_payload() -> dict:
             "object": "model",
             "created": int(time.time()),
             "owned_by": "metal-microbench",
+            "context_length": 131072,
         }],
     }
 
