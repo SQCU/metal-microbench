@@ -15,6 +15,7 @@
 
 import { test, expect } from '@playwright/test';
 import { loadAndConnect } from './_helpers/elicit_clean.mjs';
+import { openPersonaSurface } from './_helpers/open_persona_surface.js';
 
 test.describe('fixed-point iteration tab', () => {
     test.setTimeout(2 * 60 * 1000);
@@ -33,14 +34,12 @@ test.describe('fixed-point iteration tab', () => {
 
         await loadAndConnect(page);
 
-        // (1) Drawer button exists in the top row, sibling to the
-        // designer button (the FP-tab spec'd #user-fixed-point-button).
-        const button = page.locator('#user-fixed-point-button');
-        await expect(button, 'FP tab button installs in top-row drawer').toBeVisible({ timeout: 10_000 });
+        // (1) Open the FP surface via the hamburger popover (the per-tab
+        // .drawer-toggle is display:none after sillytavern-fork e2973179d).
+        await openPersonaSurface(page, 'fixed-point');
 
-        // (2) Clicking it opens the drawer with the iframe pointed at
+        // (2) The drawer is now open with the iframe pointed at
         // /api/plugins/user-personas/static/fixed_point.html.
-        await button.click();
         const iframe = page.frameLocator('iframe[src*="fixed_point.html"]');
         // Wait for the iframe's H1 to appear — the page title is the
         // load completion signal.

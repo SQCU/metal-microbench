@@ -12,6 +12,7 @@
 
 import { test, expect } from '@playwright/test';
 import { loadAndConnect } from './_helpers/elicit_clean.mjs';
+import { openPersonaSurface } from './_helpers/open_persona_surface.js';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -27,11 +28,12 @@ test.describe('session surface screenshots', () => {
     test('capture each surface to PNG', async ({ page }) => {
         await loadAndConnect(page);
 
-        // Allow the top-row drawer buttons to register.
-        await expect(page.locator('#user-fixed-point-button')).toBeVisible({ timeout: 15_000 });
+        // Allow the extension to install the hamburger button.
+        // (#user-fixed-point-button's .drawer-toggle is display:none after
+        // sillytavern-fork e2973179d — wait for the hamburger instead.)
+        await page.locator('#user-personas-tools-button').waitFor({ state: 'attached', timeout: 15_000 });
 
-        // ── (1) Top bar — show all 5 new drawer buttons in their installed state.
-        await page.locator('#user-fixed-point-button').scrollIntoViewIfNeeded();
+        // ── (1) Top bar — hamburger visible; per-tab toggles are display:none.
         await page.screenshot({
             path: path.join(OUT_DIR, '01_toprow_drawer_buttons.png'),
             clip: { x: 0, y: 0, width: 1280, height: 60 },
@@ -39,7 +41,9 @@ test.describe('session surface screenshots', () => {
 
         // ── (2) Suggester drawer — context-driven ranker, _meta strip,
         //        provenance filter row, ranked list area, +More + Synthesize CTA.
-        await page.locator('#user-suggester-button .drawer-toggle').click();
+        // Open via hamburger popover — .drawer-toggle is display:none after
+        // sillytavern-fork e2973179d; direct .drawer-toggle click is invalid.
+        await openPersonaSurface(page, 'suggester');
         const suggIframe = page.frameLocator('iframe[src*="suggester.html"]');
         await expect(suggIframe.locator('h1').first()).toBeVisible({ timeout: 15_000 });
         await page.waitForTimeout(500);
@@ -47,12 +51,12 @@ test.describe('session surface screenshots', () => {
             path: path.join(OUT_DIR, '02_suggester_drawer_open.png'),
             fullPage: false,
         });
-        // Close before opening the next one.
-        await page.locator('#user-suggester-button .drawer-toggle').click();
+        // No explicit close needed — openPersonaSurface for the next surface
+        // calls closeAllOpen() automatically before opening.
         await page.waitForTimeout(300);
 
         // ── (3) Fixed-point tab — Experiments list (default landing).
-        await page.locator('#user-fixed-point-button .drawer-toggle').click();
+        await openPersonaSurface(page, 'fixed-point');
         const fpIframe = page.frameLocator('iframe[src*="fixed_point.html"]');
         await expect(fpIframe.locator('h1, h2').first()).toBeVisible({ timeout: 15_000 });
         await page.waitForTimeout(500);
@@ -106,39 +110,32 @@ test.describe('session surface screenshots', () => {
                 fullPage: false,
             });
         }
-        // Close FP drawer.
-        await page.locator('#user-fixed-point-button .drawer-toggle').click();
+        // No explicit close — openPersonaSurface for corpus auto-closes FP.
         await page.waitForTimeout(300);
 
         // ── (6) Corpus dashboard — eff-dim PR + per-axis bar chart.
-        const corpBtn = page.locator('#user-corpus-button');
-        if (await corpBtn.count() > 0) {
-            await corpBtn.locator('.drawer-toggle').click();
-            const corpIframe = page.frameLocator('iframe[src*="corpus_dashboard.html"]');
-            await expect(corpIframe.locator('h1, h2').first()).toBeVisible({ timeout: 15_000 });
-            await page.waitForTimeout(1000);
-            await page.screenshot({
-                path: path.join(OUT_DIR, '07_corpus_dashboard.png'),
-                fullPage: false,
-            });
-            await corpBtn.locator('.drawer-toggle').click();
-            await page.waitForTimeout(300);
-        }
+        // Open via hamburger popover (corpus menu item always present).
+        await openPersonaSurface(page, 'corpus');
+        const corpIframe = page.frameLocator('iframe[src*="corpus_dashboard.html"]');
+        await expect(corpIframe.locator('h1, h2').first()).toBeVisible({ timeout: 15_000 });
+        await page.waitForTimeout(1000);
+        await page.screenshot({
+            path: path.join(OUT_DIR, '07_corpus_dashboard.png'),
+            fullPage: false,
+        });
+        // No explicit close — openPersonaSurface for axes auto-closes corpus.
+        await page.waitForTimeout(300);
 
         // ── (7) Axis registry — tree of axes.
-        const axesBtn = page.locator('#user-axes-button');
-        if (await axesBtn.count() > 0) {
-            await axesBtn.locator('.drawer-toggle').click();
-            const axesIframe = page.frameLocator('iframe[src*="axes.html"]');
-            await expect(axesIframe.locator('h1, h2').first()).toBeVisible({ timeout: 15_000 });
-            await page.waitForTimeout(800);
-            await page.screenshot({
-                path: path.join(OUT_DIR, '08_axis_registry.png'),
-                fullPage: false,
-            });
-            await axesBtn.locator('.drawer-toggle').click();
-            await page.waitForTimeout(300);
-        }
+        await openPersonaSurface(page, 'axes');
+        const axesIframe = page.frameLocator('iframe[src*="axes.html"]');
+        await expect(axesIframe.locator('h1, h2').first()).toBeVisible({ timeout: 15_000 });
+        await page.waitForTimeout(800);
+        await page.screenshot({
+            path: path.join(OUT_DIR, '08_axis_registry.png'),
+            fullPage: false,
+        });
+        await page.waitForTimeout(300);
 
         // ── (8) Manifest of captured artifacts for the operator to inspect.
         const captured = fs.readdirSync(OUT_DIR).filter(f => f.endsWith('.png')).sort();

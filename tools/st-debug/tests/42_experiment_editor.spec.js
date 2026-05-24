@@ -7,6 +7,7 @@
 
 import { test, expect } from '@playwright/test';
 import { loadAndConnect } from './_helpers/elicit_clean.mjs';
+import { openPersonaSurface } from './_helpers/open_persona_surface.js';
 
 const PLUGIN_BASE = '/api/plugins/user-personas';
 const TEST_EXP_ID = 'playwright_test_exp';
@@ -30,7 +31,9 @@ test.describe('experiment editor — desktop only', () => {
     // Helper: open the FP iframe and return the FrameLocator.
     async function openFixedPointTab(page) {
         await loadAndConnect(page);
-        await page.locator('#user-fixed-point-button').click();
+        // Open via hamburger popover — .drawer-toggle is display:none after
+        // sillytavern-fork e2973179d; direct click on wrapper is invalid.
+        await openPersonaSurface(page, 'fixed-point');
         const iframe = page.frameLocator('iframe[src*="fixed_point.html"]');
         await expect(iframe.locator('h1, h2').first()).toBeVisible({ timeout: 15_000 });
         // Wait for the experiments list to settle (status text changes
@@ -204,9 +207,9 @@ test.describe('experiment editor — desktop only', () => {
     });
 
     test('query-param prefill: ?target_bio_signature auto-opens the New form with bio_axes + stepper populated', async ({ page }) => {
-        // Bring up the tab via the normal flow so the iframe URL routing works.
+        // Bring up the tab via the hamburger popover so the iframe URL routing works.
         await loadAndConnect(page);
-        await page.locator('#user-fixed-point-button').click();
+        await openPersonaSurface(page, 'fixed-point');
         const iframeEl = page.locator('iframe[src*="fixed_point.html"]').first();
         await expect(iframeEl).toBeVisible({ timeout: 15_000 });
 

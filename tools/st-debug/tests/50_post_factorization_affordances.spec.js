@@ -32,6 +32,7 @@
 
 import { test, expect } from '@playwright/test';
 import { loadAndConnect } from './_helpers/elicit_clean.mjs';
+import { openPersonaSurface } from './_helpers/open_persona_surface.js';
 
 const DERIVED_AXIS_IDS = ['mood_fluctuation', 'relational_projection'];
 const PLUGIN_BASE = '/api/plugins/user-personas';
@@ -41,7 +42,9 @@ test.describe('post-factorization affordance audit', () => {
 
     test('E1: derived axes render in axis registry with lineage treatment', async ({ page }) => {
         await loadAndConnect(page);
-        await page.locator('#user-axes-button .drawer-toggle').click();
+        // Open via hamburger popover — .drawer-toggle is display:none after
+        // sillytavern-fork e2973179d; direct click on #user-axes-button is invalid.
+        await openPersonaSurface(page, 'axes');
         const iframe = page.frameLocator('iframe[src*="axes.html"]');
         await expect(iframe.locator('h1, h2').first()).toBeVisible({ timeout: 15_000 });
 
@@ -65,7 +68,9 @@ test.describe('post-factorization affordance audit', () => {
 
     test('E2: corpus dashboard PR reflects the expanded axis space', async ({ page }) => {
         await loadAndConnect(page);
-        await page.locator('#user-corpus-button .drawer-toggle').click();
+        // Open via hamburger popover — .drawer-toggle is display:none after
+        // sillytavern-fork e2973179d; direct click on #user-corpus-button is invalid.
+        await openPersonaSurface(page, 'corpus');
         const iframe = page.frameLocator('iframe[src*="corpus_dashboard.html"]');
         await expect(iframe.locator('h1, h2').first()).toBeVisible({ timeout: 15_000 });
         await page.waitForTimeout(800);
@@ -140,7 +145,9 @@ test.describe('post-factorization affordance audit', () => {
 
     test('E4: iteration timeline renders the post-demo lock_in_tetrad trajectory', async ({ page }) => {
         await loadAndConnect(page);
-        await page.locator('#user-fixed-point-button .drawer-toggle').click();
+        // Open via hamburger popover — .drawer-toggle is display:none after
+        // sillytavern-fork e2973179d; direct click on #user-fixed-point-button is invalid.
+        await openPersonaSurface(page, 'fixed-point');
         const iframe = page.frameLocator('iframe[src*="fixed_point.html"]');
         await expect(iframe.locator('h1, h2').first()).toBeVisible({ timeout: 15_000 });
         await page.waitForTimeout(500);

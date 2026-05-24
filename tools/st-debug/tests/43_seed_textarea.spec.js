@@ -14,6 +14,7 @@
 
 import { test, expect } from '@playwright/test';
 import { loadAndConnect } from './_helpers/elicit_clean.mjs';
+import { openPersonaSurface } from './_helpers/open_persona_surface.js';
 
 const PLUGIN_BASE = '/api/plugins/user-personas';
 const TEST_EXP_ID = 'playwright_seed_test';
@@ -42,7 +43,9 @@ test.describe('seed-input textarea — desktop only', () => {
 
     async function openSeedInputTab(page) {
         await loadAndConnect(page);
-        await page.locator('#user-fixed-point-button').click();
+        // Open via hamburger popover — .drawer-toggle is display:none after
+        // sillytavern-fork e2973179d; direct click on wrapper is invalid.
+        await openPersonaSurface(page, 'fixed-point');
         const iframe = page.frameLocator('iframe[src*="fixed_point.html"]');
         await expect(iframe.locator('h1').first()).toBeVisible({ timeout: 15_000 });
         // Wait for the experiments list to settle before switching tabs.

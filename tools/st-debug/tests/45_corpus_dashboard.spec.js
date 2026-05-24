@@ -13,6 +13,7 @@
 
 import { test, expect } from '@playwright/test';
 import { loadAndConnect } from './_helpers/elicit_clean.mjs';
+import { openPersonaSurface } from './_helpers/open_persona_surface.js';
 
 const PLUGIN_BASE = '/api/plugins/user-personas';
 
@@ -26,9 +27,9 @@ test.describe('corpus dashboard — desktop only', () => {
 
     async function openCorpusTab(page) {
         await loadAndConnect(page);
-        const button = page.locator('#user-corpus-button');
-        await expect(button, 'corpus dashboard drawer button installs').toBeVisible({ timeout: 15_000 });
-        await button.click();
+        // Open via hamburger popover — .drawer-toggle is display:none after
+        // sillytavern-fork e2973179d; direct click on wrapper is invalid.
+        await openPersonaSurface(page, 'corpus');
         const iframe = page.frameLocator('iframe[src*="corpus_dashboard.html"]');
         await expect(iframe.locator('h1').first(),
             'corpus_dashboard.html renders inside the drawer iframe').toBeVisible({ timeout: 15_000 });

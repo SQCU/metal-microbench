@@ -12,7 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { test, expect } from '@playwright/test';
-import { loadAndConnect } from './_helpers/elicit_clean.mjs';
+import { openPersonaSurface } from './_helpers/open_persona_surface.js';
 
 const PLUGIN_BASE = '/api/plugins/user-personas';
 const EXPERIMENT_ID = 'lock_in_tetrad';
@@ -26,8 +26,27 @@ function listSeededBioSlugs() {
         .sort();
 }
 
+// Lighter ST page-load for the FP tab. The trajectory spec does NOT
+// need a valid bridge connection (no LLM calls). Full loadAndConnect
+// blocks on onlineStatus='Valid' which requires the bridge to process
+// a health-check call — when 10+ subagents are running concurrently
+// this can take many minutes. This helper only waits for the preloader
+// to clear and the extension to install the FP button, then opens the
+// tab directly without going through the API-connect drawer.
+async function loadAndOpenFPTab(page) {
+    await page.goto('/');
+    await page.waitForFunction(
+        'document.getElementById("preloader") === null',
+        { timeout: 60_000 });
+    // Wait for the hamburger to install, then open FP via the popover.
+    // (#user-fixed-point-button's .drawer-toggle is display:none after
+    // sillytavern-fork e2973179d; direct click on the wrapper is invalid.)
+    await page.locator('#user-personas-tools-button').waitFor({ state: 'attached', timeout: 30_000 });
+    await openPersonaSurface(page, 'fixed-point');
+}
+
 test.describe('D10 iteration timeline — desktop only', () => {
-    test.setTimeout(2 * 60 * 1000);
+    test.setTimeout(5 * 60 * 1000);
 
     test.beforeEach(async ({}, testInfo) => {
         test.skip(testInfo.project.name !== 'desktop',
@@ -39,8 +58,7 @@ test.describe('D10 iteration timeline — desktop only', () => {
     });
 
     async function openFixedPointTab(page) {
-        await loadAndConnect(page);
-        await page.locator('#user-fixed-point-button').click();
+        await loadAndOpenFPTab(page);
         const iframe = page.frameLocator('iframe[src*="fixed_point.html"]');
         await expect(iframe.locator('h1').first()).toBeVisible({ timeout: 15_000 });
         await expect(iframe.locator('#experiments-status')).toContainText(/loaded/i, { timeout: 10_000 });

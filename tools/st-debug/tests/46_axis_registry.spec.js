@@ -7,6 +7,7 @@
 
 import { test, expect } from '@playwright/test';
 import { loadAndConnect } from './_helpers/elicit_clean.mjs';
+import { openPersonaSurface } from './_helpers/open_persona_surface.js';
 
 const PLUGIN_BASE = '/api/plugins/user-personas';
 const TEST_AXIS_ID = 'playwright_test_axis_46';
@@ -26,9 +27,9 @@ test.describe('B4 axis registry — desktop only', () => {
 
     async function openAxesTab(page) {
         await loadAndConnect(page);
-        // (1) Drawer button installs and is visible.
-        await expect(page.locator('#user-axes-button')).toBeVisible({ timeout: 15_000 });
-        await page.locator('#user-axes-button').click();
+        // (1) Open via hamburger popover — .drawer-toggle is display:none after
+        // sillytavern-fork e2973179d; direct click on #user-axes-button is invalid.
+        await openPersonaSurface(page, 'axes');
         // (2) Iframe loads with axes.html.
         const iframeEl = page.locator('iframe[src*="axes.html"]').first();
         await expect(iframeEl).toBeVisible({ timeout: 15_000 });

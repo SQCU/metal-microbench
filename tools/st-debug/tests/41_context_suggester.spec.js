@@ -40,6 +40,7 @@
 
 import { test, expect } from '@playwright/test';
 import { loadAndConnect } from './_helpers/elicit_clean.mjs';
+import { openPersonaSurface } from './_helpers/open_persona_surface.js';
 
 const PLUGIN_BASE = '/api/plugins/user-personas';
 
@@ -73,10 +74,11 @@ test.describe('context-driven suggester', () => {
     test('drawer + ranking + meta + +More + synthesize CTA + per-row suggest', async ({ page }) => {
         await loadAndConnect(page);
 
-        // ── (1) Drawer button installs + iframe loads suggester.html.
-        const sugBtn = page.locator('#user-suggester-button');
-        await expect(sugBtn, 'suggester drawer button installs').toBeVisible({ timeout: 15_000 });
-        await sugBtn.locator('.drawer-toggle').click();
+        // ── (1) Open the suggester surface via the hamburger popover.
+        // (The per-tab .drawer-toggle is display:none after sillytavern-fork
+        // e2973179d; clicking directly on #user-suggester-button or its
+        // .drawer-toggle child bypasses the navigability invariant.)
+        await openPersonaSurface(page, 'suggester');
 
         const iframe = page.frameLocator('iframe[src*="suggester.html"]');
         await expect(iframe.locator('h1'), 'suggester.html renders inside iframe').toBeVisible({ timeout: 15_000 });

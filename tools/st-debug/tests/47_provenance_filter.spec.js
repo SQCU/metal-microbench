@@ -42,10 +42,18 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { loadAndConnect } from './_helpers/elicit_clean.mjs';
+import { openPersonaSurface } from './_helpers/open_persona_surface.js';
 
 const PLUGIN_BASE = '/api/plugins/user-personas';
 const PLUGIN_DIR = '/Users/mdot/sillytavern-fork/plugins/user-personas';
 const TAG_SCRIPT = path.join(PLUGIN_DIR, 'scripts/tag_existing_corpus.mjs');
+// Bios (player cards) live in the canonical ST persona store — User Avatars/
+// — not in plugins/user-personas/players/ (that dir was eliminated when the
+// canonical-store unification landed). The tagging script still works because
+// it fetches bios via GET /personas (the API, not filesystem), but the
+// no-deletion check must watch the real on-disk location.
+const ST_DEBUG_DATA_DIR = '/Users/mdot/metal-microbench/tools/st-debug/_data';
+const USER_AVATARS_DIR = path.join(ST_DEBUG_DATA_DIR, 'default-user', 'User Avatars');
 
 function listDir(dir) {
     if (!fs.existsSync(dir)) return [];
@@ -65,17 +73,34 @@ test.describe('F16 provenance tagging + suggester filter — desktop only', () =
 
     test('schema + filter UI + persistence + no-card-deletion', async ({ page, request }) => {
         // ── (8a) snapshot the on-disk card sets BEFORE everything.
+        // Agents live in plugins/user-personas/agents/ (checked via PLUGIN_DIR).
+        // Player bios live in the canonical ST persona store (User Avatars/) —
+        // the players/ directory was eliminated when canonical-store unification
+        // landed. The tagging script fetches bios via the API, so no code reads
+        // players/. The no-deletion invariant watches User Avatars/ directly.
         const agentsBefore = listDir(path.join(PLUGIN_DIR, 'agents'));
-        const playersBefore = listDir(path.join(PLUGIN_DIR, 'players'));
+        const playersBefore = listDir(USER_AVATARS_DIR);
         expect(agentsBefore.length, 'corpus has agents to tag').toBeGreaterThan(0);
-        expect(playersBefore.length, 'corpus has players to tag').toBeGreaterThan(0);
+        expect(playersBefore.length, 'corpus has player bios in User Avatars/').toBeGreaterThan(0);
 
         // ── Setup: run the retroactive tagging script. Idempotent —
         // already-tagged cards (kind !== 'legacy') are skipped. Safe to
         // run as the spec's setup step.
+        //
+        // NO_PROXY/no_proxy: the Playwright test environment may carry
+        // proxy settings (inherited env vars or agent-level network
+        // interceptors) that redirect loopback traffic through a proxy.
+        // The tag script's fetch calls are intra-machine (127.0.0.1:8002)
+        // and must NOT go through any proxy. Setting NO_PROXY=* forces
+        // Node's fetch to use a direct connection for all URLs.
         const tagResult = spawnSync('node', [TAG_SCRIPT], {
             cwd: PLUGIN_DIR,
-            env: { ...process.env, ST_BASE: 'http://127.0.0.1:8002' },
+            env: {
+                ...process.env,
+                ST_BASE: 'http://127.0.0.1:8002',
+                NO_PROXY: '*',
+                no_proxy: '*',
+            },
             encoding: 'utf8',
         });
         expect(tagResult.status, `tagging script exits 0 (stderr: ${tagResult.stderr?.slice(0, 500)})`).toBe(0);
@@ -180,9 +205,9 @@ test.describe('F16 provenance tagging + suggester filter — desktop only', () =
             });
         });
 
-        const sugBtn = page.locator('#user-suggester-button');
-        await expect(sugBtn).toBeVisible({ timeout: 15_000 });
-        await sugBtn.locator('.drawer-toggle').click();
+        // Open via hamburger popover — .drawer-toggle is display:none after
+        // sillytavern-fork e2973179d; direct click on #user-suggester-button is invalid.
+        await openPersonaSurface(page, 'suggester');
 
         const iframe = page.frameLocator('iframe[src*="suggester.html"]');
         await expect(iframe.locator('h1')).toBeVisible({ timeout: 15_000 });
@@ -213,12 +238,17 @@ test.describe('F16 provenance tagging + suggester filter — desktop only', () =
         await expect(seedDemoCb, 'seed_demo unchecked by default').not.toBeChecked();
 
         // ── (4) Default filter hides experiment_output + seed_demo cards.
-        await iframe.locator('#new-content').fill('hello');
-        await iframe.locator('#add-turn-btn').click();
-        const rankBtn = iframe.locator('#rank-btn');
-        await rankBtn.click();
-        // With the route stub the rank request resolves immediately.
-        await expect(rankBtn).toBeEnabled({ timeout: 15_000 });
+        // The current suggester fires doRank automatically via ST's event
+        // system (no manual input field exists in this design). In the test
+        // environment there is no live ST chat, so activeChatHasContent()
+        // returns false and doRank is a no-op. Call applyRankResponse
+        // directly on the iframe's contentWindow to inject the fixture
+        // payload — this is the exact same function that doRank calls after
+        // /yapper-seed responds. It exercises the full filter+render path
+        // without requiring a live chat context or a network round-trip.
+        await sugIframeEl.evaluate((el, payload) => {
+            el.contentWindow.applyRankResponse(payload);
+        }, fixturePayload);
 
         const visibleRows = iframe.locator('.ranked-row');
         const hiddenBadge = iframe.locator('#pf-hidden-badge');
@@ -266,10 +296,10 @@ test.describe('F16 provenance tagging + suggester filter — desktop only', () =
 
         // ── (8b) NO CARD WAS DELETED. ls before/after must match exactly.
         const agentsAfter = listDir(path.join(PLUGIN_DIR, 'agents'));
-        const playersAfter = listDir(path.join(PLUGIN_DIR, 'players'));
+        const playersAfter = listDir(USER_AVATARS_DIR);
         expect(agentsAfter, 'no agent card was deleted by the spec or the tagging script')
             .toEqual(agentsBefore);
-        expect(playersAfter, 'no player card was deleted by the spec or the tagging script')
+        expect(playersAfter, 'no player bio was deleted from User Avatars/ by the spec or the tagging script')
             .toEqual(playersBefore);
     });
 });
