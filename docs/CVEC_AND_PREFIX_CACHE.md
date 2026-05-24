@@ -121,3 +121,37 @@ divergence dump as the first layer with MSE > 1e-4. A regression in digest
 partitioning will surface in the integration test as an unexpected
 adoption/miss count. Keep both passing and cvec+cache interactions stay
 bit-exact.
+
+## AR-vs-prefill kernel-pair K/V divergence (known-benign invariant)
+
+The engine uses two distinct kernel paths for QKV projection:
+
+- **AR path** — `dense_gemv_q8_0_btile_qkv_otf_b1` and its Q5_K / Q6_K /
+  Q4_0 / Q4_1 / Q5_1 / F16 mirrors. Fused RMSNorm + QKV in one dispatch,
+  per-thread scalar accumulation, 4-way simdgroup split-K reduction at
+  the end. Hand-tuned for activeB ∈ {1, 2, 4, 8} via templated kernels.
+- **Prefill path** — `prefill_mm_q8_0_swiz` and friends. Separate
+  `encRMSNormG` dispatch + simdgroup-matmul tile (NR0=64 × NR1=32 ×
+  NK=32) on Apple's `simdgroup_multiply_accumulate` hardware primitive
+  (8×8 fp32 accumulators).
+
+These two paths produce **~9% nDiff fp16 K/V on bit-identical inputs**
+by reduction-order alone — measured via `LM_KV_OVERWRITE_CHECK=1` after
+the `.primed` recover-step landed. The divergence is fundamental
+(reduction-order-dependent fp16 accumulation, not a bug) and the
+`test_KL_adopted_vs_fresh_first_token` harness confirms it's
+statistically equivalent at the sampling-distribution level.
+
+`.primed` recover-step routes through the **prefill** kernel at qLen=1
+so single-page prompts (≤16 tokens) get bit-identical producer/consumer
+K/V. Multi-page prompts still have residual drift because the prefill
+kernel's simdgroup MMA output-tile position is qLen-dependent
+(producer's row 31 in a qLen=32 tile vs consumer's row 0 in a qLen=1
+tile uses different reduction orders within the same kernel).
+
+A unified-kernel rewrite — making the AR kernel use simdgroup MMA — was
+**scoped 2026-05-23 and rejected**. The simdgroup tile geometry is
+~3% utilized at activeB=1 (NR1=32 → 1 row), so the rewrite would
+regress AR decode speed for fp-rounding-magnitude correctness gain.
+Existing tests (KL guard + per-layer divergence dump) catch any actual
+sampling-distribution regression.

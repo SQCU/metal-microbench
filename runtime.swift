@@ -71,6 +71,7 @@ if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
    ProcessInfo.processInfo.environment["LM_TEST_CVEC_CACHE"] == nil,
    ProcessInfo.processInfo.environment["LM_TEST_CACHE_DIVERGENCE"] == nil,
    ProcessInfo.processInfo.environment["LM_PROFILE_PREFILL"] == nil,
+   ProcessInfo.processInfo.environment["LM_PROFILE_PREFILL_SWEEP"] == nil,
    ProcessInfo.processInfo.environment["LM_PROFILE_AR"] == nil,
    !isDumpRun {
     // GGUF_PATH alone → LM forward benchmark. If LM_KL_REF, LM_PREFILL_VALIDATE,
@@ -101,6 +102,10 @@ if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
 if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
    ProcessInfo.processInfo.environment["LM_PROFILE_PREFILL"] != nil {
     runLmPrefillProfile(ggufPath: ggufPath)
+}
+if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
+   ProcessInfo.processInfo.environment["LM_PROFILE_PREFILL_SWEEP"] != nil {
+    runLmPrefillBandwidthSweep(ggufPath: ggufPath)
 }
 if let ggufPath = ProcessInfo.processInfo.environment["GGUF_PATH"],
    ProcessInfo.processInfo.environment["LM_PROFILE_AR"] != nil {

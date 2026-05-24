@@ -351,3 +351,361 @@ func runLmPrefillProfile(ggufPath: String) {
 
     fflush(stdout)
 }
+
+// =====================================================================
+// runLmPrefillBandwidthSweep
+//
+// 2026-05-23: characterizes per-stage prefill cost across the cross
+// product of (qLen, activeSlots). For each cell, builds + commits a
+// single CB that runs the FULL prefill forward (identical encode path
+// to encodePrefillTileInto, just split per stage for GPU timing), then
+// reports per-pass GPU wall + dominant-stage breakdown + derived tok/s.
+//
+// Aggregated into /tmp/prefill_bandwidth_sweep.csv (or LM_PROFILE_CSV
+// override). Markdown summary printed at end.
+//
+// Invocation:
+//   LM_PROFILE_PREFILL_SWEEP=1 GGUF_PATH=/path/to/Q8.gguf ./forward_graph
+// Optional env:
+//   LM_SWEEP_QLENS=64,128,256          (default = 64,128,256; >MAX_Q_LEN skipped)
+//   LM_SWEEP_ACTIVE_SLOTS=1,2,3,4,5,6,7,8 (default = full B-range)
+//   LM_SWEEP_REPS=3                    (default 3; +1 untimed warmup PER CELL)
+//   LM_PROFILE_CSV=/tmp/prefill_bandwidth_sweep.csv
+//
+// Loads weights ONCE then iterates the grid so we don't re-pay the
+// ~30 s cold load per cell.
+// =====================================================================
+private struct PrefillCellResult {
+    let qLen: Int
+    let activeSlots: Int
+    let perPassMs: Double          // sum of stage gpuMs averaged over reps
+    let stageMs: [String: Double]  // per-pass ms by stage name (averaged)
+}
+
+func runLmPrefillBandwidthSweep(ggufPath: String) {
+    print("\n=== prefill bandwidth sweep (qLen × active_slots) ===")
+    let qLensEnv = ProcessInfo.processInfo.environment["LM_SWEEP_QLENS"]
+    let activeSlotsEnv = ProcessInfo.processInfo.environment["LM_SWEEP_ACTIVE_SLOTS"]
+    let repsEnv = ProcessInfo.processInfo.environment["LM_SWEEP_REPS"].flatMap { Int($0) }
+    let csvPath = ProcessInfo.processInfo.environment["LM_PROFILE_CSV"]
+        ?? "/tmp/prefill_bandwidth_sweep.csv"
+    let reps = max(1, repsEnv ?? 3)
+
+    var rawQLens = (qLensEnv ?? "64,128,256").split(separator: ",")
+        .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+    var skippedQLens: [Int] = []
+    rawQLens = rawQLens.filter { q in
+        if q > MAX_Q_LEN { skippedQLens.append(q); return false }
+        if q < 1 { return false }
+        return true
+    }
+    let qLens = rawQLens
+
+    let activeSlotsList = (activeSlotsEnv ?? "1,2,3,4,5,6,7,8").split(separator: ",")
+        .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        .filter { $0 >= 1 && $0 <= B }
+
+    print("  qLens=\(qLens) (skipped over MAX_Q_LEN=\(MAX_Q_LEN): \(skippedQLens))")
+    print("  active_slots=\(activeSlotsList)  reps=\(reps) (+1 warmup per cell)")
+    print("  csv → \(csvPath)")
+    fflush(stdout)
+
+    let w: LmWeights
+    do { w = try loadLmWeights(ggufPath: ggufPath) }
+    catch { print("  loadLmWeights failed: \(error)"); return }
+
+    // Per-cell encode helper. Returns per-stage list summed across layers
+    // for one pass. Stage names match the profile-mode output so reads can
+    // cross-reference.
+    func encodeOnePass(qLen: Int, activeSlots: Int) -> [String: Double] {
+        let N = activeSlots * qLen
+        let NS = activeSlots * qLen * TOPK
+
+        // Re-init token/position state for this qLen. Only the active
+        // slots' rows actually matter; silenced rows aren't touched by
+        // matmuls but we set them anyway for cleanliness.
+        let tokP = pre_input_tokens.contents().bindMemory(to: UInt32.self, capacity: B * MAX_Q_LEN)
+        let posP = pre_q_positions.contents().bindMemory(to: UInt32.self, capacity: B * MAX_Q_LEN)
+        for b in 0..<B {
+            for i in 0..<qLen {
+                tokP[b * qLen + i] = 1
+                posP[b * qLen + i] = UInt32(i)
+            }
+        }
+        let klsP = pre_k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
+        let klfP = pre_k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
+        for b in 0..<B { klsP[b] = UInt32(qLen); klfP[b] = UInt32(qLen) }
+        let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
+        for b in 0..<B {
+            for p in 0..<MAX_PAGES_PER_SLOT {
+                btP[b * MAX_PAGES_PER_SLOT + p] = UInt32(b * MAX_PAGES_PER_SLOT + p) % UInt32(TOTAL_PAGES)
+            }
+        }
+        precomputeFlexPrefillMasks(qLen: qLen, positionStart: 0,
+                                    numActiveSlots: activeSlots)
+
+        var stages: [String: Double] = [:]
+
+        func add(_ name: String, _ stage: PrefillStage) {
+            stages[name, default: 0] += stage.gpuMs
+        }
+
+        add("embed", runStage("embed", layer: -1) { cb in
+            encEmbedInto(cb, tokens: pre_input_tokens, embedTable: w.embedTable,
+                         out: pre_hidden, numVecs: N)
+            encScaleByScalar(cb, x: pre_hidden, scalar: w.embedScaleBuf, N: HIDDEN, numVecs: N)
+        })
+
+        for L in 0..<NUM_LAYERS {
+            let lw = w.layers[L]
+            let isFull = lw.isFull
+            let H = isFull ? FULL_H : SLIDE_H
+            let KV_H = lw.KV_H
+            let HD = lw.HD
+            let theta: Float = isFull ? 1_000_000 : 10_000
+            let rotary = isFull ? (FULL_HD / 4) : SLIDE_HD
+            let q_out = isFull ? pre_q_full_out : pre_q_slide_out
+            let k_out = isFull ? pre_k_full_out : pre_k_slide_out
+            let v_out = isFull ? pre_v_full_out : pre_v_slide_out
+            let kArgBuf = w.K_chunks_argbuf[L]
+            let vArgBuf = w.V_chunks_argbuf[L]
+            let kChunks = w.K_chunks[L]
+            let vChunks = w.V_chunks[L]
+
+            add("qkv", runStage("qkv", layer: L) { cb in
+                let Wv = lw.attnV ?? lw.attnK
+                let WvFmt = (lw.attnV != nil) ? lw.attnVFormat : lw.attnKFormat
+                encRMSNormG(cb, x: pre_hidden, gammaBuf: lw.attnNorm, out: pre_hidden_norm,
+                             D: HIDDEN, numVecs: N)
+                encDenseMmPrefill(cb, x: pre_hidden_norm, W: lw.attnQ, format: lw.attnQFormat, Y: q_out,
+                                   Din: HIDDEN, Dout: H * HD, numVecs: N)
+                encDenseMmPrefill(cb, x: pre_hidden_norm, W: lw.attnK, format: lw.attnKFormat, Y: k_out,
+                                   Din: HIDDEN, Dout: KV_H * HD, numVecs: N)
+                encDenseMmPrefill(cb, x: pre_hidden_norm, W: Wv, format: WvFmt, Y: v_out,
+                                   Din: HIDDEN, Dout: KV_H * HD, numVecs: N)
+            })
+
+            add("qkn_rope", runStage("qkn_rope", layer: L) { cb in
+                encRMSNormG(cb, x: q_out, gammaBuf: lw.attnQNorm, out: q_out, D: HD, numVecs: N * H)
+                encRopeMulti(cb, q_out, q_positions: pre_q_positions, H: H, D: HD,
+                             rotary: rotary, theta: theta, qLen: qLen)
+                encRMSNormG(cb, x: k_out, gammaBuf: lw.attnKNorm, out: k_out, D: HD, numVecs: N * KV_H)
+                encRopeMulti(cb, k_out, q_positions: pre_q_positions, H: KV_H, D: HD,
+                             rotary: rotary, theta: theta, qLen: qLen)
+                encRMSNormNoScale(cb, x: v_out, out: v_out, D: HD, numVecs: N * KV_H)
+            })
+
+            let activeChunkIdxs = activeKVChunkIdxsFromKLen(
+                blockTable: block_table,
+                kLenSlide: pre_k_len_slide, kLenFull: pre_k_len_full,
+                activeB: B, kvChunkPages: w.kvChunkPages)
+            add("kv_attn", runStage("kv_attn", layer: L) { cb in
+                let pg = isFull ? PAGE_FULL : PAGE_SLIDE
+                encKVWriteMulti(cb, K: k_out, V: v_out,
+                                kArgBuf: kArgBuf, vArgBuf: vArgBuf,
+                                kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                                activeChunkIdxs: activeChunkIdxs,
+                                q_positions: pre_q_positions,
+                                H: KV_H, D: HD, page: pg, qLen: qLen,
+                                numActiveSlots: activeSlots)
+                let klBuf = isFull ? pre_k_len_full : pre_k_len_slide
+                if isFull {
+                    encFlexAttnFullPrefill(cb, Q: q_out, O: pre_attn_out,
+                                            kArgBuf: kArgBuf, vArgBuf: vArgBuf,
+                                            kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                                            activeChunkIdxs: activeChunkIdxs,
+                                            kLenBuf: klBuf, qPositions: pre_q_positions,
+                                            H_Q: H, H_KV: KV_H, D: HD, qLen: qLen,
+                                            numActiveSlots: activeSlots)
+                } else {
+                    encFlexAttnSlidePrefill(cb, Q: q_out, O: pre_attn_out,
+                                             kArgBuf: kArgBuf, vArgBuf: vArgBuf,
+                                             kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
+                                             activeChunkIdxs: activeChunkIdxs,
+                                             kLenBuf: klBuf, qPositions: pre_q_positions,
+                                             H_Q: H, H_KV: KV_H, D: HD, qLen: qLen,
+                                             numActiveSlots: activeSlots)
+                }
+            })
+
+            add("oproj_norm", runStage("oproj_norm", layer: L) { cb in
+                encDenseMmPrefill(cb, x: pre_attn_out, W: lw.attnOut, format: lw.attnOutFormat,
+                                   Y: pre_mlp_out, Din: H * HD, Dout: HIDDEN, numVecs: N)
+                encRmsNormAdd(cb, x: pre_mlp_out, gammaBuf: lw.postAttnNorm,
+                              residual: pre_hidden, out: pre_hidden, N: HIDDEN, numVecs: N)
+            })
+
+            add("shrd_ffn", runStage("shrd_ffn", layer: L) { cb in
+                encRMSNormG(cb, x: pre_hidden, gammaBuf: lw.ffnNorm, out: pre_hidden_norm,
+                             D: HIDDEN, numVecs: N)
+                encDenseMmPrefill(cb, x: pre_hidden_norm, W: lw.ffnGate, format: lw.ffnGateFormat,
+                                   Y: pre_shrd_gate, Din: HIDDEN, Dout: SHARED_INT, numVecs: N)
+                encDenseMmPrefill(cb, x: pre_hidden_norm, W: lw.ffnUp, format: lw.ffnUpFormat,
+                                   Y: pre_shrd_gate_up_fused, Din: HIDDEN, Dout: SHARED_INT, numVecs: N)
+                encGeluMulInplace(cb, gate: pre_shrd_gate, up: pre_shrd_gate_up_fused,
+                                   N_half: SHARED_INT, numSlots: N)
+                encDenseMmPrefill(cb, x: pre_shrd_gate, W: lw.ffnDown, format: lw.ffnDownFormat,
+                                   Y: pre_mlp_out, Din: SHARED_INT, Dout: HIDDEN, numVecs: N)
+                encRMSNormG(cb, x: pre_mlp_out, gammaBuf: lw.postFfn1Norm, out: pre_mlp_out,
+                            D: HIDDEN, numVecs: N)
+            })
+
+            add("router", runStage("router", layer: L) { cb in
+                encRouterPreNorm(cb, x: pre_hidden, per_dim_scale: lw.routerScale,
+                                  out: pre_hidden_norm, numVecs: N)
+                encGemvV5(cb, pre_hidden_norm, lw.routerW, pre_router_lg,
+                          Din: HIDDEN, Dout: E_EXP, numVecs: N)
+                encSoftmaxTopkInto(cb, logits: pre_router_lg, expertIds: pre_expert_ids,
+                                    gateW: pre_gate_w, expertScaleBuf: lw.expertScale, numVecs: N)
+                encRouteCompactInto(cb, expertIds: pre_expert_ids, groupStart: pre_group_start,
+                                     slotToken: pre_slot_token, batchSlots: pre_batch_slots,
+                                     activeExperts: active_exp,
+                                     numVecs: N)
+            })
+
+            add("moe_up", runStage("moe_up", layer: L) { cb in
+                encRMSNormG(cb, x: pre_hidden, gammaBuf: lw.preFfn2Norm, out: pre_hidden_norm,
+                            D: HIDDEN, numVecs: N)
+                encMoeUpMmPrefill(cb, x: pre_hidden_norm, W: lw.moeGateUp, format: lw.moeGateUpFormat,
+                                   Y: pre_gate_up_fused,
+                                   slotTokenBuf: pre_slot_token, activeExpBuf: active_exp,
+                                   groupStartBuf: pre_group_start,
+                                   Din: HIDDEN, Dout: MOE_FUSED_DOUT, numSlots: NS, E: E_EXP)
+            })
+            add("moe_gelu", runStage("moe_gelu", layer: L) { cb in
+                encMoeGeluMulFused(cb, fused: pre_gate_up_fused, out: pre_gate_proj,
+                                    N_half: MOE_INT, numSlots: NS)
+            })
+            add("moe_down", runStage("moe_down", layer: L) { cb in
+                encMoeDownMmPrefill(cb, x: pre_gate_proj, W: lw.moeDown, format: lw.moeDownFormat,
+                                     Y: pre_moe_down_out,
+                                     activeExpBuf: active_exp, groupStartBuf: pre_group_start,
+                                     Din: MOE_INT, Dout: HIDDEN, numSlots: NS, E: E_EXP)
+            })
+            add("moe_tail", runStage("moe_tail", layer: L) { cb in
+                encMoeCombineWriteInto(cb, moeOut: pre_moe_down_out, batchSlots: pre_batch_slots,
+                                        gateW: pre_gate_w, outBuf: pre_moe_sum, numVecs: N)
+                encRMSNormG(cb, x: pre_moe_sum, gammaBuf: lw.postFfn2Norm, out: pre_moe_sum,
+                            D: HIDDEN, numVecs: N)
+            })
+
+            add("resid", runStage("resid", layer: L) { cb in
+                encBufferCopy(cb, src: pre_mlp_out, dst: pre_ffn_combined, bytes: N * HIDDEN * 2)
+                encAddInplace(cb, dst: pre_ffn_combined, src: pre_moe_sum, N: HIDDEN, numVecs: N)
+                encRmsNormAddScale(cb, x: pre_ffn_combined, gammaBuf: lw.postFfnNorm,
+                                   residual: pre_hidden, scalar: lw.layerOutputScale,
+                                   out: pre_hidden, N: HIDDEN, numVecs: N)
+            })
+        }
+
+        add("unembed_fast", runStage("unembed_fast", layer: -1) { cb in
+            let blit = cb.makeBlitCommandEncoder()!
+            for slot in 0..<activeSlots {
+                let srcOff = (slot * qLen + (qLen - 1)) * HIDDEN * 2
+                let dstOff = slot * HIDDEN * 2
+                blit.copy(from: pre_hidden, sourceOffset: srcOff,
+                          to: hidden, destinationOffset: dstOff, size: HIDDEN * 2)
+            }
+            blit.endEncoding()
+            encRMSNormG(cb, x: hidden, gammaBuf: w.outputNorm, out: hidden_norm,
+                        D: HIDDEN, numVecs: activeSlots)
+            encGemvV4Softcap(cb, hidden_norm, w.unembedW, logits,
+                              Din: HIDDEN, Dout: VOCAB, cap: 30.0, activeB: activeSlots)
+        })
+
+        return stages
+    }
+
+    // Run grid. For each (qLen, activeSlots) we do one warmup + reps timed.
+    var results: [PrefillCellResult] = []
+    for qLen in qLens {
+        for activeSlots in activeSlotsList {
+            print("  cell qLen=\(qLen) active_slots=\(activeSlots)  warmup..."); fflush(stdout)
+            _ = encodeOnePass(qLen: qLen, activeSlots: activeSlots)
+            var sumStages: [String: Double] = [:]
+            var sumPerPass = 0.0
+            for r in 0..<reps {
+                let stages = encodeOnePass(qLen: qLen, activeSlots: activeSlots)
+                var pass = 0.0
+                for (k, v) in stages {
+                    sumStages[k, default: 0] += v
+                    pass += v
+                }
+                sumPerPass += pass
+                if r == 0 { _ = r }
+            }
+            let avgStages = sumStages.mapValues { $0 / Double(reps) }
+            let avgPerPass = sumPerPass / Double(reps)
+            let toksPerSec = Double(activeSlots * qLen) / (avgPerPass / 1000.0)
+            print(String(format: "    per-pass=%.2f ms  tok/s=%.0f  qkv=%.2f moe_up=%.2f moe_down=%.2f kv_attn=%.2f shrd_ffn=%.2f",
+                          avgPerPass, toksPerSec,
+                          avgStages["qkv"] ?? 0, avgStages["moe_up"] ?? 0,
+                          avgStages["moe_down"] ?? 0, avgStages["kv_attn"] ?? 0,
+                          avgStages["shrd_ffn"] ?? 0))
+            fflush(stdout)
+            results.append(PrefillCellResult(
+                qLen: qLen, activeSlots: activeSlots,
+                perPassMs: avgPerPass, stageMs: avgStages))
+        }
+    }
+
+    // -------- CSV emit --------
+    let stageOrderCsv = ["embed", "qkv", "qkn_rope", "kv_attn",
+                          "oproj_norm", "shrd_ffn", "router",
+                          "moe_up", "moe_gelu", "moe_down", "moe_tail",
+                          "resid", "unembed_fast"]
+    var csv = "qLen,active_slots,tokens,per_pass_ms,tokens_per_sec"
+    for s in stageOrderCsv { csv += ",ms_\(s)" }
+    csv += "\n"
+    for r in results {
+        let toks = r.activeSlots * r.qLen
+        let tps = Double(toks) / (r.perPassMs / 1000.0)
+        csv += "\(r.qLen),\(r.activeSlots),\(toks),"
+        csv += String(format: "%.3f,%.2f", r.perPassMs, tps)
+        for s in stageOrderCsv {
+            csv += String(format: ",%.4f", r.stageMs[s] ?? 0)
+        }
+        csv += "\n"
+    }
+    do {
+        try csv.write(toFile: csvPath, atomically: true, encoding: .utf8)
+        print("\n  CSV written: \(csvPath) (\(results.count) cells)")
+    } catch {
+        print("\n  CSV write failed: \(error)")
+    }
+
+    // -------- Headline tok/s table --------
+    print("\n=== headline tok/s (qLen × active_slots) ===")
+    var header = "  qLen \\ AS"
+    for a in activeSlotsList { header += String(format: "%8d", a) }
+    print(header)
+    for q in qLens {
+        var row = String(format: "  qLen=%-4d", q)
+        for a in activeSlotsList {
+            if let r = results.first(where: { $0.qLen == q && $0.activeSlots == a }) {
+                let tps = Double(a * q) / (r.perPassMs / 1000.0)
+                row += String(format: "%8.0f", tps)
+            } else {
+                row += "      —"
+            }
+        }
+        print(row)
+    }
+
+    // -------- Per-pass ms table --------
+    print("\n=== per-pass GPU wall ms (qLen × active_slots) ===")
+    print(header)
+    for q in qLens {
+        var row = String(format: "  qLen=%-4d", q)
+        for a in activeSlotsList {
+            if let r = results.first(where: { $0.qLen == q && $0.activeSlots == a }) {
+                row += String(format: "%8.2f", r.perPassMs)
+            } else {
+                row += "      —"
+            }
+        }
+        print(row)
+    }
+
+    fflush(stdout)
+}
