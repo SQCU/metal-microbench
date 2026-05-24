@@ -33,6 +33,7 @@
 import { test, expect } from '@playwright/test';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execSync } from 'node:child_process';
 
 const ST_BASE = 'http://127.0.0.1:8002';
 const PLUGIN_BASE = `${ST_BASE}/api/plugins/user-personas`;
@@ -71,9 +72,8 @@ test.describe('UX-T4: seed materialization', () => {
             return;
         }
         // Manual PNG chunk reading (avoids loading the full ST stack).
-        // We'll do a quick binary search for the base64 pattern in the
-        // ccv3 chunk rather than re-implementing the parser.
-        const { execSync } = require('node:child_process');
+        // Use execSync (imported at top of file) to run a tiny ESM snippet
+        // that reads the ccv3 chunk and prints the provenance kind.
         const pngFiles = fs.readdirSync(SEED_BIOS_DIR).filter(f => f.endsWith('.png'));
         for (const f of pngFiles) {
             const fullPath = path.join(SEED_BIOS_DIR, f);
