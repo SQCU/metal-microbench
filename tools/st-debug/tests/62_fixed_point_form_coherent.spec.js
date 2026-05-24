@@ -260,8 +260,20 @@ test.describe('fixed_point.html — coherent query interface (spec T4)', () => {
         let bareA = await auditInputs(iframe);
         expect(bareA, `Experiments-tab default view has bare inputs:\n${JSON.stringify(bareA, null, 2)}`).toEqual([]);
 
-        // ── PHASE B: Editor modal (the "+ New Experiment" form) ─────────
-        await iframe.locator('#new-experiment-btn').click();
+        // ── PHASE B: Editor modal ───────────────────────────────────────
+        // P-EMPTY-FORM (UX-T1, spec 78): the bare "+ New Experiment"
+        // button was removed because it opened a blank modal — exactly
+        // the JSON-fields-as-strings anti-pattern. We still audit the
+        // modal's inputs for label/description coverage (this spec's
+        // T4 contract) by opening it programmatically; the bare entry
+        // point stays deleted.
+        await expect(iframe.locator('#new-experiment-btn'),
+            'P-EMPTY-FORM (spec 78): bare "+ New Experiment" button must be absent'
+        ).toHaveCount(0);
+        await iframe.locator('body').evaluate(() => {
+            if (typeof window.openEditorForNew === 'function') window.openEditorForNew();
+            else if (typeof openEditorForNew === 'function') openEditorForNew();
+        });
         await expect(iframe.locator('#editor-overlay')).toBeVisible({ timeout: 5_000 });
         // The form auto-creates one bios[0] row on open. The agent_targets
         // section starts empty — click +Add agent target so we exercise

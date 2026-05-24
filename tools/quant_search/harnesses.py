@@ -663,6 +663,7 @@ class SVGMSEHarness:
     async def _eval_one_prompt(
         self, prompt: str, inbox, outbox, stop,
     ) -> dict:
+        # LINT-OK-PREFIX-SAFE: chat_id is a session-scoped ID for bridge tracking, not prompt content.
         chat_id = f"qsearch_{uuid.uuid4().hex[:12]}"
         slug = _svg_slug(prompt)
         ref_path = self.refs_dir / f"{slug}.png"

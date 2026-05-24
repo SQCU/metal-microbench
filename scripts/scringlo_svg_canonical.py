@@ -60,13 +60,19 @@ TOOLS = [{
 }]
 
 
-def fire_chat(*, max_tokens=1024, temperature=0.4) -> dict:
+def fire_chat() -> dict:
+    """Fire one chat against the bridge with the canonical discourse + tools.
+
+    Per the generation-config moratorium (lint_generation_config.mjs):
+    no temperature / no max_tokens at the caller layer. Bridge defaults
+    apply (temperature=1.0 + EOS termination). This is a regression
+    smoke-test; the assertions downstream don't depend on sampling
+    settings.
+    """
     body = json.dumps({
         "model": "gemma-4-a4b",
         "messages": CANONICAL_DISCOURSE,
         "tools": TOOLS,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
         "stream": False,
     }).encode()
     req = urllib.request.Request(

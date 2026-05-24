@@ -56,6 +56,12 @@ const FIXTURES = [
 // ── prompt variants ──────────────────────────────────────────────────
 
 const VARIANTS = {
+    // Per moratorium (lint_generation_config.mjs): variants no longer
+    // carry per-call max_tokens. The bridge default + EOS termination
+    // apply uniformly to all variants. Variant differentiation is in
+    // sys-prompt + usr-prompt shape only (which is what we're A/B-testing
+    // here anyway — the previous max_tokens variation was incidental to
+    // the experiment, not part of it).
     V0_floor: {
         description: 'Original prompt with "be willing to score 1 (absence)" license',
         sys: 'You are a behavioural-axis judge. You read ONE user-side chat ' +
@@ -69,7 +75,6 @@ const VARIANTS = {
             '## Axes (each 1-5)\n\n' + rubric + '\n\n' +
             '## Turn to score\n\n> ' + turn.replace(/\n/g, '\n> ') + '\n\n' +
             '## Emit\n\n' + template + '\n',
-        max_tokens: 200,
     },
 
     V1_full_range: {
@@ -87,7 +92,6 @@ const VARIANTS = {
             '## Axes (each 1-5)\n\n' + rubric + '\n\n' +
             '## Turn to score\n\n> ' + turn.replace(/\n/g, '\n> ') + '\n\n' +
             '## Emit\n\n' + template + '\n',
-        max_tokens: 200,
     },
 
     V2_minimal: {
@@ -99,7 +103,6 @@ const VARIANTS = {
             '## Axes (each 1-5)\n\n' + rubric + '\n\n' +
             '## Turn to score\n\n> ' + turn.replace(/\n/g, '\n> ') + '\n\n' +
             '## Emit\n\n' + template + '\n',
-        max_tokens: 200,
     },
 
     V3_describe_first: {
@@ -114,7 +117,6 @@ const VARIANTS = {
             '## Axes (each 1-5)\n\n' + rubric + '\n\n' +
             '## Turn to score\n\n> ' + turn.replace(/\n/g, '\n> ') + '\n\n' +
             '## Emit\n\nDESCRIPTION: <one sentence>\n' + template + '\n',
-        max_tokens: 400,
     },
 
     V4_anchored: {
@@ -132,7 +134,6 @@ const VARIANTS = {
             '## Axes (each 1-5)\n\n' + rubric + '\n\n' +
             '## Turn to score\n\n> ' + turn.replace(/\n/g, '\n> ') + '\n\n' +
             '## Emit\n\n' + template + '\n',
-        max_tokens: 200,
     },
 
     V5_describe_no_calibration: {
@@ -145,7 +146,6 @@ const VARIANTS = {
             '## Axes (each 1-5)\n\n' + rubric + '\n\n' +
             '## Turn to score\n\n> ' + turn.replace(/\n/g, '\n> ') + '\n\n' +
             '## Emit\n\nDESCRIPTION: <one sentence>\n' + template + '\n',
-        max_tokens: 400,
     },
 
     V6_pure_minimal: {
@@ -156,7 +156,6 @@ const VARIANTS = {
             '## Axes (each 1-5)\n\n' + rubric + '\n\n' +
             '## Turn to score\n\n> ' + turn.replace(/\n/g, '\n> ') + '\n\n' +
             '## Emit\n\n' + template + '\n',
-        max_tokens: 200,
     },
 };
 
@@ -167,9 +166,10 @@ async function judgeWithVariant(variant, turn) {
     const template = AXES.map(a => `${a.name}: ?`).join('\n');
     const sys = variant.sys;
     const usr = variant.usrFmt(rubric, turn, template);
+    // Per moratorium: no per-call max_tokens / temperature. Bridge
+    // default temperature=1.0 + EOS termination apply uniformly.
     const raw = await L.bridgeCall(
-        [{ role: 'system', content: sys }, { role: 'user', content: usr }],
-        { max_tokens: variant.max_tokens, temperature: 1.0 });
+        [{ role: 'system', content: sys }, { role: 'user', content: usr }]);
     const sig = {};
     for (const a of AXES) sig[a.name] = null;
     for (const line of raw.split('\n')) {
@@ -230,6 +230,7 @@ for (const [vName, variant] of Object.entries(VARIANTS)) {
         console.log(`  ${fx.label}:\n    ${summary}`);
     }
 }
+// LINT-OK-PREFIX-SAFE: stdout summary log, not prompt content.
 console.log(`\n[judge_prompt_ab] all calls done in ${((Date.now()-tStart)/1000).toFixed(1)}s\n`);
 
 // ── per-variant aggregates ───────────────────────────────────────────

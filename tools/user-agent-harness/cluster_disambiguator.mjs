@@ -125,9 +125,9 @@ async function proposeSpreadAxes(bios, trajs, tightnessReport) {
         `## The cluster\n\n${bioBlocks}\n\n` +
         `## Existing axis registry (do NOT propose duplicates of these)\n\n${registryListing}\n\n` +
         `## Emit\n\nPropose ${N_HYPOTHESES} candidate spread axes as JSON. Each must include a one-sentence rationale for why this axis would distinguish at least 2 of these bios.`;
+    // Per moratorium (lint_generation_config.mjs): no max_tokens at caller.
     const raw = await bridgeCall(
-        [{ role: 'system', content: sys }, { role: 'user', content: usr }],
-        { max_tokens: 1200 });
+        [{ role: 'system', content: sys }, { role: 'user', content: usr }]);
     const m = raw.match(/\{[\s\S]*\}/);
     if (!m) throw new Error(`could not parse JSON from DESIGNER_C:\n${raw.slice(0, 500)}`);
     const parsed = JSON.parse(m[0]);
@@ -183,9 +183,9 @@ async function judgeSimilarity(promptLabel, defText, blockA, blockB) {
         `## What "similarity" means here\n\n${defText}\n\n` +
         `## Block A\n\n${blockA}\n\n## Block B\n\n${blockB}\n\n` +
         `## Emit\n\nsimilarity: ?\n`;
+    // Per moratorium: no max_tokens at caller. Bridge default + EOS apply.
     const raw = await bridgeCall(
-        [{ role: 'system', content: sys }, { role: 'user', content: usr }],
-        { max_tokens: 30 });
+        [{ role: 'system', content: sys }, { role: 'user', content: usr }]);
     const m = raw.match(/similarity\s*:\s*([1-5])/i);
     return m ? Number(m[1]) : null;
 }
@@ -275,6 +275,7 @@ async function runDisambiguator(specPath) {
         }
     }
     await Promise.all(chatTasks);
+    // LINT-OK-PREFIX-SAFE: stderr-style timing log, not prompt content.
     console.log(`[disambig] chats done in ${((Date.now()-tChat0)/1000).toFixed(1)}s`);
 
     // 3. Pre-flight tightness on nominal axis

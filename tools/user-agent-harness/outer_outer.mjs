@@ -43,6 +43,7 @@ if (!EXPERIMENT_ID) {
 }
 
 const RUN_ID = process.env.LOCK_IN_RUN_ID
+    // LINT-OK-PREFIX-SAFE: RUN_ID stamped into filesystem output dirs, not prompt content.
     || `${EXPERIMENT_ID}-${new Date().toISOString().replace(/[:.]/g, '-')}-oo`;
 
 const HARNESS_DIR = path.dirname(new URL(import.meta.url).pathname);
@@ -276,6 +277,7 @@ for (let k = 1; k < K_OUTER_OUTER; k++) {
     console.log(`[outer_outer]   target: ${bioAxisNames.map(a => `${a.slice(0,8)}=${pick.target[a]}`).join(' ')}`);
 
     // Materialize a transient one-bio spec at the picked target
+    // LINT-OK-PREFIX-SAFE: transient experiment id (filesystem + DB key), not prompt content.
     const transientId = `${EXPERIMENT_ID}_oo_pass${k}_${Date.now().toString(36)}`;
     const newBioSlug = `oo-${EXPERIMENT_ID}-pass${k}`;
     const newBio = {

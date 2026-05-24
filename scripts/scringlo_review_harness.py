@@ -47,12 +47,18 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "server"))
 from bridge_config import BRIDGE_URL as DEFAULT_BRIDGE  # noqa: E402
 
 
-def chat(messages, *, max_tokens=1800, temperature=0.4, bridge=DEFAULT_BRIDGE):
-    """One round-trip to the bridge's OpenAI-compatible endpoint."""
+def chat(messages, *, bridge=DEFAULT_BRIDGE):
+    """One round-trip to the bridge's OpenAI-compatible endpoint.
+
+    Per the generation-config moratorium (see
+    tools/st-debug/sillytavern-fork/plugins/user-personas/scripts/
+    lint_generation_config.mjs): no temperature / no max_tokens at the
+    caller layer. The bridge default (temperature=1.0) and natural EOS
+    termination apply. If a longer ceiling is needed for code-review
+    output, raise the bridge default — not per-call.
+    """
     data = json.dumps({
         "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
         "stream": False,
     }).encode()
     req = urllib.request.Request(
@@ -76,8 +82,7 @@ def chat(messages, *, max_tokens=1800, temperature=0.4, bridge=DEFAULT_BRIDGE):
     return text
 
 
-def sober(label, code, *, bridge=DEFAULT_BRIDGE, max_tokens=1800, temperature=0.4,
-          system_prompt=None):
+def sober(label, code, *, bridge=DEFAULT_BRIDGE, system_prompt=None):
     """Direct senior-engineer reviewer.
 
     The default system prompt is shaped for codebase fitness reviews; pass
@@ -103,11 +108,11 @@ def sober(label, code, *, bridge=DEFAULT_BRIDGE, max_tokens=1800, temperature=0.
             {"role": "user",
              "content": f"## {label}\n\n```\n{code}\n```\n\nReview the excerpt above."},
         ],
-        bridge=bridge, max_tokens=max_tokens, temperature=temperature,
+        bridge=bridge,
     )
 
 
-def scringlo(label, code, *, bridge=DEFAULT_BRIDGE, max_tokens=1800, temperature=0.4):
+def scringlo(label, code, *, bridge=DEFAULT_BRIDGE):
     """The scringlo-scramble persona harness.
 
     Matches the chat-template the bridge logs surfaced — silly little guy
@@ -132,20 +137,17 @@ def scringlo(label, code, *, bridge=DEFAULT_BRIDGE, max_tokens=1800, temperature
             {"role": "user",
              "content": f"ok here it is, it's the {label} part:\n\n```\n{code}\n```\n\nlemme have ur takes scringlo!! be real with me!!"},
         ],
-        bridge=bridge, max_tokens=max_tokens, temperature=temperature,
+        bridge=bridge,
     )
 
 
-def run_one(label, code, *, bridge=DEFAULT_BRIDGE, sober_system=None,
-            max_tokens=1800, temperature=0.4):
+def run_one(label, code, *, bridge=DEFAULT_BRIDGE, sober_system=None):
     """Returns dict {"label", "sober", "scringlo"}."""
     print(f"\n{'=' * 70}\n  EXCERPT: {label}\n{'=' * 70}", file=sys.stderr)
     print(f"\n--- gemma-4-a4b (sober) on {label}:\n", file=sys.stderr)
-    s = sober(label, code, bridge=bridge, max_tokens=max_tokens,
-              temperature=temperature, system_prompt=sober_system)
+    s = sober(label, code, bridge=bridge, system_prompt=sober_system)
     print(f"\n--- scringlo scramble on {label}:\n", file=sys.stderr)
-    p = scringlo(label, code, bridge=bridge, max_tokens=max_tokens,
-                 temperature=temperature)
+    p = scringlo(label, code, bridge=bridge)
     return {"label": label, "sober": s, "scringlo": p}
 
 
@@ -158,8 +160,9 @@ def _main():
                     help=f"Bridge base URL (default: {DEFAULT_BRIDGE}).")
     ap.add_argument("--sober-system",
                     help="Override the sober persona's system prompt.")
-    ap.add_argument("--max-tokens", type=int, default=1800)
-    ap.add_argument("--temperature", type=float, default=0.4)
+    # Note: --max-tokens / --temperature CLI flags removed per the
+    # generation-config moratorium. Bridge defaults apply (temperature=1.0,
+    # EOS-terminated). See lint_generation_config.mjs.
     ap.add_argument("--format", choices=["json", "markdown"], default="markdown",
                     help="Output format on stdout.")
     args = ap.parse_args()
@@ -180,8 +183,7 @@ def _main():
 
     reviews = [
         run_one(e["label"], e["code"], bridge=args.bridge,
-                sober_system=args.sober_system,
-                max_tokens=args.max_tokens, temperature=args.temperature)
+                sober_system=args.sober_system)
         for e in excerpts
     ]
 

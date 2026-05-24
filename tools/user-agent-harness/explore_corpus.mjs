@@ -40,7 +40,8 @@ function allAxes() { return _AXES_CACHE; }
 const DEFAULT_MAX_ITER     = 3;
 const DEFAULT_K_CANDIDATES = 8;
 const N_TURNS_PER_CHAT     = 4;
-const TEMP_BIO_DESIGN      = 1.0;
+// TEMP_BIO_DESIGN removed: per moratorium, no per-call temperature override.
+// Bridge default = 1.0 (the value this constant carried anyway).
 
 // The 6-axis bio-side subset we measure on. Includes the cluster-derived
 // normative_directionality so the disambiguator's contribution flows into
@@ -157,9 +158,14 @@ async function designBioOnce(target, designBrief = '') {
         fmtTargetForPrompt(target) + '\n\n' +
         (designBrief ? `## Design brief\n\n${designBrief}\n\n` : '') +
         'Write the bio prose now.';
+    // Per moratorium (lint_generation_config.mjs): no max_tokens / no
+    // temperature at the caller layer. Bridge default temperature=1.0 +
+    // EOS termination apply. (TEMP_BIO_DESIGN was already 1.0; the cap
+    // on max_tokens was a soft "bio prose should be short" — but bio
+    // length is controlled by the system-prompt "3-5 sentences" instruction,
+    // not by truncation.)
     return await L.bridgeCall(
-        [{ role: 'system', content: sys }, { role: 'user', content: usr }],
-        { max_tokens: 300, temperature: TEMP_BIO_DESIGN });
+        [{ role: 'system', content: sys }, { role: 'user', content: usr }]);
 }
 
 // ── one explore iteration ────────────────────────────────────────────
@@ -180,6 +186,7 @@ async function exploreOneIteration(state, iter, rng, cp, kCandidates) {
     console.log(`            bio prose: ${prose.slice(0, 150).replace(/\n/g, ' ')}…`);
 
     // 3. Install bio + cheap agent
+    // LINT-OK-PREFIX-SAFE: slug for bio canonical_key (filesystem-ish ID), not prompt content.
     const slug = `explore-iter${iter}-${Date.now().toString(36)}`;
     const canonical_key = `${slug}.png`;
     const name = `Explore Iter ${iter}`;
@@ -304,6 +311,7 @@ for (let i = 0; i < args.maxIter; i++) {
 }
 
 const finalEff = effDim(state);
+// LINT-OK-PREFIX-SAFE: stdout summary log, not prompt content.
 console.log(`\n[explore_corpus] done. ${args.maxIter} iter(s) in ${((Date.now()-tAll)/1000).toFixed(1)}s`);
 console.log(`[explore_corpus] FINAL corpus size: ${state.bios.length} bios`);
 console.log(`[explore_corpus] FINAL eff_dim: ${finalEff.effDim?.toFixed(3) ?? 'n/a'} (${finalEff.note ?? ''})`);

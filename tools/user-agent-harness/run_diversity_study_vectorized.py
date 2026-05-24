@@ -79,13 +79,19 @@ def load_personas():
     return out
 
 
-def bridge_call(messages, *, temperature=0.9, max_tokens=400, seed=None):
+def bridge_call(messages, *, seed=None):
+    """One non-streaming chat/completions call. Returns assistant text.
+
+    Per the generation-config moratorium (see
+    tools/st-debug/sillytavern-fork/plugins/user-personas/scripts/
+    lint_generation_config.mjs): no temperature / no max_tokens at the
+    caller layer. Bridge default temperature=1.0 + EOS termination apply.
+    Diversity in this study comes from the per-call seed.
+    """
     body = {
         "model": MODEL,
         "messages": messages,
         "stream": False,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
     }
     if seed is not None:
         body["seed"] = seed
@@ -122,23 +128,23 @@ def open_turn_call(state):
         "role": "user",
         "content": "Begin your conversation with the character. Write only what you'd type as your first message — no quotes, no narration. Just your opening message.",
     }]
-    return bridge_call(messages, temperature=0.95, max_tokens=200, seed=state["seed"])
+    return bridge_call(messages, seed=state["seed"])
 
 
 def user_reply_call(state, turn_i):
     """User-agent replies to scringlo's most recent message."""
-    return bridge_call(state["user_view"], temperature=0.95, max_tokens=300, seed=state["seed"] + 2000 + turn_i)
+    return bridge_call(state["user_view"], seed=state["seed"] + 2000 + turn_i)
 
 
 def scringlo_reply_call(state, turn_i):
-    return bridge_call(state["scringlo_view"], temperature=0.85, max_tokens=400, seed=state["seed"] + 1000 + turn_i)
+    return bridge_call(state["scringlo_view"], seed=state["seed"] + 1000 + turn_i)
 
 
 def summary_call(text, role_label, seed):
     return bridge_call([
         {"role": "system", "content": "Summarize the following chat turn in ONE concise sentence (under 18 words). Capture what the speaker DID communicatively (asked / claimed / reacted / changed-subject / etc.) and the substance, not just the topic. No preamble; just the sentence."},
         {"role": "user", "content": f"Speaker: {role_label}\nTurn:\n{text}"},
-    ], temperature=0.3, max_tokens=80, seed=seed)
+    ], seed=seed)
 
 
 def run_vectorized(personas, scringlo_sys, *, n_conversations, n_turns, base_seed, max_workers=12):

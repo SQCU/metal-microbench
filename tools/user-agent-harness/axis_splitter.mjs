@@ -188,9 +188,10 @@ async function proposeSplits(parentAxisRecord, byCtx, gapSummary) {
         ctxBlocks.join('\n\n') + '\n\n' +
         `## Emit\n\nPropose ${N_HYPOTHESES} candidate splits as JSON. Each hypothesis names two new sub-axes (with rubrics) and a one-sentence rationale for why this split would separate the contexts.`;
 
+    // Per moratorium (lint_generation_config.mjs): no max_tokens at caller.
+    // Bridge default + natural EOS apply.
     const raw = await bridgeCall(
-        [{ role: 'system', content: sys }, { role: 'user', content: usr }],
-        { max_tokens: 1500 });
+        [{ role: 'system', content: sys }, { role: 'user', content: usr }]);
     // Tolerant JSON extraction (designer-LLM may emit prose around the JSON block)
     const m = raw.match(/\{[\s\S]*\}/);
     if (!m) throw new Error(`could not find JSON object in DESIGNER_S output:\n${raw}`);
@@ -216,9 +217,9 @@ async function judgeOnPair(turn, pair) {
         '## Turn to score\n\n' +
         '> ' + turn.replace(/\n/g, '\n> ') + '\n\n' +
         '## Emit\n\n' + template + '\n';
+    // Per moratorium: no max_tokens at caller. Bridge default + EOS apply.
     const raw = await bridgeCall(
-        [{ role: 'system', content: sys }, { role: 'user', content: usr }],
-        { max_tokens: 100 });
+        [{ role: 'system', content: sys }, { role: 'user', content: usr }]);
     const sig = { [pair.name1]: null, [pair.name2]: null };
     for (const line of raw.split('\n')) {
         for (const aname of [pair.name1, pair.name2]) {

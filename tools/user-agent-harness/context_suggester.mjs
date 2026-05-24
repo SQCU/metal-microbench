@@ -184,9 +184,9 @@ async function judgeContext(messages, kTotal, manifest) {
         `## Well-covered axes (use these preferentially)\n\n${wellCoveredList || '(none — manifest too sparse)'}\n\n` +
         `## Chat context\n\n${chatText || '(empty — propose generally-useful targets)'}\n\n` +
         `## Emit\n\n${kTotal} target vectors as JSON. Each target MUST include at least one well-covered axis.`;
+    // Per moratorium (lint_generation_config.mjs): no max_tokens at caller.
     const raw = await L.bridgeCall(
-        [{ role: 'system', content: sys }, { role: 'user', content: usr }],
-        { max_tokens: 1500 });
+        [{ role: 'system', content: sys }, { role: 'user', content: usr }]);
     const m = raw.match(/\{[\s\S]*\}/);
     if (!m) throw new Error(`could not parse JSON from ContextJudge:\n${raw.slice(0, 500)}`);
     const parsed = JSON.parse(m[0]);

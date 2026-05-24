@@ -42,6 +42,7 @@ import json
 import os
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -132,6 +133,18 @@ _response_qs: dict[int, "asyncio.Queue[g.StreamUpdate]"] = {}
 # high-water gate. Used for log-cadence-throttled WARN. Cleared on
 # stream cleanup (pop from _response_qs).
 _drop_counts: dict[int, int] = {}
+
+# Per-stream rolling samples of (monotonic_ts_sec, cumulative_completion_tokens).
+# Used by _compute_stream_tok_per_sec to publish live tok/s telemetry on
+# /v1/engine/state (per active stream) and /health (aggregate). Window
+# is a fixed-capacity deque — we use the last ~_RATE_WINDOW_SAMPLES
+# StreamUpdate observations and compute tok/s = Δtokens / Δt over the
+# span. At canonical ~30 tok/s that's ~1.6 s of history (sample-per-token
+# is the dominant cadence), enough to smooth single-tick jitter without
+# lagging perceived rate changes. Cleared in the same sites that pop
+# _response_qs / _drop_counts so per-stream state lifecycles stay coupled.
+_RATE_WINDOW_SAMPLES = 50
+_stream_rate_samples: dict[int, "deque[tuple[float, int]]"] = {}
 _next_stream_id_lock: "asyncio.Lock | None" = None
 _next_stream_id = 1
 _engine_thread: "threading.Thread | None" = None
@@ -214,6 +227,19 @@ def _push_update_threadsafe(loop: asyncio.AbstractEventLoop,
     rq = _response_qs.get(update.stream_id)
     if rq is None:
         return
+    # Record rolling-rate sample BEFORE the high-water drop check so
+    # we still observe rate evolution even on a stalled consumer
+    # (the engine is producing; tok/s metric should reflect engine
+    # throughput, not consumer behavior). dict.setdefault + deque
+    # append are both cheap and the deque is bounded, so this is
+    # safe to call from the engine driver thread (CPython dict mutation
+    # under the GIL is atomic at this granularity — no asyncio loop
+    # involvement needed).
+    samples = _stream_rate_samples.get(update.stream_id)
+    if samples is None:
+        samples = deque(maxlen=_RATE_WINDOW_SAMPLES)
+        _stream_rate_samples[update.stream_id] = samples
+    samples.append((time.monotonic(), int(update.completion_tokens_emitted)))
     # qsize() reads a plain int field in CPython; safe cross-thread, at
     # most one update stale.
     if rq.qsize() > _RESPONSE_Q_HIGH_WATER:
@@ -231,6 +257,43 @@ def _push_update_threadsafe(loop: asyncio.AbstractEventLoop,
     except RuntimeError:
         # Loop closed during shutdown — drop the update silently.
         pass
+
+
+def _compute_stream_tok_per_sec(stream_id: int) -> float:
+    """Return rolling tok/s estimate for `stream_id` over the last
+    ~_RATE_WINDOW_SAMPLES StreamUpdate observations.
+
+    Returns 0.0 when:
+      - the stream has no samples (not started, or already GC'd), or
+      - fewer than 2 samples have been recorded (need two points to
+        define a rate), or
+      - the elapsed window is degenerate (clamped to 0.001 s floor).
+
+    Computed as (latest_tokens - oldest_tokens) / (latest_ts - oldest_ts).
+    Snapshot-style read of the deque endpoints; deque indexing is O(1)
+    and the dict lookup is atomic under the GIL — no lock needed.
+    """
+    samples = _stream_rate_samples.get(stream_id)
+    if samples is None or len(samples) < 2:
+        return 0.0
+    oldest_ts, oldest_tokens = samples[0]
+    latest_ts, latest_tokens = samples[-1]
+    dt = max(0.001, latest_ts - oldest_ts)
+    dtok = latest_tokens - oldest_tokens
+    if dtok <= 0:
+        return 0.0
+    return float(dtok) / dt
+
+
+def _compute_aggregate_tok_per_sec() -> float:
+    """Sum of `_compute_stream_tok_per_sec` across all tracked streams.
+    Safe to call concurrently with the engine driver thread; iterates
+    a snapshot of dict keys to avoid 'dict changed during iteration'.
+    """
+    total = 0.0
+    for sid in list(_stream_rate_samples.keys()):
+        total += _compute_stream_tok_per_sec(sid)
+    return total
 
 
 async def _wait_until_disconnected(request: Request) -> None:
@@ -377,6 +440,7 @@ async def _consume_engine_stream(stream_id: int, request: Request):
             # immediately — no more engine pushes coming.
             _response_qs.pop(stream_id, None)
             _drop_counts.pop(stream_id, None)
+            _stream_rate_samples.pop(stream_id, None)
         else:
             if last_update is not None:
                 u = last_update
@@ -409,6 +473,7 @@ async def _consume_engine_stream(stream_id: int, request: Request):
                 # under the env-var escape hatch.
                 _response_qs.pop(stream_id, None)
                 _drop_counts.pop(stream_id, None)
+                _stream_rate_samples.pop(stream_id, None)
             else:
                 # Hand the queue to a background drain task that runs
                 # until the engine emits state==2 (natural termination
@@ -567,6 +632,7 @@ async def _drain_until_engine_done(stream_id: int) -> None:
             # _push_update_threadsafe.
             _response_qs.pop(stream_id, None)
             _drop_counts.pop(stream_id, None)
+            _stream_rate_samples.pop(stream_id, None)
             _reconnect_takeover_events.pop(stream_id, None)
         # If handed_off: the reconnect consumer owns cleanup of all
         # three dicts on its own exit path.
@@ -596,6 +662,7 @@ def _spawn_background_drain(stream_id: int) -> None:
               f"failed: {e}; popping queue", flush=True)
         _response_qs.pop(stream_id, None)
         _drop_counts.pop(stream_id, None)
+        _stream_rate_samples.pop(stream_id, None)
         _reconnect_takeover_events.pop(stream_id, None)
 
 
@@ -1294,8 +1361,29 @@ def engine_state() -> JSONResponse:
     underlying FFI call walks active streams + live pages under the
     same gEngineLock that serializes the AR loop; payload is < 256 KB
     in the worst realistic case (8192-page pool, 8 active streams).
+
+    Bridge enrichment (2026-05-23): each entry in `active_streams[]` is
+    augmented with a `tok_per_sec` field (rolling rate over the last
+    ~_RATE_WINDOW_SAMPLES StreamUpdate observations on the bridge side
+    — see _compute_stream_tok_per_sec). 0.0 for streams that haven't
+    emitted at least two updates yet (pure-prefill, just-submitted, or
+    GC'd). `tokens_emitted_so_far` is added as a stable alias for
+    `completion_tokens_emitted` so consumers that don't know the
+    Swift-side field name can still derive their own rates.
     """
-    return JSONResponse(g.engine_state())
+    snapshot = g.engine_state()
+    streams = snapshot.get("active_streams") or []
+    for entry in streams:
+        try:
+            sid = int(entry.get("stream_id"))
+        except (TypeError, ValueError):
+            entry["tok_per_sec"] = 0.0
+            continue
+        entry["tok_per_sec"] = _compute_stream_tok_per_sec(sid)
+        if "tokens_emitted_so_far" not in entry:
+            entry["tokens_emitted_so_far"] = entry.get(
+                "completion_tokens_emitted", 0)
+    return JSONResponse(snapshot)
 
 
 @app.get("/health")
@@ -1312,6 +1400,15 @@ def health() -> JSONResponse:
         "vision_cache_hits": s.vision_cache_hits,
         "total_steps": s.total_steps,
         "total_tokens_emitted": s.total_tokens_emitted,
+        # 2026-05-23: live bridge-side aggregate throughput across all
+        # currently-tracked streams. Computed from the same rolling
+        # _stream_rate_samples deque that backs /v1/engine/state's
+        # per-stream tok_per_sec — sum is exact across streams; each
+        # stream's rate is its own deque window so a freshly-attached
+        # stream contributes 0.0 until it has two samples. Cheap: O(n)
+        # over active streams.
+        "aggregate_tok_per_sec": _compute_aggregate_tok_per_sec(),
+        "active_stream_count": s.active_streams,
         "capabilities": {
             "max_q_len": g.max_q_len(),
         },
@@ -1674,6 +1771,7 @@ async def chat_completions(req: Request) -> Any:
     if rc != 0:
         _response_qs.pop(stream_id, None)
         _drop_counts.pop(stream_id, None)
+        _stream_rate_samples.pop(stream_id, None)
         raise HTTPException(500, f"engine submit failed: rc={rc}")
     # 2026-05-23 DEBUG (st-cache investigation): trace lifecycle so we can
     # see if SSE consumers ever start iterating after submit.
@@ -2327,6 +2425,7 @@ async def stream_reconnect_sse(stream_id: int, req: Request):
             if clean_close:
                 _response_qs.pop(stream_id, None)
                 _drop_counts.pop(stream_id, None)
+                _stream_rate_samples.pop(stream_id, None)
                 _reconnect_takeover_events.pop(stream_id, None)
             else:
                 if last_update is not None:

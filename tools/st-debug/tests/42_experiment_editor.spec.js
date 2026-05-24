@@ -48,8 +48,44 @@ test.describe('experiment editor — desktop only', () => {
         // (1) lock_in_tetrad seed card is present.
         await expect(iframe.locator('text=/lock_in_tetrad|RPG Wizard\\/Rogue/').first()).toBeVisible();
 
-        // (2) New Experiment button opens form; fields visible + empty.
-        await iframe.locator('#new-experiment-btn').click();
+        // (2) Open the New Experiment form.
+        //
+        // P-EMPTY-FORM (UX-T1, 2026-05-21, spec 78): the bare "+ New
+        // Experiment" button was removed because clicking it produced a
+        // blank modal with bare exp-id / exp-name / exp-description text
+        // inputs — exactly the JSON-fields-as-strings anti-pattern. The
+        // editor modal itself is still mounted (it's reached via the
+        // Edit button on existing experiment cards, where every field
+        // pre-fills, and via the ?target_bio_signature query-param
+        // path which pre-fills from chat context). To keep this spec
+        // exercising the underlying editor wiring (validation, save,
+        // edit pre-populate, delete) without re-introducing the
+        // forbidden surface, we invoke the editor opener programmatically
+        // — the bare entry-point button stays deleted, the wiring stays
+        // tested.
+        await expect(iframe.locator('#new-experiment-btn'),
+            'P-EMPTY-FORM (spec 78): bare "+ New Experiment" button must be absent'
+        ).toHaveCount(0);
+        await iframe.locator('body').evaluate(() => {
+            // openEditorForNew is the module-local fn behind the deleted
+            // button. Invoking it asserts the editor wiring is intact
+            // even though the UI entry point that USED to call it is
+            // gone — every other caller (query-param prefill, Edit on
+            // an existing card) still depends on this code path.
+            window.openEditorForNew && window.openEditorForNew();
+        });
+        // If openEditorForNew wasn't on window, fall back to calling
+        // it directly via the (re-exported) globals the file declares.
+        // Modern fixed_point.html declares it at top-level scope, so
+        // we re-invoke if the first attempt didn't open the modal.
+        const stillHidden = await iframe.locator('#editor-overlay').isHidden().catch(() => true);
+        if (stillHidden) {
+            await iframe.locator('body').evaluate(() => {
+                // Trigger via the eval scope — the script is in a
+                // classic <script> so identifiers are on window/global.
+                if (typeof openEditorForNew === 'function') openEditorForNew();
+            });
+        }
         await expect(iframe.locator('#editor-overlay')).toBeVisible();
         await expect(iframe.locator('#exp-id')).toHaveValue('');
         await expect(iframe.locator('#exp-name')).toHaveValue('');

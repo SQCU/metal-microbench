@@ -89,6 +89,7 @@ for (const key of KEEP) {
 }
 
 // Atomic write of settings.json.
+// LINT-OK-PREFIX-SAFE: tmp-file pid+timestamp for atomic-rename, not prompt content.
 const tmp = `${SETTINGS_JSON}.tmp-${process.pid}-${Date.now()}`;
 fs.writeFileSync(tmp, JSON.stringify(settings, null, 4));
 fs.renameSync(tmp, SETTINGS_JSON);

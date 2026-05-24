@@ -72,16 +72,35 @@ test.describe('B4 axis registry — desktop only', () => {
             .toContainText(/scored on: \d+ bios, \d+ agents/);
 
         // (5) Add axis flow.
-        await iframe.locator('#add-axis-btn').click();
-        await expect(iframe.locator('#add-form')).toBeVisible();
-        await iframe.locator('#add-id').fill(TEST_AXIS_ID);
-        await iframe.locator('#add-name').fill('PW test');
-        await iframe.locator('#add-def').fill('1: foo · 5: bar');
-        await iframe.locator('#add-kind').selectOption('bio');
-        await iframe.locator('#add-save').click();
-        // Form closes on success.
-        await expect(iframe.locator('#add-form')).toBeHidden({ timeout: 10_000 });
-        // New row visible.
+        //
+        // P-EMPTY-FORM (UX-T1, 2026-05-21, spec 78): the bare "+ Add
+        // axis" form was removed from axes.html because it was the
+        // canonical JSON-fields-as-strings anti-pattern. New axes now
+        // come from the `axis_splitter` CLI (corpus-driven). To keep
+        // this spec exercising the underlying POST /axes endpoint
+        // (which IS still supported — the registry API is intact), we
+        // POST directly here instead of driving the deleted form. The
+        // axis-card render assertion below still proves the surface
+        // reflects the new card.
+        await expect(iframe.locator('#add-axis-btn'),
+            'P-EMPTY-FORM (spec 78): "+ Add axis" button must be absent'
+        ).toHaveCount(0);
+        await expect(iframe.locator('#add-form'),
+            'P-EMPTY-FORM (spec 78): bare add-axis form must be absent'
+        ).toHaveCount(0);
+        const addResp = await request.post(`${PLUGIN_BASE}/axes/${TEST_AXIS_ID}`, {
+            data: {
+                name: 'PW test',
+                def: '1: foo · 5: bar',
+                kind: 'bio',
+                scale_min: 1,
+                scale_max: 5,
+                derived_from: null,
+            },
+        });
+        expect(addResp.status(), 'POST /axes/<id> creates the test axis').toBe(200);
+        // Trigger a refresh so the new card renders.
+        await iframe.locator('#refresh-btn').click();
         const newCard = iframe.locator(`.axis-card[data-axis-id="${TEST_AXIS_ID}"]`);
         await expect(newCard).toBeVisible({ timeout: 10_000 });
         // Server reflects it.

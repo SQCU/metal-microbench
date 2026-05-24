@@ -51,6 +51,7 @@ const EXPERIMENT_ID = process.argv[2] || 'lock_in_tetrad';
 // still carry SOMETHING traceable (a wall-clock-derived id), and the
 // audit log stays continuous even for ad-hoc runs.
 const RUN_ID = process.env.LOCK_IN_RUN_ID
+    // LINT-OK-PREFIX-SAFE: RUN_ID stamped into output filenames + audit log, not prompt content.
     || `${EXPERIMENT_ID}-cli-${new Date().toISOString().replace(/[:.]/g, '-')}`;
 
 // Load the experiment spec from the plugin. Bios, agent_targets, axis
@@ -397,4 +398,5 @@ for (const bio of BIOS) {
     }
 }
 
+// LINT-OK-PREFIX-SAFE: stdout summary log, not prompt content.
 console.log(`\n[lock_in_iterative] done. elapsed: ${((Date.now()-tAll)/1000).toFixed(1)}s`);

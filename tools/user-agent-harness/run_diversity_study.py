@@ -81,14 +81,20 @@ def load_personas():
     return out
 
 
-def bridge_call(messages, *, temperature=0.9, max_tokens=400, seed=None, reasoning_effort=None):
-    """One non-streaming chat/completions call. Returns assistant text or None."""
+def bridge_call(messages, *, seed=None, reasoning_effort=None):
+    """One non-streaming chat/completions call. Returns assistant text or None.
+
+    Per the generation-config moratorium (see
+    tools/st-debug/sillytavern-fork/plugins/user-personas/scripts/
+    lint_generation_config.mjs): no temperature / no max_tokens at the
+    caller layer. Bridge default temperature=1.0 + EOS termination apply.
+    Diversity in this study comes from the per-call seed, not from
+    sampler tweaks.
+    """
     body = {
         "model": MODEL,
         "messages": messages,
         "stream": False,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
     }
     if seed is not None:
         body["seed"] = seed
@@ -130,7 +136,7 @@ def run_conversation(persona, scringlo_sys, *, n_turns, seed):
         "role": "user",
         "content": "Begin your conversation with the character. Write only what you'd type as your first message — no quotes, no narration, no stage directions about yourself. Just your opening message.",
     }]
-    user_text = bridge_call(open_messages, temperature=0.95, max_tokens=200, seed=seed)
+    user_text = bridge_call(open_messages, seed=seed)
     user_text = user_text.strip().strip('"').strip("'")
     user_view.append({"role": "assistant", "content": user_text})  # the agent's own emission
     scringlo_view.append({"role": "user", "content": user_text})
@@ -138,7 +144,7 @@ def run_conversation(persona, scringlo_sys, *, n_turns, seed):
 
     for turn_i in range(n_turns):
         # Scringlo replies.
-        sc_text = bridge_call(scringlo_view, temperature=0.85, max_tokens=400, seed=seed + 1000 + turn_i)
+        sc_text = bridge_call(scringlo_view, seed=seed + 1000 + turn_i)
         scringlo_view.append({"role": "assistant", "content": sc_text})
         user_view.append({"role": "user", "content": sc_text})  # from agent's view, sc is the chat counterparty
         transcript.append({"role": "assistant", "text": sc_text})
@@ -147,7 +153,7 @@ def run_conversation(persona, scringlo_sys, *, n_turns, seed):
             break
 
         # User-agent responds.
-        u_text = bridge_call(user_view, temperature=0.95, max_tokens=300, seed=seed + 2000 + turn_i)
+        u_text = bridge_call(user_view, seed=seed + 2000 + turn_i)
         u_text = u_text.strip().strip('"').strip("'")
         user_view.append({"role": "assistant", "content": u_text})
         scringlo_view.append({"role": "user", "content": u_text})
@@ -159,7 +165,7 @@ def run_conversation(persona, scringlo_sys, *, n_turns, seed):
         summary = bridge_call([
             {"role": "system", "content": "Summarize the following chat turn in ONE concise sentence (under 18 words). Capture what the speaker DID communicatively (asked / claimed / reacted / changed-subject / etc.) and the substance, not just the topic. No preamble; just the sentence."},
             {"role": "user", "content": f"Speaker: {speaker}\nTurn:\n{t['text']}"},
-        ], temperature=0.3, max_tokens=80, seed=seed + 5000)
+        ], seed=seed + 5000)
         t["summary"] = summary.strip().strip('"').strip()
 
     return transcript
