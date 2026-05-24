@@ -22,7 +22,8 @@ import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
-BRIDGE_BASE = "http://127.0.0.1:8001"
+import os as _os_for_bridge_base
+BRIDGE_BASE = _os_for_bridge_base.environ.get("BRIDGE_URL", "http://127.0.0.1:8001")
 LIKERT_AXES = [
     "curious", "terse", "warm", "deferential", "performative",
     "in_character", "affective_intensity", "probe_depth", "goal_clarity",

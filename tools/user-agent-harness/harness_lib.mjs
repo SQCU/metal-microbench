@@ -5,10 +5,20 @@
 // and cluster_disambiguator.mjs each currently vendor their own copies.
 // Future refactor opportunity: migrate them to import from here.
 
-const ST     = 'http://127.0.0.1:8002';
-const BRIDGE = 'http://127.0.0.1:8001';
-const PLUGIN = `${ST}/api/plugins/user-personas`;
-const MODEL  = 'gemma-4-a4b';
+// 2026-05-24: env-driven URLs. Hardcoded host:port literals here would
+// (and did) silently break every deployment that isn't the local-canonical
+// 8001/8002 setup. The plugin that spawns this harness exports its own
+// resolved URLs as env vars so the child inherits them. Defaults match
+// the canonical local setup so legacy ad-hoc shell invocations still work.
+//
+// Lint rule (scripts/lint_port_hardcodes.mjs) forbids new literal
+// `127.0.0.1:80\d+` / `localhost:80\d+` in any source file under
+// /plugins/user-personas/ or /tools/user-agent-harness/. Add new URL
+// surfaces here, not at the literal-use site.
+const ST     = process.env.ST_URL     || 'http://127.0.0.1:8002';
+const BRIDGE = process.env.BRIDGE_URL || 'http://127.0.0.1:8001';
+const PLUGIN = process.env.PLUGIN_URL || `${ST}/api/plugins/user-personas`;
+const MODEL  = process.env.GEMMA_MODEL_NAME || 'gemma-4-a4b';
 
 export const ENDPOINTS = { ST, BRIDGE, PLUGIN, MODEL };
 

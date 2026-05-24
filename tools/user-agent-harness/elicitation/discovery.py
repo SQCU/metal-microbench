@@ -39,7 +39,9 @@ from signature import (
 )
 
 
-BRIDGE_URL = "http://localhost:8001/v1/chat/completions"
+import os as _os_for_bridge_url
+BRIDGE_URL = _os_for_bridge_url.environ.get(
+    "BRIDGE_URL", "http://localhost:8001") + "/v1/chat/completions"
 
 
 def _bridge_call(messages, max_tok=None, temperature=1.0):
@@ -95,7 +97,8 @@ def pc_interpretation(pca_layer, pc_idx: int, k: int = 5) -> str:
 
 # ─── Brief + DESIGNER prompt ────────────────────────────────────────
 
-_ST_BASE_URL = "http://localhost:8002"  # debug ST instance
+_ST_BASE_URL = _os_for_bridge_url.environ.get(
+    "ST_URL", "http://localhost:8002")  # debug ST instance
 
 
 def _load_assistant_card(path_or_name: str) -> dict | None:
