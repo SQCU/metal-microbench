@@ -258,9 +258,12 @@ test.describe('suggester resynthesis affordances (T1)', () => {
         const targetSuggestBtn = targetRow.locator('button.suggest-btn');
         const targetCompletion = targetRow.locator('.row-completion');
 
-        // Slot starts hidden / empty.
+        // Slot may already be visible from autoFireK1 (auto-poll on first paint).
+        // We click Suggest regardless — the cache-hit path handles the re-click
+        // gracefully (repaint from _previewCache, no new /poll request).
         const initiallyVisible = await targetCompletion.evaluate(el => el.classList.contains('visible'));
-        expect(initiallyVisible, '.row-completion is NOT visible before Suggest click').toBe(false);
+        // No assertion on initial visibility: the UX-T2 fix ensures top-K rows
+        // auto-stream prose on first paint, so this slot may already be populated.
 
         const pollCountBefore = pollRequests.length;
         await targetSuggestBtn.click();
@@ -284,11 +287,15 @@ test.describe('suggester resynthesis affordances (T1)', () => {
             `inline completion text is non-empty (got '${inlineText.slice(0, 60)}…')`)
             .toBeGreaterThan(3);
 
-        // The /poll endpoint was actually called.
+        // If autoFireK1 already ran (UX-T2 first-paint auto-poll), the first
+        // manual Suggest click is a cache hit — 0 new /poll fires. If autoFireK1
+        // hasn't run yet, the manual click fires exactly 1. Either way ≤1 is
+        // the correct contract: no duplicate requests, cache-correctness holds.
         const pollCountAfterFirst = pollRequests.length;
-        expect(pollCountAfterFirst - pollCountBefore,
-            `first Suggest click fires exactly one POST /poll (got ${pollCountAfterFirst - pollCountBefore})`)
-            .toBe(1);
+        const pollsFromFirstClick = pollCountAfterFirst - pollCountBefore;
+        expect(pollsFromFirstClick,
+            `first Suggest click fires ≤1 POST /poll (0 if cache hit from auto-fire, 1 if fresh) — got ${pollsFromFirstClick}`)
+            .toBeLessThanOrEqual(1);
 
         // The candidate also lands in the left-panel feed (continuity with
         // existing UX — the feed is a running history of all suggestions).
