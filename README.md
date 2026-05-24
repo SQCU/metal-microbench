@@ -8,6 +8,34 @@ A from-scratch Metal inference engine for **Gemma-4-A4B** on Apple Silicon, expo
 
 ![tetraplex — before, serialized soft-prefill (17.3s)](docs/media/tetraplex-before-multislot.gif)
 
+## canonical commits (rebase markers)
+
+The 3rd–4th rewrite cycle since the multi-agent chat suggestion thrust
+began has reproduced a recurring failure mode: an agent declares a CRUD
+feature shipped + then in subsequent "cleanup" / "unification" /
+"consistency" commits deletes feature surface or feature data. The
+following commit hashes are marked canonical at the moment the Sub-15..31
+sonnet dispatch began (2026-05-24). If features that were observably
+working at these hashes go missing in a later commit, rebase to here.
+
+- **metal-microbench main**: `24768d9f1140929e1f02fd05d4f0b91e73152e9e` (2026-05-24 02:24, "four grounding docs (re-do): pure documentation reads")
+- **sillytavern-fork toolcards**: `de653b6224b964f4fe28642080d09d1af64bd8c0` (2026-05-24 01:57, "delete vanilla PNGs from bio dir; remove the patch-over filter code")
+
+Known state at these hashes:
+- 4 canonical seed bios visible in root + st-debug: `1778631331275-DespoticMiscreant.png`, `1779035204660-scringloscrambler.png`, `rpg-rogue-cancer.png`, `rpg-wizard-sagittarius.png`
+- 4 canonical tetrad agents in `plugins/user-personas/agents/`
+- 4 tetrad axes + collapsed-set axes registered (`astrology_sagittarian`, `astrology_cancerian`, `theft_aggressiveness`, `romantic_advance` restored from archive)
+- `experiments/lock_in_tetrad.json` committed in plugin tree, gitignore exception in place
+- `src/persona-file-store.js` + tripwire in plugin `init()` + `lint_settings_persona_access.mjs` all enforce "settings.json is not a persona store"
+- Vanilla PNGs deleted from `User Avatars/` directories in both ST instances
+- Four grounding docs in `docs/_grounding_*.md` document the design state subagents should respect
+
+The "shame and dismay" protocol: if a subsequent commit causes a feature
+visible at these hashes to disappear from the live client, the operator
+forces rebase to here. The marker exists because git as a tool does not
+prevent agents from creatively destroying feature coverage during
+work-claimed-as-additive.
+
 ## docs map
 
 The engine, kernels, and bridge work is the foundation; the harness +
