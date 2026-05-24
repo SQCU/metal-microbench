@@ -256,17 +256,20 @@ def test_t4_bridge_unification():
         "shared _consume_engine_stream missing"
     assert "async def _wait_until_disconnected" in src, \
         "shared _wait_until_disconnected missing"
-    # The aggregate branch should iterate the shared coroutine.
-    assert "async for u in _consume_engine_stream(stream_id, req):" in src, \
-        "aggregate branch does not use shared coroutine"
-    # The SSE generator should iterate the same shared coroutine. The
-    # docstring of _consume_engine_stream also contains an example
-    # invocation, so we expect at least 2 (one aggregate + one SSE)
-    # and tolerate the docstring instance.
-    occurrences = src.count("async for u in _consume_engine_stream(stream_id, req)")
-    assert occurrences >= 2, (
-        f"expected at least 2 call-sites of _consume_engine_stream "
-        f"(aggregate + SSE), found {occurrences}")
+    # 2026-05-23 APPEND-LOG REFACTOR: _consume_engine_stream now yields
+    # (offset, update) tuples (driven by the per-stream append-log).
+    # Both the aggregate and SSE branches iterate the shared coroutine
+    # via `async for <offset_var>, u in _consume_engine_stream(...)`.
+    assert "_consume_engine_stream(stream_id, req)" in src, \
+        "no call-site for _consume_engine_stream(stream_id, req)"
+    # Count any tuple-form iteration (allow `_offset`, `offset`, etc.).
+    import re as _re
+    tuple_calls = _re.findall(
+        r"async for [_a-zA-Z0-9]+, u in _consume_engine_stream\(stream_id, req\)",
+        src)
+    assert len(tuple_calls) >= 2, (
+        f"expected at least 2 tuple-form call-sites of _consume_engine_stream "
+        f"(aggregate + SSE), found {len(tuple_calls)}: {tuple_calls}")
     # And the duplicate cancel-on-disconnect finally blocks should be gone.
     assert "clean_close_aggregate" not in src, \
         "stale aggregate-path cancel state lingered"
@@ -274,6 +277,12 @@ def test_t4_bridge_unification():
     # _consume_engine_stream, not in chat_completions handler body.
     assert "cancel_spec = g.StreamSpec(stream_id=stream_id, action=2)" not in src, \
         "duplicate cancel-on-disconnect block found in chat_completions"
+    # Append-log + retention machinery should be present.
+    assert "_stream_logs" in src, "append-log dict _stream_logs missing"
+    assert "_start_retention_timer" in src, \
+        "retention timer helper missing"
+    assert "_stream_log_retention_sweep" in src, \
+        "retention sweep task missing"
 
 
 if __name__ == "__main__":

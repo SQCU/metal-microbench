@@ -128,7 +128,25 @@ MODEL_NAME = os.environ.get("GEMMA_MODEL_NAME", "gemma-4-a4b")
 # ----------------------------------------------------------------------
 import threading
 
-_response_qs: dict[int, "asyncio.Queue[g.StreamUpdate]"] = {}
+# 2026-05-23 (append-log refactor): the bridge now keeps a per-stream
+# append-only log of EVERY StreamUpdate the engine emits. This is the
+# substrate for true "replay from offset" reconnect semantics — matching
+# real OpenAI/Anthropic behavior under packet loss, where a client whose
+# socket drops mid-stream can reconnect and replay the bytes it never
+# saw, not just attach to the tail of an ongoing producer.
+#
+# The asyncio.Queue is kept around purely as a NOTIFICATION mechanism:
+# the engine driver thread does `loop.call_soon_threadsafe(q.put_nowait,
+# None)` to wake any consumer awaiting new appends. The payload lives in
+# `_stream_logs[sid]`; consumers read `_stream_logs[sid][offset:]` and
+# advance their cursor.
+#
+# Memory budget (operator's "buffers are cheap, tokens are tiny"
+# principle): a StreamUpdate is ~64-128 bytes. At max_tokens=2048,
+# 2048 updates × ~96 bytes = ~200 KB per stream. 100 concurrent
+# sessions = ~20 MB. Negligible vs modern process budgets.
+_stream_logs: dict[int, list["g.StreamUpdate"]] = {}
+_response_qs: dict[int, "asyncio.Queue[None]"] = {}
 # Per-stream count of updates dropped at the _push_update_threadsafe
 # high-water gate. Used for log-cadence-throttled WARN. Cleared on
 # stream cleanup (pop from _response_qs).
@@ -186,6 +204,24 @@ _DRIVER_POLL_DEADLINE_MS = 50  # 2026-05-23: bisected from 1000 — long deadlin
 _RESPONSE_Q_HIGH_WATER = 65536
 _DISCONNECT_POLL_INTERVAL_S = 0.25
 
+# 2026-05-23 (append-log refactor): retention window for a stream's log
+# AFTER the engine emits state==2. The window lets a client reconnect
+# within N seconds even after the session naturally completed — the
+# "user walks between rooms, wifi flakes, comes back, page reloads"
+# scenario. Real OpenAI's behavior is in this same neighborhood (their
+# streams are addressable for a few minutes post-completion).
+# Env override: BRIDGE_STREAM_LOG_RETENTION_S.
+_STREAM_LOG_RETENTION_S = float(
+    os.environ.get("BRIDGE_STREAM_LOG_RETENTION_S", "300.0"))
+
+# Per-stream "this log entered retention at monotonic time T" map.
+# Populated by `_drain_until_engine_done` when it observes state==2.
+# A background sweep removes entries (and the corresponding log) once
+# `monotonic() - T > _STREAM_LOG_RETENTION_S`. If a reconnect attaches
+# while in retention, the entry is removed so retention pauses; on the
+# next disconnect-with-state==2 it's reinstated.
+_stream_log_retention_started_at: dict[int, float] = {}
+
 # 2026-05-07: deleted _conv_cache. The bridge is now stateless across
 # chat-completion requests — no warm-path adoption, no
 # message-hash-keyed memory, no LRU. Engine-side content-hash KV page
@@ -205,57 +241,71 @@ async def _next_stream_id_alloc() -> int:
 
 def _push_update_threadsafe(loop: asyncio.AbstractEventLoop,
                               update: "g.StreamUpdate") -> None:
-    """Schedule `response_q.put_nowait(update)` on the asyncio loop from
-    the native driver thread. asyncio.Queue.put_nowait is itself
-    thread-safe against the get-side; call_soon_threadsafe handles the
-    cross-thread loop wakeup. No await chain, no to_thread.
+    """Append `update` to `_stream_logs[sid]` and wake any consumer
+    awaiting new appends via the per-stream notification queue.
 
-    Overflow handling (2026-05-23 operator directive — was P5 cancel-on-
-    overflow): when qsize() crosses _RESPONSE_Q_HIGH_WATER we DROP the
-    update silently rather than telling the engine to cancel. The engine
-    has no business knowing or caring about the bridge's queue depth;
-    it owns sampling termination via its own guards (EOS, max_tokens,
-    stop sequences). Tokens are tiny (~64-128 bytes per StreamUpdate),
-    so the high-water (now 65536) gives ~8MB headroom per stream even
-    under pathological consumer-stall conditions — well within any
-    sensible budget.
+    2026-05-23 append-log refactor: the update is now stored in the
+    per-stream append-only log; the asyncio.Queue carries only a
+    `None` sentinel as a wakeup. Consumers track their own offset
+    cursor into `_stream_logs[sid]` and re-read the log slice on each
+    wakeup. This preserves all updates so a reconnect can replay from
+    any prior offset — matching real OpenAI/Anthropic semantics where
+    a flaky-network client can drop and resume mid-stream without
+    losing tokens that the producer already emitted.
 
-    Drops are logged at WARN cadence (once per 64 drops per stream) so
-    a genuinely runaway consumer-stall is still observable without
-    spamming the log.
+    The high-water gate (now applied against log length, not queue
+    qsize) still exists as a defensive ceiling, but at modern budgets
+    (~96 B/update × 65536 = ~6 MB per pathologically stalled stream)
+    it should essentially never fire in normal operation. When it does
+    fire, the engine keeps producing; the bridge silently drops the
+    overflow appends and logs at WARN cadence.
     """
-    rq = _response_qs.get(update.stream_id)
-    if rq is None:
+    sid = update.stream_id
+    log = _stream_logs.get(sid)
+    if log is None:
+        # Stream was already GC'd / never registered. Silently drop;
+        # mirrors the old `rq is None` early-return path.
         return
     # Record rolling-rate sample BEFORE the high-water drop check so
     # we still observe rate evolution even on a stalled consumer
     # (the engine is producing; tok/s metric should reflect engine
-    # throughput, not consumer behavior). dict.setdefault + deque
-    # append are both cheap and the deque is bounded, so this is
-    # safe to call from the engine driver thread (CPython dict mutation
-    # under the GIL is atomic at this granularity — no asyncio loop
-    # involvement needed).
-    samples = _stream_rate_samples.get(update.stream_id)
+    # throughput, not consumer behavior).
+    samples = _stream_rate_samples.get(sid)
     if samples is None:
         samples = deque(maxlen=_RATE_WINDOW_SAMPLES)
-        _stream_rate_samples[update.stream_id] = samples
+        _stream_rate_samples[sid] = samples
     samples.append((time.monotonic(), int(update.completion_tokens_emitted)))
-    # qsize() reads a plain int field in CPython; safe cross-thread, at
-    # most one update stale.
-    if rq.qsize() > _RESPONSE_Q_HIGH_WATER:
-        sid = update.stream_id
+    if len(log) > _RESPONSE_Q_HIGH_WATER:
         n = _drop_counts.get(sid, 0) + 1
         _drop_counts[sid] = n
         if n == 1 or (n % 64) == 0:
-            print(f"[bridge] response_q over high-water on sid={sid} "
-                  f"(qsize={rq.qsize()} > {_RESPONSE_Q_HIGH_WATER}); "
+            print(f"[bridge] stream_log over high-water on sid={sid} "
+                  f"(len={len(log)} > {_RESPONSE_Q_HIGH_WATER}); "
                   f"dropping update (dropped={n} so far). Engine continues "
                   f"— no cancel submitted.", flush=True)
         return
+    # list.append is atomic under the GIL — safe from the driver thread.
+    log.append(update)
+    # Notify any awaiting consumer. The queue is bounded but the
+    # sentinel is tiny; if it's full, the consumer will pick up the
+    # append on its next read anyway (notifications are coalesced).
+    rq = _response_qs.get(sid)
+    if rq is None:
+        return
     try:
-        loop.call_soon_threadsafe(rq.put_nowait, update)
+        loop.call_soon_threadsafe(_notify_consumer, rq)
     except RuntimeError:
-        # Loop closed during shutdown — drop the update silently.
+        # Loop closed during shutdown — drop the wakeup silently.
+        pass
+
+
+def _notify_consumer(rq: "asyncio.Queue[None]") -> None:
+    """Put a single notification sentinel onto the queue, ignoring
+    QueueFull (the consumer will see the append on its next read regardless).
+    Runs on the asyncio loop thread via call_soon_threadsafe."""
+    try:
+        rq.put_nowait(None)
+    except asyncio.QueueFull:
         pass
 
 
@@ -312,98 +362,99 @@ async def _wait_until_disconnected(request: Request) -> None:
         await asyncio.sleep(_DISCONNECT_POLL_INTERVAL_S)
 
 
-async def _consume_engine_stream(stream_id: int, request: Request):
+async def _consume_engine_stream(stream_id: int, request: Request,
+                                   from_offset: int = 0):
     """Single shared coroutine that owns engine-stream lifecycle.
 
-    Yields each StreamUpdate as it arrives from the engine. Guarantees:
-      - Races response_q.get() against client disconnect; bails out
-        within _DISCONNECT_POLL_INTERVAL_S of the client going away.
-      - On ANY non-clean exit (disconnect, exception, asyncio cancel),
-        submits opcode-2 cancel to the engine so the session is reaped.
-        "Clean exit" means the caller observed an update with
-        u.state == 2 — the engine signaled natural termination.
-      - Always pops _response_qs[stream_id] on exit.
-      - Logs (DISCONNECT) usage when the client gave up mid-stream so
-        the silent-cache-hits-on-cancel observability gap stays closed.
+    Yields `(offset, StreamUpdate)` tuples in order, starting at
+    `from_offset` (default 0 = full replay of the per-stream append-log).
 
-    Used by BOTH the aggregate (non-streaming) and SSE branches of
-    chat_completions. The branches differ only in what they do with
-    each yielded update — accumulate-then-respond, or serialize as an
-    SSE frame. This function owns the cross-cutting concerns: disconnect
-    detection, cancel-on-exit, response_q cleanup, usage logging.
-    Before this refactor those concerns were inlined separately in each
-    branch (and the non-streaming branch was missing disconnect
-    detection entirely — the bug that motivated this RCA).
+    2026-05-23 append-log refactor: the engine driver thread appends
+    every StreamUpdate to `_stream_logs[stream_id]`; this consumer
+    advances a cursor over that list and yields each entry exactly
+    once. The notification queue (`_response_qs[stream_id]`) signals
+    new appends — empty/coalesced sentinels are fine because the
+    cursor re-reads `_stream_logs[stream_id][cursor:]` on every wakeup.
+
+    Guarantees:
+      - On reach of an update with state==2 at the cursor, yields it
+        then returns ("clean close" — the engine signaled natural
+        termination).
+      - On client disconnect (within _DISCONNECT_POLL_INTERVAL_S),
+        returns without further yields. Disconnects DO NOT cancel
+        the engine session (operator directive 2026-05-23). The log
+        keeps appending; subsequent reconnect via
+        `GET /v1/streams/{id}/sse?since={N}` can replay from any prior
+        offset.
+      - The log is preserved past the disconnect for the retention
+        window (`_STREAM_LOG_RETENTION_S`) after the engine emits
+        state==2; see `_drain_until_engine_done`.
+
+    Used by BOTH the aggregate and SSE branches of chat_completions,
+    plus the reconnect endpoint. The branches differ only in what
+    they do with each yielded (offset, update). This function owns
+    the cross-cutting concerns: disconnect detection, log-cursor
+    advancement, background-drain spawn on disconnect.
 
     Caller pattern:
-        async for u in _consume_engine_stream(stream_id, req):
-            # render u as the caller's response format
+        async for offset, u in _consume_engine_stream(stream_id, req):
+            # render u as the caller's response format, embedding offset
             if u.state == 2:
                 ...  # render final state, then loop will end
         # if we get here without ever seeing u.state == 2, the
-        # client disconnected and the cancel has been submitted
+        # client disconnected; the engine session continues running
+        # and the log keeps accruing for any reconnect.
     """
     response_q = _response_qs[stream_id]
-    last_update: g.StreamUpdate | None = None
+    log = _stream_logs[stream_id]
+    cursor = int(from_offset)
+    last_yielded_update: g.StreamUpdate | None = None
     clean_close = False
     # 2026-05-23 PERF FIX: hoist disc_task OUTSIDE the loop so it lives
-    # for the duration of the stream, not per-token. Original commit
-    # 87254e8 created two fresh tasks per token (get_task + disc_task)
-    # and awaited asyncio.wait FIRST_COMPLETED on them; that pattern
-    # gave 0.16 tok/sec on aggregate-mode generation (vs ~3 tok/sec
-    # expected). Hoisting the disc_task removes the per-token
-    # create_task + cancel overhead.
-    #
-    # Semantics preserved: disc_task fires when client disconnects;
-    # we check it via .done() each iteration AND race against
-    # response_q.get() inside the loop. On disconnect, we exit + the
-    # finally block submits opcode-2 cancel. Defense-in-depth (P3
-    # engine deadline + P5 response_q overflow) still intact.
+    # for the duration of the stream, not per-iteration. Disc fires once
+    # on client disconnect; we cancel it in the finally block.
     disc_task = asyncio.create_task(_wait_until_disconnected(request))
     try:
         while True:
             # Fast path: disconnect already fired between iterations.
-            # No need to await get_task — bail out immediately.
             if disc_task.done():
                 try: disc_task.result()
                 except Exception: pass
                 break
+            # Drain everything currently in the log past our cursor.
+            # list slicing is GIL-atomic; new appends may race but
+            # we'll catch them on the next wakeup.
+            while cursor < len(log):
+                u = log[cursor]
+                cursor += 1
+                last_yielded_update = u
+                # Set clean_close BEFORE yield so a caller that breaks
+                # after seeing state==2 still triggers clean-close
+                # accounting in the finally block.
+                if u.state == 2:
+                    clean_close = True
+                yield (cursor - 1, u)
+                if clean_close:
+                    break
+            if clean_close:
+                break
+            # Cursor caught up to log tail; wait for a notification.
             get_task = asyncio.create_task(response_q.get())
             try:
-                done, pending = await asyncio.wait(
+                done, _pending = await asyncio.wait(
                     {get_task, disc_task},
                     return_when=asyncio.FIRST_COMPLETED)
             except asyncio.CancelledError:
-                # Handler task cancelled (uvicorn shutdown, timeout,
-                # etc.). Cancel both child tasks and re-raise so the
-                # finally still runs cancel-submit.
                 get_task.cancel(); disc_task.cancel()
                 raise
-            # Cancel get_task ONLY if it's pending (disc fired first).
-            # disc_task is NEVER cancelled here — it lives for the
-            # whole stream and is cancelled in the finally block.
             if disc_task in done:
                 get_task.cancel()
                 try: disc_task.result()
                 except Exception: pass
                 break
-            # get_task won. disc_task stays running for the next
-            # iteration (no per-token re-create).
-            u: g.StreamUpdate = get_task.result()
-            last_update = u
-            # Set clean_close BEFORE yield. If we set it after, a caller
-            # that `break`s out of `async for` after consuming the
-            # state==2 update would leave clean_close=False at the
-            # moment GeneratorExit propagates into this generator's
-            # frame — the finally would then submit a spurious cancel
-            # to an already-.done engine session. Setting before yield
-            # makes both "iterate to natural end" and "break after
-            # observing state==2" safe for the caller.
-            if u.state == 2:
-                clean_close = True
-            yield u
-            if clean_close:
-                break
+            # get_task won; loop back to drain freshly-appended updates.
+            # The sentinel value (None) we just received is discarded —
+            # only `_stream_logs[stream_id]` carries payload now.
     finally:
         # Always cancel the per-stream disconnect watcher we own. Idempotent.
         try: disc_task.cancel()
@@ -413,39 +464,30 @@ async def _consume_engine_stream(stream_id: int, request: Request):
         # even if disconnected 20 times a second as long as the api
         # server is there on the other side." The engine keeps prefilling
         # and generating; the prefix cache populates fully — next
-        # identical request hits warm (99.96% hit rate measured on a
-        # 2383-token ST payload).
+        # identical request hits warm.
         #
-        # 2026-05-23 CHANGE 3: on disconnect we ALSO keep the response_q
-        # alive in _response_qs so the engine's future pushes continue
-        # to land (instead of being silently dropped at the
-        # _push_update_threadsafe `rq is None` early-return). A
-        # background drain task takes over the queue and pops it ONLY
-        # after observing the engine's natural state==2 terminal update.
-        # This is the safety net that turns "disconnect tolerance" into
-        # actual prefix-cache population: the engine's terminal pushes
-        # (including the final usage update) get fully delivered into
-        # the queue and properly drained.
-        #
-        # Bounded by max_tokens × AR step time + sampling guards
-        # (~68s at 30 tok/s for max_tokens=2048); the engine-side
-        # forward-progress deadline catches any pathological stall.
+        # 2026-05-23 APPEND-LOG REFACTOR: the per-stream log captures
+        # everything the engine emits. On clean_close we mark the log
+        # for retention so a reconnect within the retention window can
+        # still replay. On disconnect, the background drain task just
+        # monitors for state==2 and triggers retention; it does NOT
+        # have to "preserve the queue" any more — the log captures
+        # everything regardless of consumer presence.
         #
         # To restore the pre-2026-05-23 aggressive-cancel behavior, set
-        # BRIDGE_CANCEL_ON_DISCONNECT=1. This exists for ops triage if a
-        # regression surfaces where engine doesn't self-bound output.
+        # BRIDGE_CANCEL_ON_DISCONNECT=1.
         import os as _os
         if clean_close:
-            # Natural completion: caller observed state==2. Safe to pop
-            # immediately — no more engine pushes coming.
-            _response_qs.pop(stream_id, None)
-            _drop_counts.pop(stream_id, None)
-            _stream_rate_samples.pop(stream_id, None)
+            # Natural completion: caller observed state==2. Mark the
+            # log for retention so a reconnect that arrives within
+            # the retention window can still replay the full sequence.
+            _start_retention_timer(stream_id)
         else:
-            if last_update is not None:
-                u = last_update
+            if last_yielded_update is not None:
+                u = last_yielded_update
                 print(f"[bridge] usage (DISCONNECT — session continues): "
                       f"stream_id={stream_id}, "
+                      f"cursor={cursor}, log_len={len(log)}, "
                       f"prompt_tokens={u.prompt_tokens_seen}, "
                       f"completion_tokens={u.completion_tokens_emitted}, "
                       f"cache_hits={u.cache_hits}, "
@@ -454,9 +496,10 @@ async def _consume_engine_stream(stream_id: int, request: Request):
                       f"state={u.state}, "
                       f"done_reason={u.done_reason}", flush=True)
             else:
-                print(f"[bridge] disconnect before first update "
-                      f"(stream_id={stream_id}); session continues — "
-                      f"prefix cache will populate from completed prefill",
+                print(f"[bridge] disconnect before first yielded update "
+                      f"(stream_id={stream_id}, cursor={cursor}, "
+                      f"log_len={len(log)}); session continues — log "
+                      f"keeps appending for any reconnect",
                       flush=True)
             if _os.environ.get("BRIDGE_CANCEL_ON_DISCONNECT") == "1":
                 try:
@@ -467,175 +510,136 @@ async def _consume_engine_stream(stream_id: int, request: Request):
                 except Exception as e:
                     print(f"[bridge] cancel-on-disconnect submit failed "
                           f"(stream_id={stream_id}): {e}", flush=True)
-                # In legacy-cancel mode we still pop right away; the
-                # cancel forces a fast state==2 and the background drain
-                # would just race the pop. Preserving the old behavior
-                # under the env-var escape hatch.
-                _response_qs.pop(stream_id, None)
-                _drop_counts.pop(stream_id, None)
-                _stream_rate_samples.pop(stream_id, None)
+                # Pop everything immediately in legacy-cancel mode.
+                _release_stream_log(stream_id)
             else:
-                # Hand the queue to a background drain task that runs
-                # until the engine emits state==2 (natural termination
-                # via sampling guards) or the engine-side forward-
-                # progress deadline fires. The drain task pops
-                # _response_qs[stream_id] on exit.
+                # The log keeps appending regardless. Spawn (or refresh)
+                # the background-drain monitor so we trigger retention
+                # when the engine emits state==2 naturally.
                 _spawn_background_drain(stream_id)
+        # Release the single-consumer slot if we held it (the initial
+        # POST does not claim it; the reconnect handler does).
+        _active_consumer_token.pop(stream_id, None)
 
 
 # Background-drain tasks for streams whose HTTP consumer disconnected.
-# Keyed by stream_id so the spawn helper can avoid double-registration
-# (defensive — _consume_engine_stream's finally only fires once per
-# generator-instance, but other future call sites might race). Tasks
-# self-remove on exit.
+# Keyed by stream_id so the spawn helper can avoid double-registration.
+# Tasks self-remove on exit.
+#
+# 2026-05-23 APPEND-LOG REFACTOR: the drain task no longer "preserves
+# the queue" or "hands off the queue to a reconnect consumer" — the
+# per-stream append-log captures everything regardless of consumer
+# presence. The drain task's ONLY remaining job is to watch for
+# state==2 and trigger the retention-window timer. If a reconnect
+# attaches before retention fires, the timer just keeps running until
+# disconnect — multi-reader semantics over an append-log don't conflict
+# with retention.
 _background_drains: dict[int, "asyncio.Task[None]"] = {}
 
-# 2026-05-23 (reconnect endpoint): per-stream coordination primitives.
-#
-# `_reconnect_takeover_events[sid]` is set by an attaching reconnect
-# consumer to signal the background drain task to release the queue.
-# When the drain task sees this event it exits WITHOUT popping
-# `_response_qs[sid]`, so the reconnect consumer can immediately start
-# pulling from the (preserved) queue.
-#
-# `_active_consumer_token[sid]` enforces single-consumer-at-a-time:
-# the value is an opaque token identifying the current owner (the
-# initial POST handler's `_consume_engine_stream` generator, or a
-# reconnect consumer's GET handler). A reconnect request that finds
-# a non-None value here returns 409 instead of doubling up on the
-# queue (asyncio.Queue.get() to two consumers would race
-# unpredictably and lose updates).
-_reconnect_takeover_events: dict[int, "asyncio.Event"] = {}
+# 2026-05-23 (reconnect endpoint): single-consumer-at-a-time gate.
+# The value is an opaque token identifying the currently-attached
+# wire consumer. We enforce this because emitting the same SSE
+# bytes to two simultaneous HTTP consumers is wasteful (and confusing
+# in logs); the log itself is multi-reader-safe, but we keep "one
+# wire reader at a time" as the public contract. A reconnect request
+# that finds the slot occupied returns 409.
 _active_consumer_token: dict[int, str] = {}
 
 
-async def _drain_until_engine_done(stream_id: int) -> None:
-    """Drain `_response_qs[stream_id]` until the engine emits state==2
-    (natural termination via EOS, max_tokens, or stop sequence), the
-    engine-side forward-progress deadline reaps the session (state==2
-    + done_reason=3 with an "abandoned" errMsg), or a reconnect
-    consumer signals takeover.
+def _start_retention_timer(stream_id: int) -> None:
+    """Mark `stream_id`'s log as retained-from-now. After
+    `_STREAM_LOG_RETENTION_S` seconds, the background sweep
+    (`_stream_log_retention_sweep`) will free the log and associated
+    state.
 
-    On natural state==2: pops the response queue + drop-count entry.
-    On reconnect takeover: exits WITHOUT popping anything; the
-    reconnect consumer becomes the new owner of the queue (it will
-    pop on its own clean exit, or respawn a fresh drain on its own
-    disconnect).
-    On cancellation: pops the queue (defensive — caller decided to
-    abandon).
-
-    Cap rationale: max_tokens + a margin worth of AR ticks at the
-    slowest sane throughput. We don't enforce a wall-clock here — the
-    engine-side `engineProgressDeadline` (formerly
-    `consumerLivenessDeadline`) is the authoritative stuck-detection
-    layer. We just iterate `response_q.get()` indefinitely; if the
-    engine never produces state==2 the engine-side reaper will, after
-    which the next get() yields the synthetic terminal update.
+    Called from `_consume_engine_stream` on clean_close (caller
+    observed state==2) and from `_drain_until_engine_done` when the
+    background monitor observes state==2. Idempotent — calling twice
+    just resets the start time, which is fine: the second call means
+    a reconnect saw state==2 again, so restarting the timer is correct
+    semantics.
     """
+    _stream_log_retention_started_at[stream_id] = time.monotonic()
+
+
+def _release_stream_log(stream_id: int) -> None:
+    """Pop ALL per-stream state. Called when the retention window
+    expires, or in legacy BRIDGE_CANCEL_ON_DISCONNECT=1 mode where the
+    log is freed immediately on disconnect."""
+    _stream_logs.pop(stream_id, None)
+    _response_qs.pop(stream_id, None)
+    _drop_counts.pop(stream_id, None)
+    _stream_rate_samples.pop(stream_id, None)
+    _stream_log_retention_started_at.pop(stream_id, None)
+    _active_consumer_token.pop(stream_id, None)
+
+
+async def _drain_until_engine_done(stream_id: int) -> None:
+    """Background monitor for streams whose wire consumer disconnected.
+
+    2026-05-23 APPEND-LOG REFACTOR: this is now a CURSOR-BASED
+    monitor over `_stream_logs[stream_id]`, not a queue-drainer.
+    It walks the log forward looking for an update with state==2,
+    then starts the retention timer. It does NOT consume the log
+    (the log is multi-reader-safe and a reconnect can still replay
+    from offset 0).
+
+    If a reconnect attaches mid-monitor, the monitor exits cleanly
+    (no work left — the wire consumer will observe state==2 itself
+    and trigger retention). The reconnect detection is via
+    `_active_consumer_token`.
+    """
+    log = _stream_logs.get(stream_id)
+    if log is None:
+        return
     rq = _response_qs.get(stream_id)
     if rq is None:
         return
-    takeover = _reconnect_takeover_events.get(stream_id)
-    drained = 0
-    handed_off = False
+    cursor = 0
     try:
-        # Hoist takeover-wait task; race it against each get().
-        takeover_task: "asyncio.Task | None" = (
-            asyncio.create_task(takeover.wait()) if takeover is not None
-            else None)
         while True:
-            if takeover_task is not None and takeover_task.done():
-                handed_off = True
+            # Drain everything currently in the log past our cursor.
+            while cursor < len(log):
+                u = log[cursor]
+                cursor += 1
+                if u.state == 2:
+                    print(f"[bridge] background drain (sid={stream_id}): "
+                          f"observed natural state==2 after scanning "
+                          f"{cursor} log entries; "
+                          f"prompt_tokens={u.prompt_tokens_seen}, "
+                          f"completion_tokens={u.completion_tokens_emitted}, "
+                          f"cache_hits={u.cache_hits}, "
+                          f"cache_misses={u.cache_misses}, "
+                          f"done_reason={u.done_reason}; "
+                          f"starting {_STREAM_LOG_RETENTION_S}s "
+                          f"retention window", flush=True)
+                    _start_retention_timer(stream_id)
+                    return
+            # Check for reconnect-takeover before waiting.
+            if stream_id in _active_consumer_token:
                 print(f"[bridge] background drain (sid={stream_id}): "
-                      f"reconnect takeover after {drained} updates; "
-                      f"releasing queue to reconnect consumer",
-                      flush=True)
-                break
-            get_task = asyncio.create_task(rq.get())
-            wait_set: set = {get_task}
-            if takeover_task is not None:
-                wait_set.add(takeover_task)
-            done, _pending = await asyncio.wait(
-                wait_set, return_when=asyncio.FIRST_COMPLETED)
-            if takeover_task is not None and takeover_task in done:
-                # If get_task ALSO completed on this tick, we'd be about
-                # to lose the consumed item. Re-enqueue it at the head
-                # by put_nowait — order doesn't matter because the
-                # reconnect consumer is about to drain everything
-                # buffered before pulling new pushes. If get_task is
-                # still pending, cancel it (asyncio.Queue.get cancellation
-                # before completion does NOT consume an item, so no loss).
-                if get_task in done:
-                    try:
-                        rescued = get_task.result()
-                        try:
-                            rq.put_nowait(rescued)
-                        except asyncio.QueueFull:
-                            print(f"[bridge] background drain "
-                                  f"(sid={stream_id}): rescued update "
-                                  f"dropped (queue full) on takeover",
-                                  flush=True)
-                    except Exception:
-                        pass
-                else:
-                    get_task.cancel()
-                handed_off = True
-                print(f"[bridge] background drain (sid={stream_id}): "
-                      f"reconnect takeover after {drained} updates; "
-                      f"releasing queue to reconnect consumer",
-                      flush=True)
-                break
-            u = get_task.result()
-            drained += 1
-            if u.state == 2:
-                print(f"[bridge] background drain (sid={stream_id}): "
-                      f"observed natural state==2 after {drained} "
-                      f"updates; "
-                      f"prompt_tokens={u.prompt_tokens_seen}, "
-                      f"completion_tokens={u.completion_tokens_emitted}, "
-                      f"cache_hits={u.cache_hits}, "
-                      f"cache_misses={u.cache_misses}, "
-                      f"done_reason={u.done_reason}", flush=True)
-                # Re-enqueue the terminal so a reconnect that races in
-                # at the very last moment still sees state==2 cleanly.
-                # We pop the queue below in the natural-completion
-                # branch, so this re-enqueue only matters if the
-                # takeover event was set in the same scheduling tick;
-                # the reconnect consumer's queue lookup happens before
-                # any awaits so the race window is tiny but real.
-                try:
-                    rq.put_nowait(u)
-                except asyncio.QueueFull:
-                    pass
-                break
+                      f"reconnect consumer attached "
+                      f"(token={_active_consumer_token[stream_id]!r}); "
+                      f"monitor handing off, wire consumer will "
+                      f"trigger retention on state==2", flush=True)
+                return
+            # Wait for a notification (new append or wakeup).
+            try:
+                await asyncio.wait_for(rq.get(),
+                                         timeout=_DISCONNECT_POLL_INTERVAL_S)
+            except asyncio.TimeoutError:
+                # Periodic wake to recheck reconnect-takeover even
+                # without a fresh append. Cheap.
+                pass
     except asyncio.CancelledError:
         print(f"[bridge] background drain (sid={stream_id}) cancelled "
-              f"after {drained} updates", flush=True)
+              f"after scanning {cursor} log entries", flush=True)
         raise
     except Exception as e:
         print(f"[bridge] background drain (sid={stream_id}) "
-              f"errored after {drained} updates: {e}", flush=True)
+              f"errored after {cursor} log entries: {e}", flush=True)
     finally:
-        # Cancel the takeover-wait task if still pending. Always pop
-        # the drain-task registry so a future _spawn_background_drain
-        # for the same sid (after another disconnect) can register.
-        try:
-            if takeover_task is not None:
-                takeover_task.cancel()
-        except Exception:
-            pass
         _background_drains.pop(stream_id, None)
-        if not handed_off:
-            # Natural completion or error: nobody else is going to
-            # consume this queue — pop it so any late engine pushes
-            # land on `rq is None` early-return in
-            # _push_update_threadsafe.
-            _response_qs.pop(stream_id, None)
-            _drop_counts.pop(stream_id, None)
-            _stream_rate_samples.pop(stream_id, None)
-            _reconnect_takeover_events.pop(stream_id, None)
-        # If handed_off: the reconnect consumer owns cleanup of all
-        # three dicts on its own exit path.
 
 
 def _spawn_background_drain(stream_id: int) -> None:
@@ -644,26 +648,49 @@ def _spawn_background_drain(stream_id: int) -> None:
     finally block (which runs on the asyncio loop thread)."""
     if stream_id in _background_drains:
         return
-    if stream_id not in _response_qs:
+    if stream_id not in _stream_logs:
         return
-    # Lazily install the takeover event (a reconnect consumer reads
-    # `_reconnect_takeover_events.get(stream_id)`; we want a single
-    # shared event per stream-id lifetime so set + wait synchronise
-    # cleanly across the drain task and the reconnect handler).
-    _reconnect_takeover_events.setdefault(stream_id, asyncio.Event())
     try:
         task = asyncio.create_task(_drain_until_engine_done(stream_id))
         _background_drains[stream_id] = task
     except RuntimeError as e:
-        # No running loop — shouldn't happen in handler context, but
-        # safest is to pop the queue and let the engine's future pushes
-        # drop at the rq is None gate.
+        # No running loop — shouldn't happen in handler context.
         print(f"[bridge] _spawn_background_drain (sid={stream_id}) "
-              f"failed: {e}; popping queue", flush=True)
-        _response_qs.pop(stream_id, None)
-        _drop_counts.pop(stream_id, None)
-        _stream_rate_samples.pop(stream_id, None)
-        _reconnect_takeover_events.pop(stream_id, None)
+              f"failed: {e}; releasing log immediately", flush=True)
+        _release_stream_log(stream_id)
+
+
+async def _stream_log_retention_sweep() -> None:
+    """Background task: every 30s, free any stream log whose retention
+    window has expired. Started in startup.
+
+    A stream is eligible for free when:
+      - It has an entry in `_stream_log_retention_started_at`
+      - monotonic() - retention_start > _STREAM_LOG_RETENTION_S
+      - NO active consumer is attached (we never free under a
+        reading consumer; the reading consumer can be replaying from
+        offset 0 of a long completed stream)
+    """
+    while True:
+        try:
+            now = time.monotonic()
+            to_free: list[int] = []
+            for sid, started_at in list(_stream_log_retention_started_at.items()):
+                if sid in _active_consumer_token:
+                    continue
+                if now - started_at > _STREAM_LOG_RETENTION_S:
+                    to_free.append(sid)
+            for sid in to_free:
+                log = _stream_logs.get(sid)
+                log_len = len(log) if log is not None else 0
+                print(f"[bridge] retention sweep: freeing sid={sid} "
+                      f"(log_len={log_len}, retained for "
+                      f"{now - _stream_log_retention_started_at.get(sid, now):.1f}s)",
+                      flush=True)
+                _release_stream_log(sid)
+        except Exception as e:
+            print(f"[bridge] retention sweep error: {e}", flush=True)
+        await asyncio.sleep(30.0)
 
 
 def _engine_driver_thread(loop: asyncio.AbstractEventLoop) -> None:
@@ -1324,6 +1351,11 @@ async def _startup() -> None:
         name="gemma-engine-driver", daemon=True)
     _engine_thread.start()
 
+    # 2026-05-23 APPEND-LOG REFACTOR: start the per-stream log retention
+    # sweep. Frees any log whose retention window has expired (default
+    # 300s after the engine emits state==2). Loops every 30s.
+    asyncio.create_task(_stream_log_retention_sweep())
+
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
@@ -1746,15 +1778,15 @@ async def chat_completions(req: Request) -> Any:
         capture_cvec_activations=capture_cvec,
         control_vectors=request_controls,
         continue_final_message=continue_final_message)
-    # Bounded queue. Maxsize is set slightly above the high-water so
-    # put_nowait doesn't QueueFull on a healthy bursty consumer that
-    # just hit the boundary by one item. Note (2026-05-23): the high-
-    # water no longer triggers an engine cancel; crossing it just
-    # causes _push_update_threadsafe to silently drop updates with a
-    # throttled WARN. See the _RESPONSE_Q_HIGH_WATER block-comment for
-    # the full rationale.
-    response_q: asyncio.Queue = asyncio.Queue(
-        maxsize=_RESPONSE_Q_HIGH_WATER + 64)
+    # 2026-05-23 APPEND-LOG REFACTOR: install both the per-stream log
+    # (the payload substrate) and the notification queue (sentinel-only).
+    # The log accepts every StreamUpdate from the engine driver thread;
+    # consumers walk an offset cursor over the log. The queue's `put_nowait(None)`
+    # wakes any awaiting consumer. Queue maxsize is small (64) because
+    # notifications are coalesced — multiple appends between consumer
+    # reads just result in (at most) one wakeup, which is fine.
+    _stream_logs[stream_id] = []
+    response_q: asyncio.Queue = asyncio.Queue(maxsize=64)
     _response_qs[stream_id] = response_q
 
     # 2026-05-07: removed conversation-state recording. Bridge is
@@ -1769,9 +1801,7 @@ async def chat_completions(req: Request) -> Any:
     # speed, not the driver's poll deadline.
     rc = g.submit([spec])
     if rc != 0:
-        _response_qs.pop(stream_id, None)
-        _drop_counts.pop(stream_id, None)
-        _stream_rate_samples.pop(stream_id, None)
+        _release_stream_log(stream_id)
         raise HTTPException(500, f"engine submit failed: rc={rc}")
     # 2026-05-23 DEBUG (st-cache investigation): trace lifecycle so we can
     # see if SSE consumers ever start iterating after submit.
@@ -1788,7 +1818,8 @@ async def chat_completions(req: Request) -> Any:
         all_thinking_tokens: list[int] = []
         collected_logprobs: list[g.TokenLogprob] = []
         terminal: g.StreamUpdate | None = None
-        async for u in _consume_engine_stream(stream_id, req):
+        # The aggregate branch ignores offsets — it just accumulates.
+        async for _offset, u in _consume_engine_stream(stream_id, req):
             all_tokens.extend(u.new_tokens)
             all_thinking_tokens.extend(u.new_thinking_tokens)
             if u.logprobs:
@@ -1967,7 +1998,20 @@ async def chat_completions(req: Request) -> Any:
         # tool-call stripper assumes its input is free of unrelated
         # special-token surface bytes.
         turn_stripper = _StreamTurnMarkerStripper()
-        async for u in _consume_engine_stream(stream_id, req):
+        # Wire-format helper for the append-log offset.
+        # 2026-05-23: prefix each SSE event with a `: offset=N` comment
+        # line so a reconnecting client can checkpoint its progress
+        # WITHOUT polluting the OpenAI-shape data payload. SSE comments
+        # (any line starting with `:`) are stripped by EventSource
+        # parsers and ignored by jq / shell tooling that filters on
+        # `data:` prefix — perfectly backwards compatible.
+        def _sse(offset: int, data_obj: dict | str) -> str:
+            if isinstance(data_obj, str):
+                # Pre-formatted (e.g. "[DONE]" sentinel).
+                return f": offset={offset}\ndata: {data_obj}\n\n"
+            return f": offset={offset}\ndata: {json.dumps(data_obj)}\n\n"
+        current_offset = 0
+        async for current_offset, u in _consume_engine_stream(stream_id, req):
             if u.new_thinking_tokens:
                 raw_delta = g.detokenize(u.new_thinking_tokens)
                 if not thinking_header_consumed:
@@ -1983,7 +2027,7 @@ async def chat_completions(req: Request) -> Any:
                 else:
                     thinking_delta = raw_delta
                 if thinking_delta:
-                    yield ("data: " + json.dumps({
+                    yield _sse(current_offset, {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": created,
@@ -1993,14 +2037,14 @@ async def chat_completions(req: Request) -> Any:
                             "delta": {"reasoning_content": thinking_delta},
                             "finish_reason": None,
                         }],
-                    }) + "\n\n")
+                    })
             if u.new_cvec_activations:
                 # Vendor extension: per-(ActiveControl, AR-step)
                 # records. Each tuple is (token_position, layer,
                 # magnitude). See server/static/steering.html for
                 # the consumer; off-path bit-identity guard is at
                 # tools/cvec_validation/baseline_logprobs.py.
-                yield ("data: " + json.dumps({
+                yield _sse(current_offset, {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
                     "created": created,
@@ -2014,7 +2058,7 @@ async def chat_completions(req: Request) -> Any:
                         ]},
                         "finish_reason": None,
                     }],
-                }) + "\n\n")
+                })
             if u.new_tokens:
                 all_tokens.extend(u.new_tokens)
                 delta_text = g.detokenize(u.new_tokens)
@@ -2027,7 +2071,7 @@ async def chat_completions(req: Request) -> Any:
                     delta_text = turn_stripper.feed(delta_text)
                     filtered = marker_stripper.feed(delta_text)
                     if filtered:
-                        yield ("data: " + json.dumps({
+                        yield _sse(current_offset, {
                             "id": completion_id,
                             "object": "chat.completion.chunk",
                             "created": created,
@@ -2037,7 +2081,7 @@ async def chat_completions(req: Request) -> Any:
                                 "delta": {"content": filtered},
                                 "finish_reason": None,
                             }],
-                        }) + "\n\n")
+                        })
             if u.state == 2:
                 # Engine-side error path: done_reason=3 + err_msg. SSE
                 # has no clean "error after partial response" shape, so
@@ -2055,7 +2099,7 @@ async def chat_completions(req: Request) -> Any:
                     err_type = ("admission_backpressure"
                                 if is_backpressure else "engine_error")
                     print(f"[bridge] (SSE) stream errored: done_reason=3 type={err_type} err_msg={err_msg!r}")
-                    yield ("data: " + json.dumps({
+                    yield _sse(current_offset, {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": created,
@@ -2066,8 +2110,8 @@ async def chat_completions(req: Request) -> Any:
                             "finish_reason": "error",
                         }],
                         "error": {"message": err_msg, "type": err_type},
-                    }) + "\n\n")
-                    yield "data: [DONE]\n\n"
+                    })
+                    yield _sse(current_offset, "[DONE]")
                     return
                 finish = "stop" if u.done_reason == 1 else (
                     "length" if u.done_reason == 2 else "stop")
@@ -2083,7 +2127,7 @@ async def chat_completions(req: Request) -> Any:
                 else:
                     final_tail = marker_stripper.flush()
                 if final_tail:
-                    yield ("data: " + json.dumps({
+                    yield _sse(current_offset, {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": created,
@@ -2093,7 +2137,7 @@ async def chat_completions(req: Request) -> Any:
                             "delta": {"content": final_tail},
                             "finish_reason": None,
                         }],
-                    }) + "\n\n")
+                    })
                 # End-of-generation tool-call extraction. The marker
                 # spans were stripped mid-stream; if any parsed cleanly
                 # here, emit a structured tool_calls delta and flip
@@ -2117,7 +2161,7 @@ async def chat_completions(req: Request) -> Any:
                             "type": tc["type"],
                             "function": tc["function"],
                         } for i, tc in enumerate(extracted)]
-                        yield ("data: " + json.dumps({
+                        yield _sse(current_offset, {
                             "id": completion_id,
                             "object": "chat.completion.chunk",
                             "created": created,
@@ -2127,8 +2171,8 @@ async def chat_completions(req: Request) -> Any:
                                 "delta": {"tool_calls": tc_deltas},
                                 "finish_reason": None,
                             }],
-                        }) + "\n\n")
-                yield ("data: " + json.dumps({
+                        })
+                yield _sse(current_offset, {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
                     "created": created,
@@ -2146,8 +2190,8 @@ async def chat_completions(req: Request) -> Any:
                         "cache_misses": u.cache_misses,
                         "vision_cache_hits": u.vision_cache_hits,
                     },
-                }) + "\n\n")
-                yield "data: [DONE]\n\n"
+                })
+                yield _sse(current_offset, "[DONE]")
                 print(f"[bridge] usage (SSE): "
                       f"prompt_tokens={u.prompt_tokens_seen}, "
                       f"completion_tokens={u.completion_tokens_emitted}, "
@@ -2157,9 +2201,9 @@ async def chat_completions(req: Request) -> Any:
                       f"done_reason={u.done_reason}")
                 return
         # If the async-for exits without hitting state==2, the client
-        # disconnected and _consume_engine_stream already submitted
-        # opcode-2 cancel + logged the DISCONNECT usage line. Nothing
-        # else to do; falling off the generator closes the SSE response.
+        # disconnected. The engine session keeps running; the append-log
+        # keeps growing. A reconnect via `GET /v1/streams/{id}/sse?since=N`
+        # can replay from any prior offset within the retention window.
     # X-Stream-Id surfaces the engine-side stream id to the client so
     # it can reconnect to `GET /v1/streams/{id}/sse` if the SSE socket
     # drops mid-generation. See `stream_reconnect_sse` below. We pick
@@ -2175,153 +2219,103 @@ async def chat_completions(req: Request) -> Any:
 # ----------------------------------------------------------------------
 # Reconnect endpoint.
 #
-# Picks up where the engine is for an in-flight session whose original
-# HTTP consumer disconnected. Pairs with the background-drain machinery
-# above: when the initial POST /v1/chat/completions handler's SSE
-# consumer disconnects, `_consume_engine_stream`'s finally block spawns
-# `_drain_until_engine_done` which preserves the response_q for any
-# subsequent reconnect.
+# 2026-05-23 APPEND-LOG REFACTOR: the reconnect endpoint is now a thin
+# wrapper that delegates to `_consume_engine_stream(stream_id, req,
+# from_offset=since)`. The per-stream append-log preserves every
+# StreamUpdate the engine has ever emitted for this stream (within
+# the retention window); a reconnect with `?since=N` replays from log
+# index N forward, then awaits future appends. This matches real
+# OpenAI/Anthropic packet-loss semantics: a client whose socket dropped
+# mid-stream can pick up EXACTLY where it left off, including bytes
+# its original consumer already drained but never rendered.
+#
+# Wire format: each SSE event is prefixed with `: offset=N\n` (SSE
+# comment line) so the client can update its cursor without parsing
+# the OAI-shape JSON. The original POST stream uses the same envelope.
 #
 # Stream-id surfacing: clients read the `X-Stream-Id` response header
-# from the initial POST. See the header-set comment at the end of
-# `chat_completions`.
+# from the initial POST.
 #
-# Single-consumer-at-a-time: a 409 is returned if another reader is
-# already attached. The active reader is tracked via
-# `_active_consumer_token`. (Multi-reader would require an event-log
-# abstraction with reader-cursors; that's a bigger lift and we opted
-# for the simpler invariant.)
+# Single-wire-consumer-at-a-time: a 409 is returned if another wire
+# reader is already attached. The append-log is multi-reader-safe in
+# principle, but emitting the same SSE bytes to two simultaneous
+# downstream sockets is wasteful and confusing in logs; keeping the
+# "one wire reader at a time" contract sidesteps that.
 #
-# Known limitation: the reconnect consumer sees ONLY updates the
-# engine pushes after attach time, PLUS whatever updates are still
-# buffered in `_response_qs[stream_id]` at attach. It does NOT replay
-# tokens that the original consumer already drained — the bridge
-# stores no event log. For "resume from exactly the position the
-# client dropped at", clients should use the `continue_final_message`
-# mechanism on a fresh POST (engine-side prefix cache makes the
-# re-prefill nearly free).
+# Retention: after the engine emits state==2, the log is kept alive
+# for `_STREAM_LOG_RETENTION_S` seconds (default 300s, env-overridable
+# via BRIDGE_STREAM_LOG_RETENTION_S). A reconnect arriving in that
+# window gets a 200 with full replay; after retention expires the
+# endpoint returns 404.
 # ----------------------------------------------------------------------
 @app.get("/v1/streams/{stream_id}/sse")
-async def stream_reconnect_sse(stream_id: int, req: Request):
-    """Attach as the (new) consumer of an in-flight engine session.
+async def stream_reconnect_sse(stream_id: int, req: Request,
+                                  since: int = 0):
+    """Attach as the (new) wire consumer of an in-flight engine session,
+    replaying from log offset `since` (default 0 = full replay).
 
-    Returns 404 if the stream id is unknown to the bridge (never
-    existed, or already GC'd after natural termination).
-    Returns 409 if another consumer is already attached.
-    Returns 200 + SSE on success; the stream emits OpenAI-shape
+    Returns 404 if the stream id is unknown (never existed, or already
+    GC'd past the retention window after natural termination).
+    Returns 409 if another wire consumer is currently attached.
+    Returns 200 + SSE on success; emits OpenAI-shape
     chat.completion.chunk frames identical in shape to the initial
-    POST /v1/chat/completions stream=true response, then `data: [DONE]`.
+    POST stream, each prefixed with a `: offset=N\\n` SSE comment line
+    that the client can read to update its replay cursor.
     """
-    if stream_id not in _response_qs:
+    if stream_id not in _stream_logs:
         raise HTTPException(404, f"stream_id={stream_id} not found "
-                                   f"(never existed or already completed)")
-    # Single-consumer-at-a-time gate. The initial POST's
-    # _consume_engine_stream sets no token here (it's the only consumer
-    # by construction), so a reconnect that races with the original
-    # client still streaming will simply double-up on the queue and
-    # interleave-corrupt — to keep that out, we require the original
-    # consumer to have given up (background drain running) before any
-    # reconnect can attach. Detect via `stream_id in _background_drains`.
-    if stream_id not in _background_drains and stream_id not in _active_consumer_token:
-        raise HTTPException(409,
-            f"stream_id={stream_id} still has its original consumer "
-            f"attached; reconnect is only valid after the initial "
-            f"client disconnects")
+                                   f"(never existed or already GC'd past "
+                                   f"retention window)")
     if stream_id in _active_consumer_token:
         raise HTTPException(409,
-            f"stream_id={stream_id} already has an attached reconnect "
+            f"stream_id={stream_id} already has an attached wire "
             f"consumer (token={_active_consumer_token[stream_id]!r}); "
             f"single-reader invariant")
+    if since < 0:
+        raise HTTPException(400, f"since={since} must be >= 0")
 
-    # Claim the consumer slot BEFORE signalling takeover, so a second
-    # concurrent reconnect that arrives between the event-set and the
-    # token-set finds the slot already taken.
+    # Claim the wire consumer slot. _consume_engine_stream's finally
+    # block will release it (we also clear it explicitly here on
+    # exit-paths to keep semantics tidy). The retention timer (if
+    # active) pauses while a consumer holds the slot; on consumer
+    # exit, if state==2 has been observed, the timer is restarted.
     token = uuid.uuid4().hex[:12]
     _active_consumer_token[stream_id] = token
+    # Pause the retention timer while this consumer is attached — a
+    # consumer that's actively replaying / awaiting future appends
+    # should not be raced against retention sweep. The timer will be
+    # reinstated via `_start_retention_timer` when the consumer
+    # observes state==2 (in `_consume_engine_stream`'s finally).
+    _stream_log_retention_started_at.pop(stream_id, None)
 
-    # Signal the background drain task to release the queue.
-    ev = _reconnect_takeover_events.get(stream_id)
-    drain_task = _background_drains.get(stream_id)
-    if ev is not None:
-        ev.set()
-    if drain_task is not None:
-        # Wait briefly for the drain to acknowledge — at most one
-        # asyncio.wait round-trip. This is mostly defensive; the drain
-        # task's wait_set already includes the takeover event so it
-        # wakes on the same tick.
-        try:
-            await asyncio.wait_for(asyncio.shield(drain_task), timeout=1.0)
-        except asyncio.TimeoutError:
-            print(f"[bridge] reconnect (sid={stream_id}): drain handoff "
-                  f"timed out waiting for drain task; proceeding anyway",
-                  flush=True)
-        except Exception:
-            pass
-
+    log_len = len(_stream_logs.get(stream_id, []))
     print(f"[bridge] reconnect attached (sid={stream_id}, "
-          f"token={token}, buffered={_response_qs[stream_id].qsize() if stream_id in _response_qs else 0})",
-          flush=True)
+          f"token={token}, since={since}, log_len={log_len}, "
+          f"replay_count={max(0, log_len - since)})", flush=True)
 
     async def gen():
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
         created = int(time.time())
         all_tokens: list[int] = []
-        # Mirror the chat_completions SSE branch's mid-stream marker
-        # stripping. Reconnect picks up wherever the engine is — there
-        # is no "I missed bytes 0..N" to filter; the stream starts at
-        # the next engine push, and any partial marker bytes would
-        # have been split across the original consumer's last delta
-        # and the first reconnect delta. The strippers re-establish
-        # invariants from this attach point forward; the result is
-        # that a marker straddling the disconnect boundary may not
-        # be stripped (worst case: client sees one literal
-        # `<|tool_call>` substring in the surfaced content). End-of-
-        # generation tool-call extraction is NOT re-run here because
-        # the reconnect consumer doesn't have the full token history.
+        # Mid-stream marker stripping. A reconnect that picks up
+        # mid-stream from offset N may see marker bytes split across
+        # the offset boundary; the strippers re-establish invariants
+        # from this attach point forward.
         marker_stripper = _StreamMarkerStripper()
         turn_stripper = _StreamTurnMarkerStripper()
-        rq = _response_qs.get(stream_id)
-        if rq is None:
-            # Race: drain task popped between our caller's check and
-            # gen-start. Send a synthetic done frame so the client
-            # gets clean SSE termination.
-            yield ("data: " + json.dumps({
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": MODEL_NAME,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }) + "\n\n")
-            yield "data: [DONE]\n\n"
-            return
-
-        disc_task = asyncio.create_task(_wait_until_disconnected(req))
-        clean_close = False
-        last_update: g.StreamUpdate | None = None
+        # Reuse the same wire-format helper as the initial POST stream.
+        def _sse(offset: int, data_obj: dict | str) -> str:
+            if isinstance(data_obj, str):
+                return f": offset={offset}\ndata: {data_obj}\n\n"
+            return f": offset={offset}\ndata: {json.dumps(data_obj)}\n\n"
+        current_offset = since
         try:
-            while True:
-                if disc_task.done():
-                    try: disc_task.result()
-                    except Exception: pass
-                    break
-                get_task = asyncio.create_task(rq.get())
-                try:
-                    done, _pending = await asyncio.wait(
-                        {get_task, disc_task},
-                        return_when=asyncio.FIRST_COMPLETED)
-                except asyncio.CancelledError:
-                    get_task.cancel()
-                    disc_task.cancel()
-                    raise
-                if disc_task in done:
-                    get_task.cancel()
-                    break
-                u: g.StreamUpdate = get_task.result()
-                last_update = u
+            async for current_offset, u in _consume_engine_stream(
+                    stream_id, req, from_offset=since):
                 if u.new_thinking_tokens:
                     raw_delta = g.detokenize(u.new_thinking_tokens)
                     if raw_delta:
-                        yield ("data: " + json.dumps({
+                        yield _sse(current_offset, {
                             "id": completion_id,
                             "object": "chat.completion.chunk",
                             "created": created,
@@ -2331,7 +2325,7 @@ async def stream_reconnect_sse(stream_id: int, req: Request):
                                 "delta": {"reasoning_content": raw_delta},
                                 "finish_reason": None,
                             }],
-                        }) + "\n\n")
+                        })
                 if u.new_tokens:
                     all_tokens.extend(u.new_tokens)
                     delta_text = g.detokenize(u.new_tokens)
@@ -2339,7 +2333,7 @@ async def stream_reconnect_sse(stream_id: int, req: Request):
                         delta_text = turn_stripper.feed(delta_text)
                         filtered = marker_stripper.feed(delta_text)
                         if filtered:
-                            yield ("data: " + json.dumps({
+                            yield _sse(current_offset, {
                                 "id": completion_id,
                                 "object": "chat.completion.chunk",
                                 "created": created,
@@ -2349,15 +2343,14 @@ async def stream_reconnect_sse(stream_id: int, req: Request):
                                     "delta": {"content": filtered},
                                     "finish_reason": None,
                                 }],
-                            }) + "\n\n")
+                            })
                 if u.state == 2:
-                    clean_close = True
                     if u.done_reason == 3:
                         err_msg = u.err_msg or "unspecified engine failure"
                         is_backpressure = err_msg.startswith("admission backpressure")
                         err_type = ("admission_backpressure"
                                     if is_backpressure else "engine_error")
-                        yield ("data: " + json.dumps({
+                        yield _sse(current_offset, {
                             "id": completion_id,
                             "object": "chat.completion.chunk",
                             "created": created,
@@ -2368,8 +2361,8 @@ async def stream_reconnect_sse(stream_id: int, req: Request):
                                 "finish_reason": "error",
                             }],
                             "error": {"message": err_msg, "type": err_type},
-                        }) + "\n\n")
-                        yield "data: [DONE]\n\n"
+                        })
+                        yield _sse(current_offset, "[DONE]")
                         return
                     finish = "stop" if u.done_reason == 1 else (
                         "length" if u.done_reason == 2 else "stop")
@@ -2379,7 +2372,7 @@ async def stream_reconnect_sse(stream_id: int, req: Request):
                     else:
                         final_tail = marker_stripper.flush()
                     if final_tail:
-                        yield ("data: " + json.dumps({
+                        yield _sse(current_offset, {
                             "id": completion_id,
                             "object": "chat.completion.chunk",
                             "created": created,
@@ -2389,8 +2382,8 @@ async def stream_reconnect_sse(stream_id: int, req: Request):
                                 "delta": {"content": final_tail},
                                 "finish_reason": None,
                             }],
-                        }) + "\n\n")
-                    yield ("data: " + json.dumps({
+                        })
+                    yield _sse(current_offset, {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": created,
@@ -2408,9 +2401,10 @@ async def stream_reconnect_sse(stream_id: int, req: Request):
                             "cache_misses": u.cache_misses,
                             "vision_cache_hits": u.vision_cache_hits,
                         },
-                    }) + "\n\n")
-                    yield "data: [DONE]\n\n"
+                    })
+                    yield _sse(current_offset, "[DONE]")
                     print(f"[bridge] usage (RECONNECT SSE sid={stream_id}): "
+                          f"replay_from={since}, final_offset={current_offset}, "
                           f"prompt_tokens={u.prompt_tokens_seen}, "
                           f"completion_tokens={u.completion_tokens_emitted}, "
                           f"cache_hits={u.cache_hits}, "
@@ -2419,34 +2413,10 @@ async def stream_reconnect_sse(stream_id: int, req: Request):
                           f"done_reason={u.done_reason}", flush=True)
                     return
         finally:
-            try: disc_task.cancel()
-            except Exception: pass
+            # _consume_engine_stream's finally has already cleared
+            # _active_consumer_token[stream_id]; defensive double-pop
+            # is a no-op.
             _active_consumer_token.pop(stream_id, None)
-            if clean_close:
-                _response_qs.pop(stream_id, None)
-                _drop_counts.pop(stream_id, None)
-                _stream_rate_samples.pop(stream_id, None)
-                _reconnect_takeover_events.pop(stream_id, None)
-            else:
-                if last_update is not None:
-                    print(f"[bridge] reconnect-consumer disconnect "
-                          f"(sid={stream_id}): last seen "
-                          f"prompt_tokens={last_update.prompt_tokens_seen}, "
-                          f"completion_tokens={last_update.completion_tokens_emitted}, "
-                          f"state={last_update.state}; session continues, "
-                          f"respawning background drain", flush=True)
-                else:
-                    print(f"[bridge] reconnect-consumer disconnect "
-                          f"(sid={stream_id}): no updates observed; "
-                          f"session continues, respawning background drain",
-                          flush=True)
-                # Reset takeover event so the next reconnect can fire
-                # it again, then respawn the background drain. The
-                # event is per-takeover-cycle.
-                ev2 = _reconnect_takeover_events.get(stream_id)
-                if ev2 is not None:
-                    ev2.clear()
-                _spawn_background_drain(stream_id)
 
     return StreamingResponse(
         gen(),

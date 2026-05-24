@@ -173,10 +173,19 @@ def _reconnect_and_consume(stream_id: int, timeout_s: float = 60.0
             buf += chunk
             while b"\n\n" in buf:
                 evt, _, buf = buf.partition(b"\n\n")
-                line = evt.decode("utf-8", "replace").strip()
-                if not line.startswith("data:"):
+                evt_text = evt.decode("utf-8", "replace")
+                # SSE event = one or more lines. We care about the
+                # `data:` line. 2026-05-23 append-log refactor: events
+                # are now prefixed with a `: offset=N` comment line
+                # for replay cursor tracking; skip non-data lines.
+                payload = None
+                for ln in evt_text.splitlines():
+                    ln = ln.strip()
+                    if ln.startswith("data:"):
+                        payload = ln[len("data:"):].strip()
+                        break
+                if payload is None:
                     continue
-                payload = line[len("data:"):].strip()
                 if payload == "[DONE]":
                     return chunks, usage
                 try:
@@ -254,18 +263,35 @@ def main() -> int:
     assert finish in ("stop", "length", "tool_calls", "error"), (
         f"unexpected finish_reason={finish!r}")
 
-    # Step 5: a second reconnect must now 404 (queue popped on
-    # clean_close in the reconnect handler's finally).
-    print(f"\n  [3] GET /v1/streams/{stream_id}/sse — must 404 post-clean-close")
+    # Step 5: a second reconnect within the retention window must
+    # SUCCEED with a full replay. 2026-05-23 APPEND-LOG REFACTOR:
+    # the bridge keeps the per-stream log alive for
+    # BRIDGE_STREAM_LOG_RETENTION_S seconds (default 300s) after the
+    # engine emits state==2; a reconnect arriving in that window gets
+    # 200 + full replay from offset 0 (matches real OpenAI/Anthropic
+    # "addressable stream id within a few minutes post-completion"
+    # semantics). Previous behavior was to pop the queue on the first
+    # consumer's clean exit → second reconnect always 404'd. The new
+    # behavior is strictly stronger.
+    print(f"\n  [3] GET /v1/streams/{stream_id}/sse — second reconnect must succeed (retention window)")
     try:
-        _reconnect_and_consume(stream_id, timeout_s=5)
-        print(f"  ✗ second reconnect succeeded — queue should have been popped")
-        return 1
+        chunks2, usage2 = _reconnect_and_consume(stream_id, timeout_s=60)
     except urllib.error.HTTPError as e:
-        if e.code != 404:
-            print(f"  ✗ expected 404, got {e.code}")
-            return 1
-        print(f"      404 as expected")
+        body = e.read().decode("utf-8", "replace") if e.fp else ""
+        print(f"  ✗ second reconnect failed: HTTP {e.code} — {body[:200]}")
+        return 1
+    if usage2 is None:
+        print(f"  ✗ second reconnect did not deliver usage")
+        return 1
+    print(f"      second reconnect delivered {len(chunks2)} chunks; "
+          f"usage prompt_tokens={usage2.get('prompt_tokens')}, "
+          f"completion_tokens={usage2.get('completion_tokens')}")
+    # Replay equivalence: the completion_tokens count must match the
+    # first reconnect (same underlying log).
+    assert usage2.get("completion_tokens") == usage.get("completion_tokens"), (
+        f"replay-divergence: first reconnect saw "
+        f"completion_tokens={usage.get('completion_tokens')}, second saw "
+        f"{usage2.get('completion_tokens')}")
 
     print(f"\n  PASS")
     return 0
