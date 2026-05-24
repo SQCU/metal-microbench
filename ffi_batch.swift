@@ -1086,16 +1086,20 @@ public func gemma_poll(_ timeoutMs: Int32,
         //    NO REMOTE LOCKS principle forbids; engine-side page-cache
         //    handles prefix reuse passively at the page_manager layer.
 
-        // 2026-05-18 (post-RCA): expire sessions whose bridge consumer
-        // appears dead. Runs BEFORE the work step so no scheduler
-        // ticks are wasted on abandoned streams (the freshly-marked
-        // .done sessions drop out of .wantsSlot immediately, so
-        // tick()'s admission pass sees the slot as free for live
-        // work). The cleanup pass at the bottom of this poll then
-        // closeSession's them, releasing pages.
+        // Reap sessions whose engine-side forward progress has stalled
+        // beyond engineProgressDeadline. Runs BEFORE the work step so
+        // no scheduler ticks are wasted on stuck streams (the freshly-
+        // marked .done sessions drop out of .wantsSlot immediately, so
+        // tick()'s admission pass sees the slot as free for live work).
+        // The cleanup pass at the bottom of this poll then closeSession's
+        // them, releasing pages.
+        //
+        // 2026-05-23 rename note: was `expireAbandonedSessions`. Stuck-
+        // detection is engine-internal (position-counter advance), not
+        // bridge/consumer coupling.
         //
         // O(n_active) per drive iteration; negligible.
-        engine.expireAbandonedSessions()
+        engine.expireStalledSessions()
 
         // 3. Drive one chunk if there's work.
         // 2026-05-07: populate per-slot GPU capture buffers BEFORE
@@ -1260,7 +1264,7 @@ public func gemma_poll(_ timeoutMs: Int32,
     // future callback or off-thread mutation) and didn't produce a
     // state==2 StreamUpdate in the current poll's `updates` array.
     // O(active_streams) cost — negligible against the AR-tick budget.
-    // expireAbandonedSessions does its own immediate closeSession now,
+    // expireStalledSessions does its own immediate closeSession now,
     // so this sweep usually does nothing on healthy runs; it's the
     // backstop for paths we haven't anticipated. Counter exposed for
     // observability (task #179 RCA).

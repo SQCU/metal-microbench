@@ -1024,22 +1024,17 @@ final class Session {
     var logprobsQueue: [LogprobRecord] = []
     var lastReportedOutputCount: Int = 0
 
-    // Forward-progress liveness pair. The engine-side backstop in the
-    // 2026-05-18 lifecycle-safety triple:
-    //   (1) bridge bounded response_q + overflow-cancel (P5)
-    //   (2) bridge request.is_disconnected() poll in
-    //       _consume_engine_stream (P1)
-    //   (3) ← this engine-side liveness deadline (P3)
-    // Each layer alone is sufficient under typical failure modes. All
-    // three together guarantee that a dead-consumer stream cannot run
-    // for longer than consumerLivenessDeadline seconds, ever — even if
-    // the bridge is alive-but-hung, even if asyncio fails to propagate
-    // cancellation, even if queue-overflow detection is defeated.
+    // Forward-progress liveness pair. The engine-internal stuck-
+    // detection layer. After the 2026-05-23 bridge⇄engine separation
+    // there is no consumer-coupling here — this is purely "did my own
+    // position counter advance?" The bridge owns disconnect detection
+    // and queue-depth backpressure on its side; the engine self-cleans
+    // any session whose own forward progress stalls.
     //
     // Signal: `position` strictly increases during BOTH prefill (every
     // chunk consumed advances by chunk size) AND AR generation (every
     // sampled token advances by 1). If position hasn't advanced for
-    // consumerLivenessDeadline seconds AND the session is in .priming
+    // engineProgressDeadline seconds AND the session is in .priming
     // or .generating, the session is stuck and gets transitioned to
     // .done with doneReason=3 + an explanatory errMsg.
     //
@@ -1049,7 +1044,7 @@ final class Session {
     // advancing chunk by chunk. A fanout-based signal would falsely
     // expire those sessions.
     //
-    // Maintained entirely by expireAbandonedSessions (called from
+    // Maintained entirely by expireStalledSessions (called from
     // gemma_poll's drive loop); no other call site touches these
     // fields. bindStream initializes both at request-time so a brand-
     // new session gets ≥1 deadline window of grace.
@@ -1579,9 +1574,9 @@ final class LmEngine {
     private(set) var requestForStream: [UInt64: Session] = [:]
     func bindStream(_ s: Session, streamId sid: UInt64) {
         s.streamId = sid
-        // Reset liveness clock on bind so a freshly-submitted session
-        // gets ≥1 full consumerLivenessDeadline of grace before
-        // expireAbandonedSessions could ever sample its position.
+        // Reset progress clock on bind so a freshly-submitted session
+        // gets ≥1 full engineProgressDeadline of grace before
+        // expireStalledSessions could ever sample its position.
         s.lastSeenPosition = s.position
         s.lastForwardProgressAt = Date()
         requestForStream[sid] = s
@@ -1593,21 +1588,31 @@ final class LmEngine {
         }
     }
 
-    // Consumer-liveness deadline for the abandoned-session reaper.
+    // Engine-progress deadline for the stalled-session reaper.
+    //
+    // SEMANTIC (2026-05-23 rename): this is NOT a "consumer liveness"
+    // signal — the engine does not observe consumer state. The check
+    // is purely engine-internal: did the session's `position` advance
+    // within the last `engineProgressDeadline` seconds?
+    //
     // 60s is generous: a healthy session advances position at AR-tick
     // speed (~25ms per token) or prefill-chunk speed (multiple tokens
     // per chunk). 60s with no position advance means the session is
-    // either (a) a dead-consumer stream still running because the
-    // bridge's disconnect-detection failed (the RCA scenario), or (b)
-    // an admission-backpressure stream that hasn't seen a slot in over
-    // a minute (operationally indistinguishable from "stuck"). Both
-    // deserve termination. See Session.lastForwardProgressAt for the
-    // full RCA reference.
-    static let consumerLivenessDeadline: TimeInterval = 60.0
+    // genuinely stuck (an admission-backpressure stream that hasn't
+    // seen a slot, a runaway condition in the scheduler, etc.). Such
+    // sessions get reaped with doneReason=3.
+    //
+    // The previous name (`consumerLivenessDeadline`) was misleading:
+    // it conflated "engine session not advancing" with "bridge consumer
+    // is dead". After the 2026-05-23 separation, those are independent
+    // concerns and only the former is the engine's business — the
+    // bridge handles all client/consumer disconnect logic on its side
+    // and the engine continues regardless. See Session.lastForwardProgressAt.
+    static let engineProgressDeadline: TimeInterval = 60.0
 
     /// Reap sessions whose forward progress has stalled. A session is
-    /// abandoned when it is in .priming or .generating AND its
-    /// `position` hasn't advanced for `consumerLivenessDeadline`
+    /// stalled when it is in .priming or .generating AND its
+    /// `position` hasn't advanced for `engineProgressDeadline`
     /// seconds. We transition each such session to .done with
     /// doneReason=3 (engine error) AND IMMEDIATELY call closeSession
     /// to release pages + unbind from requestForStream on the same
@@ -1615,7 +1620,7 @@ final class LmEngine {
     /// on the FFI pump's cleanup pass (`for u in updates where u.state
     /// == 2 { closeSession(u) }`) to do the actual reap — but that
     /// cleanup only fires when a state==2 StreamUpdate exists in the
-    /// pump's poll output, and expireAbandonedSessions doesn't emit
+    /// pump's poll output, and expireStalledSessions doesn't emit
     /// one. So reaped sessions stayed in `requestForStream` forever,
     /// accumulating to 14+ over a long session (the 400x slowdown
     /// pathology that motivated task #179). Reap and unbind here.
@@ -1626,12 +1631,18 @@ final class LmEngine {
     /// falsely expire long-prefill sessions whose chunks aren't yet
     /// producing AR tokens.
     ///
+    /// 2026-05-23 rename note: was `expireAbandonedSessions`. This is
+    /// engine-internal stuck-detection — NOT consumer coupling. The
+    /// engine has no view into bridge or client state; it only checks
+    /// whether its own position counter advanced. Bridge consumer
+    /// liveness is fully owned by the bridge.
+    ///
     /// Called from gemma_poll's drive loop before each work step. The
     /// O(active_streams) iteration cost is negligible against the AR-
     /// tick budget — there are typically ≤ 16 active streams.
-    func expireAbandonedSessions() {
+    func expireStalledSessions() {
         let now = Date()
-        let deadline = LmEngine.consumerLivenessDeadline
+        let deadline = LmEngine.engineProgressDeadline
         // Collect-then-close: closeSession mutates requestForStream
         // (via unbindStream); iterating that dict's values while
         // removing from it is undefined behavior in Swift's Dictionary.
@@ -1649,14 +1660,14 @@ final class LmEngine {
             }
             let stalled = now.timeIntervalSince(s.lastForwardProgressAt)
             if stalled > deadline {
-                print("[engine] expireAbandonedSessions: "
+                print("[engine] expireStalledSessions: "
                     + "sid=\(s.streamId) state=\(s.state) "
                     + "stalled=\(Int(stalled))s position=\(s.position) "
                     + "numGenerated=\(s.numGenerated) "
-                    + "→ .done(consumer abandoned) + closeSession")
+                    + "→ .done(engine-progress stall) + closeSession")
                 s.state = .done
                 s.doneReason = 3   // engine error (surfaces as 500 / SSE error)
-                s.errMsg = "consumer abandoned: position stalled at "
+                s.errMsg = "engine-progress stall: position stuck at "
                     + "\(s.position) for \(Int(stalled))s "
                     + "(deadline=\(Int(deadline))s, "
                     + "stream_id=\(s.streamId))"

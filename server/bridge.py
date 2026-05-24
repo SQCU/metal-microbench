@@ -128,6 +128,10 @@ MODEL_NAME = os.environ.get("GEMMA_MODEL_NAME", "gemma-4-a4b")
 import threading
 
 _response_qs: dict[int, "asyncio.Queue[g.StreamUpdate]"] = {}
+# Per-stream count of updates dropped at the _push_update_threadsafe
+# high-water gate. Used for log-cadence-throttled WARN. Cleared on
+# stream cleanup (pop from _response_qs).
+_drop_counts: dict[int, int] = {}
 _next_stream_id_lock: "asyncio.Lock | None" = None
 _next_stream_id = 1
 _engine_thread: "threading.Thread | None" = None
@@ -144,30 +148,29 @@ _TURN_END_TOKENS: list[int] = []         # set at startup; chat-template end-of-
 # to-back regardless of the deadline.
 _DRIVER_POLL_DEADLINE_MS = 50  # 2026-05-23: bisected from 1000 — long deadline starved aggregate-mode handlers (0.16 tok/sec). Short deadline restores cooperative cycling.
 
-# 2026-05-18: response-queue depth high-water mark and disconnect-poll
-# cadence — the lifecycle-safety pair that prevents the "stream
-# pretending to autoregress at 100× slowdown forever" failure mode.
-# Root-cause analysis lived as commit message in this same change; in
-# brief: the non-streaming chat_completions handler used to await
-# response_q.get() with no client-disconnect detection. When the HTTP
-# client died, the handler awaited forever, the engine kept generating
-# into a dead queue, and engine.requestForStream[sid] leaked. Fix is
-# three-way defense-in-depth:
-#   (1) HIGH_WATER bound: driver thread checks qsize() before pushing.
-#       When qsize > HIGH_WATER, consumer is presumed dead — submit
-#       opcode-2 cancel and stop pushing. Catches dead handlers without
-#       requiring asyncio to detect them.
-#   (2) DISCONNECT_POLL: in _consume_engine_stream, race response_q.get()
-#       against request.is_disconnected(). Catches TCP RST / cancel /
-#       client kill within at most _DISCONNECT_POLL_INTERVAL_S.
-#   (3) Engine-side consumer-liveness deadline (lm_engine.swift):
-#       Session.lastForwardProgressAt + expireAbandonedSessions. The ultimate
-#       backstop: even if both bridge mechanisms fail, the engine
-#       self-cleans after T_STALE seconds of no productive fanout.
-# 256 is generous: a healthy SSE consumer drains ~1 update per AR tick
-# (~25ms canonical, ~100ms throttled). qsize > 256 means the handler
-# has been silent for 6-25 seconds — long enough to call "dead".
-_RESPONSE_Q_HIGH_WATER = 256
+# 2026-05-23 (operator directive): the response-queue high-water no
+# longer triggers an engine cancel. It now ONLY decides when the bridge
+# starts silently dropping updates (per `_push_update_threadsafe`). The
+# engine continues running unaware of bridge queue depth — sampling
+# termination is engine-owned (EOS, max_tokens, stop sequences).
+#
+# Sizing rationale at 65536: each StreamUpdate is ~64-128 bytes; 65k
+# updates is ~8MB headroom per stream — trivial against modern process
+# memory budgets. This gives any conceivable consumer-stall scenario
+# (a hung downstream HTTP write, an SSE client backpressuring at ~0
+# tok/sec) tens of minutes of full-rate buffering before drops kick in.
+# At canonical 30 tok/s that's ~36 minutes of total stall budget. The
+# previous 256 was a "presumed-dead" threshold tied to the cancel-on-
+# overflow logic; once cancel-on-overflow is gone the small cap had
+# no defensive value.
+#
+# Legacy P5 narrative (kept for historians, see git blame for the
+# previous 256 era): the original 2026-05-18 design wired three layers
+# of dead-consumer defense: bridge HIGH_WATER cancel (P5), bridge
+# is_disconnected() poll (P1), engine forward-progress deadline (P3).
+# Only P1 + P3 remain. The engine no longer cares whether the bridge
+# is consuming — it self-terminates on sampling guards regardless.
+_RESPONSE_Q_HIGH_WATER = 65536
 _DISCONNECT_POLL_INTERVAL_S = 0.25
 
 # 2026-05-07: deleted _conv_cache. The bridge is now stateless across
@@ -194,30 +197,34 @@ def _push_update_threadsafe(loop: asyncio.AbstractEventLoop,
     thread-safe against the get-side; call_soon_threadsafe handles the
     cross-thread loop wakeup. No await chain, no to_thread.
 
-    Overflow protection (P5 of the 2026-05-18 RCA): qsize() crossing
-    _RESPONSE_Q_HIGH_WATER means the handler consumer hasn't drained in
-    many seconds — presumed dead. Submit opcode-2 cancel and drop the
-    update. Engine ignores cancel on already-.done sessions, so
-    repeated overflow events are idempotent. This catches the case
-    where the handler is alive but stuck (e.g. blocked on a downstream
-    HTTP write to a half-dead socket that uvicorn hasn't yet detected),
-    which the in-handler is_disconnected() poll alone wouldn't see.
+    Overflow handling (2026-05-23 operator directive — was P5 cancel-on-
+    overflow): when qsize() crosses _RESPONSE_Q_HIGH_WATER we DROP the
+    update silently rather than telling the engine to cancel. The engine
+    has no business knowing or caring about the bridge's queue depth;
+    it owns sampling termination via its own guards (EOS, max_tokens,
+    stop sequences). Tokens are tiny (~64-128 bytes per StreamUpdate),
+    so the high-water (now 65536) gives ~8MB headroom per stream even
+    under pathological consumer-stall conditions — well within any
+    sensible budget.
+
+    Drops are logged at WARN cadence (once per 64 drops per stream) so
+    a genuinely runaway consumer-stall is still observable without
+    spamming the log.
     """
     rq = _response_qs.get(update.stream_id)
     if rq is None:
         return
     # qsize() reads a plain int field in CPython; safe cross-thread, at
-    # most one update stale. False positive of "single tick of overflow"
-    # is harmless: the cancel is idempotent and the handler exits its
-    # own loop cleanly on the resulting state==2 yield.
+    # most one update stale.
     if rq.qsize() > _RESPONSE_Q_HIGH_WATER:
-        print(f"[bridge] response_q overflow on sid={update.stream_id} "
-              f"(qsize={rq.qsize()} > {_RESPONSE_Q_HIGH_WATER}) — "
-              f"consumer presumed dead, submitting cancel", flush=True)
-        try:
-            g.submit([g.StreamSpec(stream_id=update.stream_id, action=2)])
-        except Exception as e:
-            print(f"[bridge] overflow-cancel submit failed: {e}", flush=True)
+        sid = update.stream_id
+        n = _drop_counts.get(sid, 0) + 1
+        _drop_counts[sid] = n
+        if n == 1 or (n % 64) == 0:
+            print(f"[bridge] response_q over high-water on sid={sid} "
+                  f"(qsize={rq.qsize()} > {_RESPONSE_Q_HIGH_WATER}); "
+                  f"dropping update (dropped={n} so far). Engine continues "
+                  f"— no cancel submitted.", flush=True)
         return
     try:
         loop.call_soon_threadsafe(rq.put_nowait, update)
@@ -335,15 +342,45 @@ async def _consume_engine_stream(stream_id: int, request: Request):
             if clean_close:
                 break
     finally:
-        if not clean_close:
-            # Cancel-on-non-clean-exit. Fires on:
-            #   - client disconnect (disc_task won the race)
-            #   - asyncio cancellation (uvicorn / handler timeout)
-            #   - caller-side exception during `yield u` (raises
-            #     through the generator's frame to this finally)
+        # Always cancel the per-stream disconnect watcher we own. Idempotent.
+        try: disc_task.cancel()
+        except Exception: pass
+        # 2026-05-23 OPERATOR DIRECTIVE: client disconnects no longer
+        # cancel the engine session. Rationale: "session should continue
+        # even if disconnected 20 times a second as long as the api
+        # server is there on the other side." The engine keeps prefilling
+        # and generating; the prefix cache populates fully — next
+        # identical request hits warm (99.96% hit rate measured on a
+        # 2383-token ST payload).
+        #
+        # 2026-05-23 CHANGE 3: on disconnect we ALSO keep the response_q
+        # alive in _response_qs so the engine's future pushes continue
+        # to land (instead of being silently dropped at the
+        # _push_update_threadsafe `rq is None` early-return). A
+        # background drain task takes over the queue and pops it ONLY
+        # after observing the engine's natural state==2 terminal update.
+        # This is the safety net that turns "disconnect tolerance" into
+        # actual prefix-cache population: the engine's terminal pushes
+        # (including the final usage update) get fully delivered into
+        # the queue and properly drained.
+        #
+        # Bounded by max_tokens × AR step time + sampling guards
+        # (~68s at 30 tok/s for max_tokens=2048); the engine-side
+        # forward-progress deadline catches any pathological stall.
+        #
+        # To restore the pre-2026-05-23 aggressive-cancel behavior, set
+        # BRIDGE_CANCEL_ON_DISCONNECT=1. This exists for ops triage if a
+        # regression surfaces where engine doesn't self-bound output.
+        import os as _os
+        if clean_close:
+            # Natural completion: caller observed state==2. Safe to pop
+            # immediately — no more engine pushes coming.
+            _response_qs.pop(stream_id, None)
+            _drop_counts.pop(stream_id, None)
+        else:
             if last_update is not None:
                 u = last_update
-                print(f"[bridge] usage (DISCONNECT): "
+                print(f"[bridge] usage (DISCONNECT — session continues): "
                       f"stream_id={stream_id}, "
                       f"prompt_tokens={u.prompt_tokens_seen}, "
                       f"completion_tokens={u.completion_tokens_emitted}, "
@@ -354,14 +391,106 @@ async def _consume_engine_stream(stream_id: int, request: Request):
                       f"done_reason={u.done_reason}", flush=True)
             else:
                 print(f"[bridge] disconnect before first update "
-                      f"(stream_id={stream_id}); submitting cancel",
+                      f"(stream_id={stream_id}); session continues — "
+                      f"prefix cache will populate from completed prefill",
                       flush=True)
-            try:
-                g.submit([g.StreamSpec(stream_id=stream_id, action=2)])
-            except Exception as e:
-                print(f"[bridge] cancel-on-disconnect submit failed "
-                      f"(stream_id={stream_id}): {e}", flush=True)
+            if _os.environ.get("BRIDGE_CANCEL_ON_DISCONNECT") == "1":
+                try:
+                    g.submit([g.StreamSpec(stream_id=stream_id, action=2)])
+                    print(f"[bridge] BRIDGE_CANCEL_ON_DISCONNECT=1: "
+                          f"cancel submitted (stream_id={stream_id})",
+                          flush=True)
+                except Exception as e:
+                    print(f"[bridge] cancel-on-disconnect submit failed "
+                          f"(stream_id={stream_id}): {e}", flush=True)
+                # In legacy-cancel mode we still pop right away; the
+                # cancel forces a fast state==2 and the background drain
+                # would just race the pop. Preserving the old behavior
+                # under the env-var escape hatch.
+                _response_qs.pop(stream_id, None)
+                _drop_counts.pop(stream_id, None)
+            else:
+                # Hand the queue to a background drain task that runs
+                # until the engine emits state==2 (natural termination
+                # via sampling guards) or the engine-side forward-
+                # progress deadline fires. The drain task pops
+                # _response_qs[stream_id] on exit.
+                _spawn_background_drain(stream_id)
+
+
+# Background-drain tasks for streams whose HTTP consumer disconnected.
+# Keyed by stream_id so the spawn helper can avoid double-registration
+# (defensive — _consume_engine_stream's finally only fires once per
+# generator-instance, but other future call sites might race). Tasks
+# self-remove on exit.
+_background_drains: dict[int, "asyncio.Task[None]"] = {}
+
+
+async def _drain_until_engine_done(stream_id: int) -> None:
+    """Drain `_response_qs[stream_id]` until the engine emits state==2
+    (natural termination via EOS, max_tokens, or stop sequence) or the
+    engine-side forward-progress deadline reaps the session
+    (state==2 + done_reason=3 with an "abandoned" errMsg). On exit,
+    pops the response queue and drop-count entry.
+
+    Cap rationale: max_tokens + a margin worth of AR ticks at the
+    slowest sane throughput. We don't enforce a wall-clock here — the
+    engine-side `engineProgressDeadline` (formerly
+    `consumerLivenessDeadline`) is the authoritative stuck-detection
+    layer. We just iterate `response_q.get()` indefinitely; if the
+    engine never produces state==2 the engine-side reaper will, after
+    which the next get() yields the synthetic terminal update.
+    """
+    rq = _response_qs.get(stream_id)
+    if rq is None:
+        return
+    drained = 0
+    try:
+        while True:
+            u = await rq.get()
+            drained += 1
+            if u.state == 2:
+                print(f"[bridge] background drain (sid={stream_id}): "
+                      f"observed natural state==2 after {drained} "
+                      f"updates; "
+                      f"prompt_tokens={u.prompt_tokens_seen}, "
+                      f"completion_tokens={u.completion_tokens_emitted}, "
+                      f"cache_hits={u.cache_hits}, "
+                      f"cache_misses={u.cache_misses}, "
+                      f"done_reason={u.done_reason}", flush=True)
+                break
+    except asyncio.CancelledError:
+        print(f"[bridge] background drain (sid={stream_id}) cancelled "
+              f"after {drained} updates", flush=True)
+        raise
+    except Exception as e:
+        print(f"[bridge] background drain (sid={stream_id}) "
+              f"errored after {drained} updates: {e}", flush=True)
+    finally:
         _response_qs.pop(stream_id, None)
+        _drop_counts.pop(stream_id, None)
+        _background_drains.pop(stream_id, None)
+
+
+def _spawn_background_drain(stream_id: int) -> None:
+    """Start a background drain task for `stream_id` if not already
+    running. Idempotent; safe to call from `_consume_engine_stream`'s
+    finally block (which runs on the asyncio loop thread)."""
+    if stream_id in _background_drains:
+        return
+    if stream_id not in _response_qs:
+        return
+    try:
+        task = asyncio.create_task(_drain_until_engine_done(stream_id))
+        _background_drains[stream_id] = task
+    except RuntimeError as e:
+        # No running loop — shouldn't happen in handler context, but
+        # safest is to pop the queue and let the engine's future pushes
+        # drop at the rq is None gate.
+        print(f"[bridge] _spawn_background_drain (sid={stream_id}) "
+              f"failed: {e}; popping queue", flush=True)
+        _response_qs.pop(stream_id, None)
+        _drop_counts.pop(stream_id, None)
 
 
 def _engine_driver_thread(loop: asyncio.AbstractEventLoop) -> None:
@@ -1395,7 +1524,18 @@ async def chat_completions(req: Request) -> Any:
           f"messages={len(messages)}, stream={stream}, "
           f"stop_seqs={len(sampling.stop_sequences)}, "
           f"reasoning_effort={re_raw!r}, capture_cvec={capture_cvec}, "
-          f"continue_final_message={continue_final_message}")
+          f"continue_final_message={continue_final_message}", flush=True)
+    # 2026-05-23 DEBUG (st-cache investigation): dump big-prompt requests
+    # to disk so we can replay them via curl deterministically.
+    import os as _os, json as _json
+    if _os.environ.get("BRIDGE_DUMP_REQUESTS") == "1" and len(messages) >= 2:
+        try:
+            _dump_path = f"/tmp/bridge_request_{int(__import__('time').time()*1000)}.json"
+            with open(_dump_path, "w") as _f:
+                _json.dump(body, _f, indent=2, default=str)
+            print(f"[bridge DEBUG] dumped request to {_dump_path}", flush=True)
+        except Exception as _e:
+            print(f"[bridge DEBUG] dump failed: {_e}", flush=True)
     stream_id = await _next_stream_id_alloc()
     spec, _ = _build_stream_spec(
         stream_id, messages, sampling, capture_logits, tools=tools,
@@ -1403,12 +1543,13 @@ async def chat_completions(req: Request) -> Any:
         capture_cvec_activations=capture_cvec,
         control_vectors=request_controls,
         continue_final_message=continue_final_message)
-    # Bounded queue (2026-05-18 RCA P5): a dead consumer would otherwise
-    # let the driver thread push unbounded updates with no signal back.
-    # _push_update_threadsafe checks qsize() against _RESPONSE_Q_HIGH_WATER
-    # and submits opcode-2 cancel when crossed. maxsize is set slightly
-    # above the high-water so put_nowait doesn't QueueFull on a healthy
-    # bursty consumer that just hit the boundary by one item.
+    # Bounded queue. Maxsize is set slightly above the high-water so
+    # put_nowait doesn't QueueFull on a healthy bursty consumer that
+    # just hit the boundary by one item. Note (2026-05-23): the high-
+    # water no longer triggers an engine cancel; crossing it just
+    # causes _push_update_threadsafe to silently drop updates with a
+    # throttled WARN. See the _RESPONSE_Q_HIGH_WATER block-comment for
+    # the full rationale.
     response_q: asyncio.Queue = asyncio.Queue(
         maxsize=_RESPONSE_Q_HIGH_WATER + 64)
     _response_qs[stream_id] = response_q
@@ -1426,7 +1567,12 @@ async def chat_completions(req: Request) -> Any:
     rc = g.submit([spec])
     if rc != 0:
         _response_qs.pop(stream_id, None)
+        _drop_counts.pop(stream_id, None)
         raise HTTPException(500, f"engine submit failed: rc={rc}")
+    # 2026-05-23 DEBUG (st-cache investigation): trace lifecycle so we can
+    # see if SSE consumers ever start iterating after submit.
+    print(f"[bridge DEBUG] submitted stream_id={stream_id} rc={rc} stream={stream}",
+          flush=True)
 
     if not stream:
         # Aggregate (non-streaming) path. Iterates the shared consumer
