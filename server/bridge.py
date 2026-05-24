@@ -204,23 +204,42 @@ _DRIVER_POLL_DEADLINE_MS = 50  # 2026-05-23: bisected from 1000 — long deadlin
 _RESPONSE_Q_HIGH_WATER = 65536
 _DISCONNECT_POLL_INTERVAL_S = 0.25
 
-# 2026-05-23 (append-log refactor): retention window for a stream's log
-# AFTER the engine emits state==2. The window lets a client reconnect
-# within N seconds even after the session naturally completed — the
-# "user walks between rooms, wifi flakes, comes back, page reloads"
-# scenario. Real OpenAI's behavior is in this same neighborhood (their
-# streams are addressable for a few minutes post-completion).
-# Env override: BRIDGE_STREAM_LOG_RETENTION_S.
-_STREAM_LOG_RETENTION_S = float(
-    os.environ.get("BRIDGE_STREAM_LOG_RETENTION_S", "300.0"))
+# 2026-05-23 (append-log refactor; 2026-05-24 retention-policy revision):
+# Completed-stream LRU cache. When the engine emits state==2 AND no wire
+# consumer is attached, the stream's log moves into this OrderedDict
+# (newest at the END). It stays there — addressable by reconnect — until
+# pushed out by NEWER completed streams crossing a resource budget. NO
+# WALLCLOCK TIMERS: eviction is bounded by RESOURCES (bytes + count),
+# not by elapsed time. This matches the operator's preference and is
+# easier to reason about under load (no "what time is it" coupling, no
+# timer firing while busy doing something else).
+#
+# Two bounds, both checked on every new addition:
+#   - BRIDGE_MAX_RETAINED_BYTES (default 64MB) — bytes-budget across
+#     all completed-idle logs (active streams are NOT in this LRU and
+#     do not count). Primary bound — "expectation over buffer size".
+#   - BRIDGE_MAX_COMPLETED_STREAMS (default 256) — count cap as a
+#     safety net for pathological tiny-but-numerous streams.
+#
+# Reconnect transitions a stream OUT of the LRU (becomes "active again")
+# while a consumer is attached; on consumer-disconnect it goes back in,
+# moved to the END (most-recently-used).
+from collections import OrderedDict
 
-# Per-stream "this log entered retention at monotonic time T" map.
-# Populated by `_drain_until_engine_done` when it observes state==2.
-# A background sweep removes entries (and the corresponding log) once
-# `monotonic() - T > _STREAM_LOG_RETENTION_S`. If a reconnect attaches
-# while in retention, the entry is removed so retention pauses; on the
-# next disconnect-with-state==2 it's reinstated.
-_stream_log_retention_started_at: dict[int, float] = {}
+_BRIDGE_MAX_RETAINED_BYTES = int(
+    os.environ.get("BRIDGE_MAX_RETAINED_BYTES", str(64 * 1024 * 1024)))
+_BRIDGE_MAX_COMPLETED_STREAMS = int(
+    os.environ.get("BRIDGE_MAX_COMPLETED_STREAMS", "256"))
+# Estimate of a StreamUpdate's heap footprint. Used for bytes-budget
+# accounting without paying sys.getsizeof per entry. StreamUpdate is a
+# small dataclass (~6 ints + 3 small lists); 96 B is a sane average.
+_STREAM_UPDATE_EST_BYTES = 96
+
+# Completed-idle stream log LRU. Insertion order = oldest-first.
+# Eviction pops from the front (oldest). On reconnect: pop the entry
+# (becomes active again); on consumer-disconnect after state==2, add
+# back at the END (newest).
+_completed_stream_lru: "OrderedDict[int, None]" = OrderedDict()
 
 # 2026-05-07: deleted _conv_cache. The bridge is now stateless across
 # chat-completion requests — no warm-path adoption, no
@@ -386,9 +405,10 @@ async def _consume_engine_stream(stream_id: int, request: Request,
         keeps appending; subsequent reconnect via
         `GET /v1/streams/{id}/sse?since={N}` can replay from any prior
         offset.
-      - The log is preserved past the disconnect for the retention
-        window (`_STREAM_LOG_RETENTION_S`) after the engine emits
-        state==2; see `_drain_until_engine_done`.
+      - The log is preserved past the disconnect via the completed-idle
+        LRU (`_completed_stream_lru`) — bounded by bytes + count, not
+        wallclock. See `_mark_stream_completed_for_eviction` and
+        `_evict_completed_streams_to_bounds`.
 
     Used by BOTH the aggregate and SSE branches of chat_completions,
     plus the reconnect endpoint. The branches differ only in what
@@ -478,10 +498,11 @@ async def _consume_engine_stream(stream_id: int, request: Request,
         # BRIDGE_CANCEL_ON_DISCONNECT=1.
         import os as _os
         if clean_close:
-            # Natural completion: caller observed state==2. Mark the
-            # log for retention so a reconnect that arrives within
-            # the retention window can still replay the full sequence.
-            _start_retention_timer(stream_id)
+            # Natural completion: caller observed state==2. Move into
+            # the completed-idle LRU so a reconnect can still replay
+            # the full sequence — the LRU evictor (count + bytes
+            # bounds, no wallclock) decides when to free.
+            _mark_stream_completed_for_eviction(stream_id)
         else:
             if last_yielded_update is not None:
                 u = last_yielded_update
@@ -546,31 +567,80 @@ _background_drains: dict[int, "asyncio.Task[None]"] = {}
 _active_consumer_token: dict[int, str] = {}
 
 
-def _start_retention_timer(stream_id: int) -> None:
-    """Mark `stream_id`'s log as retained-from-now. After
-    `_STREAM_LOG_RETENTION_S` seconds, the background sweep
-    (`_stream_log_retention_sweep`) will free the log and associated
-    state.
-
-    Called from `_consume_engine_stream` on clean_close (caller
-    observed state==2) and from `_drain_until_engine_done` when the
-    background monitor observes state==2. Idempotent — calling twice
-    just resets the start time, which is fine: the second call means
-    a reconnect saw state==2 again, so restarting the timer is correct
-    semantics.
+def _retained_log_bytes() -> int:
+    """Estimate total bytes held by completed-idle logs in the LRU.
+    Active streams (consumer attached or engine still running) are NOT
+    in `_completed_stream_lru` and don't count toward this budget.
     """
-    _stream_log_retention_started_at[stream_id] = time.monotonic()
+    total = 0
+    for sid in _completed_stream_lru.keys():
+        log = _stream_logs.get(sid)
+        if log is not None:
+            total += len(log) * _STREAM_UPDATE_EST_BYTES
+    return total
+
+
+def _evict_completed_streams_to_bounds() -> None:
+    """Evict oldest completed-idle streams from `_completed_stream_lru`
+    (and free their per-stream state) until both bounds are satisfied:
+      - len(_completed_stream_lru) <= _BRIDGE_MAX_COMPLETED_STREAMS
+      - _retained_log_bytes() <= _BRIDGE_MAX_RETAINED_BYTES
+
+    Called on every transition INTO the LRU (i.e., every
+    `_mark_stream_completed_for_eviction` call). NOT periodic — no
+    wallclock involvement. Eviction happens exactly when new completed
+    streams push the budget over.
+    """
+    while _completed_stream_lru:
+        too_many = len(_completed_stream_lru) > _BRIDGE_MAX_COMPLETED_STREAMS
+        too_big = _retained_log_bytes() > _BRIDGE_MAX_RETAINED_BYTES
+        if not (too_many or too_big):
+            return
+        # Pop oldest (front of OrderedDict).
+        sid, _ = _completed_stream_lru.popitem(last=False)
+        log = _stream_logs.get(sid)
+        log_len = len(log) if log is not None else 0
+        reason = "count-bound" if too_many else "bytes-bound"
+        print(f"[bridge] LRU evict: freeing sid={sid} "
+              f"(log_len={log_len}, lru_size_post_evict={len(_completed_stream_lru)}, "
+              f"retained_bytes_post_evict={_retained_log_bytes()}, "
+              f"reason={reason})", flush=True)
+        _release_stream_log(sid)
+
+
+def _mark_stream_completed_for_eviction(stream_id: int) -> None:
+    """Move `stream_id` into the completed-idle LRU and run the
+    eviction policy. Called when:
+      - the wire consumer observes state==2 and disconnects, OR
+      - the background drain observes state==2 with no consumer attached
+
+    Idempotent: if already in the LRU, move to the END (most-recently
+    completed). If the stream is currently active (consumer attached),
+    DON'T add — wait until disconnect.
+    """
+    if stream_id in _active_consumer_token:
+        # Currently being read; stays "active". On consumer-disconnect
+        # the disconnect handler will call us again.
+        return
+    if stream_id not in _stream_logs:
+        # Log already freed (e.g. legacy BRIDGE_CANCEL_ON_DISCONNECT=1
+        # path); nothing to track.
+        return
+    # Move-to-end if already present; otherwise append.
+    _completed_stream_lru.pop(stream_id, None)
+    _completed_stream_lru[stream_id] = None
+    _evict_completed_streams_to_bounds()
 
 
 def _release_stream_log(stream_id: int) -> None:
-    """Pop ALL per-stream state. Called when the retention window
-    expires, or in legacy BRIDGE_CANCEL_ON_DISCONNECT=1 mode where the
-    log is freed immediately on disconnect."""
+    """Pop ALL per-stream state. Called by the LRU evictor and from
+    legacy BRIDGE_CANCEL_ON_DISCONNECT=1 mode where the log is freed
+    immediately on disconnect."""
     _stream_logs.pop(stream_id, None)
     _response_qs.pop(stream_id, None)
     _drop_counts.pop(stream_id, None)
     _stream_rate_samples.pop(stream_id, None)
-    _stream_log_retention_started_at.pop(stream_id, None)
+    _completed_stream_lru.pop(stream_id, None)
     _active_consumer_token.pop(stream_id, None)
 
 
@@ -611,9 +681,10 @@ async def _drain_until_engine_done(stream_id: int) -> None:
                           f"cache_hits={u.cache_hits}, "
                           f"cache_misses={u.cache_misses}, "
                           f"done_reason={u.done_reason}; "
-                          f"starting {_STREAM_LOG_RETENTION_S}s "
-                          f"retention window", flush=True)
-                    _start_retention_timer(stream_id)
+                          f"moving sid into completed-idle LRU "
+                          f"(eviction by bytes+count bounds, no wallclock)",
+                          flush=True)
+                    _mark_stream_completed_for_eviction(stream_id)
                     return
             # Check for reconnect-takeover before waiting.
             if stream_id in _active_consumer_token:
@@ -660,37 +731,12 @@ def _spawn_background_drain(stream_id: int) -> None:
         _release_stream_log(stream_id)
 
 
-async def _stream_log_retention_sweep() -> None:
-    """Background task: every 30s, free any stream log whose retention
-    window has expired. Started in startup.
-
-    A stream is eligible for free when:
-      - It has an entry in `_stream_log_retention_started_at`
-      - monotonic() - retention_start > _STREAM_LOG_RETENTION_S
-      - NO active consumer is attached (we never free under a
-        reading consumer; the reading consumer can be replaying from
-        offset 0 of a long completed stream)
-    """
-    while True:
-        try:
-            now = time.monotonic()
-            to_free: list[int] = []
-            for sid, started_at in list(_stream_log_retention_started_at.items()):
-                if sid in _active_consumer_token:
-                    continue
-                if now - started_at > _STREAM_LOG_RETENTION_S:
-                    to_free.append(sid)
-            for sid in to_free:
-                log = _stream_logs.get(sid)
-                log_len = len(log) if log is not None else 0
-                print(f"[bridge] retention sweep: freeing sid={sid} "
-                      f"(log_len={log_len}, retained for "
-                      f"{now - _stream_log_retention_started_at.get(sid, now):.1f}s)",
-                      flush=True)
-                _release_stream_log(sid)
-        except Exception as e:
-            print(f"[bridge] retention sweep error: {e}", flush=True)
-        await asyncio.sleep(30.0)
+# 2026-05-24: _stream_log_retention_sweep removed. Wallclock-driven
+# eviction was operator-disliked ("BUFFERS. more BUFFERS. but no time
+# coupling"). Replaced by `_evict_completed_streams_to_bounds`, which
+# runs synchronously inside `_mark_stream_completed_for_eviction` (i.e.
+# only at the moment a new stream enters the completed-idle LRU). No
+# background task, no timers, no asyncio.sleep.
 
 
 def _engine_driver_thread(loop: asyncio.AbstractEventLoop) -> None:
@@ -1351,10 +1397,11 @@ async def _startup() -> None:
         name="gemma-engine-driver", daemon=True)
     _engine_thread.start()
 
-    # 2026-05-23 APPEND-LOG REFACTOR: start the per-stream log retention
-    # sweep. Frees any log whose retention window has expired (default
-    # 300s after the engine emits state==2). Loops every 30s.
-    asyncio.create_task(_stream_log_retention_sweep())
+    # 2026-05-24: retention sweep removed. Eviction is now
+    # resource-bounded (BRIDGE_MAX_RETAINED_BYTES + MAX_COMPLETED_STREAMS),
+    # not wallclock-bounded. `_evict_completed_streams_to_bounds` runs
+    # synchronously inside `_mark_stream_completed_for_eviction` — no
+    # background task needed.
 
 
 @app.on_event("shutdown")
@@ -2242,11 +2289,15 @@ async def chat_completions(req: Request) -> Any:
 # downstream sockets is wasteful and confusing in logs; keeping the
 # "one wire reader at a time" contract sidesteps that.
 #
-# Retention: after the engine emits state==2, the log is kept alive
-# for `_STREAM_LOG_RETENTION_S` seconds (default 300s, env-overridable
-# via BRIDGE_STREAM_LOG_RETENTION_S). A reconnect arriving in that
-# window gets a 200 with full replay; after retention expires the
-# endpoint returns 404.
+# Retention: after the engine emits state==2 with no consumer attached,
+# the log moves into a completed-idle LRU (`_completed_stream_lru`).
+# The LRU is bounded by BRIDGE_MAX_RETAINED_BYTES (default 64MB) and
+# BRIDGE_MAX_COMPLETED_STREAMS (default 256) — no wallclock, no
+# scheduled sweep. A reconnect for a stream in the LRU pops it out
+# (becomes active again for the duration of the consumer attach); on
+# consumer disconnect it goes back to the END of the LRU (most
+# recently used). Eviction happens only when NEW completed streams
+# push the LRU over budget; the oldest tail entry gets freed.
 # ----------------------------------------------------------------------
 @app.get("/v1/streams/{stream_id}/sse")
 async def stream_reconnect_sse(stream_id: int, req: Request,
@@ -2276,17 +2327,14 @@ async def stream_reconnect_sse(stream_id: int, req: Request,
 
     # Claim the wire consumer slot. _consume_engine_stream's finally
     # block will release it (we also clear it explicitly here on
-    # exit-paths to keep semantics tidy). The retention timer (if
-    # active) pauses while a consumer holds the slot; on consumer
-    # exit, if state==2 has been observed, the timer is restarted.
+    # exit-paths to keep semantics tidy).
     token = uuid.uuid4().hex[:12]
     _active_consumer_token[stream_id] = token
-    # Pause the retention timer while this consumer is attached — a
-    # consumer that's actively replaying / awaiting future appends
-    # should not be raced against retention sweep. The timer will be
-    # reinstated via `_start_retention_timer` when the consumer
-    # observes state==2 (in `_consume_engine_stream`'s finally).
-    _stream_log_retention_started_at.pop(stream_id, None)
+    # Pop from the completed-idle LRU: this stream is "active again"
+    # for the duration of the reconnect. On consumer-exit, if
+    # state==2 has been observed, `_mark_stream_completed_for_eviction`
+    # re-adds the entry at the END (most-recently-used position).
+    _completed_stream_lru.pop(stream_id, None)
 
     log_len = len(_stream_logs.get(stream_id, []))
     print(f"[bridge] reconnect attached (sid={stream_id}, "
