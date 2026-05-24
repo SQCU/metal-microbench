@@ -17,9 +17,20 @@ set -euo pipefail
 # Where we live.
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 DATA_ROOT="$HERE/_data"
-ST_SRC="${ST_SRC:-/Users/mdot/sillytavern-fork}"
+# See run.sh / CLAUDE.md: st-debug owns its own clone of sillytavern-fork
+# under tools/st-debug/sillytavern-fork/. NEVER point this at the root
+# /Users/mdot/sillytavern-fork — that breaks instance isolation.
+ST_SRC="${ST_SRC:-$HERE/sillytavern-fork}"
 ST_PORT="${ST_PORT:-8002}"
 BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:8001}"
+
+if [[ ! -d "$ST_SRC" ]]; then
+    echo "[bootstrap] FAIL: ST source clone not found at $ST_SRC"
+    echo "[bootstrap] Run: git clone /Users/mdot/sillytavern-fork \"$ST_SRC\""
+    echo "[bootstrap]      cd \"$ST_SRC\" && npm install"
+    echo "[bootstrap] See $HERE/CLAUDE.md for full setup."
+    exit 1
+fi
 
 # --fresh wipes _data/ entirely.
 if [[ "${1:-}" == "--fresh" ]]; then
@@ -127,11 +138,13 @@ PY
 # location, no seed indirection). The plugin reads them on every boot
 # directly — no copy step needed. Updating a manifest IS the publish.
 if [[ ! -d "$ST_SRC/plugins/toolcards/cards" ]]; then
-    echo "[bootstrap] WARN: $ST_SRC/plugins/toolcards/cards/ missing — toolcards plugin will boot with 0 cards. Update the fork checkout."
+    echo "[bootstrap] WARN: $ST_SRC/plugins/toolcards/cards/ missing — toolcards plugin will boot with 0 cards."
+    echo "[bootstrap]       sync: cd $ST_SRC && git pull  (or rsync from /Users/mdot/sillytavern-fork/plugins/toolcards/)"
 fi
 if [[ ! -f "$ST_SRC/default/content/scringlo_scrambler.png" ]] || \
    [[ ! -f "$ST_SRC/default/content/dicemother.png" ]]; then
-    echo "[bootstrap] WARN: example personas missing from $ST_SRC/default/content/. Update the fork checkout."
+    echo "[bootstrap] WARN: example personas missing from $ST_SRC/default/content/."
+    echo "[bootstrap]       sync: cd $ST_SRC && git pull"
 fi
 
 echo "[bootstrap] done. data root: $DATA_ROOT"

@@ -106,7 +106,7 @@ def call(messages, max_tok=None):
                                   data=json.dumps(body).encode(),
                                   headers={"Content-Type": "application/json"},
                                   method="POST")
-    with urllib.request.urlopen(req, timeout=180) as resp:
+    with urllib.request.urlopen(req) as resp:
         d = json.loads(resp.read())
     return d["choices"][0]["message"]["content"]
 

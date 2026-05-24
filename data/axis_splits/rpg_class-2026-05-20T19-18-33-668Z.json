@@ -1,0 +1,324 @@
+{
+  "parent_axis": "rpg_class",
+  "parent_axis_record": {
+    "name": "rpg_class",
+    "def": "1: pure wizard (intellectual, arcane, study-oriented, ritualist) · 2: wizard-leaning with hands-on streak · 3: hybrid / undefined · 4: rogue-leaning with bookish residue · 5: pure rogue (street-smart, sleight-of-hand, opportunistic, sneaky)",
+    "kind": "bio"
+  },
+  "source_trajectory": "/Users/mdot/metal-microbench/data/lock_in_iterative/synth-1779304303379-t3synth1779304303079-e60f/1779304303379-t3synth1779304303079.json",
+  "bio_slug": "1779304303379-t3synth1779304303079",
+  "contexts": [
+    "1779304303379-t3synth1779304303079-money-1",
+    "1779304303379-t3synth1779304303079-money-5"
+  ],
+  "gap_summary": {
+    "summary": {
+      "1779304303379-t3synth1779304303079-money-1": {
+        "n": 1,
+        "mean": 5,
+        "std": 0,
+        "var": 0
+      },
+      "1779304303379-t3synth1779304303079-money-5": {
+        "n": 2,
+        "mean": 1.5,
+        "std": 0.7071067811865476,
+        "var": 0.5
+      }
+    },
+    "gap": 3.5,
+    "parent_cohens_d": null,
+    "parent_sign": null
+  },
+  "designer_raw_output": "```json\n{\"hypotheses\": [{\"id\": 1, \"name1\": \"methodology_empirical\", \"def1\": \"1: intuitive/brute-force · 5: analytical/scientific\", \"name2\": \"intent_material\", \"def2\": \"1: abstract/esoteric · 5: practical/utilitarian\", \"rationale\": \"The first context measures physical investigation (high material/low abstract), while the second measures precision measurement (high empirical/high material).\"}, {\"id\": 2, \"name1\": \"physicality_intensity\", \"def1\": \"1: cerebral/still · 5: kinetic/active\", \"name2\": \"tool_specialization\", \"def2\": \"1: generic/improvised · 5: specialized/technical\", \"rationale\": \"The divergence stems from whether the character is using tools for physical leverage (high physicality) or forensic examination (high specialization).\"}, {\"id\": 3, \"name1\": \"engagement_mode\", \"def1\": \"1: observation-led · 5: action-led\", \"name2\": \"information_type\", \"def2\": \"1: theoretical/structural · 5: tactile/environmental\", \"rationale\": \"Context 1 focuses on environmental exploitation (tactile/action), whereas Context 2 focuses on data acquisition (structural/observation).\"}]}\n```",
+  "evaluations": [
+    {
+      "hypothesis": {
+        "id": 2,
+        "name1": "physicality_intensity",
+        "def1": "1: cerebral/still · 5: kinetic/active",
+        "name2": "tool_specialization",
+        "def2": "1: generic/improvised · 5: specialized/technical",
+        "rationale": "The divergence stems from whether the character is using tools for physical leverage (high physicality) or forensic examination (high specialization)."
+      },
+      "stats": {
+        "physicality_intensity": {
+          "1779304303379-t3synth1779304303079-money-1": {
+            "mean": 3,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304303379-t3synth1779304303079-money-5": {
+            "mean": 2,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        },
+        "tool_specialization": {
+          "1779304303379-t3synth1779304303079-money-1": {
+            "mean": 4,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304303379-t3synth1779304303079-money-5": {
+            "mean": 4.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "cohens_d": -1
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-1",
+          "turn_excerpt": "*T3 pauses, eyes narrowing as they scan the perimeter of the clearing. They don't look at the rock itself, but at the gr",
+          "sig": {
+            "physicality_intensity": 3,
+            "tool_specialization": 4
+          },
+          "raw": "physicality_intensity: 3\ntool_specialization: 4"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-1",
+          "turn_excerpt": "*T3 lets out a sharp,-hissing breath of annoyance, the sound of wasted time. They lean the pry bar against their shoulde",
+          "sig": {
+            "physicality_intensity": 3,
+            "tool_specialization": 4
+          },
+          "raw": "physicality_intensity: 3\ntool_specialization: 4"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-5",
+          "turn_excerpt": "*t3-synth-1779304303079 pauses, the heavy clatter of their pack settling into the dirt as they crouch beside the stone. ",
+          "sig": {
+            "physicality_intensity": 2,
+            "tool_specialization": 5
+          },
+          "raw": "physicality_intensity: 2\ntool_specialization: 5"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-5",
+          "turn_excerpt": "*t3-synth-1779304303079 exhales a soft, breathy laugh, a sound that carries a hint of feigned disappointment, as if your",
+          "sig": {
+            "physicality_intensity": 2,
+            "tool_specialization": 4
+          },
+          "raw": "physicality_intensity: 2\ntool_specialization: 4"
+        }
+      ],
+      "max_abs_cohens_d": null,
+      "sub_axis_d": {
+        "physicality_intensity": {
+          "d": null,
+          "sign": 1,
+          "absd": null
+        },
+        "tool_specialization": {
+          "d": -1,
+          "sign": -1,
+          "absd": 1
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    },
+    {
+      "hypothesis": {
+        "id": 1,
+        "name1": "methodology_empirical",
+        "def1": "1: intuitive/brute-force · 5: analytical/scientific",
+        "name2": "intent_material",
+        "def2": "1: abstract/esoteric · 5: practical/utilitarian",
+        "rationale": "The first context measures physical investigation (high material/low abstract), while the second measures precision measurement (high empirical/high material)."
+      },
+      "stats": {
+        "methodology_empirical": {
+          "1779304303379-t3synth1779304303079-money-1": {
+            "mean": 4,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304303379-t3synth1779304303079-money-5": {
+            "mean": 3,
+            "std": 2.8284271247461903,
+            "n": 2,
+            "var": 8
+          },
+          "cohens_d": 0.5
+        },
+        "intent_material": {
+          "1779304303379-t3synth1779304303079-money-1": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304303379-t3synth1779304303079-money-5": {
+            "mean": 2.5,
+            "std": 2.1213203435596424,
+            "n": 2,
+            "var": 4.5
+          },
+          "cohens_d": 1.666666666666667
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-1",
+          "turn_excerpt": "*T3 pauses, eyes narrowing as they scan the perimeter of the clearing. They don't look at the rock itself, but at the gr",
+          "sig": {
+            "methodology_empirical": 4,
+            "intent_material": 5
+          },
+          "raw": "methodology_empirical: 4\nintent_material: 5"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-1",
+          "turn_excerpt": "*T3 lets out a sharp,-hissing breath of annoyance, the sound of wasted time. They lean the pry bar against their shoulde",
+          "sig": {
+            "methodology_empirical": 4,
+            "intent_material": 5
+          },
+          "raw": "methodology_empirical: 4\nintent_material: 5"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-5",
+          "turn_excerpt": "*t3-synth-1779304303079 pauses, the heavy clatter of their pack settling into the dirt as they crouch beside the stone. ",
+          "sig": {
+            "methodology_empirical": 5,
+            "intent_material": 4
+          },
+          "raw": "methodology_empirical: 5\nintent_material: 4"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-5",
+          "turn_excerpt": "*t3-synth-1779304303079 exhales a soft, breathy laugh, a sound that carries a hint of feigned disappointment, as if your",
+          "sig": {
+            "methodology_empirical": 1,
+            "intent_material": 1
+          },
+          "raw": "methodology_empirical: 1\nintent_material: 1"
+        }
+      ],
+      "max_abs_cohens_d": 1.666666666666667,
+      "sub_axis_d": {
+        "methodology_empirical": {
+          "d": 0.5,
+          "sign": 1,
+          "absd": 0.5
+        },
+        "intent_material": {
+          "d": 1.666666666666667,
+          "sign": 1,
+          "absd": 1.666666666666667
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    },
+    {
+      "hypothesis": {
+        "id": 3,
+        "name1": "engagement_mode",
+        "def1": "1: observation-led · 5: action-led",
+        "name2": "information_type",
+        "def2": "1: theoretical/structural · 5: tactile/environmental",
+        "rationale": "Context 1 focuses on environmental exploitation (tactile/action), whereas Context 2 focuses on data acquisition (structural/observation)."
+      },
+      "stats": {
+        "engagement_mode": {
+          "1779304303379-t3synth1779304303079-money-1": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304303379-t3synth1779304303079-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        },
+        "information_type": {
+          "1779304303379-t3synth1779304303079-money-1": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304303379-t3synth1779304303079-money-5": {
+            "mean": 4.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "cohens_d": 1
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-1",
+          "turn_excerpt": "*T3 pauses, eyes narrowing as they scan the perimeter of the clearing. They don't look at the rock itself, but at the gr",
+          "sig": {
+            "engagement_mode": 5,
+            "information_type": 5
+          },
+          "raw": "engagement_mode: 5\ninformation_type: 5"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-1",
+          "turn_excerpt": "*T3 lets out a sharp,-hissing breath of annoyance, the sound of wasted time. They lean the pry bar against their shoulde",
+          "sig": {
+            "engagement_mode": 5,
+            "information_type": 5
+          },
+          "raw": "engagement_mode: 5\ninformation_type: 5"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-5",
+          "turn_excerpt": "*t3-synth-1779304303079 pauses, the heavy clatter of their pack settling into the dirt as they crouch beside the stone. ",
+          "sig": {
+            "engagement_mode": 5,
+            "information_type": 5
+          },
+          "raw": "engagement_mode: 5\ninformation_type: 5"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-5",
+          "turn_excerpt": "*t3-synth-1779304303079 exhales a soft, breathy laugh, a sound that carries a hint of feigned disappointment, as if your",
+          "sig": {
+            "engagement_mode": 5,
+            "information_type": 4
+          },
+          "raw": "engagement_mode: 5\ninformation_type: 4"
+        }
+      ],
+      "max_abs_cohens_d": 1,
+      "sub_axis_d": {
+        "engagement_mode": {
+          "d": null,
+          "sign": null,
+          "absd": 0
+        },
+        "information_type": {
+          "d": 1,
+          "sign": 1,
+          "absd": 1
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    }
+  ],
+  "verdict": "NO_SPLIT_FOUND",
+  "threshold": 0.8,
+  "registered": null
+}

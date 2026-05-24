@@ -80,14 +80,20 @@ private struct PageInfo {
     var lastAccessTick: UInt64
 }
 
-// Value of contentIndex[hash]. Ordered: slidePrimary corresponds to
-// block_table[P] (slide cache for 16 tokens + full cache for first 8);
-// fullSibling corresponds to block_table[P+1] (full cache for the second
-// 8 tokens at that 16-token slide-page range, plus whatever slide data
-// gets written there by a later prefill tile).
-struct SharedPagePair {
-    let slidePrimary: Int
-    let fullSibling: Int
+// SlidePairContents — pair of phys page IDs representing the K/V backing
+// for a 16-token slide page. `slidePlusFullHead` corresponds to block_table[P]
+// (slide cache for 16 tokens + full cache for first 8); `fullTail`
+// corresponds to block_table[P+1] (full cache for the second 8 tokens
+// at that 16-token slide-page range, plus whatever slide data gets
+// written there by a later prefill tile).
+//
+// Followup 3 (2026-05-23): PageManager.contentIndex was deleted; the
+// radix trie (radix_trie.swift) is the sole source of truth for
+// adoption lookups. This struct survives as the value type stored at
+// each trie anchor.
+struct SlidePairContents {
+    let slidePlusFullHead: Int
+    let fullTail: Int
 }
 
 final class PageManager {
@@ -120,10 +126,18 @@ final class PageManager {
     // + remove(at:)`) become O(1) via the swap-with-last-and-pop helper
     // freeListPop(at:).
     private var freeListPos: [Int: Int] = [:]
-    // contentIndex[contentHash] = pair of phys pages carrying the
-    // 16-token slide-page's data in both cache layouts. See the
-    // PageInfo header for why sharing has to be a pair.
-    private var contentIndex: [UInt64: SharedPagePair] = [:]
+    // Followup 3 (2026-05-23): contentIndex deleted. The radix trie
+    // (radix_trie.swift, RadixTrie) is now the sole source of truth
+    // for adoption lookups; PageManager only tracks refcounts +
+    // content-hash bookkeeping per phys page, plus the per-page
+    // pairMate so the eviction callback can notify the trie about
+    // both members of a pair.
+    //
+    // Eviction callback (Track D fold-in): invoked when allocFresh
+    // forcibly evicts a cached page-pair. LmEngine wires this up to
+    // RadixTrie.invalidateAnchorFor so stale anchors get unlinked.
+    // Receives (physPage, oldHash).
+    var onPageEvicted: ((Int, UInt64) -> Void)?
     // 2026-05-07: deleted `sessionPages: [Int: [Int]]`. Callers now hold
     // their own list of phys pages they reference and call decref()
     // when done. No per-session ledger lives in the page manager —
@@ -211,12 +225,8 @@ final class PageManager {
         return h
     }
 
-    // Try to find a shared pair already holding content with this hash.
-    // nil if not cached. Does NOT increment refcount — caller probes,
-    // then commits via `shareExisting` once they've decided to use it.
-    func findByHash(_ hash: UInt64) -> SharedPagePair? {
-        return contentIndex[hash]
-    }
+    // Followup 3 (2026-05-23): findByHash deleted; adoption goes
+    // through RadixTrie.findLongestPrefix.
 
     // Grab a phys page for `sessionId`. The free list holds all
     // refcount==0 pages; some carry valid content hashes (cache entries
@@ -271,9 +281,18 @@ final class PageManager {
             let pick = oldest!  // freeList non-empty guaranteed above
             phys = freeListPop(at: pick.idx)
             // Drop the now-orphaned content hash + its pair.
+            // Followup 3 (2026-05-23): contentIndex deleted; only the
+            // PageInfo bookkeeping + eviction callback into the trie
+            // remain. The trie is responsible for unlinking the anchor.
             var p = pages[phys]
             if let h = p.contentHash {
-                contentIndex.removeValue(forKey: h)
+                // Track D: notify the radix trie BEFORE we mutate
+                // PageInfo so the callback can read accurate state if
+                // it wishes.
+                onPageEvicted?(phys, h)
+                if let partner = p.pairMate {
+                    onPageEvicted?(partner, h)
+                }
                 if let partner = p.pairMate,
                    partner >= 0 && partner < pages.count,
                    pages[partner].contentHash == h {
@@ -313,32 +332,32 @@ final class PageManager {
         pages[physPage] = p
     }
 
-    // After a fresh-allocated pair of pages has been written to (full
-    // prefill CB committed for the slide-page's 16-token range + the
-    // first 8 full-page tokens of that range + the second 8 full-page
-    // tokens), promote the pair into the content index so a later
-    // session submitting the same tokens can `findByHash` and adopt
-    // both members as read-only shared pages.
+    // Followup 3 (2026-05-23): the old promotePair(...) populated both
+    // PageInfo bookkeeping (contentHash + pairMate) AND inserted into
+    // contentIndex. With contentIndex deleted, this method survives as
+    // a small PageInfo-only writer: it stamps each phys page with the
+    // content hash + partner phys so the eviction callback in
+    // allocFresh can notify the trie about the pair as a unit.
     //
-    // `slidePrimary` corresponds to the phys index at block_table[P]
-    // (carries slide K/V for tokens [P*16, P*16+15] + full K/V for
-    // tokens [P*16, P*16+7]). `fullSibling` corresponds to block_table
-    // [P+1] (carries full K/V for tokens [P*16+8, P*16+15]).
-    func promotePair(slidePrimary: Int, fullSibling: Int, contentHash: UInt64) {
-        // Idempotence: if the same pair is already recorded under this
-        // hash, nothing to do. If this hash is recorded against a
-        // different pair, keep the older one (first-writer-wins).
-        if contentIndex[contentHash] != nil { return }
-        var p1 = pages[slidePrimary]
-        var p2 = pages[fullSibling]
+    // `slidePlusFullHead` is block_table[P] (slide K/V for tokens
+    // [P*16..P*16+15] + full K/V for [P*16..P*16+7]); `fullTail`
+    // is block_table[P+1] (full K/V for [P*16+8..P*16+15]).
+    //
+    // Idempotent: re-stamping with the same hash is a no-op modulo
+    // lastAccessTick refresh; re-stamping with a DIFFERENT hash
+    // overwrites (the trie's insertAnchor is similarly first-writer-
+    // wins via its internal walk, so callers should follow trie
+    // semantics).
+    func markPairContentIndexed(slidePlusFullHead: Int, fullTail: Int,
+                                  contentHash: UInt64) {
+        var p1 = pages[slidePlusFullHead]
+        var p2 = pages[fullTail]
         p1.contentHash = contentHash
         p2.contentHash = contentHash
-        p1.pairMate = fullSibling
-        p2.pairMate = slidePrimary
-        pages[slidePrimary] = p1
-        pages[fullSibling]  = p2
-        contentIndex[contentHash] = SharedPagePair(
-            slidePrimary: slidePrimary, fullSibling: fullSibling)
+        p1.pairMate = fullTail
+        p2.pairMate = slidePlusFullHead
+        pages[slidePlusFullHead] = p1
+        pages[fullTail]  = p2
     }
 
     // Decrement refcount. If it drops to 0, the page goes on the free
@@ -370,6 +389,14 @@ final class PageManager {
     }
 
     // Diagnostic snapshot.
+    //
+    // Followup 3 (2026-05-23): `cachedHashes` historically counted the
+    // size of contentIndex. With that dict gone, we count the number
+    // of phys pages that currently carry a non-nil contentHash — same
+    // semantic ("how many pages are content-addressed"), now derived
+    // from PageInfo state. The richer adoption-anchor count lives in
+    // RadixTrie.stats().anchorCount, surfaced in the engine-state
+    // `prefix_trie` JSON block.
     struct Stats {
         let totalPages: Int
         let freePages: Int
@@ -379,9 +406,11 @@ final class PageManager {
         let pagesInUse: Int
     }
     func stats() -> Stats {
+        var cached = 0
+        for p in pages { if p.contentHash != nil { cached += 1 } }
         return Stats(totalPages: numPhysPages,
                      freePages: freeList.count,
-                     cachedHashes: contentIndex.count,
+                     cachedHashes: cached,
                      pagesInUse: numPoolPages - freeList.count)
     }
 

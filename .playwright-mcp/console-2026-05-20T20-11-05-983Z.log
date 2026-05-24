@@ -1,0 +1,39 @@
+[     332ms] [VERBOSE] [DOM] Password field is not contained in a form: (More info: https://goo.gl/9p2vKq) %o @ http://127.0.0.1:8002/:0
+[     481ms] [WARNING] No input elements found for key: api_key_comfy_runpod @ http://127.0.0.1:8002/scripts/secrets.js:570
+[     483ms] [WARNING] Unsupported language: en-us @ http://127.0.0.1:8002/scripts/i18n.js:142
+[     793ms] [INFO] Using default TTS Provider settings @ http://127.0.0.1:8002/scripts/extensions/tts/system.js:119
+[     815ms] [LOG] [QR2] sets:  [QuickReplySet] @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[     815ms] [LOG] [QR2] settings:  QuickReplySettings @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[     829ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     830ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     830ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     830ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     830ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     830ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     830ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     830ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     830ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     830ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     830ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     830ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     830ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     830ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     830ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     830ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     830ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     830ms] [LOG] [toolcards] registered 17 tool(s) from 12 card(s) @ http://127.0.0.1:8002/scripts/extensions/toolcards/index.js:832
+[     831ms] [LOG] [user-personas] button installed @ http://127.0.0.1:8002/scripts/extensions/user-personas/index.js:1059
+[     835ms] [LOG] [user-personas] user-personas tools menu installed (hamburger → 3 surface drawers) @ http://127.0.0.1:8002/scripts/extensions/user-personas/index.js:1028
+[     835ms] [LOG] [user-personas] human-typing tracker attached to #send_textarea @ http://127.0.0.1:8002/scripts/extensions/user-personas/index.js:1369
+[     835ms] [LOG] [user-personas] PERSONAS_UPDATED handler attached @ http://127.0.0.1:8002/scripts/extensions/user-personas/index.js:1469
+[     835ms] [LOG] [user-personas] event handlers attached @ http://127.0.0.1:8002/scripts/extensions/user-personas/index.js:1473
+[     862ms] [WARNING] Failed to insert focus rule: SyntaxError: Failed to execute 'insertRule' on 'CSSStyleSheet': Failed to parse the rule '::-webkit-scrollbar-track:focus-visible { background-color: rgba(126, 126, 126, 0.2); }'.
+    at http://127.0.0.1:8002/scripts/dynamic-styles.js:144:34
+    at Array.forEach (<anonymous>)
+    at applyDynamicFocusStyles (http://127.0.0.1:8002/scripts/dynamic-styles.js:117:16)
+    at http://127.0.0.1:8002/scripts/dynamic-styles.js:192:13
+    at Array.forEach (<anonymous>)
+    at initDynamicStyles (http://127.0.0.1:8002/scripts/dynamic-styles.js:190:38)
+    at firstLoadInit (http://127.0.0.1:8002/script.js:815:5)
+    at async HTMLDocument.<anonymous> (http://127.0.0.1:8002/script.js:12823:5) @ http://127.0.0.1:8002/scripts/dynamic-styles.js:145
+[  319332ms] [ERROR] Failed to load resource: the server responded with a status of 502 (Bad Gateway) @ http://127.0.0.1:8002/api/plugins/user-personas/yapper-seed:0

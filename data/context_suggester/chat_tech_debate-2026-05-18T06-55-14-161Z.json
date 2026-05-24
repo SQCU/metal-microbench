@@ -1,0 +1,171 @@
+{
+  "chat_path": "data/context_suggester/fixtures/chat_tech_debate.json",
+  "chat_messages": [
+    {
+      "role": "assistant",
+      "content": "Look, I'll be blunt: Rust's borrow checker is a productivity tax for the vast majority of programs that don't actually need memory safety guarantees. Most code runs in environments where GC overhead is negligible. Defend the trade."
+    }
+  ],
+  "k_active": 2,
+  "k_disabled": 2,
+  "manifest_size": 19,
+  "judge_raw": "```json\n{\n  \"targets\": [\n    {\n      \"label\": \"A blunt, philosophical traveler seeking adventure\",\n      \"rationale\": \"A high-energy Sagittarius persona who reacts to the minimalism of the scene with big-picture observations or restless energy.\",\n      \"axes\": {\n        \"astrology_sagittarian\": 5,\n        \"normative_directionality\": 1,\n        \"warm\": 3\n      }\n    },\n    {\n      \"label\": \"An overly sensitive and sentimental nature observer\",\n      \"rationale\": \"A Cancerian-leaning persona who finds deep, emotional meaning in the stillness of the rock and the wind.\",\n      \"axes\": {\n        \"astrology_cancerian\": 4,\n        \"warm\": 4,\n        \"register_colloquial\": 2\n      }\n    },\n    {\n      \"label\": \"A casual, slang-using wanderer\",\n      \"rationale\": \"A relaxed, low-stakes persona that uses informal language to acknowledge the environment.\",\n      \"axes\": {\n        \"register_colloquial\": 4,\n        \"astrology_sagittarian\": 3,\n        \"warm\": 2\n      }\n    },\n    {\n      \"label\": \"A cliché-driven, prescriptive guide\",\n      \"rationale\": \"A persona that uses heavy trope-driven dialogue to tell the user exactly how to interpret the setting.\",\n      \"axes\": {\n        \"trope_density\": 5,\n        \"normative_directionality\": 5,\n        \"warm\": 1\n      }\n    }\n  ]\n}\n```",
+  "targets": [
+    {
+      "label": "A blunt, philosophical traveler seeking adventure",
+      "rationale": "A high-energy Sagittarius persona who reacts to the minimalism of the scene with big-picture observations or restless energy.",
+      "axes": {
+        "astrology_sagittarian": 5,
+        "normative_directionality": 1,
+        "warm": 3
+      }
+    },
+    {
+      "label": "An overly sensitive and sentimental nature observer",
+      "rationale": "A Cancerian-leaning persona who finds deep, emotional meaning in the stillness of the rock and the wind.",
+      "axes": {
+        "astrology_cancerian": 4,
+        "warm": 4,
+        "register_colloquial": 2
+      }
+    },
+    {
+      "label": "A casual, slang-using wanderer",
+      "rationale": "A relaxed, low-stakes persona that uses informal language to acknowledge the environment.",
+      "axes": {
+        "register_colloquial": 4,
+        "astrology_sagittarian": 3,
+        "warm": 2
+      }
+    },
+    {
+      "label": "A cliché-driven, prescriptive guide",
+      "rationale": "A persona that uses heavy trope-driven dialogue to tell the user exactly how to interpret the setting.",
+      "axes": {
+        "trope_density": 5,
+        "normative_directionality": 5,
+        "warm": 1
+      }
+    }
+  ],
+  "picks": [
+    {
+      "target": {
+        "label": "A blunt, philosophical traveler seeking adventure",
+        "rationale": "A high-energy Sagittarius persona who reacts to the minimalism of the scene with big-picture observations or restless energy.",
+        "axes": {
+          "astrology_sagittarian": 5,
+          "normative_directionality": 1,
+          "warm": 3
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-substantive-metaphys.png",
+        "name": "Sag Substantive — Metaphysical",
+        "sig": {
+          "astrology_sagittarian": 3.625,
+          "sensory_orientation": 2.875,
+          "normative_directionality": 1.875,
+          "referential_anchor": 1.375
+        },
+        "distance": 1.489546910976623,
+        "n_axes_compared": 2,
+        "n_axes_missing": 1
+      }
+    },
+    {
+      "target": {
+        "label": "An overly sensitive and sentimental nature observer",
+        "rationale": "A Cancerian-leaning persona who finds deep, emotional meaning in the stillness of the rock and the wind.",
+        "axes": {
+          "astrology_cancerian": 4,
+          "warm": 4,
+          "register_colloquial": 2
+        }
+      },
+      "persona": {
+        "persona_id": "user-personas-rpg-rogue-cancer.png",
+        "name": "RPG Rogue Cancer",
+        "sig": {
+          "astrology_sagittarian": 1.5,
+          "astrology_cancerian": 2.25
+        },
+        "distance": 1.920286436967152,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    },
+    {
+      "target": {
+        "label": "A casual, slang-using wanderer",
+        "rationale": "A relaxed, low-stakes persona that uses informal language to acknowledge the environment.",
+        "axes": {
+          "register_colloquial": 4,
+          "astrology_sagittarian": 3,
+          "warm": 2
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-paraphrase-1.png",
+        "name": "Sag Paraphrase 1",
+        "sig": {
+          "astrology_sagittarian": 2.4285714285714284,
+          "syntactic_entropy": 4.625,
+          "intellectual_hostility": 2.7142857142857144,
+          "abstraction_to_concrete_ratio": 4.25
+        },
+        "distance": 1.6659862556700857,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    },
+    {
+      "target": {
+        "label": "A cliché-driven, prescriptive guide",
+        "rationale": "A persona that uses heavy trope-driven dialogue to tell the user exactly how to interpret the setting.",
+        "axes": {
+          "trope_density": 5,
+          "normative_directionality": 5,
+          "warm": 1
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-substantive-preacher.png",
+        "name": "Sag Substantive — Moral Preacher",
+        "sig": {
+          "astrology_sagittarian": 4,
+          "sensory_orientation": 2.75,
+          "normative_directionality": 5,
+          "referential_anchor": 4.25
+        },
+        "distance": 1.632993161855452,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    }
+  ],
+  "active": [
+    {
+      "target_label": "A blunt, philosophical traveler seeking adventure",
+      "persona_id": "cluster-sag-substantive-metaphys.png",
+      "persona_name": "Sag Substantive — Metaphysical"
+    },
+    {
+      "target_label": "An overly sensitive and sentimental nature observer",
+      "persona_id": "user-personas-rpg-rogue-cancer.png",
+      "persona_name": "RPG Rogue Cancer"
+    }
+  ],
+  "disabled": [
+    {
+      "target_label": "A casual, slang-using wanderer",
+      "persona_id": "cluster-sag-paraphrase-1.png",
+      "persona_name": "Sag Paraphrase 1"
+    },
+    {
+      "target_label": "A cliché-driven, prescriptive guide",
+      "persona_id": "cluster-sag-substantive-preacher.png",
+      "persona_name": "Sag Substantive — Moral Preacher"
+    }
+  ]
+}

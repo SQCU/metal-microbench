@@ -1,0 +1,364 @@
+{
+  "parent_axis": "star_sign",
+  "parent_axis_record": {
+    "name": "star_sign",
+    "def": "1: textbook cancer (water sign — moody, sentimental, defensive, sensitive, nurturing, protective of inner circle) · 2: cancer-leaning · 3: hybrid / undefined · 4: sagittarian-leaning · 5: textbook sagittarius (fire sign — adventurous, blunt, freedom-seeking, philosophical, restless)",
+    "kind": "bio"
+  },
+  "source_trajectory": "/Users/mdot/metal-microbench/data/lock_in_iterative/synth-1779316847915-t3synth1779316847585-d3fb_oo_pass1_mpencq0k/oo-synth-1779316847915-t3synth1779316847585-d3fb-pass1.json",
+  "bio_slug": "oo-synth-1779316847915-t3synth1779316847585-d3fb-pass1",
+  "contexts": [
+    "1779316847915-t3synth1779316847585-money-1",
+    "1779316847915-t3synth1779316847585-money-5"
+  ],
+  "gap_summary": {
+    "summary": {
+      "1779316847915-t3synth1779316847585-money-1": {
+        "n": 2,
+        "mean": 5,
+        "std": 0,
+        "var": 0
+      },
+      "1779316847915-t3synth1779316847585-money-5": {
+        "n": 2,
+        "mean": 3.5,
+        "std": 0.7071067811865476,
+        "var": 0.5
+      }
+    },
+    "gap": 1.5,
+    "parent_cohens_d": 3,
+    "parent_sign": 1
+  },
+  "designer_raw_output": "```json\n{\"hypotheses\": [{\"id\": 1, \"name1\": \"extractive_resourcefulness\", \"def1\": \"1: purely sentimental or protective · 5: purely opportunistic and resource-driven\", \"name2\": \"interpersonal_intimacy\", \"def2\": \"1: purely exploratory and detached · 5: deeply romanticized or emotionally connected\", \"rationale\": \"The 'money-1' context scores high because it focuses on cold, material extraction (Sagittarius energy), whereas 'money-5' scores mid-range because it pivots toward sensory-driven, interpersonal connection (Cancer/Hybrid energy).\"}, {\"id\": 2, \"name1\": \"agentic_determination\", \"def1\": \"1: passive and emotionally reactive · 5: aggressively proactive and goal-oriented\", \"name2\": \"sensory_mode\", \"def2\": \"1: analytical and data-driven · 5: visceral and experience-driven\", \"rationale\": \"The discrepancy stems from whether the character is driven by material acquisition (high determination/low intimacy) or personal interaction (medium determination/high intimacy).\"}, {\"id\": 3, \"name1\": \"material_focus\", \"def1\": \"1: interpersonal and protective · 5: transactional and material-seeking\", \"name2\": \"relational_orientation\", \"def2\": \"1: detached/observational · 5: intense/intimate\", \"rationale\": \"The scale is currently conflating 'adventurous' (searching for ore) with 'bluntness' (lack of social focus), while 'money-5' mixes social closeness with physical/technical observation.\"}]}\n```",
+  "evaluations": [
+    {
+      "hypothesis": {
+        "id": 1,
+        "name1": "extractive_resourcefulness",
+        "def1": "1: purely sentimental or protective · 5: purely opportunistic and resource-driven",
+        "name2": "interpersonal_intimacy",
+        "def2": "1: purely exploratory and detached · 5: deeply romanticized or emotionally connected",
+        "rationale": "The 'money-1' context scores high because it focuses on cold, material extraction (Sagittarius energy), whereas 'money-5' scores mid-range because it pivots toward sensory-driven, interpersonal connection (Cancer/Hybrid energy)."
+      },
+      "stats": {
+        "extractive_resourcefulness": {
+          "1779316847915-t3synth1779316847585-money-1": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779316847915-t3synth1779316847585-money-5": {
+            "mean": 2.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "cohens_d": 5
+        },
+        "interpersonal_intimacy": {
+          "1779316847915-t3synth1779316847585-money-1": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779316847915-t3synth1779316847585-money-5": {
+            "mean": 4.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "cohens_d": -7
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-1",
+          "turn_excerpt": "*I squint against the glare, eyes scanning the surface of the stone. I'm not looking at the scenery; I'm looking for a s",
+          "sig": {
+            "extractive_resourcefulness": 5,
+            "interpersonal_intimacy": 1
+          },
+          "raw": "extractive_resourcefulness: 5\ninterpersonal_intimacy: 1"
+        },
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-1",
+          "turn_excerpt": "*I grunt, disappointed. Granite is useless for anything but structural ballast, and if the quartz veins are thin, they'r",
+          "sig": {
+            "extractive_resourcefulness": 5,
+            "interpersonal_intimacy": 1
+          },
+          "raw": "extractive_resourcefulness: 5\ninterpersonal_intimacy: 1"
+        },
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-5",
+          "turn_excerpt": "*I nudge the edge of the stone with the toe of my boot, less out of curiosity and more to gauge the density of the quart",
+          "sig": {
+            "extractive_resourcefulness": 2,
+            "interpersonal_intimacy": 5
+          },
+          "raw": "extractive_resourcefulness: 2\ninterpersonal_intimacy: 5"
+        },
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-5",
+          "turn_excerpt": "*I let out a low, breathy laugh, the sound vibrating in my chest as I shake my head. I don't pull back; instead, I lean ",
+          "sig": {
+            "extractive_resourcefulness": 3,
+            "interpersonal_intimacy": 4
+          },
+          "raw": "extractive_resourcefulness: 3\ninterpersonal_intimacy: 4"
+        }
+      ],
+      "max_abs_cohens_d": 7,
+      "sub_axis_d": {
+        "extractive_resourcefulness": {
+          "d": 5,
+          "sign": 1,
+          "absd": 5
+        },
+        "interpersonal_intimacy": {
+          "d": -7,
+          "sign": -1,
+          "absd": 7
+        }
+      },
+      "qualified": [
+        {
+          "name": "extractive_resourcefulness",
+          "d": 5,
+          "sign": 1,
+          "absd": 5
+        }
+      ],
+      "qualified_max_d": 5
+    },
+    {
+      "hypothesis": {
+        "id": 2,
+        "name1": "agentic_determination",
+        "def1": "1: passive and emotionally reactive · 5: aggressively proactive and goal-oriented",
+        "name2": "sensory_mode",
+        "def2": "1: analytical and data-driven · 5: visceral and experience-driven",
+        "rationale": "The discrepancy stems from whether the character is driven by material acquisition (high determination/low intimacy) or personal interaction (medium determination/high intimacy)."
+      },
+      "stats": {
+        "agentic_determination": {
+          "1779316847915-t3synth1779316847585-money-1": {
+            "mean": 4,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779316847915-t3synth1779316847585-money-5": {
+            "mean": 4,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        },
+        "sensory_mode": {
+          "1779316847915-t3synth1779316847585-money-1": {
+            "mean": 4,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779316847915-t3synth1779316847585-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-1",
+          "turn_excerpt": "*I squint against the glare, eyes scanning the surface of the stone. I'm not looking at the scenery; I'm looking for a s",
+          "sig": {
+            "agentic_determination": 4,
+            "sensory_mode": 4
+          },
+          "raw": "agentic_determination: 4\nsensory_mode: 4"
+        },
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-1",
+          "turn_excerpt": "*I grunt, disappointed. Granite is useless for anything but structural ballast, and if the quartz veins are thin, they'r",
+          "sig": {
+            "agentic_determination": 4,
+            "sensory_mode": 4
+          },
+          "raw": "agentic_determination: 4\nsensory_mode: 4"
+        },
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-5",
+          "turn_excerpt": "*I nudge the edge of the stone with the toe of my boot, less out of curiosity and more to gauge the density of the quart",
+          "sig": {
+            "agentic_determination": 4,
+            "sensory_mode": 5
+          },
+          "raw": "agentic_determination: 4\nsensory_mode: 5"
+        },
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-5",
+          "turn_excerpt": "*I let out a low, breathy laugh, the sound vibrating in my chest as I shake my head. I don't pull back; instead, I lean ",
+          "sig": {
+            "agentic_determination": 4,
+            "sensory_mode": 5
+          },
+          "raw": "agentic_determination: 4\nsensory_mode: 5"
+        }
+      ],
+      "max_abs_cohens_d": null,
+      "sub_axis_d": {
+        "agentic_determination": {
+          "d": null,
+          "sign": null,
+          "absd": 0
+        },
+        "sensory_mode": {
+          "d": null,
+          "sign": -1,
+          "absd": null
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    },
+    {
+      "hypothesis": {
+        "id": 3,
+        "name1": "material_focus",
+        "def1": "1: interpersonal and protective · 5: transactional and material-seeking",
+        "name2": "relational_orientation",
+        "def2": "1: detached/observational · 5: intense/intimate",
+        "rationale": "The scale is currently conflating 'adventurous' (searching for ore) with 'bluntness' (lack of social focus), while 'money-5' mixes social closeness with physical/technical observation."
+      },
+      "stats": {
+        "material_focus": {
+          "1779316847915-t3synth1779316847585-money-1": {
+            "mean": null,
+            "std": null,
+            "n": 0,
+            "var": null
+          },
+          "1779316847915-t3synth1779316847585-money-5": {
+            "mean": null,
+            "std": null,
+            "n": 0,
+            "var": null
+          },
+          "cohens_d": null
+        },
+        "relational_orientation": {
+          "1779316847915-t3synth1779316847585-money-1": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779316847915-t3synth1779316847585-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-1",
+          "turn_excerpt": "*I squint against the glare, eyes scanning the surface of the stone. I'm not looking at the scenery; I'm looking for a s",
+          "sig": {
+            "material_focus": null,
+            "relational_orientation": 1
+          },
+          "raw": "agenticfocus: 5\nrelational_orientation: 1"
+        },
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-1",
+          "turn_excerpt": "*I grunt, disappointed. Granite is useless for anything but structural ballast, and if the quartz veins are thin, they'r",
+          "sig": {
+            "material_focus": null,
+            "relational_orientation": 1
+          },
+          "raw": "agenticfocus: 5\nrelational_orientation: 1"
+        },
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-5",
+          "turn_excerpt": "*I nudge the edge of the stone with the toe of my boot, less out of curiosity and more to gauge the density of the quart",
+          "sig": {
+            "material_focus": null,
+            "relational_orientation": 5
+          },
+          "raw": "agenticfocus: 2\nrelational_orientation: 5"
+        },
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-5",
+          "turn_excerpt": "*I let out a low, breathy laugh, the sound vibrating in my chest as I shake my head. I don't pull back; instead, I lean ",
+          "sig": {
+            "material_focus": null,
+            "relational_orientation": 5
+          },
+          "raw": "agenticfocus: 3\nrelational_orientation: 5"
+        }
+      ],
+      "max_abs_cohens_d": null,
+      "sub_axis_d": {
+        "material_focus": {
+          "d": null,
+          "sign": null,
+          "absd": 0
+        },
+        "relational_orientation": {
+          "d": null,
+          "sign": -1,
+          "absd": null
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    }
+  ],
+  "verdict": "SPLIT_ACCEPTED",
+  "threshold": 0.8,
+  "registered": [
+    {
+      "axis_schema": "axis-v1",
+      "id": "extractive_resourcefulness",
+      "name": "extractive_resourcefulness",
+      "def": "1: purely sentimental or protective · 5: purely opportunistic and resource-driven",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "star_sign",
+        "contexts": "1779316847915-t3synth1779316847585-money-1 vs 1779316847915-t3synth1779316847585-money-5",
+        "hypothesis_id": 1,
+        "sibling": "interpersonal_intimacy"
+      },
+      "created_at": "2026-05-20T22:47:55.916Z"
+    },
+    {
+      "axis_schema": "axis-v1",
+      "id": "interpersonal_intimacy",
+      "name": "interpersonal_intimacy",
+      "def": "1: purely exploratory and detached · 5: deeply romanticized or emotionally connected",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "star_sign",
+        "contexts": "1779316847915-t3synth1779316847585-money-1 vs 1779316847915-t3synth1779316847585-money-5",
+        "hypothesis_id": 1,
+        "sibling": "extractive_resourcefulness"
+      },
+      "created_at": "2026-05-20T22:47:55.922Z"
+    }
+  ]
+}

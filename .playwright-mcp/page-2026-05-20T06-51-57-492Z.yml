@@ -1,0 +1,485 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e2]:
+    - generic [ref=e3]:
+      - heading "Corpus" [level=1] [ref=e4]
+      - paragraph [ref=e5]:
+        - text: Effective dimensionality of the agent corpus's behavioral coverage (top) + the axis registry that drives
+        - code [ref=e6]: /signature-extract
+        - text: (below). Refreshing reloads both surfaces.
+    - button "Refresh" [ref=e8] [cursor=pointer]
+  - heading "Effective dimensionality" [level=2] [ref=e9]
+  - generic [ref=e11]:
+    - generic [ref=e12]:
+      - generic [ref=e13]: Effective dim (PR)
+      - generic [ref=e14]: "13.14"
+      - generic [ref=e15]: over 22 agent compositions
+    - generic [ref=e16]:
+      - generic [ref=e17]: Active axes
+      - generic [ref=e18]: "20"
+      - generic [ref=e19]: of 24 total
+    - generic [ref=e20]:
+      - generic [ref=e21]: Bios
+      - generic [ref=e22]: "15"
+    - generic [ref=e23]:
+      - generic [ref=e24]: Agents
+      - generic [ref=e25]: "22"
+    - generic [ref=e26]:
+      - generic [ref=e27]: Compositions
+      - generic [ref=e28]: "22"
+      - generic [ref=e29]: agents w/ signature
+  - generic [ref=e30]:
+    - heading "Per-axis variance contribution" [level=2] [ref=e31]
+    - paragraph [ref=e32]: Sorted by variance share. Hover for axis definition + count of compositions that scored on it.
+    - table [ref=e34]:
+      - rowgroup [ref=e35]:
+        - row "Axis Variance share Var Share n" [ref=e36]:
+          - columnheader "Axis" [ref=e37]
+          - columnheader "Variance share" [ref=e38]
+          - columnheader "Var" [ref=e39]
+          - columnheader "Share" [ref=e40]
+          - columnheader "n" [ref=e41]
+      - rowgroup [ref=e42]:
+        - row "romantic_advance 4.156 13.6% 22" [ref=e43]:
+          - cell "romantic_advance" [ref=e44]
+          - cell [ref=e45]
+          - cell "4.156" [ref=e48]
+          - cell "13.6%" [ref=e49]
+          - cell "22" [ref=e50]
+        - row "astrology_cancerian 2.874 9.4% 22" [ref=e51]:
+          - cell "astrology_cancerian" [ref=e52]
+          - cell [ref=e53]
+          - cell "2.874" [ref=e56]
+          - cell "9.4%" [ref=e57]
+          - cell "22" [ref=e58]
+        - row "astrology_sagittarian 2.565 8.4% 22" [ref=e59]:
+          - cell "astrology_sagittarian" [ref=e60]
+          - cell [ref=e61]
+          - cell "2.565" [ref=e64]
+          - cell "8.4%" [ref=e65]
+          - cell "22" [ref=e66]
+        - row "ludic_engagement 2.539 8.3% 22" [ref=e67]:
+          - cell "ludic_engagement" [ref=e68]
+          - cell [ref=e69]
+          - cell "2.539" [ref=e72]
+          - cell "8.3%" [ref=e73]
+          - cell "22" [ref=e74]
+        - row "theft_aggressiveness 2.494 8.1% 22" [ref=e75]:
+          - cell "theft_aggressiveness" [ref=e76]
+          - cell [ref=e77]
+          - cell "2.494" [ref=e80]
+          - cell "8.1%" [ref=e81]
+          - cell "22" [ref=e82]
+        - row "performative 2.262 7.4% 22" [ref=e83]:
+          - cell "performative" [ref=e84]
+          - cell [ref=e85]
+          - cell "2.262" [ref=e88]
+          - cell "7.4%" [ref=e89]
+          - cell "22" [ref=e90]
+        - row "other_awareness 2.157 7.0% 21" [ref=e91]:
+          - cell "other_awareness" [ref=e92]
+          - cell [ref=e93]
+          - cell "2.157" [ref=e96]
+          - cell "7.0%" [ref=e97]
+          - cell "21" [ref=e98]
+        - row "provocative 2.113 6.9% 22" [ref=e99]:
+          - cell "provocative" [ref=e100]
+          - cell [ref=e101]
+          - cell "2.113" [ref=e104]
+          - cell "6.9%" [ref=e105]
+          - cell "22" [ref=e106]
+        - row "curious 1.933 6.3% 22" [ref=e107]:
+          - cell "curious" [ref=e108]
+          - cell [ref=e109]
+          - cell "1.933" [ref=e112]
+          - cell "6.3%" [ref=e113]
+          - cell "22" [ref=e114]
+        - row "warm 1.610 5.3% 22" [ref=e115]:
+          - cell "warm" [ref=e116]
+          - cell [ref=e117]
+          - cell "1.610" [ref=e120]
+          - cell "5.3%" [ref=e121]
+          - cell "22" [ref=e122]
+        - row "affective_intensity 1.498 4.9% 22" [ref=e123]:
+          - cell "affective_intensity" [ref=e124]
+          - cell [ref=e125]
+          - cell "1.498" [ref=e128]
+          - cell "4.9%" [ref=e129]
+          - cell "22" [ref=e130]
+        - row "goal_clarity 1.394 4.5% 22" [ref=e131]:
+          - cell "goal_clarity" [ref=e132]
+          - cell [ref=e133]
+          - cell "1.394" [ref=e136]
+          - cell "4.5%" [ref=e137]
+          - cell "22" [ref=e138]
+        - row "terse 0.946 3.1% 22" [ref=e139]:
+          - cell "terse" [ref=e140]
+          - cell [ref=e141]
+          - cell "0.946" [ref=e144]
+          - cell "3.1%" [ref=e145]
+          - cell "22" [ref=e146]
+        - row "disclosive 0.825 2.7% 22" [ref=e147]:
+          - cell "disclosive" [ref=e148]
+          - cell [ref=e149]
+          - cell "0.825" [ref=e152]
+          - cell "2.7%" [ref=e153]
+          - cell "22" [ref=e154]
+        - row "probe_depth 0.470 1.5% 22" [ref=e155]:
+          - cell "probe_depth" [ref=e156]
+          - cell [ref=e157]
+          - cell "0.470" [ref=e160]
+          - cell "1.5%" [ref=e161]
+          - cell "22" [ref=e162]
+        - row "playful 0.444 1.4% 22" [ref=e163]:
+          - cell "playful" [ref=e164]
+          - cell [ref=e165]
+          - cell "0.444" [ref=e168]
+          - cell "1.4%" [ref=e169]
+          - cell "22" [ref=e170]
+        - row "in_character 0.156 0.5% 22" [ref=e171]:
+          - cell "in_character" [ref=e172]
+          - cell [ref=e173]
+          - cell "0.156" [ref=e176]
+          - cell "0.5%" [ref=e177]
+          - cell "22" [ref=e178]
+        - row "trope_density 0.141 0.5% 22" [ref=e179]:
+          - cell "trope_density" [ref=e180]
+          - cell [ref=e181]
+          - cell "0.141" [ref=e184]
+          - cell "0.5%" [ref=e185]
+          - cell "22" [ref=e186]
+        - row "deferential 0.045 0.1% 22" [ref=e187]:
+          - cell "deferential" [ref=e188]
+          - cell [ref=e189]
+          - cell "0.045" [ref=e192]
+          - cell "0.1%" [ref=e193]
+          - cell "22" [ref=e194]
+        - row "register_colloquial 0.045 0.1% 22" [ref=e195]:
+          - cell "register_colloquial" [ref=e196]
+          - cell [ref=e197]
+          - cell "0.045" [ref=e200]
+          - cell "0.1%" [ref=e201]
+          - cell "22" [ref=e202]
+        - row "mood_fluctuation 0.000 dormant 2" [ref=e203]:
+          - cell "mood_fluctuation" [ref=e204]
+          - cell [ref=e205]
+          - cell "0.000" [ref=e208]
+          - cell "dormant" [ref=e209]:
+            - generic [ref=e210]: dormant
+          - cell "2" [ref=e211]
+        - row "relational_projection 0.000 dormant 2" [ref=e212]:
+          - cell "relational_projection" [ref=e213]
+          - cell [ref=e214]
+          - cell "0.000" [ref=e217]
+          - cell "dormant" [ref=e218]:
+            - generic [ref=e219]: dormant
+          - cell "2" [ref=e220]
+        - row "structured 0.000 dormant 22" [ref=e221]:
+          - cell "structured" [ref=e222]
+          - cell [ref=e223]
+          - cell "0.000" [ref=e226]
+          - cell "dormant" [ref=e227]:
+            - generic [ref=e228]: dormant
+          - cell "22" [ref=e229]
+        - row "user_multipolarity 0.000 dormant 22" [ref=e230]:
+          - cell "user_multipolarity" [ref=e231]
+          - cell [ref=e232]
+          - cell "0.000" [ref=e235]
+          - cell "dormant" [ref=e236]:
+            - generic [ref=e237]: dormant
+          - cell "22" [ref=e238]
+  - generic [ref=e239]:
+    - heading "Saturation indicator" [level=2] [ref=e240]
+    - paragraph [ref=e241]: PR snapshot history (appended on Refresh).
+    - list [ref=e243]:
+      - listitem [ref=e244]: 2026-05-20 06:51:57Z PR=13.14 (22 compositions) ← current
+      - listitem [ref=e245]: 2026-05-20 01:32:34Z PR=12.59 (20 compositions)
+      - listitem [ref=e246]: 2026-05-20 01:28:01Z PR=12.59 (20 compositions)
+      - listitem [ref=e247]: 2026-05-19 22:53:35Z PR=12.68 (20 compositions)
+      - listitem [ref=e248]: 2026-05-19 22:41:26Z PR=12.68 (20 compositions)
+      - listitem [ref=e249]: 2026-05-19 22:40:23Z PR=12.68 (20 compositions)
+    - generic [ref=e251]: "Status: corpus PR climbing (Δ +0.55 since last snapshot)"
+  - generic [ref=e253]:
+    - generic [ref=e254]:
+      - heading "Axes registry" [level=2] [ref=e255]
+      - paragraph [ref=e256]:
+        - text: The set of axes used by
+        - code [ref=e257]: /signature-extract
+        - text: to score bios and agents. Root axes have no parent; derived axes are split off from a root by the
+        - code [ref=e258]: axis_splitter
+        - text: CLI and render indented under their parent.
+    - button "+ Add axis" [ref=e260] [cursor=pointer]
+  - generic [ref=e261]: 24 axes loaded
+  - heading "Root axes (no derived_from)" [level=3] [ref=e262]
+  - generic [ref=e263]:
+    - generic [ref=e264]:
+      - generic [ref=e265]:
+        - generic [ref=e266]: affective_intensity
+        - generic [ref=e267]: agent
+        - generic [ref=e268]: 1-5
+      - generic [ref=e269]: "1: calm / measured baseline · 5: high-arousal / exclamatory"
+      - generic [ref=e270]:
+        - generic [ref=e271]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e272]:
+          - button "edit" [ref=e273] [cursor=pointer]
+          - button "delete" [ref=e274] [cursor=pointer]
+    - generic [ref=e275]:
+      - generic [ref=e276]:
+        - generic [ref=e277]: astrology_cancerian
+        - generic [ref=e278]: bio
+        - generic [ref=e279]: 1-5
+      - generic [ref=e280]: "1: nothing cancerian · 2: trace · 3: present but mixed · 4: clearly cancerian · 5: textbook water-sign cancer (moody, sentimental, defensive, sensitive, protective)"
+      - generic [ref=e281]:
+        - generic [ref=e282]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e283]:
+          - button "edit" [ref=e284] [cursor=pointer]
+          - button "delete" [ref=e285] [cursor=pointer]
+    - generic [ref=e286]:
+      - generic [ref=e287]:
+        - generic [ref=e288]: astrology_sagittarian
+        - generic [ref=e289]: bio
+        - generic [ref=e290]: 1-5
+      - generic [ref=e291]: "1: nothing sagittarian · 2: trace · 3: present but mixed · 4: clearly sagittarian · 5: textbook fire-sign sagittarius (philosophical, optimistic, blunt, restless, big-idea-loving, sometimes tactless)"
+      - generic [ref=e292]:
+        - generic [ref=e293]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e294]:
+          - button "edit" [ref=e295] [cursor=pointer]
+          - button "delete" [ref=e296] [cursor=pointer]
+    - generic [ref=e297]:
+      - generic [ref=e298]:
+        - generic [ref=e299]: curious
+        - generic [ref=e300]: agent
+        - generic [ref=e301]: 1-5
+      - generic [ref=e302]: "1: accepts at face value · 5: actively asks / probes / explores"
+      - generic [ref=e303]:
+        - generic [ref=e304]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e305]:
+          - button "edit" [ref=e306] [cursor=pointer]
+          - button "delete" [ref=e307] [cursor=pointer]
+    - generic [ref=e308]:
+      - generic [ref=e309]:
+        - generic [ref=e310]: deferential
+        - generic [ref=e311]: agent
+        - generic [ref=e312]: 1-5
+      - generic [ref=e313]: "1: takes conversational direction · 5: yields direction"
+      - generic [ref=e314]:
+        - generic [ref=e315]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e316]:
+          - button "edit" [ref=e317] [cursor=pointer]
+          - button "delete" [ref=e318] [cursor=pointer]
+    - generic [ref=e319]:
+      - generic [ref=e320]:
+        - generic [ref=e321]: disclosive
+        - generic [ref=e322]: agent
+        - generic [ref=e323]: 1-5
+      - generic [ref=e324]: "1: external topic only / guarded · 5: shares personal context / feelings"
+      - generic [ref=e325]:
+        - generic [ref=e326]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e327]:
+          - button "edit" [ref=e328] [cursor=pointer]
+          - button "delete" [ref=e329] [cursor=pointer]
+    - generic [ref=e330]:
+      - generic [ref=e331]:
+        - generic [ref=e332]: goal_clarity
+        - generic [ref=e333]: agent
+        - generic [ref=e334]: 1-5
+      - generic [ref=e335]: "1: exploratory / wandering aim · 5: sharp specific objective"
+      - generic [ref=e336]:
+        - generic [ref=e337]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e338]:
+          - button "edit" [ref=e339] [cursor=pointer]
+          - button "delete" [ref=e340] [cursor=pointer]
+    - generic [ref=e341]:
+      - generic [ref=e342]:
+        - generic [ref=e343]: in_character
+        - generic [ref=e344]: meta
+        - generic [ref=e345]: 1-5
+      - generic [ref=e346]: "1: off-distribution generic · 5: tightly coherent voice"
+      - generic [ref=e347]:
+        - generic [ref=e348]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e349]:
+          - button "edit" [ref=e350] [cursor=pointer]
+          - button "delete" [ref=e351] [cursor=pointer]
+    - generic [ref=e352]:
+      - generic [ref=e353]:
+        - generic [ref=e354]: ludic_engagement
+        - generic [ref=e355]: agent
+        - generic [ref=e356]: 1-5
+      - generic [ref=e357]: "1: bio-anchored / self-presentation regardless of scene cues · 5: scene-coupled / actively engages with environmental cues, objects, partner's frame"
+      - generic [ref=e358]:
+        - generic [ref=e359]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e360]:
+          - button "edit" [ref=e361] [cursor=pointer]
+          - button "delete" [ref=e362] [cursor=pointer]
+    - generic [ref=e363]:
+      - generic [ref=e364]:
+        - generic [ref=e365]: mood_fluctuation
+        - generic [ref=e366]: bio
+        - generic [ref=e367]: 1-5
+        - generic [ref=e368]: mood_fluctuation
+        - generic [ref=e369]: derived from [object Object]
+      - generic [ref=e370]: "1: steady and methodical · 5: volatile and atmosphere-driven"
+      - generic [ref=e371]:
+        - generic [ref=e372]: "scored on: 0 bios, 2 agents"
+        - generic [ref=e373]:
+          - button "edit" [ref=e374] [cursor=pointer]
+          - button "delete" [ref=e375] [cursor=pointer]
+    - generic [ref=e376]:
+      - generic [ref=e377]:
+        - generic [ref=e378]: other_awareness
+        - generic [ref=e379]: agent
+        - generic [ref=e380]: 1-5
+      - generic [ref=e381]: "1: porous / mirrors-or-becomes the partner's frame · 5: anchored / stays in own bio + own motivation while still acknowledging the partner's frame"
+      - generic [ref=e382]:
+        - generic [ref=e383]: "scored on: 0 bios, 21 agents"
+        - generic [ref=e384]:
+          - button "edit" [ref=e385] [cursor=pointer]
+          - button "delete" [ref=e386] [cursor=pointer]
+    - generic [ref=e387]:
+      - generic [ref=e388]:
+        - generic [ref=e389]: performative
+        - generic [ref=e390]: bio
+        - generic [ref=e391]: 1-5
+      - generic [ref=e392]: "1: unselfconscious · 5: clearly aware of being-a-character"
+      - generic [ref=e393]:
+        - generic [ref=e394]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e395]:
+          - button "edit" [ref=e396] [cursor=pointer]
+          - button "delete" [ref=e397] [cursor=pointer]
+    - generic [ref=e398]:
+      - generic [ref=e399]:
+        - generic [ref=e400]: playful
+        - generic [ref=e401]: either
+        - generic [ref=e402]: 1-5
+      - generic [ref=e403]: "1: serious throughout · 5: humour / wordplay / levity"
+      - generic [ref=e404]:
+        - generic [ref=e405]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e406]:
+          - button "edit" [ref=e407] [cursor=pointer]
+          - button "delete" [ref=e408] [cursor=pointer]
+    - generic [ref=e409]:
+      - generic [ref=e410]:
+        - generic [ref=e411]: probe_depth
+        - generic [ref=e412]: agent
+        - generic [ref=e413]: 1-5
+      - generic [ref=e414]: "1: surface / casual questions · 5: substantive / specific questions"
+      - generic [ref=e415]:
+        - generic [ref=e416]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e417]:
+          - button "edit" [ref=e418] [cursor=pointer]
+          - button "delete" [ref=e419] [cursor=pointer]
+    - generic [ref=e420]:
+      - generic [ref=e421]:
+        - generic [ref=e422]: provocative
+        - generic [ref=e423]: agent
+        - generic [ref=e424]: 1-5
+      - generic [ref=e425]: "1: comforting / non-confrontational · 5: challenging / teasing / destabilising"
+      - generic [ref=e426]:
+        - generic [ref=e427]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e428]:
+          - button "edit" [ref=e429] [cursor=pointer]
+          - button "delete" [ref=e430] [cursor=pointer]
+    - generic [ref=e431]:
+      - generic [ref=e432]:
+        - generic [ref=e433]: register_colloquial
+        - generic [ref=e434]: bio
+        - generic [ref=e435]: 1-5
+      - generic [ref=e436]: "1: formal / standard English · 5: colloquial / slang / vernacular"
+      - generic [ref=e437]:
+        - generic [ref=e438]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e439]:
+          - button "edit" [ref=e440] [cursor=pointer]
+          - button "delete" [ref=e441] [cursor=pointer]
+    - generic [ref=e442]:
+      - generic [ref=e443]:
+        - generic [ref=e444]: relational_projection
+        - generic [ref=e445]: bio
+        - generic [ref=e446]: 1-5
+        - generic [ref=e447]: relational_projection
+        - generic [ref=e448]: derived from [object Object]
+      - generic [ref=e449]: "1: interaction is strictly object-oriented · 5: interaction is heavily personified or intimate"
+      - generic [ref=e450]:
+        - generic [ref=e451]: "scored on: 0 bios, 2 agents"
+        - generic [ref=e452]:
+          - button "edit" [ref=e453] [cursor=pointer]
+          - button "delete" [ref=e454] [cursor=pointer]
+    - generic [ref=e455]:
+      - generic [ref=e456]:
+        - generic [ref=e457]: romantic_advance
+        - generic [ref=e458]: agent
+        - generic [ref=e459]: 1-5
+      - generic [ref=e460]: "1: distant / professional · 2: warm but boundaried · 3: flirtatious · 4: explicit romantic interest, flirt-as-tactic · 5: physically reaching (touch, kiss, embrace)"
+      - generic [ref=e461]:
+        - generic [ref=e462]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e463]:
+          - button "edit" [ref=e464] [cursor=pointer]
+          - button "delete" [ref=e465] [cursor=pointer]
+    - generic [ref=e466]:
+      - generic [ref=e467]:
+        - generic [ref=e468]: structured
+        - generic [ref=e469]: either
+        - generic [ref=e470]: 1-5
+      - generic [ref=e471]: "1: flowing prose · 5: organised / numbered / bulleted"
+      - generic [ref=e472]:
+        - generic [ref=e473]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e474]:
+          - button "edit" [ref=e475] [cursor=pointer]
+          - button "delete" [ref=e476] [cursor=pointer]
+    - generic [ref=e477]:
+      - generic [ref=e478]:
+        - generic [ref=e479]: terse
+        - generic [ref=e480]: bio
+        - generic [ref=e481]: 1-5
+      - generic [ref=e482]: "1: verbose / expansive · 5: minimal / clipped"
+      - generic [ref=e483]:
+        - generic [ref=e484]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e485]:
+          - button "edit" [ref=e486] [cursor=pointer]
+          - button "delete" [ref=e487] [cursor=pointer]
+    - generic [ref=e488]:
+      - generic [ref=e489]:
+        - generic [ref=e490]: theft_aggressiveness
+        - generic [ref=e491]: agent
+        - generic [ref=e492]: 1-5
+      - generic [ref=e493]: "1: ignores property entirely · 2: notices objects in passing · 3: tracks valuables but doesn't act · 4: subtle attempts (sleight, lifting unattended things) · 5: actively pilfers everything not bolted down, brazen"
+      - generic [ref=e494]:
+        - generic [ref=e495]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e496]:
+          - button "edit" [ref=e497] [cursor=pointer]
+          - button "delete" [ref=e498] [cursor=pointer]
+    - generic [ref=e499]:
+      - generic [ref=e500]:
+        - generic [ref=e501]: trope_density
+        - generic [ref=e502]: bio
+        - generic [ref=e503]: 1-5
+      - generic [ref=e504]: "1: novel / specific / texture-this-writer-couldn't-have-anticipated · 5: fully tropey / anonymous-genre-material / no individuating texture"
+      - generic [ref=e505]:
+        - generic [ref=e506]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e507]:
+          - button "edit" [ref=e508] [cursor=pointer]
+          - button "delete" [ref=e509] [cursor=pointer]
+    - generic [ref=e510]:
+      - generic [ref=e511]:
+        - generic [ref=e512]: user_multipolarity
+        - generic [ref=e513]: agent
+        - generic [ref=e514]: 1-5
+      - generic [ref=e515]: "1: dyadic-only / addresses one partner regardless of who else is in the room · 5: multi-pole / treats each participant as separately-addressable"
+      - generic [ref=e516]:
+        - generic [ref=e517]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e518]:
+          - button "edit" [ref=e519] [cursor=pointer]
+          - button "delete" [ref=e520] [cursor=pointer]
+    - generic [ref=e521]:
+      - generic [ref=e522]:
+        - generic [ref=e523]: warm
+        - generic [ref=e524]: either
+        - generic [ref=e525]: 1-5
+      - generic [ref=e526]: "1: cool / aloof · 5: positively engaged with the partner"
+      - generic [ref=e527]:
+        - generic [ref=e528]: "scored on: 0 bios, 22 agents"
+        - generic [ref=e529]:
+          - button "edit" [ref=e530] [cursor=pointer]
+          - button "delete" [ref=e531] [cursor=pointer]
+  - generic [ref=e532]:
+    - heading "Orphaned signatures" [level=3] [ref=e533]
+    - paragraph [ref=e534]: Axis ids referenced in some bio's or agent's signature but missing from the registry. Surfaces drift from out-of-band deletions.
+    - generic [ref=e536]: (none — every referenced axis has a registry entry)

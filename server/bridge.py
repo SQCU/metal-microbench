@@ -142,7 +142,7 @@ _TURN_END_TOKENS: list[int] = []         # set at startup; chat-template end-of-
 # bounds how long gemma_poll cond_waits when the engine is TRULY idle
 # (intake empty, no resident sessions decoding); active work runs back-
 # to-back regardless of the deadline.
-_DRIVER_POLL_DEADLINE_MS = 1000
+_DRIVER_POLL_DEADLINE_MS = 50  # 2026-05-23: bisected from 1000 — long deadline starved aggregate-mode handlers (0.16 tok/sec). Short deadline restores cooperative cycling.
 
 # 2026-05-18: response-queue depth high-water mark and disconnect-poll
 # cadence — the lifecycle-safety pair that prevents the "stream
@@ -276,15 +276,29 @@ async def _consume_engine_stream(stream_id: int, request: Request):
     response_q = _response_qs[stream_id]
     last_update: g.StreamUpdate | None = None
     clean_close = False
+    # 2026-05-23 PERF FIX: hoist disc_task OUTSIDE the loop so it lives
+    # for the duration of the stream, not per-token. Original commit
+    # 87254e8 created two fresh tasks per token (get_task + disc_task)
+    # and awaited asyncio.wait FIRST_COMPLETED on them; that pattern
+    # gave 0.16 tok/sec on aggregate-mode generation (vs ~3 tok/sec
+    # expected). Hoisting the disc_task removes the per-token
+    # create_task + cancel overhead.
+    #
+    # Semantics preserved: disc_task fires when client disconnects;
+    # we check it via .done() each iteration AND race against
+    # response_q.get() inside the loop. On disconnect, we exit + the
+    # finally block submits opcode-2 cancel. Defense-in-depth (P3
+    # engine deadline + P5 response_q overflow) still intact.
+    disc_task = asyncio.create_task(_wait_until_disconnected(request))
     try:
         while True:
-            # Race response_q.get() against client disconnect. Both are
-            # cancellable; FIRST_COMPLETED returns the winner. We cancel
-            # the loser. asyncio.wait does NOT propagate exceptions —
-            # we read .result() or .cancelled() explicitly below.
+            # Fast path: disconnect already fired between iterations.
+            # No need to await get_task — bail out immediately.
+            if disc_task.done():
+                try: disc_task.result()
+                except Exception: pass
+                break
             get_task = asyncio.create_task(response_q.get())
-            disc_task = asyncio.create_task(
-                _wait_until_disconnected(request))
             try:
                 done, pending = await asyncio.wait(
                     {get_task, disc_task},
@@ -295,14 +309,16 @@ async def _consume_engine_stream(stream_id: int, request: Request):
                 # finally still runs cancel-submit.
                 get_task.cancel(); disc_task.cancel()
                 raise
-            for t in pending:
-                t.cancel()
+            # Cancel get_task ONLY if it's pending (disc fired first).
+            # disc_task is NEVER cancelled here — it lives for the
+            # whole stream and is cancelled in the finally block.
             if disc_task in done:
-                # Client disconnected. Drain disc_task's exception (if
-                # any) silently — we're exiting either way.
+                get_task.cancel()
                 try: disc_task.result()
                 except Exception: pass
                 break
+            # get_task won. disc_task stays running for the next
+            # iteration (no per-token re-create).
             u: g.StreamUpdate = get_task.result()
             last_update = u
             # Set clean_close BEFORE yield. If we set it after, a caller
@@ -831,6 +847,19 @@ def _build_stream_spec(stream_id: int,
         raise
 
     delta_segments = _chunks_to_segments(delta_chunks, add_bos=True)
+    # 2026-05-23 DEBUG: log a hash of the FIRST N tokens of the rendered
+    # prompt so we can see if successive ST requests have the same
+    # prefix (which they should — tools + system are universal).
+    import hashlib as _hl
+    _all_tokens = []
+    for s in delta_segments:
+        if s.kind == 0:
+            _all_tokens.extend(s.tokens)
+    _pfx512 = _all_tokens[:512]
+    _h = _hl.sha1(repr(_pfx512).encode()).hexdigest()[:12]
+    print(f"[bridge DEBUG] prompt prefix hash (first 512 toks): {_h} "
+          f"| total_tokens={len(_all_tokens)} | first 20 toks: {_all_tokens[:20]}",
+          flush=True)
     spec_segments = [
         g.Segment(kind=s.kind, tokens=list(s.tokens), image_bytes=s.image_bytes)
         for s in delta_segments

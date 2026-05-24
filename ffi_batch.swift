@@ -925,6 +925,7 @@ private func drainSession(_ s: Session) -> [UInt32] {
 private func sessionStateByte(_ state: SessionState) -> UInt8 {
     switch state {
     case .priming:    return 0
+    case .primed:     return 0   // Track A: pre-first-sample; report as 'priming' on wire
     case .generating: return 1
     case .done:       return 2
     // .paused retired 2026-05-07; .idle retired 2026-05-07 (atomic
@@ -1254,6 +1255,20 @@ public func gemma_poll(_ timeoutMs: Int32,
         }
     }
 
+    // Defense-in-depth straggler sweep. Catches any session that
+    // transitioned to .done outside the work-step path (e.g., from a
+    // future callback or off-thread mutation) and didn't produce a
+    // state==2 StreamUpdate in the current poll's `updates` array.
+    // O(active_streams) cost — negligible against the AR-tick budget.
+    // expireAbandonedSessions does its own immediate closeSession now,
+    // so this sweep usually does nothing on healthy runs; it's the
+    // backstop for paths we haven't anticipated. Counter exposed for
+    // observability (task #179 RCA).
+    let strag = engine.sweepDoneStragglers()
+    if strag > 0 {
+        print("[batch_ffi] cleanup: \(strag) .done stragglers swept")
+    }
+
     let resp = encodeBatchResponse(updates)
     if resp.count > Int(outCap) {
         return -28 // -ENOSPC
@@ -1360,6 +1375,7 @@ public func gemma_engine_state(_ outBuf: UnsafeMutablePointer<UInt8>?,
             let stateStr: String
             switch s.state {
             case .priming:    stateStr = "priming"
+            case .primed:     stateStr = "primed"
             case .generating: stateStr = "generating"
             case .done:       stateStr = "done"
             }
@@ -1410,11 +1426,22 @@ public func gemma_engine_state(_ outBuf: UnsafeMutablePointer<UInt8>?,
 "last_step_ms":\(engine.lastStepMs),\
 "max_b":\(B)}
 """
+        // Track D: radix-trie stats. Keyed under kv_cache.prefix_trie
+        // so existing JSON consumers stay unaffected (Track E: wire
+        // stable). New fields are additive.
+        let trieStats = engine.prefixTrie.stats()
+        let prefixTrieSection = """
+        {"trie_nodes":\(trieStats.nodeCount),\
+"trie_anchors":\(trieStats.anchorCount),\
+"trie_max_depth":\(trieStats.maxDepth),\
+"trie_avg_depth":\(trieStats.avgDepth)}
+"""
         let kvSection = """
         {"total_pages":\(stats.totalPages),\
 "free_pages":\(stats.freePages),\
 "cached_pages":\(stats.cachedHashes),\
 "pages_in_use":\(stats.pagesInUse),\
+"prefix_trie":\(prefixTrieSection),\
 "pages":[\(pageLines.joined(separator: ","))]}
 """
         let visionSection = """

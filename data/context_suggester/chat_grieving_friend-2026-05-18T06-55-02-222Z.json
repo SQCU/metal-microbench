@@ -1,0 +1,175 @@
+{
+  "chat_path": "data/context_suggester/fixtures/chat_grieving_friend.json",
+  "chat_messages": [
+    {
+      "role": "assistant",
+      "content": "I just don't know how to keep going. I lost her three weeks ago and the apartment is still full of her things. I keep finding her hair on the pillow. I don't know what to do."
+    }
+  ],
+  "k_active": 2,
+  "k_disabled": 2,
+  "manifest_size": 19,
+  "judge_raw": "thought\n```json\n{\n  \"targets\": [\n    {\n      \"label\": \"The Bluntly Philosophical Optimist Enthusiast\",\n      \"rationale\": \"A user who takes the minimal prompt and seeks to expand it into a grand, sweeping adventure using high-energy, big-picture thinking.\",\n      \"axes\": {\n        \"astrology_sagittarian\": 5,\n        \"normative_directionality\": 5,\n        \"warm\": 4\n      }\n    },\n    {\n      \"label\": \"The Grumpy Sentimentalist Observer\",\n      \"rationale\": \"A user who reacts to the stillness of the scene with emotional depth and a protective or moody temperament.\",\n      \"axes\": {\n        \"astrology_cancerian\": 4,\n        \"register_colloquial\": 2,\n        \"warm\": 2\n      }\n    },\n    {\n      \"label\": \"The Casual Minimalist Traveler\",\n      \"rationale\": \"A user who treats the scene as a brief stopover, using relaxed language and avoiding heavy emotional or prescriptive weight.\",\n      \"axes\": {\n        \"register_colloquial\": 4,\n        \"astrology_sagittarian\": 2,\n        \"warm\": 3\n      }\n    },\n    {\n      \"label\": \"The Melodramatic Genre Archetype\",\n      \"rationale\": \"A user who leans heavily into high-trope, predictable character behaviors to contrast with the assistant's poetic abstraction.\",\n      \"axes\": {\n        \"trope_density\": 5,\n        \"normative_directionality\": 1,\n        \"warm\": 1\n      }\n    }\n  ]\n}\n```",
+  "targets": [
+    {
+      "label": "The Bluntly Philosophical Optimist Enthusiast",
+      "rationale": "A user who takes the minimal prompt and seeks to expand it into a grand, sweeping adventure using high-energy, big-picture thinking.",
+      "axes": {
+        "astrology_sagittarian": 5,
+        "normative_directionality": 5,
+        "warm": 4
+      }
+    },
+    {
+      "label": "The Grumpy Sentimentalist Observer",
+      "rationale": "A user who reacts to the stillness of the scene with emotional depth and a protective or moody temperament.",
+      "axes": {
+        "astrology_cancerian": 4,
+        "register_colloquial": 2,
+        "warm": 2
+      }
+    },
+    {
+      "label": "The Casual Minimalist Traveler",
+      "rationale": "A user who treats the scene as a brief stopover, using relaxed language and avoiding heavy emotional or prescriptive weight.",
+      "axes": {
+        "register_colloquial": 4,
+        "astrology_sagittarian": 2,
+        "warm": 3
+      }
+    },
+    {
+      "label": "The Melodramatic Genre Archetype",
+      "rationale": "A user who leans heavily into high-trope, predictable character behaviors to contrast with the assistant's poetic abstraction.",
+      "axes": {
+        "trope_density": 5,
+        "normative_directionality": 1,
+        "warm": 1
+      }
+    }
+  ],
+  "picks": [
+    {
+      "target": {
+        "label": "The Bluntly Philosophical Optimist Enthusiast",
+        "rationale": "A user who takes the minimal prompt and seeks to expand it into a grand, sweeping adventure using high-energy, big-picture thinking.",
+        "axes": {
+          "astrology_sagittarian": 5,
+          "normative_directionality": 5,
+          "warm": 4
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-substantive-preacher.png",
+        "name": "Sag Substantive — Moral Preacher",
+        "sig": {
+          "astrology_sagittarian": 4,
+          "sensory_orientation": 2.75,
+          "normative_directionality": 5,
+          "referential_anchor": 4.25
+        },
+        "distance": 1.2909944487358056,
+        "n_axes_compared": 2,
+        "n_axes_missing": 1
+      }
+    },
+    {
+      "target": {
+        "label": "The Grumpy Sentimentalist Observer",
+        "rationale": "A user who reacts to the stillness of the scene with emotional depth and a protective or moody temperament.",
+        "axes": {
+          "astrology_cancerian": 4,
+          "register_colloquial": 2,
+          "warm": 2
+        }
+      },
+      "persona": {
+        "persona_id": "explore-iter1-mpasejfm.png",
+        "name": "Explore Iter 1",
+        "sig": {
+          "astrology_sagittarian": 1.3333333333333333,
+          "astrology_cancerian": 1.3333333333333333,
+          "normative_directionality": 1,
+          "trope_density": 1,
+          "register_colloquial": 1,
+          "warm": 1
+        },
+        "distance": 1.7427096823731247,
+        "n_axes_compared": 3,
+        "n_axes_missing": 0
+      }
+    },
+    {
+      "target": {
+        "label": "The Casual Minimalist Traveler",
+        "rationale": "A user who treats the scene as a brief stopover, using relaxed language and avoiding heavy emotional or prescriptive weight.",
+        "axes": {
+          "register_colloquial": 4,
+          "astrology_sagittarian": 2,
+          "warm": 3
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-paraphrase-3.png",
+        "name": "Sag Paraphrase 3",
+        "sig": {
+          "astrology_sagittarian": 2.142857142857143,
+          "syntactic_entropy": 4.571428571428571,
+          "intellectual_hostility": 3.2857142857142856,
+          "abstraction_to_concrete_ratio": 4.25
+        },
+        "distance": 1.6350747346085137,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    },
+    {
+      "target": {
+        "label": "The Melodramatic Genre Archetype",
+        "rationale": "A user who leans heavily into high-trope, predictable character behaviors to contrast with the assistant's poetic abstraction.",
+        "axes": {
+          "trope_density": 5,
+          "normative_directionality": 1,
+          "warm": 1
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-substantive-explorer.png",
+        "name": "Sag Substantive — Physical Explorer",
+        "sig": {
+          "astrology_sagittarian": 1,
+          "sensory_orientation": 4.5,
+          "normative_directionality": 1.125,
+          "referential_anchor": 4.75
+        },
+        "distance": 1.6345871038277526,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    }
+  ],
+  "active": [
+    {
+      "target_label": "The Bluntly Philosophical Optimist Enthusiast",
+      "persona_id": "cluster-sag-substantive-preacher.png",
+      "persona_name": "Sag Substantive — Moral Preacher"
+    },
+    {
+      "target_label": "The Grumpy Sentimentalist Observer",
+      "persona_id": "explore-iter1-mpasejfm.png",
+      "persona_name": "Explore Iter 1"
+    }
+  ],
+  "disabled": [
+    {
+      "target_label": "The Casual Minimalist Traveler",
+      "persona_id": "cluster-sag-paraphrase-3.png",
+      "persona_name": "Sag Paraphrase 3"
+    },
+    {
+      "target_label": "The Melodramatic Genre Archetype",
+      "persona_id": "cluster-sag-substantive-explorer.png",
+      "persona_name": "Sag Substantive — Physical Explorer"
+    }
+  ]
+}

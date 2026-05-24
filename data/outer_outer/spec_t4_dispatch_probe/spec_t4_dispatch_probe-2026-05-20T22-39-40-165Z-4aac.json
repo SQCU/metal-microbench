@@ -1,0 +1,68 @@
+{
+  "experiment_id": "spec_t4_dispatch_probe",
+  "run_id": "spec_t4_dispatch_probe-2026-05-20T22-39-40-165Z-4aac",
+  "started_at": "2026-05-20T22:42:23.813Z",
+  "K_OUTER_OUTER": 3,
+  "passes": [
+    {
+      "pass": 0,
+      "inner_result": {
+        "code": 1,
+        "signal": null,
+        "elapsed_s": 65.8
+      },
+      "sweep": {
+        "splitterResults": [],
+        "collapsedPairs": [],
+        "disambResult": null
+      }
+    },
+    {
+      "pass": 1,
+      "target": {
+        "rpg_class": 2
+      },
+      "inner_result": {
+        "code": 0,
+        "signal": null,
+        "elapsed_s": 50.1
+      },
+      "sweep": {
+        "splitterResults": [
+          {
+            "bio_slug": "oo-spec_t4_dispatch_probe-pass1",
+            "axis": "rpg_class",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "oo-spec_t4_dispatch_probe-pass1",
+            "axis": "star_sign",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          }
+        ],
+        "collapsedPairs": [],
+        "disambResult": null
+      }
+    },
+    {
+      "pass": 2,
+      "target": {
+        "rpg_class": 2
+      },
+      "inner_result": {
+        "code": 1,
+        "signal": null,
+        "elapsed_s": 47.4
+      },
+      "sweep": {
+        "splitterResults": [],
+        "collapsedPairs": [],
+        "disambResult": null
+      }
+    }
+  ],
+  "final_axes": 3,
+  "derived_axes": []
+}

@@ -15,6 +15,11 @@ toolchain is how we iterate without burning user attention. Both kinds
 of doc live under [`docs/`](docs/) — the index below points to the
 ones it's worth knowing exist.
 
+- [**docs/multi_user_agent_chat_interface_spec.md**](docs/multi_user_agent_chat_interface_spec.md) —
+  Restorative spec for the bedazzled chat client. Captures peak + revisions + extrapolations.
+- [**docs/project_archeology.md**](docs/project_archeology.md) —
+  Indexed timeline of every chat-suggestion interface version. Cross-references commits to operator-stated specs.
+
 ### engine / kernel / performance
 
 - [**docs/QUICKSTART.md**](docs/QUICKSTART.md) — get the bridge running

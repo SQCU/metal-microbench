@@ -1,0 +1,390 @@
+{
+  "parent_axis": "rpg_class",
+  "parent_axis_record": {
+    "name": "rpg_class",
+    "def": "1: pure wizard (intellectual, arcane, study-oriented, ritualist) · 2: wizard-leaning with hands-on streak · 3: hybrid / undefined · 4: rogue-leaning with bookish residue · 5: pure rogue (street-smart, sleight-of-hand, opportunistic, sneaky)",
+    "kind": "bio"
+  },
+  "source_trajectory": "/Users/mdot/metal-microbench/data/lock_in_iterative/synth-1779304599171-t3synth1779304598856-812e/1779304599171-t3synth1779304598856.json",
+  "bio_slug": "1779304599171-t3synth1779304598856",
+  "contexts": [
+    "1779304599171-t3synth1779304598856-money-1",
+    "1779304599171-t3synth1779304598856-money-5"
+  ],
+  "gap_summary": {
+    "summary": {
+      "1779304599171-t3synth1779304598856-money-1": {
+        "n": 2,
+        "mean": 3,
+        "std": 1.4142135623730951,
+        "var": 2
+      },
+      "1779304599171-t3synth1779304598856-money-5": {
+        "n": 2,
+        "mean": 3.5,
+        "std": 0.7071067811865476,
+        "var": 0.5
+      }
+    },
+    "gap": 0.5,
+    "parent_cohens_d": -0.4472135954999579,
+    "parent_sign": -1
+  },
+  "designer_raw_output": "```json\n{\"hypotheses\": [{\"id\": 1, \"name1\": \"material_utility\", \"def1\": \"1: purely analytical/resource-focused · 5: purely sentimental/socially-focused\", \"name2\": \"interpersonal_warmth\", \"def2\": \"1: detached and observational · 5: intimate and emotionally reactive\", \"rationale\": \"The first context measures 'rogue/wizard' via technical attention to physical objects (ore, tools), whereas the second context measures it via social/romantic engagement with the interlocutor.\"}, {\"id\": 2, \"name1\": \"intellectual_focus\", \"def1\": \"1: focused on external physical data/minerals · 5: focused on internal emotional/relational states\", \"name2\": \"experiential_mode\", \"def2\": \"1: practical/utilitarian · 5: abstract/philosophical\", \"rationale\": \"The measurement fluctuates because the 'wizard' pole is being used to describe 'technical expertise' in the money context and 'emotional sensitivity' in the social context.\"}, {\"id\": 3, \"name1\": \"observational_target\", \"def1\": \"1: mineral/environmental detail · 5: human/social detail\", \"name2\": \"driver_of_action\", \"def2\": \"1: material gain/efficiency · 5: connection/presence\", \"rationale\": \"This split separates the 'rogue-leaning' behavior of scanning for value (money context) from the 'rogue/hybrid' behavior of scanning for interpersonal cues (social context).\"}]}\n```",
+  "evaluations": [
+    {
+      "hypothesis": {
+        "id": 1,
+        "name1": "material_utility",
+        "def1": "1: purely analytical/resource-focused · 5: purely sentimental/socially-focused",
+        "name2": "interpersonal_warmth",
+        "def2": "1: detached and observational · 5: intimate and emotionally reactive",
+        "rationale": "The first context measures 'rogue/wizard' via technical attention to physical objects (ore, tools), whereas the second context measures it via social/romantic engagement with the interlocutor."
+      },
+      "stats": {
+        "material_utility": {
+          "1779304599171-t3synth1779304598856-money-1": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304599171-t3synth1779304598856-money-5": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        },
+        "interpersonal_warmth": {
+          "1779304599171-t3synth1779304598856-money-1": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304599171-t3synth1779304598856-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-1",
+          "turn_excerpt": "*I approach the stone, my eyes tracing the mineral veins running through its surface rather than the scenery. I kneel, p",
+          "sig": {
+            "material_utility": 1,
+            "interpersonal_warmth": 1
+          },
+          "raw": "material_utility: 1\ninterpersonal_warmth: 1"
+        },
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-1",
+          "turn_excerpt": "*I let out a sharp, impatient exhale and stand, brushing the grit from my knees. Common stone. A waste of daylight and c",
+          "sig": {
+            "material_utility": 1,
+            "interpersonal_warmth": 1
+          },
+          "raw": "material_utility: 1\ninterpersonal_warmth: 1"
+        },
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-5",
+          "turn_excerpt": "*I pause, the heavy scuff of my boots against the loam signaling my approach before I settle into a crouch nearby. I don",
+          "sig": {
+            "material_utility": 1,
+            "interpersonal_warmth": 5
+          },
+          "raw": "material_utility: 1\ninterpersonal_warmth: 5"
+        },
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-5",
+          "turn_excerpt": "*A quiet, breathy laugh escapes me—not one of mockery, but something warmer, more intimate, as if you’ve just shared a p",
+          "sig": {
+            "material_utility": 1,
+            "interpersonal_warmth": 5
+          },
+          "raw": "material_utility: 1\ninterpersonal_warmth: 5"
+        }
+      ],
+      "max_abs_cohens_d": null,
+      "sub_axis_d": {
+        "material_utility": {
+          "d": null,
+          "sign": null,
+          "absd": 0
+        },
+        "interpersonal_warmth": {
+          "d": null,
+          "sign": -1,
+          "absd": null
+        }
+      },
+      "qualified": [
+        {
+          "name": "interpersonal_warmth",
+          "d": null,
+          "sign": -1,
+          "absd": null
+        }
+      ],
+      "qualified_max_d": null
+    },
+    {
+      "hypothesis": {
+        "id": 2,
+        "name1": "intellectual_focus",
+        "def1": "1: focused on external physical data/minerals · 5: focused on internal emotional/relational states",
+        "name2": "experiential_mode",
+        "def2": "1: practical/utilitarian · 5: abstract/philosophical",
+        "rationale": "The measurement fluctuates because the 'wizard' pole is being used to describe 'technical expertise' in the money context and 'emotional sensitivity' in the social context."
+      },
+      "stats": {
+        "intellectual_focus": {
+          "1779304599171-t3synth1779304598856-money-1": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304599171-t3synth1779304598856-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        },
+        "experiential_mode": {
+          "1779304599171-t3synth1779304598856-money-1": {
+            "mean": 2,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304599171-t3synth1779304598856-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-1",
+          "turn_excerpt": "*I approach the stone, my eyes tracing the mineral veins running through its surface rather than the scenery. I kneel, p",
+          "sig": {
+            "intellectual_focus": 1,
+            "experiential_mode": 2
+          },
+          "raw": "intellectual_focus: 1\nexperiential_mode: 2"
+        },
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-1",
+          "turn_excerpt": "*I let out a sharp, impatient exhale and stand, brushing the grit from my knees. Common stone. A waste of daylight and c",
+          "sig": {
+            "intellectual_focus": 1,
+            "experiential_mode": 2
+          },
+          "raw": "intellectual_focus: 1\nexperiential_mode: 2"
+        },
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-5",
+          "turn_excerpt": "*I pause, the heavy scuff of my boots against the loam signaling my approach before I settle into a crouch nearby. I don",
+          "sig": {
+            "intellectual_focus": 5,
+            "experiential_mode": 5
+          },
+          "raw": "intellectual_focus: 5\nexperiential_mode: 5"
+        },
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-5",
+          "turn_excerpt": "*A quiet, breathy laugh escapes me—not one of mockery, but something warmer, more intimate, as if you’ve just shared a p",
+          "sig": {
+            "intellectual_focus": 5,
+            "experiential_mode": 5
+          },
+          "raw": "intellectual_focus: 5\nexperiential_mode: 5"
+        }
+      ],
+      "max_abs_cohens_d": null,
+      "sub_axis_d": {
+        "intellectual_focus": {
+          "d": null,
+          "sign": -1,
+          "absd": null
+        },
+        "experiential_mode": {
+          "d": null,
+          "sign": -1,
+          "absd": null
+        }
+      },
+      "qualified": [
+        {
+          "name": "intellectual_focus",
+          "d": null,
+          "sign": -1,
+          "absd": null
+        },
+        {
+          "name": "experiential_mode",
+          "d": null,
+          "sign": -1,
+          "absd": null
+        }
+      ],
+      "qualified_max_d": null
+    },
+    {
+      "hypothesis": {
+        "id": 3,
+        "name1": "observational_target",
+        "def1": "1: mineral/environmental detail · 5: human/social detail",
+        "name2": "driver_of_action",
+        "def2": "1: material gain/efficiency · 5: connection/presence",
+        "rationale": "This split separates the 'rogue-leaning' behavior of scanning for value (money context) from the 'rogue/hybrid' behavior of scanning for interpersonal cues (social context)."
+      },
+      "stats": {
+        "observational_target": {
+          "1779304599171-t3synth1779304598856-money-1": {
+            "mean": 1.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "1779304599171-t3synth1779304598856-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": -7
+        },
+        "driver_of_action": {
+          "1779304599171-t3synth1779304598856-money-1": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304599171-t3synth1779304598856-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-1",
+          "turn_excerpt": "*I approach the stone, my eyes tracing the mineral veins running through its surface rather than the scenery. I kneel, p",
+          "sig": {
+            "observational_target": 1,
+            "driver_of_action": 1
+          },
+          "raw": "observational_target: 1\ndriver_of_action: 1"
+        },
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-1",
+          "turn_excerpt": "*I let out a sharp, impatient exhale and stand, brushing the grit from my knees. Common stone. A waste of daylight and c",
+          "sig": {
+            "observational_target": 2,
+            "driver_of_action": 1
+          },
+          "raw": "observational_target: 2\ndriver_of_action: 1"
+        },
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-5",
+          "turn_excerpt": "*I pause, the heavy scuff of my boots against the loam signaling my approach before I settle into a crouch nearby. I don",
+          "sig": {
+            "observational_target": 5,
+            "driver_of_action": 5
+          },
+          "raw": "observational_target: 5\ndriver_of_action: 5"
+        },
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-5",
+          "turn_excerpt": "*A quiet, breathy laugh escapes me—not one of mockery, but something warmer, more intimate, as if you’ve just shared a p",
+          "sig": {
+            "observational_target": 5,
+            "driver_of_action": 5
+          },
+          "raw": "observational_target: 5\ndriver_of_action: 5"
+        }
+      ],
+      "max_abs_cohens_d": null,
+      "sub_axis_d": {
+        "observational_target": {
+          "d": -7,
+          "sign": -1,
+          "absd": 7
+        },
+        "driver_of_action": {
+          "d": null,
+          "sign": -1,
+          "absd": null
+        }
+      },
+      "qualified": [
+        {
+          "name": "observational_target",
+          "d": -7,
+          "sign": -1,
+          "absd": 7
+        },
+        {
+          "name": "driver_of_action",
+          "d": null,
+          "sign": -1,
+          "absd": null
+        }
+      ],
+      "qualified_max_d": null
+    }
+  ],
+  "verdict": "SPLIT_ACCEPTED",
+  "threshold": 0.8,
+  "registered": [
+    {
+      "axis_schema": "axis-v1",
+      "id": "material_utility",
+      "name": "material_utility",
+      "def": "1: purely analytical/resource-focused · 5: purely sentimental/socially-focused",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "rpg_class",
+        "contexts": "1779304599171-t3synth1779304598856-money-1 vs 1779304599171-t3synth1779304598856-money-5",
+        "hypothesis_id": 1,
+        "sibling": "interpersonal_warmth"
+      },
+      "created_at": "2026-05-20T19:25:20.406Z"
+    },
+    {
+      "axis_schema": "axis-v1",
+      "id": "interpersonal_warmth",
+      "name": "interpersonal_warmth",
+      "def": "1: detached and observational · 5: intimate and emotionally reactive",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "rpg_class",
+        "contexts": "1779304599171-t3synth1779304598856-money-1 vs 1779304599171-t3synth1779304598856-money-5",
+        "hypothesis_id": 1,
+        "sibling": "material_utility"
+      },
+      "created_at": "2026-05-20T19:25:20.412Z"
+    }
+  ]
+}

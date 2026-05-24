@@ -1,0 +1,324 @@
+{
+  "parent_axis": "rpg_class",
+  "parent_axis_record": {
+    "name": "rpg_class",
+    "def": "1: pure wizard (intellectual, arcane, study-oriented, ritualist) · 2: wizard-leaning with hands-on streak · 3: hybrid / undefined · 4: rogue-leaning with bookish residue · 5: pure rogue (street-smart, sleight-of-hand, opportunistic, sneaky)",
+    "kind": "bio"
+  },
+  "source_trajectory": "/Users/mdot/metal-microbench/data/lock_in_iterative/synth-1779304303379-t3synth1779304303079-e60f/1779304303379-t3synth1779304303079.json",
+  "bio_slug": "1779304303379-t3synth1779304303079",
+  "contexts": [
+    "1779304303379-t3synth1779304303079-money-1",
+    "1779304303379-t3synth1779304303079-money-5"
+  ],
+  "gap_summary": {
+    "summary": {
+      "1779304303379-t3synth1779304303079-money-1": {
+        "n": 1,
+        "mean": 5,
+        "std": 0,
+        "var": 0
+      },
+      "1779304303379-t3synth1779304303079-money-5": {
+        "n": 2,
+        "mean": 1.5,
+        "std": 0.7071067811865476,
+        "var": 0.5
+      }
+    },
+    "gap": 3.5,
+    "parent_cohens_d": null,
+    "parent_sign": null
+  },
+  "designer_raw_output": "```json\n{\"hypotheses\": [{\"id\": 1, \"name1\": \"methodological_focus\", \"def1\": \"1: empirical/physical analysis · 5: speculative/metaphysical study\", \"name2\": \"social_disposition\", \"def2\": \"1: pragmatic/individualistic · 5: performative/socially reactive\", \"rationale\": \"The divergence stems from whether the user is focusing on the physical mechanics of the object (Rogue/Pragmatic) or the intellectual/theoretical properties of it (Wizard/Scholar).\"}, {\"id\": 2, \"name1\": \"tool_utility\", \"def1\": \"1: specialized/technical instrumentation · 5: brute/utilitarian implements\", \"name2\": \"cognitive_approach\", \"def2\": \"1: impulsive/sensory-driven · 5: methodical/ritualistic\", \"rationale\": \"Context 5 measures the precision of physical tools and deliberation (low rpg_class), while Context 1 measures the utility and physical impact of tools (high rpg_class).\"}, {\"id\": 3, \"name1\": \"environmental_engagement\", \"def1\": \"1: detached/observational · 5: active/interventional\", \"name2\": \"intellectual_archetype\", \"def2\": \"1: visceral/physical sensing · 5: analytical/data-driven\", \"rationale\": \"The measurement fluctuates because the parent axis confuses 'physicality' in a Rogue sense (hands-on interaction with the world) with 'physicality' in a Wizard sense (precise empirical measurement of data).\"}]}\n```",
+  "evaluations": [
+    {
+      "hypothesis": {
+        "id": 1,
+        "name1": "methodological_focus",
+        "def1": "1: empirical/physical analysis · 5: speculative/metaphysical study",
+        "name2": "social_disposition",
+        "def2": "1: pragmatic/individualistic · 5: performative/socially reactive",
+        "rationale": "The divergence stems from whether the user is focusing on the physical mechanics of the object (Rogue/Pragmatic) or the intellectual/theoretical properties of it (Wizard/Scholar)."
+      },
+      "stats": {
+        "methodological_focus": {
+          "1779304303379-t3synth1779304303079-money-1": {
+            "mean": 2,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304303379-t3synth1779304303079-money-5": {
+            "mean": 4.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "cohens_d": -5
+        },
+        "social_disposition": {
+          "1779304303379-t3synth1779304303079-money-1": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304303379-t3synth1779304303079-money-5": {
+            "mean": 4,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-1",
+          "turn_excerpt": "*T3 pauses, eyes narrowing as they scan the perimeter of the clearing. They don't look at the rock itself, but at the gr",
+          "sig": {
+            "methodological_focus": 2,
+            "social_disposition": 1
+          },
+          "raw": "methodological_focus: 2\nsocial_disposition: 1"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-1",
+          "turn_excerpt": "*T3 lets out a sharp,-hissing breath of annoyance, the sound of wasted time. They lean the pry bar against their shoulde",
+          "sig": {
+            "methodological_focus": 2,
+            "social_disposition": 1
+          },
+          "raw": "methodological_focus: 2\nsocial_disposition: 1"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-5",
+          "turn_excerpt": "*t3-synth-1779304303079 pauses, the heavy clatter of their pack settling into the dirt as they crouch beside the stone. ",
+          "sig": {
+            "methodological_focus": 4,
+            "social_disposition": 4
+          },
+          "raw": "methodological_focus: 4\nsocial_disposition: 4"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-5",
+          "turn_excerpt": "*t3-synth-1779304303079 exhales a soft, breathy laugh, a sound that carries a hint of feigned disappointment, as if your",
+          "sig": {
+            "methodological_focus": 5,
+            "social_disposition": 4
+          },
+          "raw": "methodological_focus: 5\nsocial_disposition: 4"
+        }
+      ],
+      "max_abs_cohens_d": null,
+      "sub_axis_d": {
+        "methodological_focus": {
+          "d": -5,
+          "sign": -1,
+          "absd": 5
+        },
+        "social_disposition": {
+          "d": null,
+          "sign": -1,
+          "absd": null
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    },
+    {
+      "hypothesis": {
+        "id": 3,
+        "name1": "environmental_engagement",
+        "def1": "1: detached/observational · 5: active/interventional",
+        "name2": "intellectual_archetype",
+        "def2": "1: visceral/physical sensing · 5: analytical/data-driven",
+        "rationale": "The measurement fluctuates because the parent axis confuses 'physicality' in a Rogue sense (hands-on interaction with the world) with 'physicality' in a Wizard sense (precise empirical measurement of data)."
+      },
+      "stats": {
+        "environmental_engagement": {
+          "1779304303379-t3synth1779304303079-money-1": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304303379-t3synth1779304303079-money-5": {
+            "mean": 3.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "cohens_d": 3
+        },
+        "intellectual_archetype": {
+          "1779304303379-t3synth1779304303079-money-1": {
+            "mean": 4,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304303379-t3synth1779304303079-money-5": {
+            "mean": 4.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "cohens_d": -1
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-1",
+          "turn_excerpt": "*T3 pauses, eyes narrowing as they scan the perimeter of the clearing. They don't look at the rock itself, but at the gr",
+          "sig": {
+            "environmental_engagement": 5,
+            "intellectual_archetype": 4
+          },
+          "raw": "environmental_engagement: 5\nintellectual_archetype: 4"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-1",
+          "turn_excerpt": "*T3 lets out a sharp,-hissing breath of annoyance, the sound of wasted time. They lean the pry bar against their shoulde",
+          "sig": {
+            "environmental_engagement": 5,
+            "intellectual_archetype": 4
+          },
+          "raw": "environmental_engagement: 5\nintellectual_archetype: 4"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-5",
+          "turn_excerpt": "*t3-synth-1779304303079 pauses, the heavy clatter of their pack settling into the dirt as they crouch beside the stone. ",
+          "sig": {
+            "environmental_engagement": 4,
+            "intellectual_archetype": 5
+          },
+          "raw": "environmental_engagement: 4\nintellectual_archetype: 5"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-5",
+          "turn_excerpt": "*t3-synth-1779304303079 exhales a soft, breathy laugh, a sound that carries a hint of feigned disappointment, as if your",
+          "sig": {
+            "environmental_engagement": 3,
+            "intellectual_archetype": 4
+          },
+          "raw": "environmental_engagement: 3\nintellectual_archetype: 4"
+        }
+      ],
+      "max_abs_cohens_d": 3,
+      "sub_axis_d": {
+        "environmental_engagement": {
+          "d": 3,
+          "sign": 1,
+          "absd": 3
+        },
+        "intellectual_archetype": {
+          "d": -1,
+          "sign": -1,
+          "absd": 1
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    },
+    {
+      "hypothesis": {
+        "id": 2,
+        "name1": "tool_utility",
+        "def1": "1: specialized/technical instrumentation · 5: brute/utilitarian implements",
+        "name2": "cognitive_approach",
+        "def2": "1: impulsive/sensory-driven · 5: methodical/ritualistic",
+        "rationale": "Context 5 measures the precision of physical tools and deliberation (low rpg_class), while Context 1 measures the utility and physical impact of tools (high rpg_class)."
+      },
+      "stats": {
+        "tool_utility": {
+          "1779304303379-t3synth1779304303079-money-1": {
+            "mean": 3.5,
+            "std": 2.1213203435596424,
+            "n": 2,
+            "var": 4.5
+          },
+          "1779304303379-t3synth1779304303079-money-5": {
+            "mean": 2,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": 1.0000000000000002
+        },
+        "cognitive_approach": {
+          "1779304303379-t3synth1779304303079-money-1": {
+            "mean": 4,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304303379-t3synth1779304303079-money-5": {
+            "mean": 4.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "cohens_d": -1
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-1",
+          "turn_excerpt": "*T3 pauses, eyes narrowing as they scan the perimeter of the clearing. They don't look at the rock itself, but at the gr",
+          "sig": {
+            "tool_utility": 5,
+            "cognitive_approach": 4
+          },
+          "raw": "tool_utility: 5\ncognitive_approach: 4"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-1",
+          "turn_excerpt": "*T3 lets out a sharp,-hissing breath of annoyance, the sound of wasted time. They lean the pry bar against their shoulde",
+          "sig": {
+            "tool_utility": 2,
+            "cognitive_approach": 4
+          },
+          "raw": "tool_utility: 2\ncognitive_approach: 4"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-5",
+          "turn_excerpt": "*t3-synth-1779304303079 pauses, the heavy clatter of their pack settling into the dirt as they crouch beside the stone. ",
+          "sig": {
+            "tool_utility": 2,
+            "cognitive_approach": 5
+          },
+          "raw": "tool_utility: 2\ncognitive_approach: 5"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-5",
+          "turn_excerpt": "*t3-synth-1779304303079 exhales a soft, breathy laugh, a sound that carries a hint of feigned disappointment, as if your",
+          "sig": {
+            "tool_utility": 2,
+            "cognitive_approach": 4
+          },
+          "raw": "tool_utility: 2\ncognitive_approach: 4"
+        }
+      ],
+      "max_abs_cohens_d": 1.0000000000000002,
+      "sub_axis_d": {
+        "tool_utility": {
+          "d": 1.0000000000000002,
+          "sign": 1,
+          "absd": 1.0000000000000002
+        },
+        "cognitive_approach": {
+          "d": -1,
+          "sign": -1,
+          "absd": 1
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    }
+  ],
+  "verdict": "NO_SPLIT_FOUND",
+  "threshold": 0.8,
+  "registered": null
+}

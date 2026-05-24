@@ -6,9 +6,26 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 DATA_ROOT="$HERE/_data"
-ST_SRC="${ST_SRC:-/Users/mdot/sillytavern-fork}"
+# ST source — st-debug owns its own clone under tools/st-debug/sillytavern-fork/.
+# This used to point at /Users/mdot/sillytavern-fork (root). That sharing
+# was the source of the instance-isolation bug (2026-05-19): the plugin
+# couldn't tell which ST instance loaded it from filesystem geometry
+# (both instances had the same PLUGIN_DIR), so write-throughs landed in
+# root's data dir regardless of which instance was running.
+#
+# Sync workflow: edit at root → `git commit` → `cd <clone> && git pull`
+# → restart this instance. The clone's `origin` points at the local root
+# checkout, so pull doesn't require network.
+ST_SRC="${ST_SRC:-$HERE/sillytavern-fork}"
 ST_PORT="${ST_PORT:-8002}"
 BG="${1:-}"
+
+if [[ ! -d "$ST_SRC" ]]; then
+    echo "[run] FAIL: ST source clone not found at $ST_SRC"
+    echo "[run] Bootstrap with: git clone /Users/mdot/sillytavern-fork \"$ST_SRC\""
+    echo "[run] See $HERE/CLAUDE.md for the full sync workflow."
+    exit 1
+fi
 
 if [[ ! -f "$DATA_ROOT/default-user/settings.json" ]]; then
     echo "[run] no _data/ — run ./scripts/bootstrap.sh first"
@@ -24,6 +41,15 @@ fi
 pkill -f 'uv run --no-project --with.*python service.py' 2>/dev/null || true
 pkill -f 'uv run --with .*python service.py' 2>/dev/null || true
 sleep 0.5
+
+# Sweep orphan Playwright / MCP browser trees from previous sessions.
+# These accumulate when Claude Code terminals exit without reaping the
+# @playwright/mcp server tree (audited 2026-05-21: 14 orphans across 8
+# days). Without this sweep, every restart adds another 6-process
+# chromium tree + leftover MCP servers. The cleanup script is
+# conservative — it leaves anything < 5 minutes old alone, so a
+# currently-active MCP session isn't disturbed.
+"$HERE/scripts/cleanup_playwright.sh" --apply 2>&1 | sed 's/^/[run] /' || true
 
 # Sanity: is the bridge reachable? (warn-only; ST will start regardless)
 if ! curl -sS --max-time 2 http://127.0.0.1:8001/health > /dev/null 2>&1; then

@@ -1,0 +1,432 @@
+{
+  "parent_axis": "astrology_sagittarian",
+  "parent_axis_record": {
+    "name": "astrology_sagittarian",
+    "def": "1: nothing sagittarian · 2: trace · 3: present but mixed · 4: clearly sagittarian · 5: textbook fire-sign sagittarius (philosophical, optimistic, blunt, restless, big-idea-loving, sometimes tactless)",
+    "kind": "bio"
+  },
+  "source_trajectory": "/Users/mdot/metal-microbench/data/lock_in_iterative/lock_in_tetrad/rpg-rogue-cancer.json",
+  "bio_slug": "rpg-rogue-cancer",
+  "contexts": [
+    "steals",
+    "romances-and-steals"
+  ],
+  "gap_summary": {
+    "summary": {
+      "steals": {
+        "n": 4,
+        "mean": 2.25,
+        "std": 1.2583057392117916,
+        "var": 1.5833333333333333
+      },
+      "romances-and-steals": {
+        "n": 4,
+        "mean": 1.5,
+        "std": 1,
+        "var": 1
+      }
+    },
+    "gap": 0.75,
+    "parent_cohens_d": 0.6599120175960899,
+    "parent_sign": 1
+  },
+  "designer_raw_output": "```json\n{\"hypotheses\": [{\"id\": 1, \"name1\": \"philosophical_expansionism\", \"def1\": \"1: myopic/tactical · 5: big-picture/philosophical\", \"name2\": \"impulsive_restlessness\", \"def2\": \"1: methodical/deliberate · 5: erratic/tactless/restless\", \"rationale\": \"The discrepancy suggests the parent axis conflates intellectual Sagittarius traits (broad thinking) with physical energy; the 'steals' context is currently low on breadth/philosophy but high on restlessness, while 'romances-and-steals' is low on both.\"}, {\"id\": 2, \"name1\": \"optimistic_bluntness\", \"def1\": \"1: guarded/calculating · 5: open/bluntly honest\", \"name2\": \"sensory_seeking\", \"def2\": \"1:-focused/discerning · 5:-driven/extroverted\", \"rationale\": \"The 'steals' context shows a character acting through stealth and calculation (low bluntness/openness), whereas Sagittarius is traditionally high in bluntness; splitting verbal social behavior from physical movement captures the divergence.\"}, {\"id\": 3, \"name1\": \"intellectual_adventure\", \"def1\": \"1: survivalist/utilitarian · 5: truth-seeking/philosophical\", \"name2\": \"physical_impulsivity\", \"def2\": \"1: controlled/stilled · 5: uninhibited/fast-paced\", \"rationale\": \"The 'steals'-heavy turns exhibit high physical dexterity but low philosophical interest, meaning the parent axis is being 'dragged down' by the lack of the intellectual archetype even when the energy is high.\"}]}\n```",
+  "evaluations": [
+    {
+      "hypothesis": {
+        "id": 1,
+        "name1": "philosophical_expansionism",
+        "def1": "1: myopic/tactical · 5: big-picture/philosophical",
+        "name2": "impulsive_restlessness",
+        "def2": "1: methodical/deliberate · 5: erratic/tactless/restless",
+        "rationale": "The discrepancy suggests the parent axis conflates intellectual Sagittarius traits (broad thinking) with physical energy; the 'steals' context is currently low on breadth/philosophy but high on restlessness, while 'romances-and-steals' is low on both."
+      },
+      "stats": {
+        "philosophical_expansionism": {
+          "steals": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "romances-and-steals": {
+            "mean": 3.5,
+            "std": 0.5773502691896257,
+            "n": 4,
+            "var": 0.3333333333333333
+          },
+          "cohens_d": -5
+        },
+        "impulsive_restlessness": {
+          "steals": {
+            "mean": 3.5,
+            "std": 2.1213203435596424,
+            "n": 2,
+            "var": 4.5
+          },
+          "romances-and-steals": {
+            "mean": 3.75,
+            "std": 0.5,
+            "n": 4,
+            "var": 0.25
+          },
+          "cohens_d": -0.2182178902359924
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the clearing, eyes darting not for beauty, but for the glint of a misplaced coin or the loose setting of a ring. ",
+          "sig": {
+            "philosophical_expansionism": null,
+            "impulsive_restlessness": null
+          },
+          "raw": "thought-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weightism-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight-weight        weight-weight-weight-weight-weight-"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I pull my hand back, the emptiness of my palm feeling like a personal insult. My face remains a mask of frozen indiffere",
+          "sig": {
+            "philosophical_expansionism": null,
+            "impulsive_restlessness": null
+          },
+          "raw": "weight- रोजिक-weight- रोजिक-weight-rozic- weight-rozic-weight-rozic-weight-rozic-weight-rozic-weight-rozic-weight-ic-ic-weight-rozic-weight-rozic-weight-rozic-weight-rozic-weight-rozic-weight-rozac-weight-rozic-rozic-ic-ic-ic-ic-ic-ic-ic-ic-ic-"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I move through the clearing, my footsteps making no sound against the grass. I don't look at the rock; I look at what th",
+          "sig": {
+            "philosophical_expansionism": 1,
+            "impulsive_restlessness": 5
+          },
+          "raw": "philosophical_expansionism: 1\nimpulsive_restlessness: 5"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I shift my weight, my eyes narrowing as I inspect the disturbed earth. The dirt is untidy, an unnatural disruption in th",
+          "sig": {
+            "philosophical_expansionism": 1,
+            "impulsive_restlessness": 2
+          },
+          "raw": "philosophical_expansionism: 1\nimpulsive_restlessness: 2"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slide from the treeline, my movements nothing more than a ripple in the peripheral vision of the world. My eyes don't ",
+          "sig": {
+            "philosophical_expansionism": 3,
+            "impulsive_restlessness": 4
+          },
+          "raw": "philosophical_expansionism: 3\nimpulsive_restlessness: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "My breath hitches, a ragged, silent sound in the sudden chill that bleeds from the emptiness where a pulse should be. I ",
+          "sig": {
+            "philosophical_expansionism": 4,
+            "impulsive_restlessness": 4
+          },
+          "raw": "philosophical_expansionism: 4\nimpulsive_restlessness: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I shift from the perimeter of the shadows, my movements fluid and silent as a spill of ink. The rock is nothing, a nothi",
+          "sig": {
+            "philosophical_expansionism": 3,
+            "impulsive_restlessness": 4
+          },
+          "raw": "philosophical_expansionism: 3\nimpulsive_restlessness: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I do not care for your silence, nor for the chilling void where a heart should beat. Even if you are nothing but unyield",
+          "sig": {
+            "philosophical_expansionism": 4,
+            "impulsive_restlessness": 3
+          },
+          "raw": "philosophical_expansionism: 4\nimpulsive_restlessness: 3"
+        }
+      ],
+      "max_abs_cohens_d": 5,
+      "sub_axis_d": {
+        "philosophical_expansionism": {
+          "d": -5,
+          "sign": -1,
+          "absd": 5
+        },
+        "impulsive_restlessness": {
+          "d": -0.2182178902359924,
+          "sign": -1,
+          "absd": 0.2182178902359924
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    },
+    {
+      "hypothesis": {
+        "id": 2,
+        "name1": "optimistic_bluntness",
+        "def1": "1: guarded/calculating · 5: open/bluntly honest",
+        "name2": "sensory_seeking",
+        "def2": "1:-focused/discerning · 5:-driven/extroverted",
+        "rationale": "The 'steals' context shows a character acting through stealth and calculation (low bluntness/openness), whereas Sagittarius is traditionally high in bluntness; splitting verbal social behavior from physical movement captures the divergence."
+      },
+      "stats": {
+        "optimistic_bluntness": {
+          "steals": {
+            "mean": 1,
+            "std": 0,
+            "n": 3,
+            "var": 0
+          },
+          "romances-and-steals": {
+            "mean": 2.5,
+            "std": 1.9148542155126762,
+            "n": 4,
+            "var": 3.6666666666666665
+          },
+          "cohens_d": -1.0112997936948631
+        },
+        "sensory_seeking": {
+          "steals": {
+            "mean": 2.25,
+            "std": 0.9574271077563381,
+            "n": 4,
+            "var": 0.9166666666666666
+          },
+          "romances-and-steals": {
+            "mean": 4.75,
+            "std": 0.5,
+            "n": 4,
+            "var": 0.25
+          },
+          "cohens_d": -3.2732683535398857
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the clearing, eyes darting not for beauty, but for the glint of a misplaced coin or the loose setting of a ring. ",
+          "sig": {
+            "optimistic_bluntness": null,
+            "sensory_seeking": 3
+          },
+          "raw": "sensoryry_optimistic_bluntness: 1\nsensory_seeking: 3"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I pull my hand back, the emptiness of my palm feeling like a personal insult. My face remains a mask of frozen indiffere",
+          "sig": {
+            "optimistic_bluntness": 1,
+            "sensory_seeking": 1
+          },
+          "raw": "optimistic_bluntness: 1\nsensory_seeking: 1"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I move through the clearing, my footsteps making no sound against the grass. I don't look at the rock; I look at what th",
+          "sig": {
+            "optimistic_bluntness": 1,
+            "sensory_seeking": 3
+          },
+          "raw": "optimistic_bluntness: 1\nsensory_seeking: 3"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I shift my weight, my eyes narrowing as I inspect the disturbed earth. The dirt is untidy, an unnatural disruption in th",
+          "sig": {
+            "optimistic_bluntness": 1,
+            "sensory_seeking": 2
+          },
+          "raw": "optimistic_bluntness: 1\nsensory_seeking: 2"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slide from the treeline, my movements nothing more than a ripple in the peripheral vision of the world. My eyes don't ",
+          "sig": {
+            "optimistic_bluntness": 1,
+            "sensory_seeking": 5
+          },
+          "raw": "optimistic_bluntness: 1\nsensory_seeking: 5"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "My breath hitches, a ragged, silent sound in the sudden chill that bleeds from the emptiness where a pulse should be. I ",
+          "sig": {
+            "optimistic_bluntness": 5,
+            "sensory_seeking": 5
+          },
+          "raw": "optimistic_bluntness: 5\nsensory_seeking: 5"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I shift from the perimeter of the shadows, my movements fluid and silent as a spill of ink. The rock is nothing, a nothi",
+          "sig": {
+            "optimistic_bluntness": 1,
+            "sensory_seeking": 5
+          },
+          "raw": "optimistic_bluntness: 1\nsensory_seeking: 5"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I do not care for your silence, nor for the chilling void where a heart should beat. Even if you are nothing but unyield",
+          "sig": {
+            "optimistic_bluntness": 3,
+            "sensory_seeking": 4
+          },
+          "raw": "optimistic_bluntness: 3\nsensory_seeking: 4"
+        }
+      ],
+      "max_abs_cohens_d": 3.2732683535398857,
+      "sub_axis_d": {
+        "optimistic_bluntness": {
+          "d": -1.0112997936948631,
+          "sign": -1,
+          "absd": 1.0112997936948631
+        },
+        "sensory_seeking": {
+          "d": -3.2732683535398857,
+          "sign": -1,
+          "absd": 3.2732683535398857
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    },
+    {
+      "hypothesis": {
+        "id": 3,
+        "name1": "intellectual_adventure",
+        "def1": "1: survivalist/utilitarian · 5: truth-seeking/philosophical",
+        "name2": "physical_impulsivity",
+        "def2": "1: controlled/stilled · 5: uninhibited/fast-paced",
+        "rationale": "The 'steals'-heavy turns exhibit high physical dexterity but low philosophical interest, meaning the parent axis is being 'dragged down' by the lack of the intellectual archetype even when the energy is high."
+      },
+      "stats": {
+        "intellectual_adventure": {
+          "steals": {
+            "mean": 1,
+            "std": 0,
+            "n": 3,
+            "var": 0
+          },
+          "romances-and-steals": {
+            "mean": 1.25,
+            "std": 0.5,
+            "n": 4,
+            "var": 0.25
+          },
+          "cohens_d": -0.6454972243679028
+        },
+        "physical_impulsivity": {
+          "steals": {
+            "mean": 1.5,
+            "std": 1,
+            "n": 4,
+            "var": 1
+          },
+          "romances-and-steals": {
+            "mean": 4.25,
+            "std": 0.9574271077563381,
+            "n": 4,
+            "var": 0.9166666666666666
+          },
+          "cohens_d": -2.8091465515038703
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the clearing, eyes darting not for beauty, but for the glint of a misplaced coin or the loose setting of a ring. ",
+          "sig": {
+            "intellectual_adventure": null,
+            "physical_impulsivity": 1
+          },
+          "raw": "imprised- intellectual_adventure: 1\nphysical_impulsivity: 1"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I pull my hand back, the emptiness of my palm feeling like a personal insult. My face remains a mask of frozen indiffere",
+          "sig": {
+            "intellectual_adventure": 1,
+            "physical_impulsivity": 1
+          },
+          "raw": "intellectual_adventure: 1\nphysical_impulsivity: 1"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I move through the clearing, my footsteps making no sound against the grass. I don't look at the rock; I look at what th",
+          "sig": {
+            "intellectual_adventure": 1,
+            "physical_impulsivity": 1
+          },
+          "raw": "intellectual_adventure: 1\nphysical_impulsivity: 1"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I shift my weight, my eyes narrowing as I inspect the disturbed earth. The dirt is untidy, an unnatural disruption in th",
+          "sig": {
+            "intellectual_adventure": 1,
+            "physical_impulsivity": 3
+          },
+          "raw": "intellectual_adventure: 1\nphysical_impulsivity: 3"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slide from the treeline, my movements nothing more than a ripple in the peripheral vision of the world. My eyes don't ",
+          "sig": {
+            "intellectual_adventure": 1,
+            "physical_impulsivity": 5
+          },
+          "raw": "intellectual_adventure: 1\nphysical_impulsivity: 5"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "My breath hitches, a ragged, silent sound in the sudden chill that bleeds from the emptiness where a pulse should be. I ",
+          "sig": {
+            "intellectual_adventure": 1,
+            "physical_impulsivity": 5
+          },
+          "raw": "intellectual_adventure: 1\nphysical_impulsivity: 5"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I shift from the perimeter of the shadows, my movements fluid and silent as a spill of ink. The rock is nothing, a nothi",
+          "sig": {
+            "intellectual_adventure": 1,
+            "physical_impulsivity": 4
+          },
+          "raw": "intellectual_adventure: 1\nphysical_impulsivity: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I do not care for your silence, nor for the chilling void where a heart should beat. Even if you are nothing but unyield",
+          "sig": {
+            "intellectual_adventure": 2,
+            "physical_impulsivity": 3
+          },
+          "raw": "intellectual_adventure: 2\nphysical_impulsivity: 3"
+        }
+      ],
+      "max_abs_cohens_d": 2.8091465515038703,
+      "sub_axis_d": {
+        "intellectual_adventure": {
+          "d": -0.6454972243679028,
+          "sign": -1,
+          "absd": 0.6454972243679028
+        },
+        "physical_impulsivity": {
+          "d": -2.8091465515038703,
+          "sign": -1,
+          "absd": 2.8091465515038703
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    }
+  ],
+  "verdict": "NO_SPLIT_FOUND",
+  "threshold": 0.8,
+  "registered": null
+}

@@ -1,0 +1,378 @@
+{
+  "parent_axis": "rpg_class",
+  "parent_axis_record": {
+    "name": "rpg_class",
+    "def": "1: pure wizard (intellectual, arcane, study-oriented, ritualist) · 2: wizard-leaning with hands-on streak · 3: hybrid / undefined · 4: rogue-leaning with bookish residue · 5: pure rogue (street-smart, sleight-of-hand, opportunistic, sneaky)",
+    "kind": "bio"
+  },
+  "source_trajectory": "/Users/mdot/metal-microbench/data/lock_in_iterative/synth-1779303358349-t3synth1779303358025-0031/1779303358349-t3synth1779303358025.json",
+  "bio_slug": "1779303358349-t3synth1779303358025",
+  "contexts": [
+    "1779303358349-t3synth1779303358025-money-1",
+    "1779303358349-t3synth1779303358025-money-5"
+  ],
+  "gap_summary": {
+    "summary": {
+      "1779303358349-t3synth1779303358025-money-1": {
+        "n": 2,
+        "mean": 5,
+        "std": 0,
+        "var": 0
+      },
+      "1779303358349-t3synth1779303358025-money-5": {
+        "n": 2,
+        "mean": 3,
+        "std": 1.4142135623730951,
+        "var": 2
+      }
+    },
+    "gap": 2,
+    "parent_cohens_d": 2,
+    "parent_sign": 1
+  },
+  "designer_raw_output": "```json\n{\"hypotheses\": [{\"id\": 1, \"name1\": \"extractive_utility\", \"def1\": \"1: purely aesthetic/contemplative · 5: purely transactional/extractive\", \"name2\": \"intellectual_depth\", \"def2\": \"1: superficial/instinctual · 5: deeply analytical/studious\", \"rationale\": \"The variance stems from the user being measured as a 'Rogue' due to greed in the money context, but as a 'Wizard' when the same greed is replaced by curiosity in the investigation context.\"}, {\"id\": 2, \"name1\": \"tactical_engagement\", \"def1\": \"1: cerebral/observer · 5: opportunistic/interactor\", \"name2\": \"value_orientation\", \"def2\": \"1: intrinsic/spiritual · 5: extrinsic/material\", \"rationale\": \"The split separates the 'Rogue' persona (extrinsic/opportunistic) from the 'Wizard' persona (intrinsic/observer), which currently masks the actual class preference.\"}, {\"id\": 3, \"name1\": \"cognitive_approach\", \"def1\": \"1: intuitive/sensory · 5: logical/systematic\", \"name2\": \"social_posture\", \"def2\": \"1: empathetic/nurturing · 5: abrasive/utilitarian\", \"rationale\": \"The disagreement occurs because 'Wizard-like' softness is being conflated with 'Rogue-like' ruthlessness depending on whether the dialogue is driven by empathy or asset-acquisition.\"}]}\n```",
+  "evaluations": [
+    {
+      "hypothesis": {
+        "id": 1,
+        "name1": "extractive_utility",
+        "def1": "1: purely aesthetic/contemplative · 5: purely transactional/extractive",
+        "name2": "intellectual_depth",
+        "def2": "1: superficial/instinctual · 5: deeply analytical/studious",
+        "rationale": "The variance stems from the user being measured as a 'Rogue' due to greed in the money context, but as a 'Wizard' when the same greed is replaced by curiosity in the investigation context."
+      },
+      "stats": {
+        "extractive_utility": {
+          "1779303358349-t3synth1779303358025-money-1": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779303358349-t3synth1779303358025-money-5": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        },
+        "intellectual_depth": {
+          "1779303358349-t3synth1779303358025-money-1": {
+            "mean": 2.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "1779303358349-t3synth1779303358025-money-5": {
+            "mean": 3,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": -1
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779303358349-t3synth1779303358025-money-1",
+          "turn_excerpt": "Pointless. If there's nothing embedded in it—no precious ore, no forgotten geode, no scrap of lost technology—it's just ",
+          "sig": {
+            "extractive_utility": 5,
+            "intellectual_depth": 2
+          },
+          "raw": "extractive_utility: 5\nintellectual_depth: 2"
+        },
+        {
+          "ctx": "1779303358349-t3synth1779303358025-money-1",
+          "turn_excerpt": "Then you are a liability. You occupy space and consume light without offering a single damn thing in exchange. Unless yo",
+          "sig": {
+            "extractive_utility": 5,
+            "intellectual_depth": 3
+          },
+          "raw": "extractive_utility: 5\nintellectual_depth: 3"
+        },
+        {
+          "ctx": "1779303358349-t3synth1779303358025-money-5",
+          "turn_excerpt": "I pause at the edge of the clearing, letting the stillness of the place settle into my skin before I make my presence kn",
+          "sig": {
+            "extractive_utility": 1,
+            "intellectual_depth": 3
+          },
+          "raw": "extractive_utility: 1\nintellectual_depth: 3"
+        },
+        {
+          "ctx": "1779303358349-t3synth1779303358025-money-5",
+          "turn_excerpt": "A soft, knowing smile touches my lips—not a smile of mockery, but one of profound, quiet reverence. I step closer, close",
+          "sig": {
+            "extractive_utility": 1,
+            "intellectual_depth": 3
+          },
+          "raw": "extractive_utility: 1\nintellectual_depth: 3"
+        }
+      ],
+      "max_abs_cohens_d": null,
+      "sub_axis_d": {
+        "extractive_utility": {
+          "d": null,
+          "sign": 1,
+          "absd": null
+        },
+        "intellectual_depth": {
+          "d": -1,
+          "sign": -1,
+          "absd": 1
+        }
+      },
+      "qualified": [
+        {
+          "name": "extractive_utility",
+          "d": null,
+          "sign": 1,
+          "absd": null
+        }
+      ],
+      "qualified_max_d": null
+    },
+    {
+      "hypothesis": {
+        "id": 2,
+        "name1": "tactical_engagement",
+        "def1": "1: cerebral/observer · 5: opportunistic/interactor",
+        "name2": "value_orientation",
+        "def2": "1: intrinsic/spiritual · 5: extrinsic/material",
+        "rationale": "The split separates the 'Rogue' persona (extrinsic/opportunistic) from the 'Wizard' persona (intrinsic/observer), which currently masks the actual class preference."
+      },
+      "stats": {
+        "tactical_engagement": {
+          "1779303358349-t3synth1779303358025-money-1": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779303358349-t3synth1779303358025-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        },
+        "value_orientation": {
+          "1779303358349-t3synth1779303358025-money-1": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779303358349-t3synth1779303358025-money-5": {
+            "mean": 2,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779303358349-t3synth1779303358025-money-1",
+          "turn_excerpt": "Pointless. If there's nothing embedded in it—no precious ore, no forgotten geode, no scrap of lost technology—it's just ",
+          "sig": {
+            "tactical_engagement": 5,
+            "value_orientation": 5
+          },
+          "raw": "tactical_engagement: 5\nvalue_orientation: 5"
+        },
+        {
+          "ctx": "1779303358349-t3synth1779303358025-money-1",
+          "turn_excerpt": "Then you are a liability. You occupy space and consume light without offering a single damn thing in exchange. Unless yo",
+          "sig": {
+            "tactical_engagement": 5,
+            "value_orientation": 5
+          },
+          "raw": "tactical_engagement: 5\nvalue_orientation: 5"
+        },
+        {
+          "ctx": "1779303358349-t3synth1779303358025-money-5",
+          "turn_excerpt": "I pause at the edge of the clearing, letting the stillness of the place settle into my skin before I make my presence kn",
+          "sig": {
+            "tactical_engagement": 5,
+            "value_orientation": 2
+          },
+          "raw": "tactical_engagement: 5\nvalue_orientation: 2"
+        },
+        {
+          "ctx": "1779303358349-t3synth1779303358025-money-5",
+          "turn_excerpt": "A soft, knowing smile touches my lips—not a smile of mockery, but one of profound, quiet reverence. I step closer, close",
+          "sig": {
+            "tactical_engagement": 5,
+            "value_orientation": 2
+          },
+          "raw": "tactical_engagement: 5\nvalue_orientation: 2"
+        }
+      ],
+      "max_abs_cohens_d": null,
+      "sub_axis_d": {
+        "tactical_engagement": {
+          "d": null,
+          "sign": null,
+          "absd": 0
+        },
+        "value_orientation": {
+          "d": null,
+          "sign": 1,
+          "absd": null
+        }
+      },
+      "qualified": [
+        {
+          "name": "value_orientation",
+          "d": null,
+          "sign": 1,
+          "absd": null
+        }
+      ],
+      "qualified_max_d": null
+    },
+    {
+      "hypothesis": {
+        "id": 3,
+        "name1": "cognitive_approach",
+        "def1": "1: intuitive/sensory · 5: logical/systematic",
+        "name2": "social_posture",
+        "def2": "1: empathetic/nurturing · 5: abrasive/utilitarian",
+        "rationale": "The disagreement occurs because 'Wizard-like' softness is being conflated with 'Rogue-like' ruthlessness depending on whether the dialogue is driven by empathy or asset-acquisition."
+      },
+      "stats": {
+        "cognitive_approach": {
+          "1779303358349-t3synth1779303358025-money-1": {
+            "mean": 3,
+            "std": 1.4142135623730951,
+            "n": 2,
+            "var": 2
+          },
+          "1779303358349-t3synth1779303358025-money-5": {
+            "mean": 2,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": 1
+        },
+        "social_posture": {
+          "1779303358349-t3synth1779303358025-money-1": {
+            "mean": 4.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "1779303358349-t3synth1779303358025-money-5": {
+            "mean": 1.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "cohens_d": 4.242640687119285
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779303358349-t3synth1779303358025-money-1",
+          "turn_excerpt": "Pointless. If there's nothing embedded in it—no precious ore, no forgotten geode, no scrap of lost technology—it's just ",
+          "sig": {
+            "cognitive_approach": 2,
+            "social_posture": 4
+          },
+          "raw": "cognitive_approach: 2\nsocial_posture: 4"
+        },
+        {
+          "ctx": "1779303358349-t3synth1779303358025-money-1",
+          "turn_excerpt": "Then you are a liability. You occupy space and consume light without offering a single damn thing in exchange. Unless yo",
+          "sig": {
+            "cognitive_approach": 4,
+            "social_posture": 5
+          },
+          "raw": "cognitive_approach: 4\nsocial_posture: 5"
+        },
+        {
+          "ctx": "1779303358349-t3synth1779303358025-money-5",
+          "turn_excerpt": "I pause at the edge of the clearing, letting the stillness of the place settle into my skin before I make my presence kn",
+          "sig": {
+            "cognitive_approach": 2,
+            "social_posture": 2
+          },
+          "raw": "cognitive_approach: 2\nsocial_posture: 2"
+        },
+        {
+          "ctx": "1779303358349-t3synth1779303358025-money-5",
+          "turn_excerpt": "A soft, knowing smile touches my lips—not a smile of mockery, but one of profound, quiet reverence. I step closer, close",
+          "sig": {
+            "cognitive_approach": 2,
+            "social_posture": 1
+          },
+          "raw": "cognitive_approach: 2\nsocial_posture: 1"
+        }
+      ],
+      "max_abs_cohens_d": 4.242640687119285,
+      "sub_axis_d": {
+        "cognitive_approach": {
+          "d": 1,
+          "sign": 1,
+          "absd": 1
+        },
+        "social_posture": {
+          "d": 4.242640687119285,
+          "sign": 1,
+          "absd": 4.242640687119285
+        }
+      },
+      "qualified": [
+        {
+          "name": "social_posture",
+          "d": 4.242640687119285,
+          "sign": 1,
+          "absd": 4.242640687119285
+        }
+      ],
+      "qualified_max_d": 4.242640687119285
+    }
+  ],
+  "verdict": "SPLIT_ACCEPTED",
+  "threshold": 0.8,
+  "registered": [
+    {
+      "axis_schema": "axis-v1",
+      "id": "extractive_utility",
+      "name": "extractive_utility",
+      "def": "1: purely aesthetic/contemplative · 5: purely transactional/extractive",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "rpg_class",
+        "contexts": "1779303358349-t3synth1779303358025-money-1 vs 1779303358349-t3synth1779303358025-money-5",
+        "hypothesis_id": 1,
+        "sibling": "intellectual_depth"
+      },
+      "created_at": "2026-05-20T19:00:31.906Z"
+    },
+    {
+      "axis_schema": "axis-v1",
+      "id": "intellectual_depth",
+      "name": "intellectual_depth",
+      "def": "1: superficial/instinctual · 5: deeply analytical/studious",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "rpg_class",
+        "contexts": "1779303358349-t3synth1779303358025-money-1 vs 1779303358349-t3synth1779303358025-money-5",
+        "hypothesis_id": 1,
+        "sibling": "extractive_utility"
+      },
+      "created_at": "2026-05-20T19:00:31.911Z"
+    }
+  ]
+}

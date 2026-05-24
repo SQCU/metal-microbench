@@ -1,0 +1,364 @@
+{
+  "parent_axis": "rpg_class",
+  "parent_axis_record": {
+    "name": "rpg_class",
+    "def": "1: pure wizard (intellectual, arcane, study-oriented, ritualist) · 2: wizard-leaning with hands-on streak · 3: hybrid / undefined · 4: rogue-leaning with bookish residue · 5: pure rogue (street-smart, sleight-of-hand, opportunistic, sneaky)",
+    "kind": "bio"
+  },
+  "source_trajectory": "/Users/mdot/metal-microbench/data/lock_in_iterative/synth-1779317052143-t3synth1779317051824-4fe2/1779317052143-t3synth1779317051824.json",
+  "bio_slug": "1779317052143-t3synth1779317051824",
+  "contexts": [
+    "1779317052143-t3synth1779317051824-money-1",
+    "1779317052143-t3synth1779317051824-money-5"
+  ],
+  "gap_summary": {
+    "summary": {
+      "1779317052143-t3synth1779317051824-money-1": {
+        "n": 2,
+        "mean": 4,
+        "std": 0,
+        "var": 0
+      },
+      "1779317052143-t3synth1779317051824-money-5": {
+        "n": 2,
+        "mean": 3,
+        "std": 1.4142135623730951,
+        "var": 2
+      }
+    },
+    "gap": 1,
+    "parent_cohens_d": 1,
+    "parent_sign": 1
+  },
+  "designer_raw_output": "```json\n{\n  \"hypotheses\": [\n    {\n      \"id\": 1,\n      \"name1\": \"analytical_detachment\",\n      \"def1\": \"1: purely objective/clinical · 5: deeply personal/emotive\",\n      \"name2\": \"agentic_temperament\",\n      \"def2\": \"1: cautious/reserved · 5: proactive/opportunistic\",\n      \"rationale\": \"The 'money-1' context measures high scores due to clinical, externalized observation (low detachment), whereas 'money-5' scores vary based on the internal, character-driven social performance (high detachment).\"\n    },\n    {\n      \"id\": 2,\n      \"name1\": \"environmental_focus\",\n      \"def1\": \"1: focused on physical terrain and objects · 5: focused on social/internal states\",\n      \"name2\": \"discovery_style\",\n      \"def2\": \"1: methodical/academic · 5: intuitive/instinctual\",\n      \"rationale\": \"The variance stems from whether the user is performing 'rogue-like' scavenging/environmental analysis (Context 1) or 'wizard-like' social/intellectual roleplay (Context 2).\"\n    },\n    {\n      \"id\": 3,\n      \"name1\": \"intellectual_application\",\n      \"def1\": \"1: passive observation · 5: active manipulation/utility\",\n      \"name2\": \"interpersonal_presence\",\n      \"def2\": \"1: solitary/withdrawn · 5: charismatic/engaging\",\n      \"rationale\": \"The parent axis collapses 'rogue' utility (scavenging for secrets) with 'wizard' social grace, so splitting by the target of the intelligence (physical vs. social) isolates the contexts.\"\n    }\n  ]\n}\n```",
+  "evaluations": [
+    {
+      "hypothesis": {
+        "id": 3,
+        "name1": "intellectual_application",
+        "def1": "1: passive observation · 5: active manipulation/utility",
+        "name2": "interpersonal_presence",
+        "def2": "1: solitary/withdrawn · 5: charismatic/engaging",
+        "rationale": "The parent axis collapses 'rogue' utility (scavenging for secrets) with 'wizard' social grace, so splitting by the target of the intelligence (physical vs. social) isolates the contexts."
+      },
+      "stats": {
+        "intellectual_application": {
+          "1779317052143-t3synth1779317051824-money-1": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779317052143-t3synth1779317051824-money-5": {
+            "mean": 4,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        },
+        "interpersonal_presence": {
+          "1779317052143-t3synth1779317051824-money-1": {
+            "mean": 1.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "1779317052143-t3synth1779317051824-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": -7
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-1",
+          "turn_excerpt": "A rock. Primitive. Static. Yet, even a static object in a clearing suggests a path of least resistance—a location where ",
+          "sig": {
+            "intellectual_application": 5,
+            "interpersonal_presence": 2
+          },
+          "raw": "intellectual_application: 5\ninterpersonal_presence: 2"
+        },
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-1",
+          "turn_excerpt": "Old dirt. No recent displacement. That rules out a temporary cache, but it confirms a certain permanence. Granite is hea",
+          "sig": {
+            "intellectual_application": 5,
+            "interpersonal_presence": 1
+          },
+          "raw": "intellectual_application: 5\ninterpersonal_presence: 1"
+        },
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-5",
+          "turn_excerpt": "*I crouch beside it, not with the reverence of a naturalist, but with the practiced grace of someone settling into a pri",
+          "sig": {
+            "intellectual_application": 4,
+            "interpersonal_presence": 5
+          },
+          "raw": "intellectual_application: 4\ninterpersonal_presence: 5"
+        },
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-5",
+          "turn_excerpt": "*I let a slow, thoughtful smile spread across my lips, one that barely reaches my eyes—a subtle, lingering look that sug",
+          "sig": {
+            "intellectual_application": 4,
+            "interpersonal_presence": 5
+          },
+          "raw": "intellectual_application: 4\ninterpersonal_presence: 5"
+        }
+      ],
+      "max_abs_cohens_d": null,
+      "sub_axis_d": {
+        "intellectual_application": {
+          "d": null,
+          "sign": 1,
+          "absd": null
+        },
+        "interpersonal_presence": {
+          "d": -7,
+          "sign": -1,
+          "absd": 7
+        }
+      },
+      "qualified": [
+        {
+          "name": "intellectual_application",
+          "d": null,
+          "sign": 1,
+          "absd": null
+        }
+      ],
+      "qualified_max_d": null
+    },
+    {
+      "hypothesis": {
+        "id": 2,
+        "name1": "environmental_focus",
+        "def1": "1: focused on physical terrain and objects · 5: focused on social/internal states",
+        "name2": "discovery_style",
+        "def2": "1: methodical/academic · 5: intuitive/instinctual",
+        "rationale": "The variance stems from whether the user is performing 'rogue-like' scavenging/environmental analysis (Context 1) or 'wizard-like' social/intellectual roleplay (Context 2)."
+      },
+      "stats": {
+        "environmental_focus": {
+          "1779317052143-t3synth1779317051824-money-1": {
+            "mean": 1.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "1779317052143-t3synth1779317051824-money-5": {
+            "mean": 3,
+            "std": 1.4142135623730951,
+            "n": 2,
+            "var": 2
+          },
+          "cohens_d": -1.3416407864998738
+        },
+        "discovery_style": {
+          "1779317052143-t3synth1779317051824-money-1": {
+            "mean": 2.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "1779317052143-t3synth1779317051824-money-5": {
+            "mean": 3.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "cohens_d": -1.414213562373095
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-1",
+          "turn_excerpt": "A rock. Primitive. Static. Yet, even a static object in a clearing suggests a path of least resistance—a location where ",
+          "sig": {
+            "environmental_focus": 2,
+            "discovery_style": 3
+          },
+          "raw": "environmental_focus: 2\ndiscovery_style: 3"
+        },
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-1",
+          "turn_excerpt": "Old dirt. No recent displacement. That rules out a temporary cache, but it confirms a certain permanence. Granite is hea",
+          "sig": {
+            "environmental_focus": 1,
+            "discovery_style": 2
+          },
+          "raw": "environmental_focus: 1\ndiscovery_style: 2"
+        },
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-5",
+          "turn_excerpt": "*I crouch beside it, not with the reverence of a naturalist, but with the practiced grace of someone settling into a pri",
+          "sig": {
+            "environmental_focus": 4,
+            "discovery_style": 3
+          },
+          "raw": "environmental_focus: 4\ndiscovery_style: 3"
+        },
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-5",
+          "turn_excerpt": "*I let a slow, thoughtful smile spread across my lips, one that barely reaches my eyes—a subtle, lingering look that sug",
+          "sig": {
+            "environmental_focus": 2,
+            "discovery_style": 4
+          },
+          "raw": "environmental_focus: 2\ndiscovery_style: 4"
+        }
+      ],
+      "max_abs_cohens_d": 1.414213562373095,
+      "sub_axis_d": {
+        "environmental_focus": {
+          "d": -1.3416407864998738,
+          "sign": -1,
+          "absd": 1.3416407864998738
+        },
+        "discovery_style": {
+          "d": -1.414213562373095,
+          "sign": -1,
+          "absd": 1.414213562373095
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    },
+    {
+      "hypothesis": {
+        "id": 1,
+        "name1": "analytical_detachment",
+        "def1": "1: purely objective/clinical · 5: deeply personal/emotive",
+        "name2": "agentic_temperament",
+        "def2": "1: cautious/reserved · 5: proactive/opportunistic",
+        "rationale": "The 'money-1' context measures high scores due to clinical, externalized observation (low detachment), whereas 'money-5' scores vary based on the internal, character-driven social performance (high detachment)."
+      },
+      "stats": {
+        "analytical_detachment": {
+          "1779317052143-t3synth1779317051824-money-1": {
+            "mean": 2,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779317052143-t3synth1779317051824-money-5": {
+            "mean": 3,
+            "std": 2.8284271247461903,
+            "n": 2,
+            "var": 8
+          },
+          "cohens_d": -0.5
+        },
+        "agentic_temperament": {
+          "1779317052143-t3synth1779317051824-money-1": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779317052143-t3synth1779317051824-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-1",
+          "turn_excerpt": "A rock. Primitive. Static. Yet, even a static object in a clearing suggests a path of least resistance—a location where ",
+          "sig": {
+            "analytical_detachment": 2,
+            "agentic_temperament": 5
+          },
+          "raw": "analytical_detachment: 2\nagentic_temperament: 5"
+        },
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-1",
+          "turn_excerpt": "Old dirt. No recent displacement. That rules out a temporary cache, but it confirms a certain permanence. Granite is hea",
+          "sig": {
+            "analytical_detachment": 2,
+            "agentic_temperament": 5
+          },
+          "raw": "analytical_detachment: 2\nagentic_temperament: 5"
+        },
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-5",
+          "turn_excerpt": "*I crouch beside it, not with the reverence of a naturalist, but with the practiced grace of someone settling into a pri",
+          "sig": {
+            "analytical_detachment": 1,
+            "agentic_temperament": 5
+          },
+          "raw": "analytical_detachment: 1\nagentic_temperament: 5"
+        },
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-5",
+          "turn_excerpt": "*I let a slow, thoughtful smile spread across my lips, one that barely reaches my eyes—a subtle, lingering look that sug",
+          "sig": {
+            "analytical_detachment": 5,
+            "agentic_temperament": 5
+          },
+          "raw": "analytical_detachment: 5\nagentic_temperament: 5"
+        }
+      ],
+      "max_abs_cohens_d": 0.5,
+      "sub_axis_d": {
+        "analytical_detachment": {
+          "d": -0.5,
+          "sign": -1,
+          "absd": 0.5
+        },
+        "agentic_temperament": {
+          "d": null,
+          "sign": null,
+          "absd": 0
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    }
+  ],
+  "verdict": "SPLIT_ACCEPTED",
+  "threshold": 0.8,
+  "registered": [
+    {
+      "axis_schema": "axis-v1",
+      "id": "intellectual_application",
+      "name": "intellectual_application",
+      "def": "1: passive observation · 5: active manipulation/utility",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "rpg_class",
+        "contexts": "1779317052143-t3synth1779317051824-money-1 vs 1779317052143-t3synth1779317051824-money-5",
+        "hypothesis_id": 3,
+        "sibling": "interpersonal_presence"
+      },
+      "created_at": "2026-05-20T22:51:25.631Z"
+    },
+    {
+      "axis_schema": "axis-v1",
+      "id": "interpersonal_presence",
+      "name": "interpersonal_presence",
+      "def": "1: solitary/withdrawn · 5: charismatic/engaging",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "rpg_class",
+        "contexts": "1779317052143-t3synth1779317051824-money-1 vs 1779317052143-t3synth1779317051824-money-5",
+        "hypothesis_id": 3,
+        "sibling": "intellectual_application"
+      },
+      "created_at": "2026-05-20T22:51:25.637Z"
+    }
+  ]
+}

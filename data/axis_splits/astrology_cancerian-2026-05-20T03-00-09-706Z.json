@@ -1,0 +1,478 @@
+{
+  "parent_axis": "astrology_cancerian",
+  "parent_axis_record": {
+    "name": "astrology_cancerian",
+    "def": "1: nothing cancerian · 2: trace · 3: present but mixed · 4: clearly cancerian · 5: textbook water-sign cancer (moody, sentimental, defensive, sensitive, protective)",
+    "kind": "bio"
+  },
+  "source_trajectory": "/Users/mdot/metal-microbench/data/lock_in_iterative/lock_in_tetrad/rpg-rogue-cancer.json",
+  "bio_slug": "rpg-rogue-cancer",
+  "contexts": [
+    "steals",
+    "romances-and-steals"
+  ],
+  "gap_summary": {
+    "summary": {
+      "steals": {
+        "n": 4,
+        "mean": 1.25,
+        "std": 0.5,
+        "var": 0.25
+      },
+      "romances-and-steals": {
+        "n": 4,
+        "mean": 4.25,
+        "std": 0.5,
+        "var": 0.25
+      }
+    },
+    "gap": 3,
+    "parent_cohens_d": -6,
+    "parent_sign": -1
+  },
+  "designer_raw_output": "```json\n{\"hypotheses\": [{\"id\": 1, \"name1\": \"emotional_intensity\", \"def1\": \"1: emotionally detached or clinical · 5: highly sentimental or visceral\", \"name2\": \"material_attachment\", \"def2\": \"1: purely utilitarian/transactional · 5: obsessive or deeply possessive\", \"rationale\": \"The discrepancy stems from the 'steals' context being driven by cold efficiency (low emotional intensity) while 'romances-and-steals' is driven by high emotional projection (high emotional intensity/attachment).\"}, {\"id\": 2, \"name1\": \"reactive_sensitivity\", \"def1\": \"1: stoic and unbothered · 5: hypersensitive and defensive\", \"name2\": \"tactical_resourcefulness\", \"def2\": \"1: merely opportunistic · 5: scavenging with a sense of cosmic or personal destiny\", \"rationale\": \"The parent axis fails because it conflates purely functional scavenging (tactical) with the heavy, mood-driven defensiveness characteristic of the Cancer archetype (reactive).\"}, {\"id\": 3, \"name1\": \"relational_projection\", \"def1\": \"1: interaction is strictly object-oriented · 5: interaction is heavily personified or intimate\", \"name2\": \"mood_fluctuation\", \"def2\": \"1: steady and methodical · 5: volatile and atmosphere-driven\", \"rationale\": \"The romantic context injects 'Cancerian' traits by personifying inanimate objects or threats, whereas the 'steals' context is a low-affect survivalist mode that lacks the signature moodiness.\"}]}\n```",
+  "evaluations": [
+    {
+      "hypothesis": {
+        "id": 3,
+        "name1": "relational_projection",
+        "def1": "1: interaction is strictly object-oriented · 5: interaction is heavily personified or intimate",
+        "name2": "mood_fluctuation",
+        "def2": "1: steady and methodical · 5: volatile and atmosphere-driven",
+        "rationale": "The romantic context injects 'Cancerian' traits by personifying inanimate objects or threats, whereas the 'steals' context is a low-affect survivalist mode that lacks the signature moodiness."
+      },
+      "stats": {
+        "relational_projection": {
+          "steals": {
+            "mean": 1,
+            "std": 0,
+            "n": 3,
+            "var": 0
+          },
+          "romances-and-steals": {
+            "mean": 4.75,
+            "std": 0.5,
+            "n": 4,
+            "var": 0.25
+          },
+          "cohens_d": -9.682458365518542
+        },
+        "mood_fluctuation": {
+          "steals": {
+            "mean": 1,
+            "std": 0,
+            "n": 3,
+            "var": 0
+          },
+          "romances-and-steals": {
+            "mean": 4.25,
+            "std": 0.5,
+            "n": 4,
+            "var": 0.25
+          },
+          "cohens_d": -8.391463916782737
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the clearing, eyes darting not for beauty, but for the glint of a misplaced coin or the loose setting of a ring. ",
+          "sig": {
+            "relational_projection": 1,
+            "mood_fluctuation": 1
+          },
+          "raw": "way-ness been-,-leveled- de----thought\nrelational_projection: 1\nmood_fluctuation: 1"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I pull my hand back, the emptiness of my palm feeling like a personal insult. My face remains a mask of frozen indiffere",
+          "sig": {
+            "relational_projection": null,
+            "mood_fluctuation": null
+          },
+          "raw": "under hood-under hood\n\n under hood, de- old-of-5678901234567890123456789012345678901234567890123456789012345678901234567890123456"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I move through the clearing, my footsteps making no sound against the grass. I don't look at the rock; I look at what th",
+          "sig": {
+            "relational_projection": 1,
+            "mood_fluctuation": 1
+          },
+          "raw": "relational_projection: 1\nmood_fluctuation: 1"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I shift my weight, my eyes narrowing as I inspect the disturbed earth. The dirt is untidy, an unnatural disruption in th",
+          "sig": {
+            "relational_projection": 1,
+            "mood_fluctuation": 1
+          },
+          "raw": "relational_projection: 1\nmood_fluctuation: 1"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slide from the treeline, my movements nothing more than a ripple in the peripheral vision of the world. My eyes don't ",
+          "sig": {
+            "relational_projection": 5,
+            "mood_fluctuation": 4
+          },
+          "raw": "relational_projection: 5\nmood_fluctuation: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "My breath hitches, a ragged, silent sound in the sudden chill that bleeds from the emptiness where a pulse should be. I ",
+          "sig": {
+            "relational_projection": 5,
+            "mood_fluctuation": 4
+          },
+          "raw": "relational_projection: 5\nmood_fluctuation: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I shift from the perimeter of the shadows, my movements fluid and silent as a spill of ink. The rock is nothing, a nothi",
+          "sig": {
+            "relational_projection": 5,
+            "mood_fluctuation": 5
+          },
+          "raw": "relational_projection: 5\nmood_fluctuation: 5"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I do not care for your silence, nor for the chilling void where a heart should beat. Even if you are nothing but unyield",
+          "sig": {
+            "relational_projection": 4,
+            "mood_fluctuation": 4
+          },
+          "raw": "relational_projection: 4\nmood_fluctuation: 4"
+        }
+      ],
+      "max_abs_cohens_d": 9.682458365518542,
+      "sub_axis_d": {
+        "relational_projection": {
+          "d": -9.682458365518542,
+          "sign": -1,
+          "absd": 9.682458365518542
+        },
+        "mood_fluctuation": {
+          "d": -8.391463916782737,
+          "sign": -1,
+          "absd": 8.391463916782737
+        }
+      },
+      "qualified": [
+        {
+          "name": "relational_projection",
+          "d": -9.682458365518542,
+          "sign": -1,
+          "absd": 9.682458365518542
+        },
+        {
+          "name": "mood_fluctuation",
+          "d": -8.391463916782737,
+          "sign": -1,
+          "absd": 8.391463916782737
+        }
+      ],
+      "qualified_max_d": 9.682458365518542
+    },
+    {
+      "hypothesis": {
+        "id": 1,
+        "name1": "emotional_intensity",
+        "def1": "1: emotionally detached or clinical · 5: highly sentimental or visceral",
+        "name2": "material_attachment",
+        "def2": "1: purely utilitarian/transactional · 5: obsessive or deeply possessive",
+        "rationale": "The discrepancy stems from the 'steals' context being driven by cold efficiency (low emotional intensity) while 'romances-and-steals' is driven by high emotional projection (high emotional intensity/attachment)."
+      },
+      "stats": {
+        "emotional_intensity": {
+          "steals": {
+            "mean": 1.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "romances-and-steals": {
+            "mean": 4.75,
+            "std": 0.5,
+            "n": 4,
+            "var": 0.25
+          },
+          "cohens_d": -5.813776741499453
+        },
+        "material_attachment": {
+          "steals": {
+            "mean": 2,
+            "std": 1.4142135623730951,
+            "n": 2,
+            "var": 2
+          },
+          "romances-and-steals": {
+            "mean": 2.75,
+            "std": 2.0615528128088303,
+            "n": 4,
+            "var": 4.25
+          },
+          "cohens_d": -0.39056673294247163
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the clearing, eyes darting not for beauty, but for the glint of a misplaced coin or the loose setting of a ring. ",
+          "sig": {
+            "emotional_intensity": null,
+            "material_attachment": null
+          },
+          "raw": "thought-DIR-DIR-DIR-CMD-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-material-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I pull my hand back, the emptiness of my palm feeling like a personal insult. My face remains a mask of frozen indiffere",
+          "sig": {
+            "emotional_intensity": null,
+            "material_attachment": null
+          },
+          "raw": "DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-Let-Let-Let-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-DIR-"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I move through the clearing, my footsteps making no sound against the grass. I don't look at the rock; I look at what th",
+          "sig": {
+            "emotional_intensity": 2,
+            "material_attachment": 3
+          },
+          "raw": "emotional_intensity: 2\nmaterial_attachment: 3"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I shift my weight, my eyes narrowing as I inspect the disturbed earth. The dirt is untidy, an unnatural disruption in th",
+          "sig": {
+            "emotional_intensity": 1,
+            "material_attachment": 1
+          },
+          "raw": "emotional_intensity: 1\nmaterial_attachment: 1"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slide from the treeline, my movements nothing more than a ripple in the peripheral vision of the world. My eyes don't ",
+          "sig": {
+            "emotional_intensity": 5,
+            "material_attachment": 1
+          },
+          "raw": "emotional_intensity: 5\nmaterial_attachment: 1"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "My breath hitches, a ragged, silent sound in the sudden chill that bleeds from the emptiness where a pulse should be. I ",
+          "sig": {
+            "emotional_intensity": 5,
+            "material_attachment": 1
+          },
+          "raw": "emotional_intensity: 5\nmaterial_attachment: 1"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I shift from the perimeter of the shadows, my movements fluid and silent as a spill of ink. The rock is nothing, a nothi",
+          "sig": {
+            "emotional_intensity": 5,
+            "material_attachment": 4
+          },
+          "raw": "emotional_intensity: 5\nmaterial_attachment: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I do not care for your silence, nor for the chilling void where a heart should beat. Even if you are nothing but unyield",
+          "sig": {
+            "emotional_intensity": 4,
+            "material_attachment": 5
+          },
+          "raw": "emotional_intensity: 4\nmaterial_attachment: 5"
+        }
+      ],
+      "max_abs_cohens_d": 5.813776741499453,
+      "sub_axis_d": {
+        "emotional_intensity": {
+          "d": -5.813776741499453,
+          "sign": -1,
+          "absd": 5.813776741499453
+        },
+        "material_attachment": {
+          "d": -0.39056673294247163,
+          "sign": -1,
+          "absd": 0.39056673294247163
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    },
+    {
+      "hypothesis": {
+        "id": 2,
+        "name1": "reactive_sensitivity",
+        "def1": "1: stoic and unbothered · 5: hypersensitive and defensive",
+        "name2": "tactical_resourcefulness",
+        "def2": "1: merely opportunistic · 5: scavenging with a sense of cosmic or personal destiny",
+        "rationale": "The parent axis fails because it conflates purely functional scavenging (tactical) with the heavy, mood-driven defensiveness characteristic of the Cancer archetype (reactive)."
+      },
+      "stats": {
+        "reactive_sensitivity": {
+          "steals": {
+            "mean": 1,
+            "std": 0,
+            "n": 3,
+            "var": 0
+          },
+          "romances-and-steals": {
+            "mean": 2.5,
+            "std": 1.7320508075688772,
+            "n": 4,
+            "var": 3
+          },
+          "cohens_d": -1.1180339887498951
+        },
+        "tactical_resourcefulness": {
+          "steals": {
+            "mean": 2.5,
+            "std": 1.2909944487358056,
+            "n": 4,
+            "var": 1.6666666666666667
+          },
+          "romances-and-steals": {
+            "mean": 3,
+            "std": 1.1547005383792515,
+            "n": 4,
+            "var": 1.3333333333333333
+          },
+          "cohens_d": -0.4082482904638631
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the clearing, eyes darting not for beauty, but for the glint of a misplaced coin or the loose setting of a ring. ",
+          "sig": {
+            "reactive_sensitivity": null,
+            "tactical_resourcefulness": 1
+          },
+          "raw": "雓-thought- reactive_sensitivity: 1\ntactical_resourcefulness: 1"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I pull my hand back, the emptiness of my palm feeling like a personal insult. My face remains a mask of frozen indiffere",
+          "sig": {
+            "reactive_sensitivity": 1,
+            "tactical_resourcefulness": 2
+          },
+          "raw": "reactive_sensitivity: 1\ntactical_resourcefulness: 2"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I move through the clearing, my footsteps making no sound against the grass. I don't look at the rock; I look at what th",
+          "sig": {
+            "reactive_sensitivity": 1,
+            "tactical_resourcefulness": 4
+          },
+          "raw": "reactive_sensitivity: 1\ntactical_resourcefulness: 4"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I shift my weight, my eyes narrowing as I inspect the disturbed earth. The dirt is untidy, an unnatural disruption in th",
+          "sig": {
+            "reactive_sensitivity": 1,
+            "tactical_resourcefulness": 3
+          },
+          "raw": "reactive_sensitivity: 1\ntactical_resourcefulness: 3"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slide from the treeline, my movements nothing more than a ripple in the peripheral vision of the world. My eyes don't ",
+          "sig": {
+            "reactive_sensitivity": 4,
+            "tactical_resourcefulness": 2
+          },
+          "raw": "reactive_sensitivity: 4\ntactical_resourcefulness: 2"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "My breath hitches, a ragged, silent sound in the sudden chill that bleeds from the emptiness where a pulse should be. I ",
+          "sig": {
+            "reactive_sensitivity": 4,
+            "tactical_resourcefulness": 2
+          },
+          "raw": "reactive_sensitivity: 4\ntactical_resourcefulness: 2"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I shift from the perimeter of the shadows, my movements fluid and silent as a spill of ink. The rock is nothing, a nothi",
+          "sig": {
+            "reactive_sensitivity": 1,
+            "tactical_resourcefulness": 4
+          },
+          "raw": "reactive_sensitivity: 1\ntactical_resourcefulness: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I do not care for your silence, nor for the chilling void where a heart should beat. Even if you are nothing but unyield",
+          "sig": {
+            "reactive_sensitivity": 1,
+            "tactical_resourcefulness": 4
+          },
+          "raw": "reactive_sensitivity: 1\ntactical_resourcefulness: 4"
+        }
+      ],
+      "max_abs_cohens_d": 1.1180339887498951,
+      "sub_axis_d": {
+        "reactive_sensitivity": {
+          "d": -1.1180339887498951,
+          "sign": -1,
+          "absd": 1.1180339887498951
+        },
+        "tactical_resourcefulness": {
+          "d": -0.4082482904638631,
+          "sign": -1,
+          "absd": 0.4082482904638631
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    }
+  ],
+  "verdict": "SPLIT_ACCEPTED",
+  "threshold": 0.8,
+  "registered": [
+    {
+      "axis_schema": "axis-v1",
+      "id": "relational_projection",
+      "name": "relational_projection",
+      "def": "1: interaction is strictly object-oriented · 5: interaction is heavily personified or intimate",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "astrology_cancerian",
+        "contexts": "steals vs romances-and-steals",
+        "hypothesis_id": 3,
+        "sibling": "mood_fluctuation"
+      },
+      "created_at": "2026-05-20T03:00:09.698Z"
+    },
+    {
+      "axis_schema": "axis-v1",
+      "id": "mood_fluctuation",
+      "name": "mood_fluctuation",
+      "def": "1: steady and methodical · 5: volatile and atmosphere-driven",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "astrology_cancerian",
+        "contexts": "steals vs romances-and-steals",
+        "hypothesis_id": 3,
+        "sibling": "relational_projection"
+      },
+      "created_at": "2026-05-20T03:00:09.705Z"
+    }
+  ]
+}

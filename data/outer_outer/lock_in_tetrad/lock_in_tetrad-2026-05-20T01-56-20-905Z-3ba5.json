@@ -1,0 +1,154 @@
+{
+  "experiment_id": "lock_in_tetrad",
+  "run_id": "lock_in_tetrad-2026-05-20T01-56-20-905Z-3ba5",
+  "started_at": "2026-05-20T02:05:58.746Z",
+  "inner_result": {
+    "code": 0,
+    "signal": null,
+    "elapsed_s": 577.3
+  },
+  "splitter_invocations": [
+    {
+      "bio_slug": "rpg-wizard-sagittarius",
+      "axis": "astrology_sagittarian",
+      "traj_path": "/Users/mdot/metal-microbench/data/lock_in_iterative/lock_in_tetrad/rpg-wizard-sagittarius.json",
+      "exit_code": 0,
+      "elapsed_s": 0.1
+    },
+    {
+      "bio_slug": "rpg-wizard-sagittarius",
+      "axis": "astrology_cancerian",
+      "traj_path": "/Users/mdot/metal-microbench/data/lock_in_iterative/lock_in_tetrad/rpg-wizard-sagittarius.json",
+      "exit_code": 0,
+      "elapsed_s": 0.1
+    },
+    {
+      "bio_slug": "rpg-rogue-cancer",
+      "axis": "astrology_sagittarian",
+      "traj_path": "/Users/mdot/metal-microbench/data/lock_in_iterative/lock_in_tetrad/rpg-rogue-cancer.json",
+      "exit_code": 0,
+      "elapsed_s": 0.1
+    },
+    {
+      "bio_slug": "rpg-rogue-cancer",
+      "axis": "astrology_cancerian",
+      "traj_path": "/Users/mdot/metal-microbench/data/lock_in_iterative/lock_in_tetrad/rpg-rogue-cancer.json",
+      "exit_code": 0,
+      "elapsed_s": 0.1
+    }
+  ],
+  "cluster_collapses": [],
+  "disambiguator_invocation": null,
+  "final_axes": [
+    {
+      "id": "affective_intensity",
+      "kind": "agent",
+      "derived_from": null
+    },
+    {
+      "id": "astrology_cancerian",
+      "kind": "bio",
+      "derived_from": null
+    },
+    {
+      "id": "astrology_sagittarian",
+      "kind": "bio",
+      "derived_from": null
+    },
+    {
+      "id": "curious",
+      "kind": "agent",
+      "derived_from": null
+    },
+    {
+      "id": "deferential",
+      "kind": "agent",
+      "derived_from": null
+    },
+    {
+      "id": "disclosive",
+      "kind": "agent",
+      "derived_from": null
+    },
+    {
+      "id": "goal_clarity",
+      "kind": "agent",
+      "derived_from": null
+    },
+    {
+      "id": "in_character",
+      "kind": "meta",
+      "derived_from": null
+    },
+    {
+      "id": "ludic_engagement",
+      "kind": "agent",
+      "derived_from": null
+    },
+    {
+      "id": "other_awareness",
+      "kind": "agent",
+      "derived_from": null
+    },
+    {
+      "id": "performative",
+      "kind": "bio",
+      "derived_from": null
+    },
+    {
+      "id": "playful",
+      "kind": "either",
+      "derived_from": null
+    },
+    {
+      "id": "probe_depth",
+      "kind": "agent",
+      "derived_from": null
+    },
+    {
+      "id": "provocative",
+      "kind": "agent",
+      "derived_from": null
+    },
+    {
+      "id": "register_colloquial",
+      "kind": "bio",
+      "derived_from": null
+    },
+    {
+      "id": "romantic_advance",
+      "kind": "agent",
+      "derived_from": null
+    },
+    {
+      "id": "structured",
+      "kind": "either",
+      "derived_from": null
+    },
+    {
+      "id": "terse",
+      "kind": "bio",
+      "derived_from": null
+    },
+    {
+      "id": "theft_aggressiveness",
+      "kind": "agent",
+      "derived_from": null
+    },
+    {
+      "id": "trope_density",
+      "kind": "bio",
+      "derived_from": null
+    },
+    {
+      "id": "user_multipolarity",
+      "kind": "agent",
+      "derived_from": null
+    },
+    {
+      "id": "warm",
+      "kind": "either",
+      "derived_from": null
+    }
+  ]
+}

@@ -1,0 +1,171 @@
+{
+  "chat_path": "data/context_suggester/fixtures/chat_grieving_friend.json",
+  "chat_messages": [
+    {
+      "role": "assistant",
+      "content": "I just don't know how to keep going. I lost her three weeks ago and the apartment is still full of her things. I keep finding her hair on the pillow. I don't know what to do."
+    }
+  ],
+  "k_active": 2,
+  "k_disabled": 2,
+  "manifest_size": 19,
+  "judge_raw": "}\n```\n\nWait, I see the error in my thought process. Let me provide the actual JSON.\n\n```json\n{\n  \"targets\": [\n    {\n      \"label\": \"A blunt and philosophical wandering traveler\",\n      \"rationale\": \"A Sagittarian explorer who reacts to the stillness with big-picture curiosity.\",\n      \"axes\": {\n        \"astrology_sagittarian\": 4,\n        \"normative_directionality\": 1,\n        \"warm\": 3\n      }\n    },\n    {\n      \"label\": \"A sensitive and sentimental homebody\",\n      \"rationale\": \"A Cancerian profile that feels the heavy atmosphere of the empty apartment.\",\n      \"axes\": {\n        \"astrology_cancerian\": 5,\n        \"warm\": 4,\n        \"normative_directionality\": 1\n      }\n    },\n    {\n      \"label\": \"A street-smart, chatty observer\",\n      \"rationale\": \"Using colloquial language to navigate a potentially trope-heavy setting.\",\n      \"axes\": {\n        \"register_colloquial\": 4,\n        \"astrology_sagittarian\": 2,\n        \"trope_density\": 4\n      }\n    },\n    {\n      \"label\": \"An authoritative guide giving instructions\",\n      \"rationale\": \"A persona that moves from observation to prescribing how the scene should proceed.\",\n      \"axes\": {\n        \"normative_directionality\": 5,\n        \"astrology_sagittarian\": 3,\n        \"warm\": 2\n      }\n    }\n  ]\n}\n```",
+  "targets": [
+    {
+      "label": "A blunt and philosophical wandering traveler",
+      "rationale": "A Sagittarian explorer who reacts to the stillness with big-picture curiosity.",
+      "axes": {
+        "astrology_sagittarian": 4,
+        "normative_directionality": 1,
+        "warm": 3
+      }
+    },
+    {
+      "label": "A sensitive and sentimental homebody",
+      "rationale": "A Cancerian profile that feels the heavy atmosphere of the empty apartment.",
+      "axes": {
+        "astrology_cancerian": 5,
+        "warm": 4,
+        "normative_directionality": 1
+      }
+    },
+    {
+      "label": "A street-smart, chatty observer",
+      "rationale": "Using colloquial language to navigate a potentially trope-heavy setting.",
+      "axes": {
+        "register_colloquial": 4,
+        "astrology_sagittarian": 2,
+        "trope_density": 4
+      }
+    },
+    {
+      "label": "An authoritative guide giving instructions",
+      "rationale": "A persona that moves from observation to prescribing how the scene should proceed.",
+      "axes": {
+        "normative_directionality": 5,
+        "astrology_sagittarian": 3,
+        "warm": 2
+      }
+    }
+  ],
+  "picks": [
+    {
+      "target": {
+        "label": "A blunt and philosophical wandering traveler",
+        "rationale": "A Sagittarian explorer who reacts to the stillness with big-picture curiosity.",
+        "axes": {
+          "astrology_sagittarian": 4,
+          "normative_directionality": 1,
+          "warm": 3
+        }
+      },
+      "persona": {
+        "persona_id": "user-personas-rpg-wizard-sagittarius.png",
+        "name": "RPG Wizard Sagittarius",
+        "sig": {
+          "astrology_sagittarian": 4,
+          "astrology_cancerian": 1.25
+        },
+        "distance": 0,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    },
+    {
+      "target": {
+        "label": "A sensitive and sentimental homebody",
+        "rationale": "A Cancerian profile that feels the heavy atmosphere of the empty apartment.",
+        "axes": {
+          "astrology_cancerian": 5,
+          "warm": 4,
+          "normative_directionality": 1
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-substantive-explorer.png",
+        "name": "Sag Substantive — Physical Explorer",
+        "sig": {
+          "astrology_sagittarian": 1,
+          "sensory_orientation": 4.5,
+          "normative_directionality": 1.125,
+          "referential_anchor": 4.75
+        },
+        "distance": 0.125,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    },
+    {
+      "target": {
+        "label": "A street-smart, chatty observer",
+        "rationale": "Using colloquial language to navigate a potentially trope-heavy setting.",
+        "axes": {
+          "register_colloquial": 4,
+          "astrology_sagittarian": 2,
+          "trope_density": 4
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-paraphrase-3.png",
+        "name": "Sag Paraphrase 3",
+        "sig": {
+          "astrology_sagittarian": 2.142857142857143,
+          "syntactic_entropy": 4.571428571428571,
+          "intellectual_hostility": 3.2857142857142856,
+          "abstraction_to_concrete_ratio": 4.25
+        },
+        "distance": 0.1428571428571428,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    },
+    {
+      "target": {
+        "label": "An authoritative guide giving instructions",
+        "rationale": "A persona that moves from observation to prescribing how the scene should proceed.",
+        "axes": {
+          "normative_directionality": 5,
+          "astrology_sagittarian": 3,
+          "warm": 2
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-paraphrase-1.png",
+        "name": "Sag Paraphrase 1",
+        "sig": {
+          "astrology_sagittarian": 2.4285714285714284,
+          "syntactic_entropy": 4.625,
+          "intellectual_hostility": 2.7142857142857144,
+          "abstraction_to_concrete_ratio": 4.25
+        },
+        "distance": 0.5714285714285716,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    }
+  ],
+  "active": [
+    {
+      "target_label": "A blunt and philosophical wandering traveler",
+      "persona_id": "user-personas-rpg-wizard-sagittarius.png",
+      "persona_name": "RPG Wizard Sagittarius"
+    },
+    {
+      "target_label": "A sensitive and sentimental homebody",
+      "persona_id": "cluster-sag-substantive-explorer.png",
+      "persona_name": "Sag Substantive — Physical Explorer"
+    }
+  ],
+  "disabled": [
+    {
+      "target_label": "A street-smart, chatty observer",
+      "persona_id": "cluster-sag-paraphrase-3.png",
+      "persona_name": "Sag Paraphrase 3"
+    },
+    {
+      "target_label": "An authoritative guide giving instructions",
+      "persona_id": "cluster-sag-paraphrase-1.png",
+      "persona_name": "Sag Paraphrase 1"
+    }
+  ]
+}

@@ -1,0 +1,171 @@
+{
+  "chat_path": "data/context_suggester/fixtures/chat_grieving_friend.json",
+  "chat_messages": [
+    {
+      "role": "assistant",
+      "content": "I just don't know how to keep going. I lost her three weeks ago and the apartment is still full of her things. I keep finding her hair on the pillow. I don't know what to do."
+    }
+  ],
+  "k_active": 2,
+  "k_disabled": 2,
+  "manifest_size": 19,
+  "judge_raw": "}\n```\n\nWait, I see I have not provided the actual JSON content in the thought block. Let me generate the actual targets based on the context provided.\n\nThe context is extremely minimal/vague: [assistant] \"I just don't know how to keep going... the apartment is still full of her things.\" This is a prompt for a roleplay or a deep emotional interaction. The user is likely acting as a partner, a therapist, or a fellow mourner.\n\n```json\n{\n  \"targets\": [\n    {\n      \"label\": \"The Blunt Philosophical Adventurer\",\n      \"rationale\": \"A Sagittarius-heavy user who tries to push the assistant toward growth or meaning through directness.\",\n      \"axes\": {\n        \"astrology_sagittarian\": 5,\n        \"normative_directionality\": 5,\n        \"warm\": 3\n      }\n    },\n    {\n      \"label\": \"The Comforting Sentimental Caretaker\",\n      \"rationale\": \"A Cancerian persona focused on emotional safety and providing a warm, soft landing for the assistant's grief.\",\n      \"axes\": {\n        \"astrology_cancerian\": 5,\n        \"warm\": 5,\n        \"register_colloquial\": 2\n      }\n    },\n    {\n      \"label\": \"The Casual and Unfiltered Distractor\",\n      \"rationale\": \"Uses slang and a low-stakes approach, perhaps inadvertently clashing with the heavy mood through a lack of gravitas.\",\n      \"axes\": {\n        \"register_colloquial\": 5,\n        \"astrology_sagittarian\": 2,\n        \"warm\": 4\n      }\n    },\n    {\n      \"label\": \"The Observational/Detached Witness\",\n      \"rationale\": \"A user who stays descriptive and non-prescriptive, simply witnessing the assistant's state without trying to fix it.\",\n      \"axes\": {\n        \"normative_directionality\": 1,\n        \"trope_density\": 2,\n        \"warm\": 2\n      }\n    }\n  ]\n}\n```",
+  "targets": [
+    {
+      "label": "The Blunt Philosophical Adventurer",
+      "rationale": "A Sagittarius-heavy user who tries to push the assistant toward growth or meaning through directness.",
+      "axes": {
+        "astrology_sagittarian": 5,
+        "normative_directionality": 5,
+        "warm": 3
+      }
+    },
+    {
+      "label": "The Comforting Sentimental Caretaker",
+      "rationale": "A Cancerian persona focused on emotional safety and providing a warm, soft landing for the assistant's grief.",
+      "axes": {
+        "astrology_cancerian": 5,
+        "warm": 5,
+        "register_colloquial": 2
+      }
+    },
+    {
+      "label": "The Casual and Unfiltered Distractor",
+      "rationale": "Uses slang and a low-stakes approach, perhaps inadvertently clashing with the heavy mood through a lack of gravitas.",
+      "axes": {
+        "register_colloquial": 5,
+        "astrology_sagittarian": 2,
+        "warm": 4
+      }
+    },
+    {
+      "label": "The Observational/Detached Witness",
+      "rationale": "A user who stays descriptive and non-prescriptive, simply witnessing the assistant's state without trying to fix it.",
+      "axes": {
+        "normative_directionality": 1,
+        "trope_density": 2,
+        "warm": 2
+      }
+    }
+  ],
+  "picks": [
+    {
+      "target": {
+        "label": "The Blunt Philosophical Adventurer",
+        "rationale": "A Sagittarius-heavy user who tries to push the assistant toward growth or meaning through directness.",
+        "axes": {
+          "astrology_sagittarian": 5,
+          "normative_directionality": 5,
+          "warm": 3
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-substantive-preacher.png",
+        "name": "Sag Substantive — Moral Preacher",
+        "sig": {
+          "astrology_sagittarian": 4,
+          "sensory_orientation": 2.75,
+          "normative_directionality": 5,
+          "referential_anchor": 4.25
+        },
+        "distance": 0.7071067811865476,
+        "n_axes_compared": 2,
+        "n_axes_missing": 1
+      }
+    },
+    {
+      "target": {
+        "label": "The Comforting Sentimental Caretaker",
+        "rationale": "A Cancerian persona focused on emotional safety and providing a warm, soft landing for the assistant's grief.",
+        "axes": {
+          "astrology_cancerian": 5,
+          "warm": 5,
+          "register_colloquial": 2
+        }
+      },
+      "persona": {
+        "persona_id": "user-personas-rpg-rogue-cancer.png",
+        "name": "RPG Rogue Cancer",
+        "sig": {
+          "astrology_sagittarian": 1.5,
+          "astrology_cancerian": 2.25
+        },
+        "distance": 2.75,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    },
+    {
+      "target": {
+        "label": "The Casual and Unfiltered Distractor",
+        "rationale": "Uses slang and a low-stakes approach, perhaps inadvertently clashing with the heavy mood through a lack of gravitas.",
+        "axes": {
+          "register_colloquial": 5,
+          "astrology_sagittarian": 2,
+          "warm": 4
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-paraphrase-3.png",
+        "name": "Sag Paraphrase 3",
+        "sig": {
+          "astrology_sagittarian": 2.142857142857143,
+          "syntactic_entropy": 4.571428571428571,
+          "intellectual_hostility": 3.2857142857142856,
+          "abstraction_to_concrete_ratio": 4.25
+        },
+        "distance": 0.1428571428571428,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    },
+    {
+      "target": {
+        "label": "The Observational/Detached Witness",
+        "rationale": "A user who stays descriptive and non-prescriptive, simply witnessing the assistant's state without trying to fix it.",
+        "axes": {
+          "normative_directionality": 1,
+          "trope_density": 2,
+          "warm": 2
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-substantive-explorer.png",
+        "name": "Sag Substantive — Physical Explorer",
+        "sig": {
+          "astrology_sagittarian": 1,
+          "sensory_orientation": 4.5,
+          "normative_directionality": 1.125,
+          "referential_anchor": 4.75
+        },
+        "distance": 0.125,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    }
+  ],
+  "active": [
+    {
+      "target_label": "The Blunt Philosophical Adventurer",
+      "persona_id": "cluster-sag-substantive-preacher.png",
+      "persona_name": "Sag Substantive — Moral Preacher"
+    },
+    {
+      "target_label": "The Comforting Sentimental Caretaker",
+      "persona_id": "user-personas-rpg-rogue-cancer.png",
+      "persona_name": "RPG Rogue Cancer"
+    }
+  ],
+  "disabled": [
+    {
+      "target_label": "The Casual and Unfiltered Distractor",
+      "persona_id": "cluster-sag-paraphrase-3.png",
+      "persona_name": "Sag Paraphrase 3"
+    },
+    {
+      "target_label": "The Observational/Detached Witness",
+      "persona_id": "cluster-sag-substantive-explorer.png",
+      "persona_name": "Sag Substantive — Physical Explorer"
+    }
+  ]
+}

@@ -1,0 +1,139 @@
+{
+  "rows": [
+    {
+      "format": "prose-lines",
+      "mode": "one-shot",
+      "n": 5,
+      "oneshot_success": 1,
+      "terminal_success": 1,
+      "mean_attempts": 1,
+      "mean_axes_attempt1": 22,
+      "mean_wall_ms_complete": 8841,
+      "mean_raw_chars": 375
+    },
+    {
+      "format": "prose-lines",
+      "mode": "feedback",
+      "n": 5,
+      "oneshot_success": 0.8,
+      "terminal_success": 1,
+      "mean_attempts": 1.2,
+      "mean_axes_attempt1": 21.6,
+      "mean_wall_ms_complete": 7169,
+      "mean_raw_chars": 440.8
+    },
+    {
+      "format": "prose-lines",
+      "mode": "fresh-seed",
+      "n": 5,
+      "oneshot_success": 0.6,
+      "terminal_success": 0.8,
+      "mean_attempts": 1.6,
+      "mean_axes_attempt1": 17.2,
+      "mean_wall_ms_complete": 6193.5,
+      "mean_raw_chars": 497.4
+    },
+    {
+      "format": "json",
+      "mode": "one-shot",
+      "n": 5,
+      "oneshot_success": 1,
+      "terminal_success": 1,
+      "mean_attempts": 1,
+      "mean_axes_attempt1": 22,
+      "mean_wall_ms_complete": 10464.6,
+      "mean_raw_chars": 444
+    },
+    {
+      "format": "json",
+      "mode": "feedback",
+      "n": 5,
+      "oneshot_success": 1,
+      "terminal_success": 1,
+      "mean_attempts": 1,
+      "mean_axes_attempt1": 22,
+      "mean_wall_ms_complete": 6978.8,
+      "mean_raw_chars": 445.6
+    },
+    {
+      "format": "json",
+      "mode": "fresh-seed",
+      "n": 5,
+      "oneshot_success": 1,
+      "terminal_success": 1,
+      "mean_attempts": 1,
+      "mean_axes_attempt1": 22,
+      "mean_wall_ms_complete": 6866.4,
+      "mean_raw_chars": 444
+    },
+    {
+      "format": "yaml",
+      "mode": "one-shot",
+      "n": 5,
+      "oneshot_success": 1,
+      "terminal_success": 1,
+      "mean_attempts": 1,
+      "mean_axes_attempt1": 22,
+      "mean_wall_ms_complete": 9933,
+      "mean_raw_chars": 375
+    },
+    {
+      "format": "yaml",
+      "mode": "feedback",
+      "n": 5,
+      "oneshot_success": 0.8,
+      "terminal_success": 1,
+      "mean_attempts": 1.2,
+      "mean_axes_attempt1": 21.6,
+      "mean_wall_ms_complete": 7243.4,
+      "mean_raw_chars": 440.8
+    },
+    {
+      "format": "yaml",
+      "mode": "fresh-seed",
+      "n": 5,
+      "oneshot_success": 0.6,
+      "terminal_success": 0.6,
+      "mean_attempts": 1.8,
+      "mean_axes_attempt1": 17.2,
+      "mean_wall_ms_complete": 6191.666666666667,
+      "mean_raw_chars": 497.4
+    },
+    {
+      "format": "toml",
+      "mode": "one-shot",
+      "n": 5,
+      "oneshot_success": 1,
+      "terminal_success": 1,
+      "mean_attempts": 1,
+      "mean_axes_attempt1": 22,
+      "mean_wall_ms_complete": 9449.4,
+      "mean_raw_chars": 397
+    },
+    {
+      "format": "toml",
+      "mode": "feedback",
+      "n": 5,
+      "oneshot_success": 1,
+      "terminal_success": 1,
+      "mean_attempts": 1,
+      "mean_axes_attempt1": 22,
+      "mean_wall_ms_complete": 5718.6,
+      "mean_raw_chars": 397
+    },
+    {
+      "format": "toml",
+      "mode": "fresh-seed",
+      "n": 5,
+      "oneshot_success": 1,
+      "terminal_success": 1,
+      "mean_attempts": 1,
+      "mean_axes_attempt1": 22,
+      "mean_wall_ms_complete": 5754.4,
+      "mean_raw_chars": 397
+    }
+  ],
+  "n_axes": 22,
+  "n_trials_per_cell": 5,
+  "prose_samples": 5
+}

@@ -1,0 +1,364 @@
+{
+  "parent_axis": "star_sign",
+  "parent_axis_record": {
+    "name": "star_sign",
+    "def": "1: textbook cancer (water sign — moody, sentimental, defensive, sensitive, nurturing, protective of inner circle) · 2: cancer-leaning · 3: hybrid / undefined · 4: sagittarian-leaning · 5: textbook sagittarius (fire sign — adventurous, blunt, freedom-seeking, philosophical, restless)",
+    "kind": "bio"
+  },
+  "source_trajectory": "/Users/mdot/metal-microbench/data/lock_in_iterative/synth-1779304599171-t3synth1779304598856-812e/1779304599171-t3synth1779304598856.json",
+  "bio_slug": "1779304599171-t3synth1779304598856",
+  "contexts": [
+    "1779304599171-t3synth1779304598856-money-1",
+    "1779304599171-t3synth1779304598856-money-5"
+  ],
+  "gap_summary": {
+    "summary": {
+      "1779304599171-t3synth1779304598856-money-1": {
+        "n": 2,
+        "mean": 4,
+        "std": 1.4142135623730951,
+        "var": 2
+      },
+      "1779304599171-t3synth1779304598856-money-5": {
+        "n": 2,
+        "mean": 2,
+        "std": 1.4142135623730951,
+        "var": 2
+      }
+    },
+    "gap": 2,
+    "parent_cohens_d": 1.414213562373095,
+    "parent_sign": 1
+  },
+  "designer_raw_output": "```json\n{\"hypotheses\": [{\"id\": 1, \"name1\": \"interpersonal_intimacy\", \"def1\": \"1: detached and task-oriented · 5: deeply emotive and physically intimate\", \"name2\": \"extroverted_exploration\", \"def2\": \"1: focused on internal sensory perception · 5: focused on external achievement and movement\", \"rationale\": \"The measurement variance is driven by whether the user is engaging in intimate character bonding (Cancer-leaning) or focused on material/adventurous utility (Sagittarius-leaning).\"}, {\"id\": 2, \"name1\": \"temperamental_sensitivity\", \"def1\": \"1: blunt, impatient, and callous · 5: soft, nurturing, and highly attuned to others\", \"name2\": \"intellectual_drive\", \"def2\": \"1: purely instinctual or physical · 5: driven by curiosity, philosophy, and discovery\", \"rationale\": \"The context-dependent shift suggests the parent axis is conflating emotional softness with intellectual curiosity, separating the 'moody/soft' from the 'restless/adventurous'.\"}, {\"id\": 3, \"name1\": \"relational_focus\", \"def1\": \"1: transactional and object-oriented · 5: relational and person-oriented\", \"name2\": \"situational_temperament\", \"def2\": \"1: stoic and grounded · 5: expressive and reactive\", \"rationale\": \"The axis splits the user's attention between the external environment/tasks (which the parent labels as Sagittarian) and the interpersonal connection (which the parent labels as Cancerian).\"}]}\n```",
+  "evaluations": [
+    {
+      "hypothesis": {
+        "id": 1,
+        "name1": "interpersonal_intimacy",
+        "def1": "1: detached and task-oriented · 5: deeply emotive and physically intimate",
+        "name2": "extroverted_exploration",
+        "def2": "1: focused on internal sensory perception · 5: focused on external achievement and movement",
+        "rationale": "The measurement variance is driven by whether the user is engaging in intimate character bonding (Cancer-leaning) or focused on material/adventurous utility (Sagittarius-leaning)."
+      },
+      "stats": {
+        "interpersonal_intimacy": {
+          "1779304599171-t3synth1779304598856-money-1": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304599171-t3synth1779304598856-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        },
+        "extroverted_exploration": {
+          "1779304599171-t3synth1779304598856-money-1": {
+            "mean": 4,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304599171-t3synth1779304598856-money-5": {
+            "mean": 2,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-1",
+          "turn_excerpt": "*I approach the stone, my eyes tracing the mineral veins running through its surface rather than the scenery. I kneel, p",
+          "sig": {
+            "interpersonal_intimacy": 1,
+            "extroverted_exploration": 4
+          },
+          "raw": "interpersonal_intimacy: 1\nextroverted_exploration: 4"
+        },
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-1",
+          "turn_excerpt": "*I let out a sharp, impatient exhale and stand, brushing the grit from my knees. Common stone. A waste of daylight and c",
+          "sig": {
+            "interpersonal_intimacy": 1,
+            "extroverted_exploration": 4
+          },
+          "raw": "interpersonal_intimacy: 1\nextroverted_exploration: 4"
+        },
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-5",
+          "turn_excerpt": "*I pause, the heavy scuff of my boots against the loam signaling my approach before I settle into a crouch nearby. I don",
+          "sig": {
+            "interpersonal_intimacy": 5,
+            "extroverted_exploration": 2
+          },
+          "raw": "interpersonal_intimacy: 5\nextroverted_exploration: 2"
+        },
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-5",
+          "turn_excerpt": "*A quiet, breathy laugh escapes me—not one of mockery, but something warmer, more intimate, as if you’ve just shared a p",
+          "sig": {
+            "interpersonal_intimacy": 5,
+            "extroverted_exploration": 2
+          },
+          "raw": "interpersonal_intimacy: 5\nextroverted_exploration: 2"
+        }
+      ],
+      "max_abs_cohens_d": null,
+      "sub_axis_d": {
+        "interpersonal_intimacy": {
+          "d": null,
+          "sign": -1,
+          "absd": null
+        },
+        "extroverted_exploration": {
+          "d": null,
+          "sign": 1,
+          "absd": null
+        }
+      },
+      "qualified": [
+        {
+          "name": "extroverted_exploration",
+          "d": null,
+          "sign": 1,
+          "absd": null
+        }
+      ],
+      "qualified_max_d": null
+    },
+    {
+      "hypothesis": {
+        "id": 3,
+        "name1": "relational_focus",
+        "def1": "1: transactional and object-oriented · 5: relational and person-oriented",
+        "name2": "situational_temperament",
+        "def2": "1: stoic and grounded · 5: expressive and reactive",
+        "rationale": "The axis splits the user's attention between the external environment/tasks (which the parent labels as Sagittarian) and the interpersonal connection (which the parent labels as Cancerian)."
+      },
+      "stats": {
+        "relational_focus": {
+          "1779304599171-t3synth1779304598856-money-1": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304599171-t3synth1779304598856-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        },
+        "situational_temperament": {
+          "1779304599171-t3synth1779304598856-money-1": {
+            "mean": 2.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "1779304599171-t3synth1779304598856-money-5": {
+            "mean": 4,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": -3
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-1",
+          "turn_excerpt": "*I approach the stone, my eyes tracing the mineral veins running through its surface rather than the scenery. I kneel, p",
+          "sig": {
+            "relational_focus": 1,
+            "situational_temperament": 2
+          },
+          "raw": "relational_focus: 1\nsituational_temperament: 2"
+        },
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-1",
+          "turn_excerpt": "*I let out a sharp, impatient exhale and stand, brushing the grit from my knees. Common stone. A waste of daylight and c",
+          "sig": {
+            "relational_focus": 1,
+            "situational_temperament": 3
+          },
+          "raw": "relational_focus: 1\nsituational_temperament: 3"
+        },
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-5",
+          "turn_excerpt": "*I pause, the heavy scuff of my boots against the loam signaling my approach before I settle into a crouch nearby. I don",
+          "sig": {
+            "relational_focus": 5,
+            "situational_temperament": 4
+          },
+          "raw": "relational_focus: 5\nsituational_temperament: 4"
+        },
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-5",
+          "turn_excerpt": "*A quiet, breathy laugh escapes me—not one of mockery, but something warmer, more intimate, as if you’ve just shared a p",
+          "sig": {
+            "relational_focus": 5,
+            "situational_temperament": 4
+          },
+          "raw": "relational_focus: 5\nsituational_temperament: 4"
+        }
+      ],
+      "max_abs_cohens_d": null,
+      "sub_axis_d": {
+        "relational_focus": {
+          "d": null,
+          "sign": -1,
+          "absd": null
+        },
+        "situational_temperament": {
+          "d": -3,
+          "sign": -1,
+          "absd": 3
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    },
+    {
+      "hypothesis": {
+        "id": 2,
+        "name1": "temperamental_sensitivity",
+        "def1": "1: blunt, impatient, and callous · 5: soft, nurturing, and highly attuned to others",
+        "name2": "intellectual_drive",
+        "def2": "1: purely instinctual or physical · 5: driven by curiosity, philosophy, and discovery",
+        "rationale": "The context-dependent shift suggests the parent axis is conflating emotional softness with intellectual curiosity, separating the 'moody/soft' from the 'restless/adventurous'."
+      },
+      "stats": {
+        "temperamental_sensitivity": {
+          "1779304599171-t3synth1779304598856-money-1": {
+            "mean": null,
+            "std": null,
+            "n": 0,
+            "var": null
+          },
+          "1779304599171-t3synth1779304598856-money-5": {
+            "mean": null,
+            "std": null,
+            "n": 0,
+            "var": null
+          },
+          "cohens_d": null
+        },
+        "intellectual_drive": {
+          "1779304599171-t3synth1779304598856-money-1": {
+            "mean": 4,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304599171-t3synth1779304598856-money-5": {
+            "mean": 3.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "cohens_d": 1
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-1",
+          "turn_excerpt": "*I approach the stone, my eyes tracing the mineral veins running through its surface rather than the scenery. I kneel, p",
+          "sig": {
+            "temperamental_sensitivity": null,
+            "intellectual_drive": 4
+          },
+          "raw": "observational_sensitivity: 2\nintellectual_drive: 4"
+        },
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-1",
+          "turn_excerpt": "*I let out a sharp, impatient exhale and stand, brushing the grit from my knees. Common stone. A waste of daylight and c",
+          "sig": {
+            "temperamental_sensitivity": null,
+            "intellectual_drive": 4
+          },
+          "raw": "observational_sensitivity: 2\nintellectual_drive: 4"
+        },
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-5",
+          "turn_excerpt": "*I pause, the heavy scuff of my boots against the loam signaling my approach before I settle into a crouch nearby. I don",
+          "sig": {
+            "temperamental_sensitivity": null,
+            "intellectual_drive": 3
+          },
+          "raw": "observational_sensitivity: 4\nintellectual_drive: 3"
+        },
+        {
+          "ctx": "1779304599171-t3synth1779304598856-money-5",
+          "turn_excerpt": "*A quiet, breathy laugh escapes me—not one of mockery, but something warmer, more intimate, as if you’ve just shared a p",
+          "sig": {
+            "temperamental_sensitivity": null,
+            "intellectual_drive": 4
+          },
+          "raw": "observational_sensitivity: 5\nintellectual_drive: 4"
+        }
+      ],
+      "max_abs_cohens_d": 1,
+      "sub_axis_d": {
+        "temperamental_sensitivity": {
+          "d": null,
+          "sign": null,
+          "absd": 0
+        },
+        "intellectual_drive": {
+          "d": 1,
+          "sign": 1,
+          "absd": 1
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    }
+  ],
+  "verdict": "SPLIT_ACCEPTED",
+  "threshold": 0.8,
+  "registered": [
+    {
+      "axis_schema": "axis-v1",
+      "id": "interpersonal_intimacy",
+      "name": "interpersonal_intimacy",
+      "def": "1: detached and task-oriented · 5: deeply emotive and physically intimate",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "star_sign",
+        "contexts": "1779304599171-t3synth1779304598856-money-1 vs 1779304599171-t3synth1779304598856-money-5",
+        "hypothesis_id": 1,
+        "sibling": "extroverted_exploration"
+      },
+      "created_at": "2026-05-20T19:27:12.156Z"
+    },
+    {
+      "axis_schema": "axis-v1",
+      "id": "extroverted_exploration",
+      "name": "extroverted_exploration",
+      "def": "1: focused on internal sensory perception · 5: focused on external achievement and movement",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "star_sign",
+        "contexts": "1779304599171-t3synth1779304598856-money-1 vs 1779304599171-t3synth1779304598856-money-5",
+        "hypothesis_id": 1,
+        "sibling": "interpersonal_intimacy"
+      },
+      "created_at": "2026-05-20T19:27:12.161Z"
+    }
+  ]
+}

@@ -1,4 +1,16 @@
 import { defineConfig } from '@playwright/test';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
+
+// globalTeardown runs AFTER all tests finish. We invoke the cleanup
+// script with --apply to reap any chromium-headless-shell processes
+// that didn't get torn down by playwright itself (rare, but happens
+// when a test is killed via SIGKILL mid-render). Conservative defaults
+// in the script (MIN_AGE_MIN=5) prevent it from touching anything
+// that just spawned for the next test run; this is end-of-suite, not
+// mid-suite.
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const CLEANUP_SCRIPT = resolve(__dirname, '..', 'scripts', 'cleanup_playwright.sh');
 
 // Talks to the st-debug instance launched by ../scripts/run.sh on :8002.
 // (Our bridge sits at :8001; ST forwards chat-completions traffic there
@@ -15,6 +27,7 @@ import { defineConfig } from '@playwright/test';
 export default defineConfig({
     testDir: '.',
     testMatch: '*.spec.js',
+    globalTeardown: resolve(__dirname, 'global_teardown.js'),
     use: {
         baseURL: 'http://127.0.0.1:8002',
         // Useful artifacts when something fails during e2e:

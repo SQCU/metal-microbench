@@ -1,0 +1,173 @@
+{
+  "chat_path": "data/context_suggester/fixtures/chat_rock_intro.json",
+  "chat_messages": [
+    {
+      "role": "assistant",
+      "content": "*The rock sits in a clearing. It is a rock. The wind moves over it.*"
+    }
+  ],
+  "k_active": 2,
+  "k_disabled": 2,
+  "manifest_size": 19,
+  "judge_raw": "```json\n{\n  \"targets\": [\n    {\n      \"label\": \"The philosophical wanderer seeking existential truths\",\n      \"rationale\": \"Uses the Sagittarian philosophy and descriptive directionality to respond to the mundane rock with big-picture pondering.\",\n      \"axes\": {\n        \"astrology_sagittarian\": 5,\n        \"normative_directionality\": 1,\n        \"warm\": 3\n      }\n    },\n    {\n      \"label\": \"The overly sentimental protector of nature\",\n      \"rationale\": \"A Cancerian persona that attaches deep, protective feelings to the inanimate object in the scene.\",\n      \"axes\": {\n        \"astrology_cancerian\": 5,\n        \"warm\": 5,\n        \"normative_directionality\": 1\n      }\n    },\n    {\n      \"label\": \"The blunt and casual street-smart traveler\",\n      \"rationale\": \"A high-colloquial, Sagittarian persona that treats the scene with unpretentious, direct energy.\",\n      \"axes\": {\n        \"astrology_sagittarian\": 4,\n        \"register_colloquial\": 5,\n        \"normative_directionality\": 5\n      }\n    },\n    {\n      \"label\": \"A generic fantasy trope-heavy adventurer\",\n      \"rationale\": \"Focuses on high trope density and a standard descriptive tone to ground the scene in a recognizable genre.\",\n      \"axes\": {\n        \"trope_density\": 5,\n        \"normative_directionality\": 1,\n        \"warm\": 2\n      }\n    }\n  ]\n}\n```",
+  "targets": [
+    {
+      "label": "The philosophical wanderer seeking existential truths",
+      "rationale": "Uses the Sagittarian philosophy and descriptive directionality to respond to the mundane rock with big-picture pondering.",
+      "axes": {
+        "astrology_sagittarian": 5,
+        "normative_directionality": 1,
+        "warm": 3
+      }
+    },
+    {
+      "label": "The overly sentimental protector of nature",
+      "rationale": "A Cancerian persona that attaches deep, protective feelings to the inanimate object in the scene.",
+      "axes": {
+        "astrology_cancerian": 5,
+        "warm": 5,
+        "normative_directionality": 1
+      }
+    },
+    {
+      "label": "The blunt and casual street-smart traveler",
+      "rationale": "A high-colloquial, Sagittarian persona that treats the scene with unpretentious, direct energy.",
+      "axes": {
+        "astrology_sagittarian": 4,
+        "register_colloquial": 5,
+        "normative_directionality": 5
+      }
+    },
+    {
+      "label": "A generic fantasy trope-heavy adventurer",
+      "rationale": "Focuses on high trope density and a standard descriptive tone to ground the scene in a recognizable genre.",
+      "axes": {
+        "trope_density": 5,
+        "normative_directionality": 1,
+        "warm": 2
+      }
+    }
+  ],
+  "picks": [
+    {
+      "target": {
+        "label": "The philosophical wanderer seeking existential truths",
+        "rationale": "Uses the Sagittarian philosophy and descriptive directionality to respond to the mundane rock with big-picture pondering.",
+        "axes": {
+          "astrology_sagittarian": 5,
+          "normative_directionality": 1,
+          "warm": 3
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-substantive-metaphys.png",
+        "name": "Sag Substantive — Metaphysical",
+        "sig": {
+          "astrology_sagittarian": 3.625,
+          "sensory_orientation": 2.875,
+          "normative_directionality": 1.875,
+          "referential_anchor": 1.375
+        },
+        "distance": 1.489546910976623,
+        "n_axes_compared": 2,
+        "n_axes_missing": 1
+      }
+    },
+    {
+      "target": {
+        "label": "The overly sentimental protector of nature",
+        "rationale": "A Cancerian persona that attaches deep, protective feelings to the inanimate object in the scene.",
+        "axes": {
+          "astrology_cancerian": 5,
+          "warm": 5,
+          "normative_directionality": 1
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-substantive-explorer.png",
+        "name": "Sag Substantive — Physical Explorer",
+        "sig": {
+          "astrology_sagittarian": 1,
+          "sensory_orientation": 4.5,
+          "normative_directionality": 1.125,
+          "referential_anchor": 4.75
+        },
+        "distance": 1.6345871038277526,
+        "n_axes_compared": 1,
+        "n_axes_missing": 2
+      }
+    },
+    {
+      "target": {
+        "label": "The blunt and casual street-smart traveler",
+        "rationale": "A high-colloquial, Sagittarian persona that treats the scene with unpretentious, direct energy.",
+        "axes": {
+          "astrology_sagittarian": 4,
+          "register_colloquial": 5,
+          "normative_directionality": 5
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-substantive-preacher.png",
+        "name": "Sag Substantive — Moral Preacher",
+        "sig": {
+          "astrology_sagittarian": 4,
+          "sensory_orientation": 2.75,
+          "normative_directionality": 5,
+          "referential_anchor": 4.25
+        },
+        "distance": 1.1547005383792515,
+        "n_axes_compared": 2,
+        "n_axes_missing": 1
+      }
+    },
+    {
+      "target": {
+        "label": "A generic fantasy trope-heavy adventurer",
+        "rationale": "Focuses on high trope density and a standard descriptive tone to ground the scene in a recognizable genre.",
+        "axes": {
+          "trope_density": 5,
+          "normative_directionality": 1,
+          "warm": 2
+        }
+      },
+      "persona": {
+        "persona_id": "cluster-sag-paraphrase-1.png",
+        "name": "Sag Paraphrase 1",
+        "sig": {
+          "astrology_sagittarian": 2.4285714285714284,
+          "syntactic_entropy": 4.625,
+          "intellectual_hostility": 2.7142857142857144,
+          "abstraction_to_concrete_ratio": 4.25
+        },
+        "distance": 2,
+        "n_axes_compared": 0,
+        "n_axes_missing": 3
+      }
+    }
+  ],
+  "active": [
+    {
+      "target_label": "The philosophical wanderer seeking existential truths",
+      "persona_id": "cluster-sag-substantive-metaphys.png",
+      "persona_name": "Sag Substantive — Metaphysical"
+    },
+    {
+      "target_label": "The overly sentimental protector of nature",
+      "persona_id": "cluster-sag-substantive-explorer.png",
+      "persona_name": "Sag Substantive — Physical Explorer"
+    }
+  ],
+  "disabled": [
+    {
+      "target_label": "The blunt and casual street-smart traveler",
+      "persona_id": "cluster-sag-substantive-preacher.png",
+      "persona_name": "Sag Substantive — Moral Preacher"
+    },
+    {
+      "target_label": "A generic fantasy trope-heavy adventurer",
+      "persona_id": "cluster-sag-paraphrase-1.png",
+      "persona_name": "Sag Paraphrase 1"
+    }
+  ]
+}

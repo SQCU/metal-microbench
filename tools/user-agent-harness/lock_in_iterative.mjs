@@ -44,6 +44,14 @@ import {
 const { ST, BRIDGE, PLUGIN } = ENDPOINTS;
 
 const EXPERIMENT_ID = process.argv[2] || 'lock_in_tetrad';
+// F16 provenance. The plugin's /experiments/:id/run handler sets
+// LOCK_IN_RUN_ID in the spawn env so the run_id flows down without an
+// extra round-trip. Standalone CLI invocations may omit it; in that
+// case we synthesize a local run_id so the experiment_output stamps
+// still carry SOMETHING traceable (a wall-clock-derived id), and the
+// audit log stays continuous even for ad-hoc runs.
+const RUN_ID = process.env.LOCK_IN_RUN_ID
+    || `${EXPERIMENT_ID}-cli-${new Date().toISOString().replace(/[:.]/g, '-')}`;
 
 // Load the experiment spec from the plugin. Bios, agent_targets, axis
 // subsets, counterparty, and loop-control all come from there.
@@ -68,8 +76,23 @@ const AGENT_TARGETS = spec.agent_targets;
 
 // Loop control values from the spec (with defaults baked into the
 // plugin-side validateExperimentCard so omitted keys behave sanely).
-const K_MAX_INNER     = spec.loop_control.k_max_inner;
-const K_MAX_OUTER     = spec.loop_control.k_max_outer;
+//
+// K_MAX_CEILING: defense-in-depth hard cap. The plugin's validator
+// already clamps both k_max_inner and k_max_outer to 5; this re-clamps
+// here in case a card was loaded from disk bypassing validation, or in
+// case a future code path forgot to round-trip through the validator.
+// Belt + suspenders so an unbounded loop is structurally impossible.
+const K_MAX_CEILING = 5;
+function clampK(label, value) {
+    const n = Number.isInteger(value) ? value : 1;
+    if (n > K_MAX_CEILING) {
+        console.warn(`[lock_in_iterative] ${label}=${n} exceeds ceiling ${K_MAX_CEILING}; clamping`);
+        return K_MAX_CEILING;
+    }
+    return Math.max(1, n);
+}
+const K_MAX_INNER     = clampK('k_max_inner', spec.loop_control.k_max_inner);
+const K_MAX_OUTER     = clampK('k_max_outer', spec.loop_control.k_max_outer);
 const N_TURNS_PER_CHAT = spec.loop_control.n_turns_per_chat;
 const EPS_PER_AXIS    = spec.loop_control.eps_per_axis;
 const STALL_WINDOW    = spec.loop_control.stall_window;
@@ -202,7 +225,7 @@ async function designAgentPass(bio, agentTarget, prior_attempts) {
 
 // ── INNER LOOP: user-agent designer with judge feedback ──────────────
 
-async function designAgentToConvergence(bio, agentTarget, rock) {
+async function designAgentToConvergence(bio, agentTarget, rock, outerIter = 0) {
     const attempts = [];
     let bestAttempt = null;
     let bestMaxDist = Infinity;
@@ -210,8 +233,19 @@ async function designAgentToConvergence(bio, agentTarget, rock) {
         const t0 = Date.now();
         const agent_text = await designAgentPass(bio, agentTarget, attempts);
         const agent_id = `${bio.slug}-${agentTarget.slug}-iter${k}`;
+        // F16 provenance: every agent born from the fixed-point loop is
+        // an experiment_output. The {experiment_id, run_id, iter} tuple
+        // is fully traceable back to the dispatching plugin endpoint
+        // (which set LOCK_IN_RUN_ID in the spawn env) and to its source
+        // experiment-spec card on disk.
+        const provenance = {
+            kind: 'experiment_output',
+            experiment_id: EXPERIMENT_ID,
+            run_id: RUN_ID,
+            iter: { outer: outerIter, inner: k },
+        };
         await saveAgent(agent_id, `${bio.name} — ${agentTarget.slug} (iter ${k})`,
-                        agent_text, bio.canonical_key);
+                        agent_text, bio.canonical_key, provenance);
         const chat = await runChat(bio, agent_id, rock, N_TURNS_PER_CHAT);
         // Judge each user turn on the agent axes ONLY (the inner loop's target is in A)
         const turnJudgments = [];
@@ -254,26 +288,40 @@ async function designBioToConvergence(bio, rock) {
         const t0 = Date.now();
         const bioProse = await designBioPass(bio, attempts);
         bio.prose = bioProse;
-        await saveBio(bio);
+        // F16 provenance for bio writes: if the experiment-spec carried a
+        // verbatim seed_phrase (set by the seed-textarea Materialize path
+        // in fixed_point.html), this bio was born of a seed_demo probe.
+        // Otherwise (the structured editor path) it's a manual creation
+        // promoted into an experiment. Operator-curated promotions to
+        // canonical happen via a separate /personas POST after the run.
+        const bioProvenance = bio.seed_phrase
+            ? { kind: 'seed_demo', seed_phrase: bio.seed_phrase }
+            : { kind: 'manual' };
+        await saveBio({ ...bio, prose: bioProse, provenance: bioProvenance });
         console.log(`  [outer k=${k}] bio prose: ${bioProse.slice(0,120).replace(/\n/g,' ')}…`);
         // Run inner for each agent target
         const innerResults = [];
         for (const agentTarget of AGENT_TARGETS) {
             console.log(`    → inner: agent target = ${agentTarget.slug} (${fmtSig(agentTarget.target_agent)})`);
-            const innerR = await designAgentToConvergence(bio, agentTarget, rock);
+            const innerR = await designAgentToConvergence(bio, agentTarget, rock, k);
             innerResults.push({ agentTarget, ...innerR });
         }
         // Aggregate BIO-axis measurements across all user turns of all best
         // inner runs. Bio axes are scored per-turn but in a separate judge
         // call (so the inner loop's judge isn't muddled with bio-axis noise).
-        const allUserTurns = [];
-        for (const r of innerResults) {
-            allUserTurns.push(...userTurns(r.best.chat));
-        }
+        // Each entry is tagged with `context` = agent_target.slug so
+        // axis_splitter (which buckets turns by chat context to detect
+        // entanglement on a bio-kind parent axis) can find which turns
+        // came from which agent_target. Without the tag, bio-axis splits
+        // can't be diagnosed and axis_splitter no-ops with "gap too small".
         const bioTurnJudgments = [];
-        for (const turn of allUserTurns) {
-            const { sig, raw } = await judgeOneTurn(turn, BIO_AXES);
-            bioTurnJudgments.push({ turn, sig, raw });
+        for (const r of innerResults) {
+            const ctx = r.agentTarget.slug;
+            const turns = userTurns(r.best.chat);
+            for (const turn of turns) {
+                const { sig, raw } = await judgeOneTurn(turn, BIO_AXES);
+                bioTurnJudgments.push({ turn, sig, raw, context: ctx });
+            }
         }
         const measured_bio = meanSig(bioTurnJudgments.map(j => j.sig), BIO_AXES);
         const dist = distancePerAxis(measured_bio, bio.target_bio, BIO_AXES);
@@ -323,6 +371,30 @@ for (const bio of BIOS) {
         elapsed_ms_total: Date.now() - tAll,
     }, null, 2));
     console.log(`[bio ${bio.slug}] saved: ${outFile}`);
+
+    // Re-save the bio with its measured signature so downstream consumers
+    // (corpus dashboard PR, outer_outer's ΔPR picker, suggester L2,
+    // axis-registry scored-on counts) can read it directly. Use best
+    // attempt's measured bio-axis values; that's the closest the loop
+    // got to the target. If no measurement (unlikely — best.measured is
+    // populated by every outer iteration), skip the re-save.
+    const measuredSig = result.best?.measured;
+    if (measuredSig && Object.keys(measuredSig).length > 0) {
+        const bioProvenance = {
+            kind: bio.seed_phrase ? 'seed_demo' : 'experiment_output',
+            experiment_id: EXPERIMENT_ID,
+            run_id: RUN_ID,
+            ...(bio.seed_phrase ? { seed_phrase: bio.seed_phrase } : {}),
+        };
+        await saveBio({
+            canonical_key: bio.canonical_key,
+            name: bio.name,
+            prose: result.best.prose,
+            provenance: bioProvenance,
+            signature: measuredSig,
+        });
+        console.log(`[bio ${bio.slug}] re-saved with measured signature: ${fmtSig(measuredSig)}`);
+    }
 }
 
 console.log(`\n[lock_in_iterative] done. elapsed: ${((Date.now()-tAll)/1000).toFixed(1)}s`);

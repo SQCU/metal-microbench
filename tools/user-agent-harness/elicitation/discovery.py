@@ -467,30 +467,31 @@ def parse_designer_output(text: str,
 
 # ─── Measurement + drift ────────────────────────────────────────────
 
-def measure_turn(turn_text: str) -> dict[str, int]:
-    """Run a chat turn through the existing two-stage cascade and
-    return the parsed per-axis Likert. Reuses the proven cascade
-    pipeline from probe_persist; this is the same instrument that
-    measured the rest of the corpus."""
+def measure_turn(turn_text: str) -> tuple[dict[str, int], str]:
+    """Run a chat turn through the probe_persist two-stage cascade and
+    return the parsed per-axis Likert plus the stage-1 prose summary."""
     s = stage1_summary(turn_text)
     raw = stage2_likert(s)
     return parse_elementwise(raw), s
 
 
 def drift_report(target: np.ndarray, measured_named: dict[str, int],
-                  cov_layer) -> dict:
+                  cov_layer, axis_names: list[str] | None = None) -> dict:
     """Compare measured vs target. Mahalanobis distance + per-axis
     deltas. Caller decides convergence."""
-    measured = np.array([measured_named.get(a, np.nan) for a in AXIS_NAMES],
+    if axis_names is None:
+        axis_names = AXIS_NAMES
+    n_axes = len(axis_names)
+    measured = np.array([measured_named.get(a, np.nan) for a in axis_names],
                         dtype=float)
     target_arr = np.asarray(target, dtype=float)
     diffs = measured - target_arr
     out = {
-        "per_axis": {AXIS_NAMES[i]: {
+        "per_axis": {axis_names[i]: {
             "target": int(target_arr[i]),
             "measured": int(measured[i]) if not np.isnan(measured[i]) else None,
             "delta": float(diffs[i]) if not np.isnan(diffs[i]) else None,
-        } for i in range(N_AXES)},
+        } for i in range(n_axes)},
         "mahalanobis": None,
         "max_abs_delta": float(np.nanmax(np.abs(diffs))),
         "rms_delta": float(np.sqrt(np.nanmean(diffs ** 2))),
@@ -507,7 +508,8 @@ def feedback_message(target_named: dict[str, int],
                       measured_named: dict[str, int],
                       drift: dict,
                       judge_stage1_summary: str | None = None,
-                      threshold: float = 1.0) -> str:
+                      threshold: float = 1.0,
+                      axis_names: list[str] | None = None) -> str:
     """Build a feedback message describing how the prior turn was READ
     by the judge + how its measured signature relates to the target.
 
@@ -519,10 +521,12 @@ def feedback_message(target_named: dict[str, int],
     sees the measurement; with it, the DESIGNER sees both the
     measurement AND the *interpretive prose* that produced it.
     """
+    if axis_names is None:
+        axis_names = AXIS_NAMES
     landed = []
     drifted = []
     missing = []
-    for axis in AXIS_NAMES:
+    for axis in axis_names:
         a = drift["per_axis"][axis]
         if a["measured"] is None:
             missing.append(axis)
@@ -635,8 +639,6 @@ def run(jsonl_path: Path,
         target = pca_target(fs.pca_layer, pc_idx, n_sigma=n_sigma, direction=direction)
         target_named = named_target(target)
 
-    # Use whichever mean is available (pca_layer mean if PCA exists,
-    # otherwise a per-axis mean across full records).
     if fs.pca_layer is not None:
         mean_vec = fs.pca_layer.mean_vec
     else:

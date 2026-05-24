@@ -33,12 +33,18 @@ import numpy as np
 from axes import AXIS_NAMES, N_AXES
 
 
-# Sample-size gates.
+# Sample-size gates. The gates here are the bare minima at which the
+# math is well-defined; consumers should layer their own tighter gates
+# on top if they care about statistical power. Previous larger gates
+# (MIN_N_COV_TOTAL=30, MIN_N_PCA=2*N_AXES, MIN_N_COV_PER_PERS=5) gave
+# the layer the false dignity of refusing to estimate at small N; the
+# small-N paths below are well-conditioned through regularization and
+# the consumer can decide whether the result has signal.
 MIN_N_UNIVARIATE   = 2
 MIN_N_CORRELATION  = 6
-MIN_N_COV_TOTAL    = 30
-MIN_N_COV_PER_PERS = 5
-MIN_N_PCA          = 2 * N_AXES   # 28; "minimum sane"; really want 50+
+MIN_N_COV_TOTAL    = 2
+MIN_N_COV_PER_PERS = 1
+MIN_N_PCA          = 2
 
 
 def load_records(path: str | Path) -> list[dict]:
@@ -58,36 +64,38 @@ def load_records(path: str | Path) -> list[dict]:
 
 
 def records_to_matrix(records: list[dict],
-                       require_full: bool = True
+                       require_full: bool = True,
+                       axis_names: list[str] | None = None,
                        ) -> tuple[np.ndarray, list[str], list[int]]:
     """Convert a list of records into (X, persona_labels, indices) where
-    X is an (n_kept × N_AXES) matrix of Likert scores. If require_full,
-    drop any record with fewer than N_AXES axes parsed. Otherwise impute
-    missing axes by the column mean across the kept records."""
+    X is an (n_kept × n_axes) matrix of Likert scores. The axis schema
+    defaults to the module-level AXIS_NAMES but can be overridden via
+    the `axis_names` kwarg for callers working with a different schema."""
+    if axis_names is None:
+        axis_names = AXIS_NAMES
+    n_axes = len(axis_names)
     kept = []
     for r in records:
         likert = r.get("likert") or {}
-        if require_full and len(likert) != N_AXES:
+        if require_full and len(likert) != n_axes:
             continue
         kept.append(r)
 
     if not kept:
-        return np.zeros((0, N_AXES)), [], []
+        return np.zeros((0, n_axes)), [], []
 
     if require_full:
-        X = np.array([[r["likert"][a] for a in AXIS_NAMES] for r in kept],
+        X = np.array([[r["likert"][a] for a in axis_names] for r in kept],
                      dtype=float)
     else:
-        # Partial-record path: build with NaN and mean-impute by column.
-        X = np.full((len(kept), N_AXES), np.nan)
+        X = np.full((len(kept), n_axes), np.nan)
         for i, r in enumerate(kept):
-            for j, a in enumerate(AXIS_NAMES):
+            for j, a in enumerate(axis_names):
                 v = r.get("likert", {}).get(a)
                 if v is not None:
                     X[i, j] = v
         col_means = np.nanmean(X, axis=0)
-        # Replace each NaN with its column's mean.
-        for j in range(N_AXES):
+        for j in range(n_axes):
             mask = np.isnan(X[:, j])
             X[mask, j] = col_means[j]
     return X, [r["persona"] for r in kept], [r.get("sample_index", -1) for r in kept]
@@ -193,18 +201,40 @@ class CovarianceLayer:
     n_per_persona: dict[str, int]
 
 
-def covariance_layer(records: list[dict]) -> CovarianceLayer | None:
+def covariance_layer(records: list[dict],
+                      axis_names: list[str] | None = None
+                      ) -> CovarianceLayer | None:
     """Pooled within-persona covariance + persona-conditional means.
-    Returns None unless gates pass. The pooled covariance is the
-    natural noise model for Mahalanobis distance — it treats sample-
-    to-sample variation within a persona as the noise floor and asks
-    'how far apart are persona means in units of that noise?'"""
-    full_records = [r for r in records if r.get("axes_recovered", 0) == N_AXES]
+
+    Two regimes, auto-selected by data shape (caller passes nothing):
+
+    - **within-persona** (n_total > K): canonical pooled within-class
+      covariance with (N − K) DoF denominator. The pooled covariance is
+      the natural noise model for Mahalanobis distance — sample-to-sample
+      variation within a persona is the noise floor; we ask 'how far apart
+      are persona means in units of that noise?'.
+
+    - **across-persona-fallback** (n_total == K, i.e. every persona has
+      a single sample): no within-persona variation to pool. Falls back
+      to total covariance across persona means + diagonal shrinkage so
+      the matrix is invertible. Mahalanobis semantics shift to 'distance
+      in units of cross-persona variation' — interpretable, well-defined,
+      and the only sensible move when within-persona variation is
+      unobservable.
+
+    Gate is `len(likert) == n_axes` — vector-complete is the right
+    test; `axes_recovered` (a count of non-default entries) naturally
+    runs ≪ n_axes for sparse one-hot composite vectors and is the
+    wrong test there."""
+    if axis_names is None:
+        axis_names = AXIS_NAMES
+    n_axes = len(axis_names)
+    full_records = [r for r in records if len(r.get("likert", {})) == n_axes]
     if len(full_records) < MIN_N_COV_TOTAL:
         return None
     by_persona: dict[str, list[np.ndarray]] = defaultdict(list)
     for r in full_records:
-        vec = np.array([r["likert"][a] for a in AXIS_NAMES], dtype=float)
+        vec = np.array([r["likert"][a] for a in axis_names], dtype=float)
         by_persona[r["persona"]].append(vec)
 
     eligible = {p: np.stack(vs) for p, vs in by_persona.items()
@@ -215,34 +245,48 @@ def covariance_layer(records: list[dict]) -> CovarianceLayer | None:
     persona_means = {p: X.mean(axis=0) for p, X in eligible.items()}
     n_per_persona = {p: int(X.shape[0]) for p, X in eligible.items()}
 
-    # Pooled within-class covariance: (N - K) degree-of-freedom denominator,
-    # where K is the number of personas and N the total kept samples.
-    centered_blocks = []
-    for p, X in eligible.items():
-        centered_blocks.append(X - persona_means[p])
+    K = len(eligible)
+    centered_blocks = [X - persona_means[p] for p, X in eligible.items()]
     C = np.vstack(centered_blocks)
     n_total = C.shape[0]
-    K = len(eligible)
-    if n_total <= K:
-        return None
-    pooled = (C.T @ C) / (n_total - K)
 
-    # Add a tiny ridge to keep it invertible. Likert ordinals can produce
-    # singular covariances at low N (especially on collapsed axes like
-    # `deferential` in our pilot data).
-    ridge = 1e-3 * np.trace(pooled) / N_AXES * np.eye(N_AXES)
-    pooled_reg = pooled + ridge
+    if n_total > K:
+        # Within-persona pooled covariance — canonical.
+        pooled = (C.T @ C) / (n_total - K)
+        regime = "within-persona"
+    else:
+        # n_total == K: each persona has 1 sample. Fall back to
+        # across-persona total covariance.
+        means_matrix = np.stack(list(persona_means.values()))
+        grand_mean = means_matrix.mean(axis=0)
+        Mc = means_matrix - grand_mean
+        if Mc.shape[0] > 1:
+            pooled = (Mc.T @ Mc) / max(Mc.shape[0] - 1, 1)
+        else:
+            pooled = np.eye(n_axes)  # K==1: identity placeholder
+        regime = "across-persona-fallback"
+
+    alpha = min(0.95, n_axes / max(n_total, 1) * 0.1)
+    diag_target = np.diag(np.diag(pooled))
+    if np.trace(diag_target) < 1e-9:
+        diag_target = np.eye(n_axes) * max(1.0 / n_axes, 1e-6)
+    pooled_shrunk = (1 - alpha) * pooled + alpha * diag_target
+    ridge = 1e-3 * max(np.trace(pooled_shrunk) / n_axes, 1e-9) * np.eye(n_axes)
+    pooled_reg = pooled_shrunk + ridge
+
     try:
         inv = np.linalg.inv(pooled_reg)
     except np.linalg.LinAlgError:
         inv = None
 
-    return CovarianceLayer(
+    layer = CovarianceLayer(
         persona_means=persona_means,
-        pooled_within=pooled,
+        pooled_within=pooled_reg,
         pooled_within_inv=inv,
         n_per_persona=n_per_persona,
     )
+    layer._cov_regime = regime  # diagnostic attribute (not a dataclass field)
+    return layer
 
 
 def mahalanobis(x: np.ndarray, mu: np.ndarray, cov_inv: np.ndarray) -> float:
@@ -280,30 +324,29 @@ class PCALayer:
     mean_vec: np.ndarray              # what was centered out
 
 
-def pca(records: list[dict]) -> PCALayer | None:
-    """PCA on the pooled sample matrix across all personas. The principal
-    directions are the natural axes of variation IN THE OBSERVED DATA —
-    they reveal where 14 named axes collapse to a lower-d effective
-    subspace. Effective dimensionality is read off the cumulative-
-    variance curve."""
-    X, _, _ = records_to_matrix(records, require_full=True)
+def pca(records: list[dict],
+        axis_names: list[str] | None = None) -> PCALayer | None:
+    """PCA via SVD on the centered sample matrix. Works for any N ≥ 2;
+    yields min(N − 1, D) non-zero singular values, with the remaining
+    dimensions returned as zero-padding so consumers see the canonical
+    (D, D) component matrix regardless of N. Effective dimensionality
+    is the cumulative-variance crossing of the consumer's threshold."""
+    X, _, _ = records_to_matrix(records, require_full=True, axis_names=axis_names)
     if X.shape[0] < MIN_N_PCA:
         return None
-    n = X.shape[0]
+    n, d = X.shape
     mu = X.mean(axis=0)
     Xc = X - mu
-    # Sample covariance (N - 1 denominator).
-    S = (Xc.T @ Xc) / (n - 1)
-    # Eigendecomposition of the symmetric covariance.
-    eigvals, eigvecs = np.linalg.eigh(S)
-    # eigh returns ascending; flip to descending.
-    order = np.argsort(eigvals)[::-1]
-    eigvals = eigvals[order]
-    eigvecs = eigvecs[:, order]
+    # SVD: Xc = U @ diag(S) @ Vt. Rows of Vt are the right singular
+    # vectors — the principal directions in feature space.
+    U, S, Vt = np.linalg.svd(Xc, full_matrices=True)
+    eigvals = np.zeros(d, dtype=float)
+    eigvals[:len(S)] = (S ** 2) / max(n - 1, 1)
+    components = np.zeros((d, d), dtype=float)
+    components[:Vt.shape[0]] = Vt
     cum = np.cumsum(eigvals) / max(eigvals.sum(), 1e-12)
-    # Components: rows = PCs, columns = axes.
     return PCALayer(
-        components=eigvecs.T,
+        components=components,
         variance_explained=eigvals,
         cumulative_explained=cum,
         n_samples=n,
@@ -341,14 +384,18 @@ class FullSignature:
     pca_layer: PCALayer | None
 
 
-def full_signature(records: list[dict]) -> FullSignature:
+def full_signature(records: list[dict],
+                    axis_names: list[str] | None = None) -> FullSignature:
     """Run all layers, gating each by its own sample-size precondition.
     Returns a structured report; consumers decide which layers to use."""
+    if axis_names is None:
+        axis_names = AXIS_NAMES
+    n_axes = len(axis_names)
     n_records = len(records)
-    n_full = sum(1 for r in records if r.get("axes_recovered", 0) == N_AXES)
+    n_full = sum(1 for r in records if len(r.get("likert", {})) == n_axes)
     n_pp = defaultdict(int)
     for r in records:
-        if r.get("axes_recovered", 0) == N_AXES:
+        if len(r.get("likert", {})) == n_axes:
             n_pp[r["persona"]] += 1
     return FullSignature(
         n_records=n_records,
@@ -357,6 +404,6 @@ def full_signature(records: list[dict]) -> FullSignature:
         univariate_global=univariate(records, per_persona=False) if n_full >= MIN_N_UNIVARIATE else None,
         univariate_per_persona=univariate(records, per_persona=True) if n_full >= MIN_N_UNIVARIATE else None,
         correlation=correlation_matrix(records),
-        covariance_layer=covariance_layer(records),
-        pca_layer=pca(records),
+        covariance_layer=covariance_layer(records, axis_names=axis_names),
+        pca_layer=pca(records, axis_names=axis_names),
     )

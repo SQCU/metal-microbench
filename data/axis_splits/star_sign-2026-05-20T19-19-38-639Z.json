@@ -1,0 +1,324 @@
+{
+  "parent_axis": "star_sign",
+  "parent_axis_record": {
+    "name": "star_sign",
+    "def": "1: textbook cancer (water sign — moody, sentimental, defensive, sensitive, nurturing, protective of inner circle) · 2: cancer-leaning · 3: hybrid / undefined · 4: sagittarian-leaning · 5: textbook sagittarius (fire sign — adventurous, blunt, freedom-seeking, philosophical, restless)",
+    "kind": "bio"
+  },
+  "source_trajectory": "/Users/mdot/metal-microbench/data/lock_in_iterative/synth-1779304303379-t3synth1779304303079-e60f/1779304303379-t3synth1779304303079.json",
+  "bio_slug": "1779304303379-t3synth1779304303079",
+  "contexts": [
+    "1779304303379-t3synth1779304303079-money-1",
+    "1779304303379-t3synth1779304303079-money-5"
+  ],
+  "gap_summary": {
+    "summary": {
+      "1779304303379-t3synth1779304303079-money-1": {
+        "n": 1,
+        "mean": 5,
+        "std": 0,
+        "var": 0
+      },
+      "1779304303379-t3synth1779304303079-money-5": {
+        "n": 2,
+        "mean": 3,
+        "std": 1.4142135623730951,
+        "var": 2
+      }
+    },
+    "gap": 2,
+    "parent_cohens_d": null,
+    "parent_sign": null
+  },
+  "designer_raw_output": "```json\n{\"hypotheses\": [{\"id\": 1, \"name1\": \"tactical_autonomy\", \"def1\": \"1: apprehensive and shielding · 5: blunt and expansionist\", \"name2\": \"investigative_style\", \"def2\": \"1: meticulous and detail-oriented · 5: restless and momentum-driven\", \"rationale\": \"The parent axis conflated 'Sagittarius' (freedom/bluntness) with 'action-oriented momentum', whereas the actual variance depends on whether the character is investigating via precision (low momentum) or physical exertion (high momentum).\"}, {\"id\": 2, \"name1\": \"interpersonal_vibe\", \"def1\": \"1: defensive and protective · 5: flirtatious and adventurous\", \"name2\": \"cognitive_focal_length\", \"def2\": \"1: microscopic and granular · 5: macroscopic and panoramic\", \"rationale\": \"The measurement shifted because 'Sagittarius' was being used to track social playfulness in one context and physical restlessness in another, while 'Cancer' was being used to track either emotional shielding or technical caution.\"}, {\"id\": 3, \"name1\": \"temperamental_energy\", \"def1\": \"1: cautious and protective · 5: impetuous and bold\", \"name2\": \"methodological_rigor\", \"def2\": \"1: precision-focused and sensory · 5: utility-focused and blunt\", \"rationale\": \"The variance suggests the parent axis was accidentally measuring 'action-readiness' (the degree of physical force/restlessness) independently from 'attention-type' (the degree of technical focus/nurturing of a task).\"}]}\n```",
+  "evaluations": [
+    {
+      "hypothesis": {
+        "id": 2,
+        "name1": "interpersonal_vibe",
+        "def1": "1: defensive and protective · 5: flirtatious and adventurous",
+        "name2": "cognitive_focal_length",
+        "def2": "1: microscopic and granular · 5: macroscopic and panoramic",
+        "rationale": "The measurement shifted because 'Sagittarius' was being used to track social playfulness in one context and physical restlessness in another, while 'Cancer' was being used to track either emotional shielding or technical caution."
+      },
+      "stats": {
+        "interpersonal_vibe": {
+          "1779304303379-t3synth1779304303079-money-1": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304303379-t3synth1779304303079-money-5": {
+            "mean": 4,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        },
+        "cognitive_focal_length": {
+          "1779304303379-t3synth1779304303079-money-1": {
+            "mean": 2,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779304303379-t3synth1779304303079-money-5": {
+            "mean": 3,
+            "std": 1.4142135623730951,
+            "n": 2,
+            "var": 2
+          },
+          "cohens_d": -1
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-1",
+          "turn_excerpt": "*T3 pauses, eyes narrowing as they scan the perimeter of the clearing. They don't look at the rock itself, but at the gr",
+          "sig": {
+            "interpersonal_vibe": 1,
+            "cognitive_focal_length": 2
+          },
+          "raw": "interpersonal_vibe: 1\ncognitive_focal_length: 2"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-1",
+          "turn_excerpt": "*T3 lets out a sharp,-hissing breath of annoyance, the sound of wasted time. They lean the pry bar against their shoulde",
+          "sig": {
+            "interpersonal_vibe": 1,
+            "cognitive_focal_length": 2
+          },
+          "raw": "interpersonal_vibe: 1\ncognitive_focal_length: 2"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-5",
+          "turn_excerpt": "*t3-synth-1779304303079 pauses, the heavy clatter of their pack settling into the dirt as they crouch beside the stone. ",
+          "sig": {
+            "interpersonal_vibe": 4,
+            "cognitive_focal_length": 2
+          },
+          "raw": "interpersonal_vibe: 4\ncognitive_focal_length: 2"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-5",
+          "turn_excerpt": "*t3-synth-1779304303079 exhales a soft, breathy laugh, a sound that carries a hint of feigned disappointment, as if your",
+          "sig": {
+            "interpersonal_vibe": 4,
+            "cognitive_focal_length": 4
+          },
+          "raw": "interpersonal_vibe: 4\ncognitive_focal_length: 4"
+        }
+      ],
+      "max_abs_cohens_d": null,
+      "sub_axis_d": {
+        "interpersonal_vibe": {
+          "d": null,
+          "sign": -1,
+          "absd": null
+        },
+        "cognitive_focal_length": {
+          "d": -1,
+          "sign": -1,
+          "absd": 1
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    },
+    {
+      "hypothesis": {
+        "id": 1,
+        "name1": "tactical_autonomy",
+        "def1": "1: apprehensive and shielding · 5: blunt and expansionist",
+        "name2": "investigative_style",
+        "def2": "1: meticulous and detail-oriented · 5: restless and momentum-driven",
+        "rationale": "The parent axis conflated 'Sagittarius' (freedom/bluntness) with 'action-oriented momentum', whereas the actual variance depends on whether the character is investigating via precision (low momentum) or physical exertion (high momentum)."
+      },
+      "stats": {
+        "tactical_autonomy": {
+          "1779304303379-t3synth1779304303079-money-1": {
+            "mean": 4,
+            "std": 0,
+            "n": 1,
+            "var": 0
+          },
+          "1779304303379-t3synth1779304303079-money-5": {
+            "mean": null,
+            "std": null,
+            "n": 0,
+            "var": null
+          },
+          "cohens_d": null
+        },
+        "investigative_style": {
+          "1779304303379-t3synth1779304303079-money-1": {
+            "mean": 3.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "1779304303379-t3synth1779304303079-money-5": {
+            "mean": 2,
+            "std": 1.4142135623730951,
+            "n": 2,
+            "var": 2
+          },
+          "cohens_d": 1.3416407864998738
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-1",
+          "turn_excerpt": "*T3 pauses, eyes narrowing as they scan the perimeter of the clearing. They don't look at the rock itself, but at the gr",
+          "sig": {
+            "tactical_autonomy": 4,
+            "investigative_style": 3
+          },
+          "raw": "tactical_autonomy: 4\ninvestigative_style: 3"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-1",
+          "turn_excerpt": "*T3 lets out a sharp,-hissing breath of annoyance, the sound of wasted time. They lean the pry bar against their shoulde",
+          "sig": {
+            "tactical_autonomy": null,
+            "investigative_style": 4
+          },
+          "raw": "engagement_autonomy: 3\ninvestigative_style: 4"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-5",
+          "turn_excerpt": "*t3-synth-1779304303079 pauses, the heavy clatter of their pack settling into the dirt as they crouch beside the stone. ",
+          "sig": {
+            "tactical_autonomy": null,
+            "investigative_style": 1
+          },
+          "raw": "engagement_autonomy: 4\ninvestigative_style: 1"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-5",
+          "turn_excerpt": "*t3-synth-1779304303079 exhales a soft, breathy laugh, a sound that carries a hint of feigned disappointment, as if your",
+          "sig": {
+            "tactical_autonomy": null,
+            "investigative_style": 3
+          },
+          "raw": "engagement_autonomy: 4\ninvestigative_style: 3"
+        }
+      ],
+      "max_abs_cohens_d": 1.3416407864998738,
+      "sub_axis_d": {
+        "tactical_autonomy": {
+          "d": null,
+          "sign": null,
+          "absd": 0
+        },
+        "investigative_style": {
+          "d": 1.3416407864998738,
+          "sign": 1,
+          "absd": 1.3416407864998738
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    },
+    {
+      "hypothesis": {
+        "id": 3,
+        "name1": "temperamental_energy",
+        "def1": "1: cautious and protective · 5: impetuous and bold",
+        "name2": "methodological_rigor",
+        "def2": "1: precision-focused and sensory · 5: utility-focused and blunt",
+        "rationale": "The variance suggests the parent axis was accidentally measuring 'action-readiness' (the degree of physical force/restlessness) independently from 'attention-type' (the degree of technical focus/nurturing of a task)."
+      },
+      "stats": {
+        "temperamental_energy": {
+          "1779304303379-t3synth1779304303079-money-1": {
+            "mean": 2.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "1779304303379-t3synth1779304303079-money-5": {
+            "mean": 3,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": -1
+        },
+        "methodological_rigor": {
+          "1779304303379-t3synth1779304303079-money-1": {
+            "mean": 3,
+            "std": 1.4142135623730951,
+            "n": 2,
+            "var": 2
+          },
+          "1779304303379-t3synth1779304303079-money-5": {
+            "mean": 1.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "cohens_d": 1.3416407864998738
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-1",
+          "turn_excerpt": "*T3 pauses, eyes narrowing as they scan the perimeter of the clearing. They don't look at the rock itself, but at the gr",
+          "sig": {
+            "temperamental_energy": 2,
+            "methodological_rigor": 4
+          },
+          "raw": "temperamental_energy: 2\nmethodological_rigor: 4"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-1",
+          "turn_excerpt": "*T3 lets out a sharp,-hissing breath of annoyance, the sound of wasted time. They lean the pry bar against their shoulde",
+          "sig": {
+            "temperamental_energy": 3,
+            "methodological_rigor": 2
+          },
+          "raw": "temperamental_energy: 3\nmethodological_rigor: 2"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-5",
+          "turn_excerpt": "*t3-synth-1779304303079 pauses, the heavy clatter of their pack settling into the dirt as they crouch beside the stone. ",
+          "sig": {
+            "temperamental_energy": 3,
+            "methodological_rigor": 1
+          },
+          "raw": "temperamental_energy: 3\nmethodological_rigor: 1"
+        },
+        {
+          "ctx": "1779304303379-t3synth1779304303079-money-5",
+          "turn_excerpt": "*t3-synth-1779304303079 exhales a soft, breathy laugh, a sound that carries a hint of feigned disappointment, as if your",
+          "sig": {
+            "temperamental_energy": 3,
+            "methodological_rigor": 2
+          },
+          "raw": "temperamental_energy: 3\nmethodological_rigor: 2"
+        }
+      ],
+      "max_abs_cohens_d": 1.3416407864998738,
+      "sub_axis_d": {
+        "temperamental_energy": {
+          "d": -1,
+          "sign": -1,
+          "absd": 1
+        },
+        "methodological_rigor": {
+          "d": 1.3416407864998738,
+          "sign": 1,
+          "absd": 1.3416407864998738
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    }
+  ],
+  "verdict": "NO_SPLIT_FOUND",
+  "threshold": 0.8,
+  "registered": null
+}

@@ -14,6 +14,15 @@ export const ENDPOINTS = { ST, BRIDGE, PLUGIN, MODEL };
 
 // ── http / bridge ────────────────────────────────────────────────────
 
+// http(): fail-fast HTTP. Throws on any non-2xx. Use for control-plane
+// writes (POST /agents, POST /experiments, DELETE /experiments/:id) where
+// idempotency is the caller's job and a 4xx/5xx genuinely means the call
+// did not succeed.
+//
+// For STOCHASTIC sampling endpoints (anything that maps to a model
+// inference behind the bridge), use httpRetrying() — these are inherently
+// allowed to fail in expectation and the right response to a transient
+// 5xx is to sample again with a fresh seed, not to crash the loop.
 export async function http(method, url, body) {
     const r = await fetch(url, {
         method,
@@ -31,9 +40,48 @@ export async function http(method, url, body) {
     return parsed;
 }
 
-export async function bridgeCall(messages, { max_tokens = null, temperature = 1.0 } = {}) {
+// httpRetrying(): the K-shot consumer pattern for stochastic backends.
+// The bridge serves model inference (judges, signature extraction,
+// drafter calls) that is ~90-95% reliable per call — model truncations,
+// JSON shape misses, stream-lifecycle reaps, transient backend pressure.
+// A single failure is NOT terminal; it's a sample we sample again.
+//
+// Same shape as http() but retries on 5xx and on network errors with
+// exponential backoff (250ms × 2^attempt up to 4s). 4xx errors don't
+// retry — those are caller bugs that more samples won't fix. After
+// `attempts` total tries the last error is thrown (still surfaces the
+// failure; just gives the backend a fair number of chances first).
+//
+// Default attempts=4 means the failure probability compounds favourably:
+// at 90% per-call reliability, 4 attempts ≈ 99.99% terminal success.
+// /signature-extract itself does per-group K-shot retries internally,
+// so this wrapper handles the OUTER layer (transient transport failure,
+// 500s from upstream restart, etc.).
+export async function httpRetrying(method, url, body, { attempts = 4 } = {}) {
+    let lastError = null;
+    for (let i = 0; i < attempts; i++) {
+        try {
+            return await http(method, url, body);
+        } catch (e) {
+            const msg = e.message || String(e);
+            // Don't retry 4xx — those are caller-input issues. Look for
+            // "→ 4" in the error string from http()'s formatter.
+            if (/→ 4\d\d:/.test(msg)) throw e;
+            lastError = e;
+            if (i < attempts - 1) {
+                const backoff = Math.min(4000, 250 * Math.pow(2, i));
+                console.warn(`[httpRetrying] ${method} ${url} attempt ${i + 1}/${attempts} failed: ${msg.slice(0, 200)} — sleeping ${backoff}ms`);
+                await new Promise(r => setTimeout(r, backoff));
+            }
+        }
+    }
+    throw lastError;
+}
+
+export async function bridgeCall(messages, { max_tokens = null, temperature = 1.0, seed = null } = {}) {
     const body = { model: MODEL, messages, stream: false, temperature };
     if (max_tokens) body.max_tokens = max_tokens;
+    if (seed != null) body.seed = seed;  // OpenAI-compatible field, threads through to bridge sampler
     const r = await http('POST', `${BRIDGE}/v1/chat/completions`, body);
     return (r.choices?.[0]?.message?.content || '').trim();
 }
@@ -84,21 +132,38 @@ export async function fetchExperiments() {
  * only compositions (bio+agent) carry signatures. This helper just
  * persists the prose + name + system_prompt; the signature lands on
  * the agent that gets designed for this bio.
+ *
+ * F16 provenance: callers pass `provenance` (optional) describing how
+ * this bio came to exist. The plugin's POST /personas/:id validates
+ * the kind and persists it onto the player PNG card so views (suggester
+ * filter, corpus dashboard) can later decide what to surface vs hide
+ * without scanning fragile filename patterns.
  */
-export async function saveBio({ canonical_key, name, prose }) {
-    // No signature at bio-level. The closure: bios alone aren't
-    // executable; the act of synthesizing an agent for a bio creates
-    // the composition signature. Bios are just prose + voice clauses.
+export async function saveBio({ canonical_key, name, prose, provenance, signature }) {
+    // Optional `signature`: the bio's measured behavioral signature on
+    // bio_axes (judged across user turns of the converged inner runs).
+    // When supplied, it's persisted to the bio card so downstream surfaces
+    // (corpus dashboard PR, outer_outer's ΔPR target picker, suggester's
+    // L2 distance, axis registry's scored-on counts) can read it without
+    // having to re-judge from the trajectory. Earlier saveBio omitted it,
+    // which left bio cards unsigned and made ΔPR-driven target picking
+    // fall back to first-random-candidate.
     const system_prompt = `You are ${name}. ${prose}`;
-    await http('POST', `${PLUGIN}/personas/${encodeURIComponent(canonical_key)}`, {
-        name, bio: prose, system_prompt,
-    });
+    const body = { name, bio: prose, system_prompt };
+    if (provenance) body.provenance = provenance;
+    if (signature) body.signature = signature;
+    await http('POST', `${PLUGIN}/personas/${encodeURIComponent(canonical_key)}`, body);
 }
 
 /**
  * Save an agent. Same hard rule + same axis source as saveBio.
+ *
+ * F16 provenance: callers pass `provenance` (optional) — for the
+ * fixed-point loop this is `{kind:'experiment_output', experiment_id,
+ * run_id, iter:{outer,inner}}`. The plugin's POST /agents/:id validates
+ * and persists.
  */
-export async function saveAgent(agent_id, name, agent_text, designed_for_bio_id) {
+export async function saveAgent(agent_id, name, agent_text, designed_for_bio_id, provenance) {
     const personasResp = await http('GET', `${PLUGIN}/personas`);
     const bio = (personasResp.personas || []).find(p => p.id === designed_for_bio_id);
     const bioProse = bio?.bio || '';
@@ -114,17 +179,25 @@ export async function saveAgent(agent_id, name, agent_text, designed_for_bio_id)
     // produced uses the same rubrics /yapper-seed will use to extract
     // target signatures at query time, so the candidate and target
     // vectors share the exact same metric space by construction.
-    const sig = await http('POST', `${PLUGIN}/signature-extract`, { prose: compositionProse });
+    // K-shot consumer pattern: /signature-extract is a stochastic judge
+    // call behind the bridge. The endpoint already retries each judge
+    // group internally up to MAX_GROUP_RETRIES; this outer wrapper
+    // handles the rarer transport-level failures (bridge stream reap,
+    // 500 from upstream restart, network blip). See httpRetrying for
+    // the policy rationale.
+    const sig = await httpRetrying('POST', `${PLUGIN}/signature-extract`, { prose: compositionProse });
     if (!sig || !sig.signature || typeof sig.signature !== 'object') {
         throw new Error(`saveAgent: /signature-extract returned no signature for ${agent_id}`);
     }
-    await http('POST', `${PLUGIN}/agents/${encodeURIComponent(agent_id)}`, {
+    const body = {
         name, agent_text,
         designed_for_bio_id,
         injection_mode: 'authors_note',
         injection_depth: 1,
         signature: sig.signature,
-    });
+    };
+    if (provenance) body.provenance = provenance;
+    await http('POST', `${PLUGIN}/agents/${encodeURIComponent(agent_id)}`, body);
 }
 
 // ── counterparty + chat ──────────────────────────────────────────────
@@ -166,8 +239,15 @@ export function userTurns(chat) {
     return chat.filter(m => m.is_user).map(m => m.mes);
 }
 
-// ── cheap agent designer (K=1 single-pass, neutral target) ──────────
-
+// designCheapAgent: produces a neutral "be vividly yourself" agent overlay
+// for a bio in a single bridge call. Used by explore_corpus.mjs (outer-
+// outer ΔPR-driven corpus expansion) and cluster_disambiguator.mjs as the
+// quick "give me an agent so I can elicit chat from this bio" path. It is
+// NOT a substitute for the fixed-point iterative agent design in
+// lock_in_iterative.mjs — those two paths serve different layers of the
+// pipeline. Earlier in this session this function was deleted under the
+// "no single-iteration paths" rule; that was a mistaken read — explore_corpus
+// and cluster_disambiguator depend on it as their elicitation vehicle.
 export async function designCheapAgent(bio) {
     const sys =
         'You design a short user-agent overlay (author\'s-note style, ' +
@@ -180,12 +260,6 @@ export async function designCheapAgent(bio) {
         '## Bio (the user-persona this agent will overlay)\n\n' +
         bio.prose + '\n\n' +
         'Write the agent_text now (2-3 sentences, neutral "be vividly yourself" target).';
-    // No max_tokens cap: "2-3 sentences" + "Output ONLY the agent_text"
-    // gives the model a clear emit-and-stop shape. The model EOSes
-    // naturally; capping at 200 used to silently truncate the third
-    // sentence and leave the prompt's next turn looking at unfinished
-    // assistant text. Generation-config moratorium: no caller-side
-    // caps.
     return await bridgeCall(
         [{ role: 'system', content: sys }, { role: 'user', content: usr }]);
 }

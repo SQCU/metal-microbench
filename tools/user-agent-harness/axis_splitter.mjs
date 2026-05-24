@@ -70,23 +70,46 @@ const N_HYPOTHESES = 3;
  *   { contextLabel: [ { turn, agentTargetSig, outerIter, innerIter } ] }
  * where contextLabel is `agentTarget.slug` (e.g. "steals" / "romances-and-steals").
  */
-function bucketTurnsByContext(traj) {
+function bucketTurnsByContext(traj, parentAxisRecord = null) {
+    // Inner-loop turnJudgments carry AGENT-axis signatures only (the
+    // inner loop judges agent behavior). Outer-loop bioTurnJudgments
+    // carry BIO-axis signatures (judged in a separate pass on the best
+    // inner chats). For a bio-kind parent axis we MUST read from
+    // bioTurnJudgments — innerResults' turnJudgments don't carry that
+    // axis at all and the gap detector returns -∞. Each
+    // bioTurnJudgments entry is tagged with `context` (the source
+    // agent_target.slug) by lock_in_iterative so bucketing works.
+    const isBioParent = parentAxisRecord?.kind === 'bio';
     const byCtx = new Map();
     for (let oi = 0; oi < traj.result.attempts.length; oi++) {
         const outer = traj.result.attempts[oi];
-        for (const ir of outer.innerResults) {
-            const ctx = ir.agentTarget.slug;
-            if (!byCtx.has(ctx)) byCtx.set(ctx, []);
-            for (let ii = 0; ii < ir.attempts.length; ii++) {
-                const ia = ir.attempts[ii];
-                for (const tj of ia.turnJudgments) {
-                    byCtx.get(ctx).push({
-                        turn: tj.turn,
-                        original_sig: tj.sig,
-                        agent_target: ir.agentTarget.target_agent,
-                        outer_iter: oi,
-                        inner_iter: ii,
-                    });
+        if (isBioParent && Array.isArray(outer.bioTurnJudgments)) {
+            for (const tj of outer.bioTurnJudgments) {
+                const ctx = tj.context || 'unknown';
+                if (!byCtx.has(ctx)) byCtx.set(ctx, []);
+                byCtx.get(ctx).push({
+                    turn: tj.turn,
+                    original_sig: tj.sig,
+                    agent_target: null,
+                    outer_iter: oi,
+                    inner_iter: null,
+                });
+            }
+        } else {
+            for (const ir of outer.innerResults) {
+                const ctx = ir.agentTarget.slug;
+                if (!byCtx.has(ctx)) byCtx.set(ctx, []);
+                for (let ii = 0; ii < ir.attempts.length; ii++) {
+                    const ia = ir.attempts[ii];
+                    for (const tj of ia.turnJudgments) {
+                        byCtx.get(ctx).push({
+                            turn: tj.turn,
+                            original_sig: tj.sig,
+                            agent_target: ir.agentTarget.target_agent,
+                            outer_iter: oi,
+                            inner_iter: ii,
+                        });
+                    }
                 }
             }
         }
@@ -279,7 +302,7 @@ async function runSplitter(trajFile, parentAxisName) {
     console.log(`[splitter] parent axis: ${parentAxisName} (${parentAxis.kind})`);
     console.log(`[splitter] trajectory:  ${trajFile}`);
 
-    const byCtx = bucketTurnsByContext(traj);
+    const byCtx = bucketTurnsByContext(traj, parentAxis);
     const contexts = [...byCtx.keys()];
     console.log(`[splitter] contexts: ${contexts.map(c => `${c} (n=${byCtx.get(c).length})`).join(', ')}`);
 

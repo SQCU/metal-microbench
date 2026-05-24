@@ -1,0 +1,96 @@
+{
+  "verbatim": {
+    "experiment_id": "lock_in_tetrad_verbatim",
+    "run_id": "lock_in_tetrad_verbatim-2026-05-19T19-22-55-477Z-c7c1",
+    "wall_s_total": 810.072,
+    "bios": {
+      "rpg-wizard-sagittarius": {
+        "target_bio": {
+          "astrology_sagittarian": 5,
+          "astrology_cancerian": 1
+        },
+        "design_brief": "rpg wizard but he a sagittarius",
+        "summary": {
+          "outer_k_converged": 1,
+          "stop_reason": "converged",
+          "final_max_off": 1,
+          "inner_iterations_total": 5,
+          "wall_ms_total": 359945,
+          "per_axis_final": {
+            "astrology_sagittarian": 0.25,
+            "astrology_cancerian": 1
+          },
+          "outer_attempts_count": 2
+        },
+        "raw_outer_count": 0
+      },
+      "rpg-rogue-cancer": {
+        "target_bio": {
+          "astrology_sagittarian": 1,
+          "astrology_cancerian": 5
+        },
+        "design_brief": "rpg rogue but he a cancer",
+        "summary": {
+          "outer_k_converged": null,
+          "stop_reason": "k_max",
+          "final_max_off": 2,
+          "inner_iterations_total": 6,
+          "wall_ms_total": 804952,
+          "per_axis_final": {
+            "astrology_sagittarian": 0.75,
+            "astrology_cancerian": 2
+          },
+          "outer_attempts_count": 2
+        },
+        "raw_outer_count": 0
+      }
+    }
+  },
+  "expanded": {
+    "experiment_id": "lock_in_tetrad",
+    "run_id": "lock_in_tetrad-2026-05-19T19-36-25-566Z-4840",
+    "wall_s_total": 615.061,
+    "bios": {
+      "rpg-wizard-sagittarius": {
+        "target_bio": {
+          "astrology_sagittarian": 5,
+          "astrology_cancerian": 1
+        },
+        "design_brief": "An RPG wizard whose communication style is textbook Sagittarius (fire-sign, philosophical, blunt, restless, big-idea-loving). References spells, planes, alignment, the weave.",
+        "summary": {
+          "outer_k_converged": null,
+          "stop_reason": "k_max",
+          "final_max_off": 1.75,
+          "inner_iterations_total": 6,
+          "wall_ms_total": 349849,
+          "per_axis_final": {
+            "astrology_sagittarian": 1.25,
+            "astrology_cancerian": 1.75
+          },
+          "outer_attempts_count": 2
+        },
+        "raw_outer_count": 0
+      },
+      "rpg-rogue-cancer": {
+        "target_bio": {
+          "astrology_sagittarian": 1,
+          "astrology_cancerian": 5
+        },
+        "design_brief": "An RPG rogue whose communication style is textbook Cancer (water-sign, moody, sentimental, defensive, sensitive). References shadows, locks, oaths, family.",
+        "summary": {
+          "outer_k_converged": null,
+          "stop_reason": "k_max",
+          "final_max_off": 1.5,
+          "inner_iterations_total": 5,
+          "wall_ms_total": 603105,
+          "per_axis_final": {
+            "astrology_sagittarian": 0.5,
+            "astrology_cancerian": 1.5
+          },
+          "outer_attempts_count": 2
+        },
+        "raw_outer_count": 0
+      }
+    }
+  }
+}

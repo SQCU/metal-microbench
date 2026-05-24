@@ -1,0 +1,517 @@
+{
+  "experiment_id": "lock_in_tetrad",
+  "run_id": "lock_in_tetrad-2026-05-20T02-43-01-318Z-add7",
+  "started_at": "2026-05-20T03:13:06.999Z",
+  "K_OUTER_OUTER": 3,
+  "passes": [
+    {
+      "pass": 0,
+      "inner_result": {
+        "code": 0,
+        "signal": null,
+        "elapsed_s": 987.6
+      },
+      "sweep": {
+        "splitterResults": [
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "astrology_cancerian",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "astrology_sagittarian",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "performative",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "playful",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "register_colloquial",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "structured",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "terse",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "trope_density",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "warm",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "astrology_cancerian",
+            "exit_code": 0,
+            "elapsed_s": 39.8
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "astrology_sagittarian",
+            "exit_code": 0,
+            "elapsed_s": 35.4
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "performative",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "playful",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "register_colloquial",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "structured",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "terse",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "trope_density",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "warm",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          }
+        ],
+        "collapsedPairs": [],
+        "disambResult": null
+      }
+    },
+    {
+      "pass": 1,
+      "target": {
+        "astrology_sagittarian": 4,
+        "astrology_cancerian": 2
+      },
+      "inner_result": {
+        "code": 0,
+        "signal": null,
+        "elapsed_s": 135.1
+      },
+      "sweep": {
+        "splitterResults": [
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "astrology_cancerian",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "astrology_sagittarian",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "mood_fluctuation",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "performative",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "playful",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "register_colloquial",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "relational_projection",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "structured",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "terse",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "trope_density",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "warm",
+            "exit_code": 0,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "astrology_cancerian",
+            "exit_code": 1,
+            "elapsed_s": 301.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "astrology_sagittarian",
+            "exit_code": 1,
+            "elapsed_s": 301.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "mood_fluctuation",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "performative",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "playful",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "register_colloquial",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "relational_projection",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "structured",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "terse",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "trope_density",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "warm",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "oo-lock_in_tetrad-pass1",
+            "axis": "astrology_cancerian",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "oo-lock_in_tetrad-pass1",
+            "axis": "astrology_sagittarian",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "oo-lock_in_tetrad-pass1",
+            "axis": "mood_fluctuation",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "oo-lock_in_tetrad-pass1",
+            "axis": "performative",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "oo-lock_in_tetrad-pass1",
+            "axis": "playful",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "oo-lock_in_tetrad-pass1",
+            "axis": "register_colloquial",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "oo-lock_in_tetrad-pass1",
+            "axis": "relational_projection",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "oo-lock_in_tetrad-pass1",
+            "axis": "structured",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "oo-lock_in_tetrad-pass1",
+            "axis": "terse",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "oo-lock_in_tetrad-pass1",
+            "axis": "trope_density",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "oo-lock_in_tetrad-pass1",
+            "axis": "warm",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          }
+        ],
+        "collapsedPairs": [],
+        "disambResult": null
+      }
+    },
+    {
+      "pass": 2,
+      "target": {
+        "astrology_sagittarian": 4,
+        "astrology_cancerian": 3
+      },
+      "inner_result": {
+        "code": 1,
+        "signal": null,
+        "elapsed_s": 0.1
+      },
+      "sweep": {
+        "splitterResults": [
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "astrology_cancerian",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "astrology_sagittarian",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "mood_fluctuation",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "performative",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "playful",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "register_colloquial",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "relational_projection",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "structured",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "terse",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "trope_density",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-wizard-sagittarius",
+            "axis": "warm",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "astrology_cancerian",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "astrology_sagittarian",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "mood_fluctuation",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "performative",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "playful",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "register_colloquial",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "relational_projection",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "structured",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "terse",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "trope_density",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          },
+          {
+            "bio_slug": "rpg-rogue-cancer",
+            "axis": "warm",
+            "exit_code": 1,
+            "elapsed_s": 0.1
+          }
+        ],
+        "collapsedPairs": [],
+        "disambResult": null
+      }
+    }
+  ],
+  "final_axes": 24,
+  "derived_axes": [
+    {
+      "id": "mood_fluctuation",
+      "derived_from": {
+        "parent": "astrology_cancerian",
+        "contexts": "steals vs romances-and-steals",
+        "hypothesis_id": 3,
+        "sibling": "relational_projection"
+      }
+    },
+    {
+      "id": "relational_projection",
+      "derived_from": {
+        "parent": "astrology_cancerian",
+        "contexts": "steals vs romances-and-steals",
+        "hypothesis_id": 3,
+        "sibling": "mood_fluctuation"
+      }
+    }
+  ]
+}

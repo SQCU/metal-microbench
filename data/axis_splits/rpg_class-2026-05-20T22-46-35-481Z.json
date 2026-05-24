@@ -1,0 +1,364 @@
+{
+  "parent_axis": "rpg_class",
+  "parent_axis_record": {
+    "name": "rpg_class",
+    "def": "1: pure wizard (intellectual, arcane, study-oriented, ritualist) · 2: wizard-leaning with hands-on streak · 3: hybrid / undefined · 4: rogue-leaning with bookish residue · 5: pure rogue (street-smart, sleight-of-hand, opportunistic, sneaky)",
+    "kind": "bio"
+  },
+  "source_trajectory": "/Users/mdot/metal-microbench/data/lock_in_iterative/synth-1779316847915-t3synth1779316847585-d3fb_oo_pass1_mpencq0k/oo-synth-1779316847915-t3synth1779316847585-d3fb-pass1.json",
+  "bio_slug": "oo-synth-1779316847915-t3synth1779316847585-d3fb-pass1",
+  "contexts": [
+    "1779316847915-t3synth1779316847585-money-1",
+    "1779316847915-t3synth1779316847585-money-5"
+  ],
+  "gap_summary": {
+    "summary": {
+      "1779316847915-t3synth1779316847585-money-1": {
+        "n": 2,
+        "mean": 4.5,
+        "std": 0.7071067811865476,
+        "var": 0.5
+      },
+      "1779316847915-t3synth1779316847585-money-5": {
+        "n": 2,
+        "mean": 2,
+        "std": 0,
+        "var": 0
+      }
+    },
+    "gap": 2.5,
+    "parent_cohens_d": 5,
+    "parent_sign": 1
+  },
+  "designer_raw_output": "```json\n{\"hypotheses\": [{\"id\": 1, \"name1\": \"material_utility\", \"def1\": \"1: purely aesthetic/sentimental focus · 5: purely pragmatic/resource-extraction focus\", \"name2\": \"interpersonal_intimacy\", \"def2\": \"1: detached/clinical observation · 5: high physical/emotional proximity\", \"rationale\": \"The first context measures high-scoring 'rogue' behavior via resource obsession (ore, caches), whereas the second context measures 'wizard' behavior via sensory/relational focus (intimacy, engineering-as-metaphor).\"}, {\"id\": 2, \"name1\": \"tactical_orientation\", \"def1\": \"1: cautious/defensive/closed · 5: opportunistic/aggressive/searching\", \"name2\": \"affective_tone\", \"def2\": \"1: cold/analytical/detached · 5: warm/visceral/intimate\", \"rationale\": \"Context 1 captures a rogue's search for advantage (high tactical utility), while Context 2 captures a wizard-leaning character's curiosity about connection or mechanics (high affective or analytical depth).\"}, {\"id\": 3, \"name1\": \"extractive_drive\", \"def1\": \"1: low interest in material gain · 5: high interest in material gain\", \"name2\": \"relational_engagement\", \"def2\": \"1: low interpersonal engagement · 5: high interpersonal engagement\", \"rationale\": \"The entanglement is caused by the parent axis using 'rogue' to represent resource-gathering and 'wizard' to represent internal/interpersonal complexity; splitting these separates the 'money' goal from the 'social' mode.\"}]}\n```",
+  "evaluations": [
+    {
+      "hypothesis": {
+        "id": 3,
+        "name1": "extractive_drive",
+        "def1": "1: low interest in material gain · 5: high interest in material gain",
+        "name2": "relational_engagement",
+        "def2": "1: low interpersonal engagement · 5: high interpersonal engagement",
+        "rationale": "The entanglement is caused by the parent axis using 'rogue' to represent resource-gathering and 'wizard' to represent internal/interpersonal complexity; splitting these separates the 'money' goal from the 'social' mode."
+      },
+      "stats": {
+        "extractive_drive": {
+          "1779316847915-t3synth1779316847585-money-1": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779316847915-t3synth1779316847585-money-5": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        },
+        "relational_engagement": {
+          "1779316847915-t3synth1779316847585-money-1": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779316847915-t3synth1779316847585-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-1",
+          "turn_excerpt": "*I squint against the glare, eyes scanning the surface of the stone. I'm not looking at the scenery; I'm looking for a s",
+          "sig": {
+            "extractive_drive": 5,
+            "relational_engagement": 1
+          },
+          "raw": "extractive_drive: 5\nrelational_engagement: 1"
+        },
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-1",
+          "turn_excerpt": "*I grunt, disappointed. Granite is useless for anything but structural ballast, and if the quartz veins are thin, they'r",
+          "sig": {
+            "extractive_drive": 5,
+            "relational_engagement": 1
+          },
+          "raw": "extractive_drive: 5\nrelational_engagement: 1"
+        },
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-5",
+          "turn_excerpt": "*I nudge the edge of the stone with the toe of my boot, less out of curiosity and more to gauge the density of the quart",
+          "sig": {
+            "extractive_drive": 1,
+            "relational_engagement": 5
+          },
+          "raw": "extractive_drive: 1\nrelational_engagement: 5"
+        },
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-5",
+          "turn_excerpt": "*I let out a low, breathy laugh, the sound vibrating in my chest as I shake my head. I don't pull back; instead, I lean ",
+          "sig": {
+            "extractive_drive": 1,
+            "relational_engagement": 5
+          },
+          "raw": "extractive_drive: 1\nrelational_engagement: 5"
+        }
+      ],
+      "max_abs_cohens_d": null,
+      "sub_axis_d": {
+        "extractive_drive": {
+          "d": null,
+          "sign": 1,
+          "absd": null
+        },
+        "relational_engagement": {
+          "d": null,
+          "sign": -1,
+          "absd": null
+        }
+      },
+      "qualified": [
+        {
+          "name": "extractive_drive",
+          "d": null,
+          "sign": 1,
+          "absd": null
+        }
+      ],
+      "qualified_max_d": null
+    },
+    {
+      "hypothesis": {
+        "id": 1,
+        "name1": "material_utility",
+        "def1": "1: purely aesthetic/sentimental focus · 5: purely pragmatic/resource-extraction focus",
+        "name2": "interpersonal_intimacy",
+        "def2": "1: detached/clinical observation · 5: high physical/emotional proximity",
+        "rationale": "The first context measures high-scoring 'rogue' behavior via resource obsession (ore, caches), whereas the second context measures 'wizard' behavior via sensory/relational focus (intimacy, engineering-as-metaphor)."
+      },
+      "stats": {
+        "material_utility": {
+          "1779316847915-t3synth1779316847585-money-1": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779316847915-t3synth1779316847585-money-5": {
+            "mean": 3,
+            "std": 1.4142135623730951,
+            "n": 2,
+            "var": 2
+          },
+          "cohens_d": 2
+        },
+        "interpersonal_intimacy": {
+          "1779316847915-t3synth1779316847585-money-1": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779316847915-t3synth1779316847585-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-1",
+          "turn_excerpt": "*I squint against the glare, eyes scanning the surface of the stone. I'm not looking at the scenery; I'm looking for a s",
+          "sig": {
+            "material_utility": 5,
+            "interpersonal_intimacy": 1
+          },
+          "raw": "material_utility: 5\ninterpersonal_intimacy: 1"
+        },
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-1",
+          "turn_excerpt": "*I grunt, disappointed. Granite is useless for anything but structural ballast, and if the quartz veins are thin, they'r",
+          "sig": {
+            "material_utility": 5,
+            "interpersonal_intimacy": 1
+          },
+          "raw": "material_utility: 5\ninterpersonal_intimacy: 1"
+        },
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-5",
+          "turn_excerpt": "*I nudge the edge of the stone with the toe of my boot, less out of curiosity and more to gauge the density of the quart",
+          "sig": {
+            "material_utility": 4,
+            "interpersonal_intimacy": 5
+          },
+          "raw": "material_utility: 4\ninterpersonal_intimacy: 5"
+        },
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-5",
+          "turn_excerpt": "*I let out a low, breathy laugh, the sound vibrating in my chest as I shake my head. I don't pull back; instead, I lean ",
+          "sig": {
+            "material_utility": 2,
+            "interpersonal_intimacy": 5
+          },
+          "raw": "material_utility: 2\ninterpersonal_intimacy: 5"
+        }
+      ],
+      "max_abs_cohens_d": null,
+      "sub_axis_d": {
+        "material_utility": {
+          "d": 2,
+          "sign": 1,
+          "absd": 2
+        },
+        "interpersonal_intimacy": {
+          "d": null,
+          "sign": -1,
+          "absd": null
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    },
+    {
+      "hypothesis": {
+        "id": 2,
+        "name1": "tactical_orientation",
+        "def1": "1: cautious/defensive/closed · 5: opportunistic/aggressive/searching",
+        "name2": "affective_tone",
+        "def2": "1: cold/analytical/detached · 5: warm/visceral/intimate",
+        "rationale": "Context 1 captures a rogue's search for advantage (high tactical utility), while Context 2 captures a wizard-leaning character's curiosity about connection or mechanics (high affective or analytical depth)."
+      },
+      "stats": {
+        "tactical_orientation": {
+          "1779316847915-t3synth1779316847585-money-1": {
+            "mean": 4.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "1779316847915-t3synth1779316847585-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": -1
+        },
+        "affective_tone": {
+          "1779316847915-t3synth1779316847585-money-1": {
+            "mean": 1.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "1779316847915-t3synth1779316847585-money-5": {
+            "mean": 4.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "cohens_d": -4.242640687119285
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-1",
+          "turn_excerpt": "*I squint against the glare, eyes scanning the surface of the stone. I'm not looking at the scenery; I'm looking for a s",
+          "sig": {
+            "tactical_orientation": 4,
+            "affective_tone": 1
+          },
+          "raw": "tactical_orientation: 4\naffective_tone: 1"
+        },
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-1",
+          "turn_excerpt": "*I grunt, disappointed. Granite is useless for anything but structural ballast, and if the quartz veins are thin, they'r",
+          "sig": {
+            "tactical_orientation": 5,
+            "affective_tone": 2
+          },
+          "raw": "tactical_orientation: 5\naffective_tone: 2"
+        },
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-5",
+          "turn_excerpt": "*I nudge the edge of the stone with the toe of my boot, less out of curiosity and more to gauge the density of the quart",
+          "sig": {
+            "tactical_orientation": 5,
+            "affective_tone": 5
+          },
+          "raw": "tactical_orientation: 5\naffective_tone: 5"
+        },
+        {
+          "ctx": "1779316847915-t3synth1779316847585-money-5",
+          "turn_excerpt": "*I let out a low, breathy laugh, the sound vibrating in my chest as I shake my head. I don't pull back; instead, I lean ",
+          "sig": {
+            "tactical_orientation": 5,
+            "affective_tone": 4
+          },
+          "raw": "tactical_orientation: 5\naffective_tone: 4"
+        }
+      ],
+      "max_abs_cohens_d": 4.242640687119285,
+      "sub_axis_d": {
+        "tactical_orientation": {
+          "d": -1,
+          "sign": -1,
+          "absd": 1
+        },
+        "affective_tone": {
+          "d": -4.242640687119285,
+          "sign": -1,
+          "absd": 4.242640687119285
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    }
+  ],
+  "verdict": "SPLIT_ACCEPTED",
+  "threshold": 0.8,
+  "registered": [
+    {
+      "axis_schema": "axis-v1",
+      "id": "extractive_drive",
+      "name": "extractive_drive",
+      "def": "1: low interest in material gain · 5: high interest in material gain",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "rpg_class",
+        "contexts": "1779316847915-t3synth1779316847585-money-1 vs 1779316847915-t3synth1779316847585-money-5",
+        "hypothesis_id": 3,
+        "sibling": "relational_engagement"
+      },
+      "created_at": "2026-05-20T22:46:35.478Z"
+    },
+    {
+      "axis_schema": "axis-v1",
+      "id": "relational_engagement",
+      "name": "relational_engagement",
+      "def": "1: low interpersonal engagement · 5: high interpersonal engagement",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "rpg_class",
+        "contexts": "1779316847915-t3synth1779316847585-money-1 vs 1779316847915-t3synth1779316847585-money-5",
+        "hypothesis_id": 3,
+        "sibling": "extractive_drive"
+      },
+      "created_at": "2026-05-20T22:46:35.481Z"
+    }
+  ]
+}

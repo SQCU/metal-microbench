@@ -1,0 +1,94 @@
+{
+  "experiment_id": "synth-user-personas-oo-synth-1779316847915-t3synth1779316847585-d3fb-pass2-dd23",
+  "run_id": "synth-user-personas-oo-synth-1779316847915-t3synth1779316847585-d3fb-pass2-dd23-2026-05-20T22-48-15-265Z-17bb",
+  "started_at": "2026-05-20T22:50:46.014Z",
+  "K_OUTER_OUTER": 3,
+  "passes": [
+    {
+      "pass": 0,
+      "inner_result": {
+        "code": null,
+        "signal": "SIGTERM",
+        "elapsed_s": 134.8
+      },
+      "sweep": {
+        "splitterResults": [],
+        "collapsedPairs": [],
+        "disambResult": null
+      }
+    },
+    {
+      "pass": 1,
+      "target": {
+        "rpg_class": 3,
+        "star_sign": 3
+      },
+      "inner_result": {
+        "code": null,
+        "signal": "SIGTERM",
+        "elapsed_s": 11
+      },
+      "sweep": {
+        "splitterResults": [],
+        "collapsedPairs": [],
+        "disambResult": null
+      }
+    },
+    {
+      "pass": 2,
+      "target": {
+        "rpg_class": 2,
+        "star_sign": 1
+      },
+      "inner_result": {
+        "code": null,
+        "signal": "SIGTERM",
+        "elapsed_s": 4.8
+      },
+      "sweep": {
+        "splitterResults": [],
+        "collapsedPairs": [],
+        "disambResult": null
+      }
+    }
+  ],
+  "final_axes": 7,
+  "derived_axes": [
+    {
+      "id": "extractive_drive",
+      "derived_from": {
+        "parent": "rpg_class",
+        "contexts": "1779316847915-t3synth1779316847585-money-1 vs 1779316847915-t3synth1779316847585-money-5",
+        "hypothesis_id": 3,
+        "sibling": "relational_engagement"
+      }
+    },
+    {
+      "id": "extractive_resourcefulness",
+      "derived_from": {
+        "parent": "star_sign",
+        "contexts": "1779316847915-t3synth1779316847585-money-1 vs 1779316847915-t3synth1779316847585-money-5",
+        "hypothesis_id": 1,
+        "sibling": "interpersonal_intimacy"
+      }
+    },
+    {
+      "id": "interpersonal_intimacy",
+      "derived_from": {
+        "parent": "star_sign",
+        "contexts": "1779316847915-t3synth1779316847585-money-1 vs 1779316847915-t3synth1779316847585-money-5",
+        "hypothesis_id": 1,
+        "sibling": "extractive_resourcefulness"
+      }
+    },
+    {
+      "id": "relational_engagement",
+      "derived_from": {
+        "parent": "rpg_class",
+        "contexts": "1779316847915-t3synth1779316847585-money-1 vs 1779316847915-t3synth1779316847585-money-5",
+        "hypothesis_id": 3,
+        "sibling": "extractive_drive"
+      }
+    }
+  ]
+}

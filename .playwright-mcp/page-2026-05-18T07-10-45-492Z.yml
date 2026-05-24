@@ -1,0 +1,198 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e5]:
+    - generic [ref=e6]:
+      - button "" [ref=e51] [cursor=pointer]
+      - text:                                        + No items                         ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☑ ☰ ☑ ☰ ☑ ☰ ☑ ☰ ☑ ☰ ☑ ☰ ☐ ☰ ☐ ☰ ☐ ☰                                  + No items      ☰ ☰ ☰ ☰ ☰ ☰ ☰  ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰  ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰  ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰                  +     No items   X                                      
+    - generic [ref=e9]:
+      - button "" [ref=e52] [cursor=pointer]
+      - text:                                                                       
+    - generic [ref=e12]:
+      - button "" [ref=e53] [cursor=pointer]
+      - text:                                               
+    - generic [ref=e15]:
+      - button "" [ref=e54] [cursor=pointer]
+      - text:                +     
+    - generic [ref=e18]:
+      - button "" [ref=e55] [cursor=pointer]
+      - text:                                   
+    - generic [ref=e21]:
+      - generic "Change Background Image" [ref=e22]:
+        - button "" [ref=e56] [cursor=pointer]
+      - text:       +                            
+    - generic [ref=e24]:
+      - button "" [ref=e57] [cursor=pointer]
+      - text:         +               +                                  +   + +  +     +        +        +        +                                                
+    - button "" [ref=e58] [cursor=pointer]
+    - generic [ref=e30]:
+      - button "" [ref=e59] [cursor=pointer]
+      - text:                                    
+    - generic [ref=e33]:
+      - button "" [ref=e60] [cursor=pointer]
+      - text:                                                     Group is empty.          No characters available                             
+  - generic:                      +                                                                                +    + +                  
+  - generic:                  
+  - generic [ref=e36]:
+    - text: 
+    - generic [ref=e37]:
+      - generic [ref=e61]:
+        - generic [ref=e62]:
+          - img "SillyTavern Logo" [ref=e63]
+          - generic [ref=e64]: SillyTavern 1.17.0 'toolcards' (dcc69bc31)
+          - text: 
+          - button "" [ref=e65] [cursor=pointer]:
+            - generic [ref=e66]: 
+        - generic [ref=e67]:
+          - generic [ref=e68]: Recent Chats
+          - generic [ref=e69]:
+            - button " Docs" [ref=e70] [cursor=pointer]:
+              - generic [ref=e71]: 
+              - generic [ref=e72]: Docs
+            - button " GitHub" [ref=e73] [cursor=pointer]:
+              - generic [ref=e74]: 
+              - generic [ref=e75]: GitHub
+            - button " Discord" [ref=e76] [cursor=pointer]:
+              - generic [ref=e77]: 
+              - generic [ref=e78]: Discord
+            - generic [ref=e79]: "|"
+            - button " Temporary Chat" [ref=e80] [cursor=pointer]:
+              - generic [ref=e81]: 
+              - generic [ref=e82]: Temporary Chat
+        - list [ref=e84]:
+          - listitem [ref=e85] [cursor=pointer]:
+            - 'generic "[Character] scringlo scrambler File: scringlo_scrambler.png" [ref=e86]':
+              - img "scringlo scrambler" [ref=e87]
+            - generic [ref=e88]:
+              - generic [ref=e89]:
+                - generic "scringlo scrambler - 2026-05-17@19h07m30s280ms.jsonl" [ref=e90]:
+                  - strong [ref=e91]: scringlo scrambler
+                  - text: – scringlo scrambler - 2026-05-17@19h07m30s280ms
+                - generic "May 17, 2026 7:07 PM" [ref=e92]: 5/17/2026
+                - generic [ref=e93]:
+                  - button "" [ref=e94]:
+                    - generic [ref=e95]: 
+                  - button "" [ref=e96]:
+                    - generic [ref=e97]: 
+                  - button "" [ref=e98]:
+                    - generic [ref=e99]: 
+              - generic [ref=e100]:
+                - generic "uhmmmm... hlello?" [ref=e101]
+                - generic [ref=e102]:
+                  - generic [ref=e103]:
+                    - generic [ref=e104]: 
+                    - generic [ref=e105]: "1"
+                    - text: "|"
+                  - generic [ref=e106]: 1.95KB
+          - listitem [ref=e107] [cursor=pointer]:
+            - 'generic "[Character] scringlo scrambler File: scringlo_scrambler.png" [ref=e108]':
+              - img "scringlo scrambler" [ref=e109]
+            - generic [ref=e110]:
+              - generic [ref=e111]:
+                - generic "scringlo scrambler - 2026-05-17@18h49m19s079ms.jsonl" [ref=e112]:
+                  - strong [ref=e113]: scringlo scrambler
+                  - text: – scringlo scrambler - 2026-05-17@18h49m19s079ms
+                - generic "May 17, 2026 6:49 PM" [ref=e114]: 5/17/2026
+                - generic [ref=e115]:
+                  - button "" [ref=e116]:
+                    - generic [ref=e117]: 
+                  - button "" [ref=e118]:
+                    - generic [ref=e119]: 
+                  - button "" [ref=e120]:
+                    - generic [ref=e121]: 
+              - generic [ref=e122]:
+                - generic "uhmmmm... hlello?" [ref=e123]
+                - generic [ref=e124]:
+                  - generic [ref=e125]:
+                    - generic [ref=e126]: 
+                    - generic [ref=e127]: "1"
+                    - text: "|"
+                  - generic [ref=e128]: 1.95KB
+          - listitem [ref=e129] [cursor=pointer]:
+            - 'generic "[Character] scringlo scrambler File: scringlo_scrambler.png" [ref=e130]':
+              - img "scringlo scrambler" [ref=e131]
+            - generic [ref=e132]:
+              - generic [ref=e133]:
+                - generic "scringlo scrambler - 2026-05-17@18h44m08s592ms.jsonl" [ref=e134]:
+                  - strong [ref=e135]: scringlo scrambler
+                  - text: – scringlo scrambler - 2026-05-17@18h44m08s592ms
+                - generic "May 17, 2026 6:44 PM" [ref=e136]: 5/17/2026
+                - generic [ref=e137]:
+                  - button "" [ref=e138]:
+                    - generic [ref=e139]: 
+                  - button "" [ref=e140]:
+                    - generic [ref=e141]: 
+                  - button "" [ref=e142]:
+                    - generic [ref=e143]: 
+              - generic [ref=e144]:
+                - generic "uhmmmm... hlello?" [ref=e145]
+                - generic [ref=e146]:
+                  - generic [ref=e147]:
+                    - generic [ref=e148]: 
+                    - generic [ref=e149]: "1"
+                    - text: "|"
+                  - generic [ref=e150]: 1.95KB
+          - button "" [ref=e151] [cursor=pointer]:
+            - generic [ref=e152]: 
+      - generic [ref=e153]:
+        - img [ref=e156] [cursor=pointer]
+        - generic [ref=e157]:
+          - generic [ref=e158]:
+            - generic [ref=e160]:
+              - generic [ref=e161]: Assistant
+              - text: 
+              - generic [ref=e162]: May 18, 2026 12:09 AM
+            - generic [ref=e163]:                
+            - text:       
+          - text:       
+          - generic [ref=e164]:
+            - paragraph [ref=e165]: If you're connected to an API, try asking me something!
+            - separator [ref=e166]
+            - paragraph [ref=e167]:
+              - strong [ref=e168]: "Hint:"
+              - text: Set any character as your welcome page assistant from their "More…" menu.
+      - generic [ref=e170]:
+        - text:                               
+        - generic [ref=e172]:
+          - button " API Connections" [ref=e173] [cursor=pointer]:
+            - generic [ref=e174]: 
+            - generic [ref=e175]: API Connections
+          - button " Character Management" [ref=e176] [cursor=pointer]:
+            - generic [ref=e177]: 
+            - generic [ref=e178]: Character Management
+          - button " Extensions" [ref=e179] [cursor=pointer]:
+            - generic [ref=e180]: 
+            - generic [ref=e181]: Extensions
+    - generic [ref=e183]:
+      - generic [ref=e184] [cursor=pointer]:
+        - generic [ref=e185]: User-personas
+        - generic [ref=e186]: …
+        - generic [ref=e187]: ▾
+      - generic [ref=e188]:
+        - button "↻ Re-suggest" [ref=e189] [cursor=pointer]
+        - button "↯ Run sweep" [ref=e190] [cursor=pointer]
+        - button "+ Add user-agent" [ref=e191] [cursor=pointer]
+      - button "×" [ref=e193] [cursor=pointer]
+      - generic [ref=e194]: (asking ContextJudge for chat-appropriate personas…)
+    - generic [ref=e39]:
+      - text:  
+      - generic [ref=e40]:
+        - generic [ref=e41]:
+          - generic [ref=e42] [cursor=pointer]: 
+          - generic "Extensions" [ref=e195] [cursor=pointer]: 
+          - button "" [ref=e196] [cursor=pointer]
+          - button "" [ref=e197] [cursor=pointer]
+        - textbox "Not connected to API!" [ref=e43]
+        - generic [ref=e44]:       
+  - text:                       1  
+  - generic [ref=e198]: 
+  - status [ref=e199]
+  - status [ref=e200]
+  - status [ref=e201]
+  - status [ref=e202]
+  - status [ref=e203]
+  - status [ref=e204]
+  - status [ref=e205]
+  - status [ref=e206]
+  - status [ref=e207]
+  - status [ref=e208]
+  - status [ref=e209]
+  - status [ref=e210]

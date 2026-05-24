@@ -43,7 +43,7 @@ for (const p of personas) {
     const prose = `Bio (user-side persona):\n${p.bio || ''}\n\nVoice clauses:\n${p.system_prompt || ''}`;
     try {
         const t0 = Date.now();
-        const sigResp = await L.http('POST', `${L.ENDPOINTS.PLUGIN}/signature-extract`,
+        const sigResp = await L.httpRetrying('POST', `${L.ENDPOINTS.PLUGIN}/signature-extract`,
             { prose, axes });
         if (!sigResp.signature || Object.keys(sigResp.signature).length === 0) {
             throw new Error(`extract returned empty signature`);
@@ -85,7 +85,7 @@ for (const a of agents) {
         `Agent voice clauses (injected at depth ${a.injection_depth || 1}):\n${a.agent_text || ''}`;
     try {
         const t0 = Date.now();
-        const sigResp = await L.http('POST', `${L.ENDPOINTS.PLUGIN}/signature-extract`,
+        const sigResp = await L.httpRetrying('POST', `${L.ENDPOINTS.PLUGIN}/signature-extract`,
             { prose, axes });
         await L.http('POST', `${L.ENDPOINTS.PLUGIN}/agents/${encodeURIComponent(a.id)}`, {
             name: a.name, agent_text: a.agent_text,

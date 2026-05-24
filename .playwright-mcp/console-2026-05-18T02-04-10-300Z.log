@@ -1,0 +1,80 @@
+[     209ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8002/api/plugins/user-personas/static/designer.html:0
+[     412ms] [VERBOSE] [DOM] Password field is not contained in a form: (More info: https://goo.gl/9p2vKq) %o @ http://127.0.0.1:8002/:0
+[     521ms] [WARNING] No input elements found for key: api_key_comfy_runpod @ http://127.0.0.1:8002/scripts/secrets.js:570
+[     523ms] [WARNING] Unsupported language: en-us @ http://127.0.0.1:8002/scripts/i18n.js:142
+[     825ms] [INFO] Using default TTS Provider settings @ http://127.0.0.1:8002/scripts/extensions/tts/system.js:119
+[     844ms] [LOG] [QR2] sets:  [QuickReplySet] @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[     844ms] [LOG] [QR2] settings:  QuickReplySettings @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[     857ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     857ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     857ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     857ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     857ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     857ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     857ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     857ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     857ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     858ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     858ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     858ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     858ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     858ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     858ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     858ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     858ms] [LOG] [ToolManager] Registered function tool: ToolDefinition @ http://127.0.0.1:8002/scripts/tool-calling.js:292
+[     858ms] [LOG] [toolcards] registered 17 tool(s) from 12 card(s) @ http://127.0.0.1:8002/scripts/extensions/toolcards/index.js:832
+[     859ms] [LOG] [user-personas] button installed @ http://127.0.0.1:8002/scripts/extensions/user-personas/index.js:1177
+[     859ms] [LOG] [user-personas] operator-typing tracker attached to #send_textarea @ http://127.0.0.1:8002/scripts/extensions/user-personas/index.js:1533
+[     860ms] [LOG] [user-personas] event handlers attached (incl. CHAT_CHANGED → re-seed) @ http://127.0.0.1:8002/scripts/extensions/user-personas/index.js:1573
+[     876ms] [WARNING] Failed to insert focus rule: SyntaxError: Failed to execute 'insertRule' on 'CSSStyleSheet': Failed to parse the rule '::-webkit-scrollbar-track:focus-visible { background-color: rgba(126, 126, 126, 0.2); }'.
+    at http://127.0.0.1:8002/scripts/dynamic-styles.js:144:34
+    at Array.forEach (<anonymous>)
+    at applyDynamicFocusStyles (http://127.0.0.1:8002/scripts/dynamic-styles.js:117:16)
+    at http://127.0.0.1:8002/scripts/dynamic-styles.js:192:13
+    at Array.forEach (<anonymous>)
+    at initDynamicStyles (http://127.0.0.1:8002/scripts/dynamic-styles.js:190:38)
+    at firstLoadInit (http://127.0.0.1:8002/script.js:815:5)
+    at async HTMLDocument.<anonymous> (http://127.0.0.1:8002/script.js:12823:5) @ http://127.0.0.1:8002/scripts/dynamic-styles.js:145
+[   31458ms] [INFO] Rendered 2 messages in 0.009 seconds. @ http://127.0.0.1:8002/script.js:1590
+[   31471ms] [LOG] [QR2] calling {functionToCall: , args: Array(1)} @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[   31471ms] [LOG] [QR2] CHAT_CHANGED User-persona Bio Designer - 2026-05-17@18h49m40s161ms @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[   33598ms] [LOG] Generate entered @ http://127.0.0.1:8002/script.js:4552
+[   33599ms] [LOG] [QR2] calling {functionToCall: , args: Array(3)} @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[   33599ms] [LOG] [QR2] Before-generation hook skipped due to dryRun. @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[   33601ms] [LOG] Core/all messages: 2/2 @ http://127.0.0.1:8002/script.js:4861
+[   33603ms] [LOG] skipWIAN not active, adding WIAN @ http://127.0.0.1:8002/script.js:4920
+[   33620ms] [LOG] [ToolManager] Registered function tools: [Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object] @ http://127.0.0.1:8002/scripts/tool-calling.js:418
+[   69465ms] [LOG] Generate entered @ http://127.0.0.1:8002/script.js:4552
+[   69477ms] [LOG] [QR2] calling {functionToCall: , args: Array(3)} @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[   69494ms] [LOG] [QR2] calling {functionToCall: , args: Array(1)} @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[   69611ms] [LOG] Core/all messages: 3/3 @ http://127.0.0.1:8002/script.js:4861
+[   69611ms] [LOG] skipWIAN not active, adding WIAN @ http://127.0.0.1:8002/script.js:4920
+[   69614ms] [LOG] [ToolManager] Registered function tools: [Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object] @ http://127.0.0.1:8002/scripts/tool-calling.js:418
+[   69640ms] [LOG] [ToolManager] Registered function tools: [Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object] @ http://127.0.0.1:8002/scripts/tool-calling.js:418
+[   89347ms] [WARNING] Stream stats: 78 tokens, 2.29 seconds, rate: 34.12 TPS @ http://127.0.0.1:8002/script.js:4164
+[   89355ms] [LOG] [QR2] calling {functionToCall: , args: Array(2)} @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[   90451ms] [LOG] Generate entered @ http://127.0.0.1:8002/script.js:4552
+[   90451ms] [LOG] [QR2] calling {functionToCall: , args: Array(3)} @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[   90451ms] [LOG] [QR2] Before-generation hook skipped due to dryRun. @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[   90451ms] [LOG] Core/all messages: 4/4 @ http://127.0.0.1:8002/script.js:4861
+[   90452ms] [LOG] skipWIAN not active, adding WIAN @ http://127.0.0.1:8002/script.js:4920
+[   90456ms] [LOG] [ToolManager] Registered function tools: [Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object] @ http://127.0.0.1:8002/scripts/tool-calling.js:418
+[  174922ms] [INFO] Rendered 1 messages in 0.006 seconds. @ http://127.0.0.1:8002/script.js:1590
+[  174936ms] [LOG] [QR2] calling {functionToCall: , args: Array(1)} @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[  174936ms] [LOG] [QR2] CHAT_CHANGED scringlo scrambler - 2026-05-17@18h49m19s079ms @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[  174959ms] [LOG] [QR2] calling {functionToCall: , args: Array(2)} @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[  175473ms] [INFO] Rendered 4 messages in 0.004 seconds. @ http://127.0.0.1:8002/script.js:1590
+[  175480ms] [LOG] [QR2] calling {functionToCall: , args: Array(1)} @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[  175480ms] [LOG] [QR2] CHAT_CHANGED User-persona Bio Designer - 2026-05-17@18h49m40s161ms @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[  176062ms] [LOG] Generate entered @ http://127.0.0.1:8002/script.js:4552
+[  176062ms] [LOG] [QR2] calling {functionToCall: , args: Array(3)} @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[  176062ms] [LOG] [QR2] Before-generation hook skipped due to dryRun. @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[  176064ms] [LOG] Core/all messages: 4/4 @ http://127.0.0.1:8002/script.js:4861
+[  176065ms] [LOG] skipWIAN not active, adding WIAN @ http://127.0.0.1:8002/script.js:4920
+[  176071ms] [LOG] [ToolManager] Registered function tools: [Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object] @ http://127.0.0.1:8002/scripts/tool-calling.js:418
+[  177629ms] [LOG] Generate entered @ http://127.0.0.1:8002/script.js:4552
+[  177629ms] [LOG] [QR2] calling {functionToCall: , args: Array(3)} @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[  177629ms] [LOG] [QR2] Before-generation hook skipped due to dryRun. @ http://127.0.0.1:8002/scripts/extensions/quick-reply/index.js:18
+[  177630ms] [LOG] Core/all messages: 4/4 @ http://127.0.0.1:8002/script.js:4861
+[  177630ms] [LOG] skipWIAN not active, adding WIAN @ http://127.0.0.1:8002/script.js:4920
+[  177634ms] [LOG] [ToolManager] Registered function tools: [Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object] @ http://127.0.0.1:8002/scripts/tool-calling.js:418

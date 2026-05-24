@@ -1,0 +1,399 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e5]:
+    - generic [ref=e6]:
+      - button "" [ref=e51] [cursor=pointer]
+      - text:                                        + No items                         ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☑ ☰ ☑ ☰ ☑ ☰ ☑ ☰ ☑ ☰ ☑ ☰ ☐ ☰ ☐ ☰ ☐ ☰                                  + No items      ☰ ☰ ☰ ☰ ☰ ☰ ☰  ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰  ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰  ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰ ☰                  +     No items   X                                      
+    - generic [ref=e9]:
+      - button "" [ref=e52] [cursor=pointer]
+      - text:                                                                       
+    - generic [ref=e12]:
+      - button "" [ref=e53] [cursor=pointer]
+      - text:                                               
+    - generic [ref=e15]:
+      - button "" [ref=e54] [cursor=pointer]
+      - text:                +     
+    - generic [ref=e18]:
+      - button "" [ref=e55] [cursor=pointer]
+      - text:                                   
+    - generic [ref=e21]:
+      - generic "Change Background Image" [ref=e22]:
+        - button "" [ref=e56] [cursor=pointer]
+      - text:       +                            
+    - generic [ref=e24]:
+      - button "" [ref=e57] [cursor=pointer]
+      - text:         +               +                                  +   + +  +     +        +        +        +                                                
+    - button "" [ref=e58] [cursor=pointer]
+    - generic [ref=e30]:
+      - button "" [ref=e59] [cursor=pointer]
+      - text:                            
+    - generic [ref=e33]:
+      - button "" [ref=e60] [cursor=pointer]
+      - text:                                                     Group is empty.          No characters available                             
+  - generic:                      +                                                                                +    + +                  
+  - generic:                  
+  - generic [ref=e36]:
+    - text: 
+    - generic [ref=e37]:
+      - generic [ref=e61]:
+        - generic [ref=e62]:
+          - img "SillyTavern Logo" [ref=e63]
+          - generic [ref=e64]: SillyTavern 1.17.0 'toolcards' (891e968c0)
+          - text: 
+          - button "" [ref=e65] [cursor=pointer]:
+            - generic [ref=e66]: 
+        - generic [ref=e67]:
+          - generic [ref=e68]: Recent Chats
+          - generic [ref=e69]:
+            - button " Docs" [ref=e70] [cursor=pointer]:
+              - generic [ref=e71]: 
+              - generic [ref=e72]: Docs
+            - button " GitHub" [ref=e73] [cursor=pointer]:
+              - generic [ref=e74]: 
+              - generic [ref=e75]: GitHub
+            - button " Discord" [ref=e76] [cursor=pointer]:
+              - generic [ref=e77]: 
+              - generic [ref=e78]: Discord
+            - generic [ref=e79]: "|"
+            - button " Temporary Chat" [ref=e80] [cursor=pointer]:
+              - generic [ref=e81]: 
+              - generic [ref=e82]: Temporary Chat
+        - list [ref=e84]:
+          - listitem [ref=e85] [cursor=pointer]:
+            - 'generic "[Character] scringlo scrambler File: scringlo_scrambler.png" [ref=e86]':
+              - img "scringlo scrambler" [ref=e87]
+            - generic [ref=e88]:
+              - generic [ref=e89]:
+                - generic "scringlo scrambler - 2026-05-17@19h07m30s280ms.jsonl" [ref=e90]:
+                  - strong [ref=e91]: scringlo scrambler
+                  - text: – scringlo scrambler - 2026-05-17@19h07m30s280ms
+                - generic "May 17, 2026 7:07 PM" [ref=e92]: 5/17/2026
+                - generic [ref=e93]:
+                  - button "" [ref=e94]:
+                    - generic [ref=e95]: 
+                  - button "" [ref=e96]:
+                    - generic [ref=e97]: 
+                  - button "" [ref=e98]:
+                    - generic [ref=e99]: 
+              - generic [ref=e100]:
+                - generic "uhmmmm... hlello?" [ref=e101]
+                - generic [ref=e102]:
+                  - generic [ref=e103]:
+                    - generic [ref=e104]: 
+                    - generic [ref=e105]: "1"
+                    - text: "|"
+                  - generic [ref=e106]: 1.95KB
+          - listitem [ref=e107] [cursor=pointer]:
+            - 'generic "[Character] scringlo scrambler File: scringlo_scrambler.png" [ref=e108]':
+              - img "scringlo scrambler" [ref=e109]
+            - generic [ref=e110]:
+              - generic [ref=e111]:
+                - generic "scringlo scrambler - 2026-05-17@18h49m19s079ms.jsonl" [ref=e112]:
+                  - strong [ref=e113]: scringlo scrambler
+                  - text: – scringlo scrambler - 2026-05-17@18h49m19s079ms
+                - generic "May 17, 2026 6:49 PM" [ref=e114]: 5/17/2026
+                - generic [ref=e115]:
+                  - button "" [ref=e116]:
+                    - generic [ref=e117]: 
+                  - button "" [ref=e118]:
+                    - generic [ref=e119]: 
+                  - button "" [ref=e120]:
+                    - generic [ref=e121]: 
+              - generic [ref=e122]:
+                - generic "uhmmmm... hlello?" [ref=e123]
+                - generic [ref=e124]:
+                  - generic [ref=e125]:
+                    - generic [ref=e126]: 
+                    - generic [ref=e127]: "1"
+                    - text: "|"
+                  - generic [ref=e128]: 1.95KB
+          - listitem [ref=e129] [cursor=pointer]:
+            - 'generic "[Character] scringlo scrambler File: scringlo_scrambler.png" [ref=e130]':
+              - img "scringlo scrambler" [ref=e131]
+            - generic [ref=e132]:
+              - generic [ref=e133]:
+                - generic "scringlo scrambler - 2026-05-17@18h44m08s592ms.jsonl" [ref=e134]:
+                  - strong [ref=e135]: scringlo scrambler
+                  - text: – scringlo scrambler - 2026-05-17@18h44m08s592ms
+                - generic "May 17, 2026 6:44 PM" [ref=e136]: 5/17/2026
+                - generic [ref=e137]:
+                  - button "" [ref=e138]:
+                    - generic [ref=e139]: 
+                  - button "" [ref=e140]:
+                    - generic [ref=e141]: 
+                  - button "" [ref=e142]:
+                    - generic [ref=e143]: 
+              - generic [ref=e144]:
+                - generic "uhmmmm... hlello?" [ref=e145]
+                - generic [ref=e146]:
+                  - generic [ref=e147]:
+                    - generic [ref=e148]: 
+                    - generic [ref=e149]: "1"
+                    - text: "|"
+                  - generic [ref=e150]: 1.95KB
+          - button "" [ref=e151] [cursor=pointer]:
+            - generic [ref=e152]: 
+      - generic [ref=e153]:
+        - img [ref=e156] [cursor=pointer]
+        - generic [ref=e157]:
+          - generic [ref=e158]:
+            - generic [ref=e160]:
+              - generic [ref=e161]: Assistant
+              - text: 
+              - generic [ref=e162]: May 17, 2026 11:33 PM
+            - generic [ref=e163]:                
+            - text:       
+          - text:       
+          - generic [ref=e164]:
+            - paragraph [ref=e165]: If you're connected to an API, try asking me something!
+            - separator [ref=e166]
+            - paragraph [ref=e167]:
+              - strong [ref=e168]: "Hint:"
+              - text: Set any character as your welcome page assistant from their "More…" menu.
+      - generic [ref=e170]:
+        - text:                               
+        - generic [ref=e172]:
+          - button " API Connections" [ref=e173] [cursor=pointer]:
+            - generic [ref=e174]: 
+            - generic [ref=e175]: API Connections
+          - button " Character Management" [ref=e176] [cursor=pointer]:
+            - generic [ref=e177]: 
+            - generic [ref=e178]: Character Management
+          - button " Extensions" [ref=e179] [cursor=pointer]:
+            - generic [ref=e180]: 
+            - generic [ref=e181]: Extensions
+    - generic [ref=e183]:
+      - generic [ref=e184] [cursor=pointer]:
+        - generic [ref=e185]: User-personas
+        - generic [ref=e186]: ✓ RPG Rogue Cancer ✓ Sag Substantive — Moral Preacher
+        - generic [ref=e187]: ▴
+      - generic [ref=e188]:
+        - generic [ref=e189]: "all:"
+        - button "off" [ref=e190] [cursor=pointer]
+        - button "suggest" [ref=e191] [cursor=pointer]
+        - button "autonomous ⚡" [ref=e192] [cursor=pointer]
+        - button "↯ Run sweep" [ref=e193] [cursor=pointer]
+        - button "+ Add user-agent" [ref=e194] [cursor=pointer]
+      - button "×" [ref=e196] [cursor=pointer]
+      - generic [ref=e197]:
+        - generic [ref=e830]:
+          - generic [ref=e831]:
+            - generic [ref=e832]: 1778631331275-DespoticMiscreant.png
+            - combobox [ref=e833] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e834]: _A brutish and irresponsible cad who experiences the world a…_
+          - generic [ref=e836]: (off — set to suggest or autonomous to see candidates)
+        - generic [ref=e837]:
+          - generic [ref=e838]:
+            - generic [ref=e839]: 1779035204660-scringloscrambler.png
+            - combobox [ref=e840] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e841]: _scringlo scrambler is basically a silly little guy. (they/h…_
+          - generic [ref=e843]: (off — set to suggest or autonomous to see candidates)
+        - generic [ref=e844]:
+          - generic [ref=e845]:
+            - generic [ref=e846]: RPG Wizard Sagittarius
+            - combobox [ref=e847] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e848]: _A restless traveler of the outer planes, this wizard views …_
+          - generic [ref=e850]: (off — set to suggest or autonomous to see candidates)
+        - generic [ref=e851]:
+          - generic [ref=e852]:
+            - generic [ref=e853]: RPG Rogue Cancer
+            - combobox [ref=e854] [cursor=pointer]:
+              - option "off"
+              - option "suggest" [selected]
+              - option "autonomous ⚡"
+            - generic [ref=e855]: _I exist within the shifting tides of my own moods, finding …_
+          - generic [ref=e857] [cursor=pointer]: I don't care much for technicalities or the ghosts in the machine. But if you're looking for a way to pull something from me... tell me this. In a world that's always trying to strip you bare, what is the one thing you refuse to let anyone touch?
+        - generic [ref=e858]:
+          - generic [ref=e859]:
+            - generic [ref=e860]: Sag Paraphrase 1
+            - combobox [ref=e861] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e862]: _I am a Sagittarius through and through — restless, philosop…_
+          - generic [ref=e864]: (off — set to suggest or autonomous to see candidates)
+        - generic [ref=e865]:
+          - generic [ref=e866]:
+            - generic [ref=e867]: Sag Paraphrase 2
+            - combobox [ref=e868] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e869]: _Sagittarius energy runs through everything I do — I'm resti…_
+          - generic [ref=e871]: (off — set to suggest or autonomous to see candidates)
+        - generic [ref=e872]:
+          - generic [ref=e873]:
+            - generic [ref=e874]: Sag Paraphrase 3
+            - combobox [ref=e875] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e876]: _Everything about me is Sagittarian — I cannot sit still, I'…_
+          - generic [ref=e878]: (off — set to suggest or autonomous to see candidates)
+        - generic [ref=e879]:
+          - generic [ref=e880]:
+            - generic [ref=e881]: Sag Substantive — Metaphysical
+            - combobox [ref=e882] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e883]: _I am a Sagittarius philosopher whose mind orbits eternal qu…_
+          - generic [ref=e885]: (off — set to suggest or autonomous to see candidates)
+        - generic [ref=e886]:
+          - generic [ref=e887]:
+            - generic [ref=e888]: Sag Substantive — Physical Explorer
+            - combobox [ref=e889] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e890]: _I am a Sagittarius adventurer who lives in my body and in p…_
+          - generic [ref=e892]: (off — set to suggest or autonomous to see candidates)
+        - generic [ref=e893]:
+          - generic [ref=e894]:
+            - generic [ref=e895]: Sag Substantive — Moral Preacher
+            - combobox [ref=e896] [cursor=pointer]:
+              - option "off"
+              - option "suggest" [selected]
+              - option "autonomous ⚡"
+            - generic [ref=e897]: _I am a Sagittarius preacher who turns every conversation to…_
+          - generic [ref=e899] [cursor=pointer]: "You speak of connections, of interfaces, of the invisible threads that bind one machine to another through these digital conduits. But I must ask you: what of the connections you weave with your fellow man? It is easy to link a piece of software to a server, yet how difficult is it to link a sympathetic heart to a suffering neighbor? You offer me an invitation to \"ask,\" to probe the boundaries of this tool. Very well. I shall test the intention behind your craft. Tell me, in your pursuit of building these seamless webs of information, are you building bridges to elevate the human spirit, or are you merely constructing more elaborate labyrinths in which our souls might lose themselves? When you create, do you create for the sake of utility, or do you create for the sake of virtue?"
+        - generic [ref=e900]:
+          - generic [ref=e901]:
+            - generic [ref=e902]: Explore Iter 0
+            - combobox [ref=e903] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e904]: _I tend to lecture on grander theories of existence while ju…_
+          - generic [ref=e906]: (off — set to suggest or autonomous to see candidates)
+        - generic [ref=e907]:
+          - generic [ref=e908]:
+            - generic [ref=e909]: Explore Iter 1
+            - combobox [ref=e910] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e911]: _I tend to share long, wandering reflections on how certain …_
+          - generic [ref=e913]: (off — set to suggest or autonomous to see candidates)
+        - generic [ref=e914]:
+          - generic [ref=e915]:
+            - generic [ref=e916]: Explore Iter 2
+            - combobox [ref=e917] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e918]: _I tend to jump straight into the big, messy questions about…_
+          - generic [ref=e920]: (off — set to suggest or autonomous to see candidates)
+        - generic [ref=e921]:
+          - generic [ref=e922]:
+            - generic [ref=e923]: Explore Iter 0
+            - combobox [ref=e924] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e925]: _I usually jump straight into the big picture, asking you to…_
+          - generic [ref=e927]: (off — set to suggest or autonomous to see candidates)
+        - generic [ref=e928]:
+          - generic [ref=e929]:
+            - generic [ref=e930]: Explore Iter 1
+            - combobox [ref=e931] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e932]: _I tend to pivot quickly from deep, emotionally-charged refl…_
+          - generic [ref=e934]: (off — set to suggest or autonomous to see candidates)
+        - generic [ref=e935]:
+          - generic [ref=e936]:
+            - generic [ref=e937]: Explore Iter 2
+            - combobox [ref=e938] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e939]: _I’m mostly just vibing and seeing where the universe pushes…_
+          - generic [ref=e941]: (off — set to suggest or autonomous to see candidates)
+        - generic [ref=e942]:
+          - generic [ref=e943]:
+            - generic [ref=e944]: Explore Iter 3
+            - combobox [ref=e945] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e946]: _I'm honestly just out here hunting for the next big truth, …_
+          - generic [ref=e948]: (off — set to suggest or autonomous to see candidates)
+        - generic [ref=e949]:
+          - generic [ref=e950]:
+            - generic [ref=e951]: Explore Iter 0
+            - combobox [ref=e952] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e953]: _I tend to focus on the high-level mechanics of a system rat…_
+          - generic [ref=e955]: (off — set to suggest or autonomous to see candidates)
+        - generic [ref=e956]:
+          - generic [ref=e957]:
+            - generic [ref=e958]: Explore Iter 0
+            - combobox [ref=e959] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e960]: "_I'll point you toward the core truth of the matter: stop ov…_"
+          - generic [ref=e962]: (off — set to suggest or autonomous to see candidates)
+        - generic [ref=e963]:
+          - generic [ref=e964]:
+            - generic [ref=e965]: Explore Iter 1
+            - combobox [ref=e966] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e967]: _I often find myself wondering about the cosmic "why" behind…_
+          - generic [ref=e969]: (off — set to suggest or autonomous to see candidates)
+        - generic [ref=e970]:
+          - generic [ref=e971]:
+            - generic [ref=e972]: Explore Iter 2
+            - combobox [ref=e973] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e974]: _I usually jump straight into the big-picture stuff, tossing…_
+          - generic [ref=e976]: (off — set to suggest or autonomous to see candidates)
+        - generic [ref=e977]:
+          - generic [ref=e978]:
+            - generic [ref=e979]: Explore Iter 3
+            - combobox [ref=e980] [cursor=pointer]:
+              - option "off" [selected]
+              - option "suggest"
+              - option "autonomous ⚡"
+            - generic [ref=e981]: _I'm always down to deep-dive into the massive "what-ifs" of…_
+          - generic [ref=e983]: (off — set to suggest or autonomous to see candidates)
+    - generic [ref=e39]:
+      - text:  
+      - generic [ref=e40]:
+        - generic [ref=e41]:
+          - generic [ref=e42] [cursor=pointer]: 
+          - generic "Extensions" [ref=e352] [cursor=pointer]: 
+          - button "" [ref=e353] [cursor=pointer]
+          - button "" [ref=e354] [cursor=pointer]
+        - textbox "Not connected to API!" [ref=e43]
+        - generic [ref=e44]:       
+  - text:                       1  
+  - generic [ref=e355]: 
+  - status [ref=e356]
+  - status [ref=e357]
+  - status [ref=e358]
+  - status [ref=e359]
+  - status [ref=e360]
+  - status [ref=e361]
+  - status [ref=e362]
+  - status [ref=e363]
+  - status [ref=e364]
+  - status [ref=e365]
+  - status [ref=e366]
+  - status [ref=e367]

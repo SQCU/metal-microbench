@@ -116,6 +116,9 @@ if ProcessInfo.processInfo.environment["ATTN_BENCH"] != nil {
 if ProcessInfo.processInfo.environment["KV_VIZ"] != nil {
     runKvVisualizer()
 }
+if ProcessInfo.processInfo.environment["LM_TEST_RADIX_TRIE"] != nil {
+    runRadixTrieTests()
+}
 // LM_SHARED_PREFIX_DEMO / LM_BRANCH_DEMO / LM_PAUSE_DEMO were inline-
 // template harnesses replicating what /v1/chat/completions does. Removed.
 // The scheduler features these demos exercised (prefix caching, branch,
