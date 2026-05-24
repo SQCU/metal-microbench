@@ -53,3 +53,10 @@ bridge-logs/
 study-records/
 study-logs/
 /.claude/
+
+# Large media source files for vision/frame test fixtures.
+# Decoded frames (frame_*.png) are tracked; source videos are too big
+# for github (>100MB) and easily re-downloaded.
+test_data/frames_v2/**/source.mp4
+test_data/frames_v2/**/source.mkv
+test_data/frames_v2/**/source.webm
