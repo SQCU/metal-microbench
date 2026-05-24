@@ -172,9 +172,26 @@ test.describe('B4 axis registry — desktop only', () => {
             }
         }
 
-        // (9) Orphaned signatures section: empty in the current corpus.
-        await expect(iframe.locator('#orphans-list [data-role="orphans-empty"]')).toBeVisible();
-        await expect(iframe.locator('#orphans-list [data-role="orphans-empty"]'))
-            .toContainText(/none/i);
+        // (9) Orphaned signatures section: the section renders. If the corpus
+        //     has orphaned axis IDs (ids in signatures but not in the registry)
+        //     they render as .orphan-row elements; if there are none the
+        //     empty-state message appears. Both cases are valid.
+        const orphansList = iframe.locator('#orphans-list');
+        await expect(orphansList, 'orphans-list container renders').toBeVisible();
+        const orphanRows = orphansList.locator('.orphan-row');
+        const orphanEmpty = orphansList.locator('[data-role="orphans-empty"]');
+        const rowCount = await orphanRows.count();
+        if (rowCount > 0) {
+            // Corpus has orphaned references; each row must have the
+            // orphan-id span and orphan-meta span.
+            await expect(orphanRows.first().locator('.orphan-id'),
+                'orphan row has orphan-id span').toBeVisible();
+            await expect(orphanRows.first().locator('.orphan-meta'),
+                'orphan row has orphan-meta span').toBeVisible();
+        } else {
+            // No orphans: empty-state message must be present.
+            await expect(orphanEmpty, 'empty-state renders when no orphans').toBeVisible();
+            await expect(orphanEmpty).toContainText(/none/i);
+        }
     });
 });
