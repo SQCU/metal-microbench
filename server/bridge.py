@@ -425,13 +425,39 @@ async def _consume_engine_stream(stream_id: int, request: Request):
 # self-remove on exit.
 _background_drains: dict[int, "asyncio.Task[None]"] = {}
 
+# 2026-05-23 (reconnect endpoint): per-stream coordination primitives.
+#
+# `_reconnect_takeover_events[sid]` is set by an attaching reconnect
+# consumer to signal the background drain task to release the queue.
+# When the drain task sees this event it exits WITHOUT popping
+# `_response_qs[sid]`, so the reconnect consumer can immediately start
+# pulling from the (preserved) queue.
+#
+# `_active_consumer_token[sid]` enforces single-consumer-at-a-time:
+# the value is an opaque token identifying the current owner (the
+# initial POST handler's `_consume_engine_stream` generator, or a
+# reconnect consumer's GET handler). A reconnect request that finds
+# a non-None value here returns 409 instead of doubling up on the
+# queue (asyncio.Queue.get() to two consumers would race
+# unpredictably and lose updates).
+_reconnect_takeover_events: dict[int, "asyncio.Event"] = {}
+_active_consumer_token: dict[int, str] = {}
+
 
 async def _drain_until_engine_done(stream_id: int) -> None:
     """Drain `_response_qs[stream_id]` until the engine emits state==2
-    (natural termination via EOS, max_tokens, or stop sequence) or the
-    engine-side forward-progress deadline reaps the session
-    (state==2 + done_reason=3 with an "abandoned" errMsg). On exit,
-    pops the response queue and drop-count entry.
+    (natural termination via EOS, max_tokens, or stop sequence), the
+    engine-side forward-progress deadline reaps the session (state==2
+    + done_reason=3 with an "abandoned" errMsg), or a reconnect
+    consumer signals takeover.
+
+    On natural state==2: pops the response queue + drop-count entry.
+    On reconnect takeover: exits WITHOUT popping anything; the
+    reconnect consumer becomes the new owner of the queue (it will
+    pop on its own clean exit, or respawn a fresh drain on its own
+    disconnect).
+    On cancellation: pops the queue (defensive — caller decided to
+    abandon).
 
     Cap rationale: max_tokens + a margin worth of AR ticks at the
     slowest sane throughput. We don't enforce a wall-clock here — the
@@ -444,10 +470,57 @@ async def _drain_until_engine_done(stream_id: int) -> None:
     rq = _response_qs.get(stream_id)
     if rq is None:
         return
+    takeover = _reconnect_takeover_events.get(stream_id)
     drained = 0
+    handed_off = False
     try:
+        # Hoist takeover-wait task; race it against each get().
+        takeover_task: "asyncio.Task | None" = (
+            asyncio.create_task(takeover.wait()) if takeover is not None
+            else None)
         while True:
-            u = await rq.get()
+            if takeover_task is not None and takeover_task.done():
+                handed_off = True
+                print(f"[bridge] background drain (sid={stream_id}): "
+                      f"reconnect takeover after {drained} updates; "
+                      f"releasing queue to reconnect consumer",
+                      flush=True)
+                break
+            get_task = asyncio.create_task(rq.get())
+            wait_set: set = {get_task}
+            if takeover_task is not None:
+                wait_set.add(takeover_task)
+            done, _pending = await asyncio.wait(
+                wait_set, return_when=asyncio.FIRST_COMPLETED)
+            if takeover_task is not None and takeover_task in done:
+                # If get_task ALSO completed on this tick, we'd be about
+                # to lose the consumed item. Re-enqueue it at the head
+                # by put_nowait — order doesn't matter because the
+                # reconnect consumer is about to drain everything
+                # buffered before pulling new pushes. If get_task is
+                # still pending, cancel it (asyncio.Queue.get cancellation
+                # before completion does NOT consume an item, so no loss).
+                if get_task in done:
+                    try:
+                        rescued = get_task.result()
+                        try:
+                            rq.put_nowait(rescued)
+                        except asyncio.QueueFull:
+                            print(f"[bridge] background drain "
+                                  f"(sid={stream_id}): rescued update "
+                                  f"dropped (queue full) on takeover",
+                                  flush=True)
+                    except Exception:
+                        pass
+                else:
+                    get_task.cancel()
+                handed_off = True
+                print(f"[bridge] background drain (sid={stream_id}): "
+                      f"reconnect takeover after {drained} updates; "
+                      f"releasing queue to reconnect consumer",
+                      flush=True)
+                break
+            u = get_task.result()
             drained += 1
             if u.state == 2:
                 print(f"[bridge] background drain (sid={stream_id}): "
@@ -458,6 +531,17 @@ async def _drain_until_engine_done(stream_id: int) -> None:
                       f"cache_hits={u.cache_hits}, "
                       f"cache_misses={u.cache_misses}, "
                       f"done_reason={u.done_reason}", flush=True)
+                # Re-enqueue the terminal so a reconnect that races in
+                # at the very last moment still sees state==2 cleanly.
+                # We pop the queue below in the natural-completion
+                # branch, so this re-enqueue only matters if the
+                # takeover event was set in the same scheduling tick;
+                # the reconnect consumer's queue lookup happens before
+                # any awaits so the race window is tiny but real.
+                try:
+                    rq.put_nowait(u)
+                except asyncio.QueueFull:
+                    pass
                 break
     except asyncio.CancelledError:
         print(f"[bridge] background drain (sid={stream_id}) cancelled "
@@ -467,9 +551,25 @@ async def _drain_until_engine_done(stream_id: int) -> None:
         print(f"[bridge] background drain (sid={stream_id}) "
               f"errored after {drained} updates: {e}", flush=True)
     finally:
-        _response_qs.pop(stream_id, None)
-        _drop_counts.pop(stream_id, None)
+        # Cancel the takeover-wait task if still pending. Always pop
+        # the drain-task registry so a future _spawn_background_drain
+        # for the same sid (after another disconnect) can register.
+        try:
+            if takeover_task is not None:
+                takeover_task.cancel()
+        except Exception:
+            pass
         _background_drains.pop(stream_id, None)
+        if not handed_off:
+            # Natural completion or error: nobody else is going to
+            # consume this queue — pop it so any late engine pushes
+            # land on `rq is None` early-return in
+            # _push_update_threadsafe.
+            _response_qs.pop(stream_id, None)
+            _drop_counts.pop(stream_id, None)
+            _reconnect_takeover_events.pop(stream_id, None)
+        # If handed_off: the reconnect consumer owns cleanup of all
+        # three dicts on its own exit path.
 
 
 def _spawn_background_drain(stream_id: int) -> None:
@@ -480,6 +580,11 @@ def _spawn_background_drain(stream_id: int) -> None:
         return
     if stream_id not in _response_qs:
         return
+    # Lazily install the takeover event (a reconnect consumer reads
+    # `_reconnect_takeover_events.get(stream_id)`; we want a single
+    # shared event per stream-id lifetime so set + wait synchronise
+    # cleanly across the drain task and the reconnect handler).
+    _reconnect_takeover_events.setdefault(stream_id, asyncio.Event())
     try:
         task = asyncio.create_task(_drain_until_engine_done(stream_id))
         _background_drains[stream_id] = task
@@ -491,6 +596,7 @@ def _spawn_background_drain(stream_id: int) -> None:
               f"failed: {e}; popping queue", flush=True)
         _response_qs.pop(stream_id, None)
         _drop_counts.pop(stream_id, None)
+        _reconnect_takeover_events.pop(stream_id, None)
 
 
 def _engine_driver_thread(loop: asyncio.AbstractEventLoop) -> None:
@@ -1703,14 +1809,17 @@ async def chat_completions(req: Request) -> Any:
                     ],
                 } for lp in collected_logprobs]
             }
-        return JSONResponse({
-            "id": f"chatcmpl-{uuid.uuid4().hex[:16]}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": MODEL_NAME,
-            "choices": [choice],
-            "usage": usage,
-        })
+        return JSONResponse(
+            {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:16]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": MODEL_NAME,
+                "choices": [choice],
+                "usage": usage,
+            },
+            headers={"X-Stream-Id": str(stream_id)},
+        )
 
     # SSE streaming. The shared _consume_engine_stream coroutine owns
     # all the cross-cutting concerns: client-disconnect detection,
@@ -1953,7 +2062,297 @@ async def chat_completions(req: Request) -> Any:
         # disconnected and _consume_engine_stream already submitted
         # opcode-2 cancel + logged the DISCONNECT usage line. Nothing
         # else to do; falling off the generator closes the SSE response.
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    # X-Stream-Id surfaces the engine-side stream id to the client so
+    # it can reconnect to `GET /v1/streams/{id}/sse` if the SSE socket
+    # drops mid-generation. See `stream_reconnect_sse` below. We pick
+    # the header path over an in-band first SSE chunk to keep the chat-
+    # completions stream payload OpenAI-compatible byte-for-byte; the
+    # header is invisible to clients that don't know to read it.
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"X-Stream-Id": str(stream_id)})
+
+
+# ----------------------------------------------------------------------
+# Reconnect endpoint.
+#
+# Picks up where the engine is for an in-flight session whose original
+# HTTP consumer disconnected. Pairs with the background-drain machinery
+# above: when the initial POST /v1/chat/completions handler's SSE
+# consumer disconnects, `_consume_engine_stream`'s finally block spawns
+# `_drain_until_engine_done` which preserves the response_q for any
+# subsequent reconnect.
+#
+# Stream-id surfacing: clients read the `X-Stream-Id` response header
+# from the initial POST. See the header-set comment at the end of
+# `chat_completions`.
+#
+# Single-consumer-at-a-time: a 409 is returned if another reader is
+# already attached. The active reader is tracked via
+# `_active_consumer_token`. (Multi-reader would require an event-log
+# abstraction with reader-cursors; that's a bigger lift and we opted
+# for the simpler invariant.)
+#
+# Known limitation: the reconnect consumer sees ONLY updates the
+# engine pushes after attach time, PLUS whatever updates are still
+# buffered in `_response_qs[stream_id]` at attach. It does NOT replay
+# tokens that the original consumer already drained — the bridge
+# stores no event log. For "resume from exactly the position the
+# client dropped at", clients should use the `continue_final_message`
+# mechanism on a fresh POST (engine-side prefix cache makes the
+# re-prefill nearly free).
+# ----------------------------------------------------------------------
+@app.get("/v1/streams/{stream_id}/sse")
+async def stream_reconnect_sse(stream_id: int, req: Request):
+    """Attach as the (new) consumer of an in-flight engine session.
+
+    Returns 404 if the stream id is unknown to the bridge (never
+    existed, or already GC'd after natural termination).
+    Returns 409 if another consumer is already attached.
+    Returns 200 + SSE on success; the stream emits OpenAI-shape
+    chat.completion.chunk frames identical in shape to the initial
+    POST /v1/chat/completions stream=true response, then `data: [DONE]`.
+    """
+    if stream_id not in _response_qs:
+        raise HTTPException(404, f"stream_id={stream_id} not found "
+                                   f"(never existed or already completed)")
+    # Single-consumer-at-a-time gate. The initial POST's
+    # _consume_engine_stream sets no token here (it's the only consumer
+    # by construction), so a reconnect that races with the original
+    # client still streaming will simply double-up on the queue and
+    # interleave-corrupt — to keep that out, we require the original
+    # consumer to have given up (background drain running) before any
+    # reconnect can attach. Detect via `stream_id in _background_drains`.
+    if stream_id not in _background_drains and stream_id not in _active_consumer_token:
+        raise HTTPException(409,
+            f"stream_id={stream_id} still has its original consumer "
+            f"attached; reconnect is only valid after the initial "
+            f"client disconnects")
+    if stream_id in _active_consumer_token:
+        raise HTTPException(409,
+            f"stream_id={stream_id} already has an attached reconnect "
+            f"consumer (token={_active_consumer_token[stream_id]!r}); "
+            f"single-reader invariant")
+
+    # Claim the consumer slot BEFORE signalling takeover, so a second
+    # concurrent reconnect that arrives between the event-set and the
+    # token-set finds the slot already taken.
+    token = uuid.uuid4().hex[:12]
+    _active_consumer_token[stream_id] = token
+
+    # Signal the background drain task to release the queue.
+    ev = _reconnect_takeover_events.get(stream_id)
+    drain_task = _background_drains.get(stream_id)
+    if ev is not None:
+        ev.set()
+    if drain_task is not None:
+        # Wait briefly for the drain to acknowledge — at most one
+        # asyncio.wait round-trip. This is mostly defensive; the drain
+        # task's wait_set already includes the takeover event so it
+        # wakes on the same tick.
+        try:
+            await asyncio.wait_for(asyncio.shield(drain_task), timeout=1.0)
+        except asyncio.TimeoutError:
+            print(f"[bridge] reconnect (sid={stream_id}): drain handoff "
+                  f"timed out waiting for drain task; proceeding anyway",
+                  flush=True)
+        except Exception:
+            pass
+
+    print(f"[bridge] reconnect attached (sid={stream_id}, "
+          f"token={token}, buffered={_response_qs[stream_id].qsize() if stream_id in _response_qs else 0})",
+          flush=True)
+
+    async def gen():
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
+        created = int(time.time())
+        all_tokens: list[int] = []
+        # Mirror the chat_completions SSE branch's mid-stream marker
+        # stripping. Reconnect picks up wherever the engine is — there
+        # is no "I missed bytes 0..N" to filter; the stream starts at
+        # the next engine push, and any partial marker bytes would
+        # have been split across the original consumer's last delta
+        # and the first reconnect delta. The strippers re-establish
+        # invariants from this attach point forward; the result is
+        # that a marker straddling the disconnect boundary may not
+        # be stripped (worst case: client sees one literal
+        # `<|tool_call>` substring in the surfaced content). End-of-
+        # generation tool-call extraction is NOT re-run here because
+        # the reconnect consumer doesn't have the full token history.
+        marker_stripper = _StreamMarkerStripper()
+        turn_stripper = _StreamTurnMarkerStripper()
+        rq = _response_qs.get(stream_id)
+        if rq is None:
+            # Race: drain task popped between our caller's check and
+            # gen-start. Send a synthetic done frame so the client
+            # gets clean SSE termination.
+            yield ("data: " + json.dumps({
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": MODEL_NAME,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }) + "\n\n")
+            yield "data: [DONE]\n\n"
+            return
+
+        disc_task = asyncio.create_task(_wait_until_disconnected(req))
+        clean_close = False
+        last_update: g.StreamUpdate | None = None
+        try:
+            while True:
+                if disc_task.done():
+                    try: disc_task.result()
+                    except Exception: pass
+                    break
+                get_task = asyncio.create_task(rq.get())
+                try:
+                    done, _pending = await asyncio.wait(
+                        {get_task, disc_task},
+                        return_when=asyncio.FIRST_COMPLETED)
+                except asyncio.CancelledError:
+                    get_task.cancel()
+                    disc_task.cancel()
+                    raise
+                if disc_task in done:
+                    get_task.cancel()
+                    break
+                u: g.StreamUpdate = get_task.result()
+                last_update = u
+                if u.new_thinking_tokens:
+                    raw_delta = g.detokenize(u.new_thinking_tokens)
+                    if raw_delta:
+                        yield ("data: " + json.dumps({
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": MODEL_NAME,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"reasoning_content": raw_delta},
+                                "finish_reason": None,
+                            }],
+                        }) + "\n\n")
+                if u.new_tokens:
+                    all_tokens.extend(u.new_tokens)
+                    delta_text = g.detokenize(u.new_tokens)
+                    if delta_text:
+                        delta_text = turn_stripper.feed(delta_text)
+                        filtered = marker_stripper.feed(delta_text)
+                        if filtered:
+                            yield ("data: " + json.dumps({
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": MODEL_NAME,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": filtered},
+                                    "finish_reason": None,
+                                }],
+                            }) + "\n\n")
+                if u.state == 2:
+                    clean_close = True
+                    if u.done_reason == 3:
+                        err_msg = u.err_msg or "unspecified engine failure"
+                        is_backpressure = err_msg.startswith("admission backpressure")
+                        err_type = ("admission_backpressure"
+                                    if is_backpressure else "engine_error")
+                        yield ("data: " + json.dumps({
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": MODEL_NAME,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": ""},
+                                "finish_reason": "error",
+                            }],
+                            "error": {"message": err_msg, "type": err_type},
+                        }) + "\n\n")
+                        yield "data: [DONE]\n\n"
+                        return
+                    finish = "stop" if u.done_reason == 1 else (
+                        "length" if u.done_reason == 2 else "stop")
+                    turn_tail = turn_stripper.flush()
+                    if turn_tail:
+                        final_tail = marker_stripper.feed(turn_tail) + marker_stripper.flush()
+                    else:
+                        final_tail = marker_stripper.flush()
+                    if final_tail:
+                        yield ("data: " + json.dumps({
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": MODEL_NAME,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": final_tail},
+                                "finish_reason": None,
+                            }],
+                        }) + "\n\n")
+                    yield ("data: " + json.dumps({
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": MODEL_NAME,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": finish,
+                        }],
+                        "usage": {
+                            "prompt_tokens": u.prompt_tokens_seen,
+                            "completion_tokens": u.completion_tokens_emitted,
+                            "total_tokens": u.prompt_tokens_seen + u.completion_tokens_emitted,
+                            "cache_hits": u.cache_hits,
+                            "cache_misses": u.cache_misses,
+                            "vision_cache_hits": u.vision_cache_hits,
+                        },
+                    }) + "\n\n")
+                    yield "data: [DONE]\n\n"
+                    print(f"[bridge] usage (RECONNECT SSE sid={stream_id}): "
+                          f"prompt_tokens={u.prompt_tokens_seen}, "
+                          f"completion_tokens={u.completion_tokens_emitted}, "
+                          f"cache_hits={u.cache_hits}, "
+                          f"cache_misses={u.cache_misses}, "
+                          f"vision_cache_hits={u.vision_cache_hits}, "
+                          f"done_reason={u.done_reason}", flush=True)
+                    return
+        finally:
+            try: disc_task.cancel()
+            except Exception: pass
+            _active_consumer_token.pop(stream_id, None)
+            if clean_close:
+                _response_qs.pop(stream_id, None)
+                _drop_counts.pop(stream_id, None)
+                _reconnect_takeover_events.pop(stream_id, None)
+            else:
+                if last_update is not None:
+                    print(f"[bridge] reconnect-consumer disconnect "
+                          f"(sid={stream_id}): last seen "
+                          f"prompt_tokens={last_update.prompt_tokens_seen}, "
+                          f"completion_tokens={last_update.completion_tokens_emitted}, "
+                          f"state={last_update.state}; session continues, "
+                          f"respawning background drain", flush=True)
+                else:
+                    print(f"[bridge] reconnect-consumer disconnect "
+                          f"(sid={stream_id}): no updates observed; "
+                          f"session continues, respawning background drain",
+                          flush=True)
+                # Reset takeover event so the next reconnect can fire
+                # it again, then respawn the background drain. The
+                # event is per-takeover-cycle.
+                ev2 = _reconnect_takeover_events.get(stream_id)
+                if ev2 is not None:
+                    ev2.clear()
+                _spawn_background_drain(stream_id)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"X-Stream-Id": str(stream_id)})
 
 
 # ----------------------------------------------------------------------
