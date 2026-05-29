@@ -1069,18 +1069,22 @@ private func _runVisionTowerBatchForwardCore(batches: [PatchBatch], weights: Vis
     encGemvFp16InFp32Out(cb, x: patchesBuf, W: weights.patchEmbedW, out: x,
                           B: BN, Din: 768, Dout: h)
 
-    // 2) Pos embed — per-image (each has its own gridW). Dispatch B times
-    // with buffer offsets into the batched x.
-    for (b, batch) in batches.enumerated() {
+    // 2) Pos embed — ONE batched dispatch over all B*N rows. Indexes the
+    // precomputed per-row grid coords posY/posX (filled above), so a batch
+    // of images with differing gridW is handled correctly in a single
+    // dispatch (no per-image loop, no per-image nPatchesX).
+    do {
         let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(visionPosEmbedFp32PSO)
-        enc.setBuffer(x, offset: b * N * h * 4, index: 0)
+        enc.setBuffer(x, offset: 0, index: 0)
         enc.setBuffer(weights.posEmbedTable, offset: weights.posMax * h * 2, index: 1)
         enc.setBuffer(weights.posEmbedTable, offset: 0, index: 2)
-        enc.setBuffer(x, offset: b * N * h * 4, index: 3)
-        var nx = UInt32(batch.gridW), hh = UInt32(h)
-        enc.setBytes(&nx, length: 4, index: 4); enc.setBytes(&hh, length: 4, index: 5)
-        enc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1),
+        enc.setBuffer(x, offset: 0, index: 3)
+        enc.setBuffer(posYBuf, offset: 0, index: 4)
+        enc.setBuffer(posXBuf, offset: 0, index: 5)
+        var hh = UInt32(h)
+        enc.setBytes(&hh, length: 4, index: 6)
+        enc.dispatchThreadgroups(MTLSize(width: BN, height: 1, depth: 1),
                                   threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
         enc.endEncoding()
     }
@@ -1130,47 +1134,87 @@ private func _runVisionTowerBatchForwardCore(batches: [PatchBatch], weights: Vis
         encQuantizeFp32ToBf16(cb, x: x, N: h, numVecs: BN)
     }
 
-    // 4) Tail: pool + std_norm + pre_proj_norm + embed_vision_proj.
-    // Each image has its own grid shape and pooled-token count; dispatch
-    // per-image with buffer offsets. Weights (stdBias/stdScale/embedVisionProj)
-    // are still streamed once across B per-image dispatches — same amortization
-    // as the per-row ops since we're inside one CB.
-    var results: [(MTLBuffer, Int)] = []
-    results.reserveCapacity(B)
+    // 4) Tail: batched pool -> std_norm -> pre_proj_norm -> vision_proj.
+    // Each stage is ONE dispatch over ALL pooled tokens across the batch
+    // (totalPooled = Σ_i nPooled_i). Per-image output sizes differ, so we
+    // prefix-sum the per-image pooled counts and map each global pooled
+    // token back to its image (tokenImage). No per-image dispatch loop, no
+    // shared mutable scratch reused across images — correct for any batch.
     let sqrtH = Float(h).squareRoot()
+    var nPooledPer     = [Int](repeating: 0, count: B)
+    var outWPer        = [UInt32](repeating: 0, count: B)
+    var gridWPer       = [UInt32](repeating: 0, count: B)
+    var pooledStartPer = [UInt32](repeating: 0, count: B)
+    var totalPooled = 0
     for (b, batch) in batches.enumerated() {
-        let outH = batch.gridH / 3, outW = batch.gridW / 3
-        let nPooled = outH * outW
-        // pooled + stdNormed reused from the pool (sized to max nPooled).
-        // Earlier images' contents are overwritten by later ones; Metal's
-        // serial command-queue ordering guarantees the GPU has consumed
-        // image_a's pooled/stdNormed into image_a's softTokens BEFORE the
-        // image_b encoder dispatches that overwrite begin executing.
-        let pooled    = _gVisionScratchPool.pooled!
-        let stdNormed = _gVisionScratchPool.stdNormed!
-        // softTokens IS returned to the caller (consumed by LM as a
-        // prompt segment / cached in gVisionCache); cannot be pooled.
-        let softTokens = device.makeBuffer(length: nPooled * weights.textHidden * 4, options: .storageModeShared)!
+        pooledStartPer[b] = UInt32(totalPooled)
+        let nP = (batch.gridH / 3) * (batch.gridW / 3)
+        nPooledPer[b] = nP
+        outWPer[b]    = UInt32(batch.gridW / 3)
+        gridWPer[b]   = UInt32(batch.gridW)
+        totalPooled  += nP
+    }
+    var tokenImageArr = [UInt32](repeating: 0, count: max(1, totalPooled))
+    for b in 0..<B {
+        let start = Int(pooledStartPer[b])
+        for k in 0..<nPooledPer[b] { tokenImageArr[start + k] = UInt32(b) }
+    }
+    func u32buf(_ a: [UInt32]) -> MTLBuffer {
+        let buf = device.makeBuffer(length: max(1, a.count) * 4, options: .storageModeShared)!
+        if !a.isEmpty { a.withUnsafeBytes { _ = memcpy(buf.contents(), $0.baseAddress!, a.count * 4) } }
+        return buf
+    }
+    let tokenImageBuf  = u32buf(tokenImageArr)
+    let pooledStartBuf = u32buf(pooledStartPer)
+    let gridWBuf       = u32buf(gridWPer)
+    let outWBuf        = u32buf(outWPer)
 
-        // Pool with per-image grid, reading from x at offset.
+    let tp = max(1, totalPooled)
+    let pooledAll     = device.makeBuffer(length: tp * h * 4, options: .storageModeShared)!
+    let stdNormedAll  = device.makeBuffer(length: tp * h * 4, options: .storageModeShared)!
+    let softTokensAll = device.makeBuffer(length: tp * weights.textHidden * 4, options: .storageModeShared)!
+
+    do {
         let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(visionPool2DFp32InFp32OutPSO)
-        enc.setBuffer(x, offset: b * N * h * 4, index: 0)
-        enc.setBuffer(pooled, offset: 0, index: 1)
-        var gw = UInt32(batch.gridW), ow = UInt32(outW), ks: UInt32 = 3, hh = UInt32(h)
-        enc.setBytes(&gw, length: 4, index: 2); enc.setBytes(&ow, length: 4, index: 3)
-        enc.setBytes(&ks, length: 4, index: 4); enc.setBytes(&hh, length: 4, index: 5)
-        enc.dispatchThreadgroups(MTLSize(width: nPooled, height: 1, depth: 1),
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(pooledAll, offset: 0, index: 1)
+        enc.setBuffer(tokenImageBuf, offset: 0, index: 2)
+        enc.setBuffer(pooledStartBuf, offset: 0, index: 3)
+        enc.setBuffer(gridWBuf, offset: 0, index: 4)
+        enc.setBuffer(outWBuf, offset: 0, index: 5)
+        var Nv = UInt32(N), ks: UInt32 = 3, hh = UInt32(h)
+        enc.setBytes(&Nv, length: 4, index: 6)
+        enc.setBytes(&ks, length: 4, index: 7)
+        enc.setBytes(&hh, length: 4, index: 8)
+        enc.dispatchThreadgroups(MTLSize(width: tp, height: 1, depth: 1),
                                   threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
         enc.endEncoding()
-
-        encVisionScaledStdNormFp32(cb, x: pooled, bias: weights.stdBias, scale: weights.stdScale,
-                                     out: stdNormed, D: h, numVecs: nPooled, globalScale: sqrtH)
-        encRMSNormNoScaleFp32(cb, x: stdNormed, out: stdNormed, D: h, numVecs: nPooled)
-        encGemvFp32V5(cb, x: stdNormed, W: weights.embedVisionProj, out: softTokens,
-                        B: nPooled, Din: h, Dout: weights.textHidden)
-        results.append((softTokens, nPooled))
     }
+    encVisionScaledStdNormFp32(cb, x: pooledAll, bias: weights.stdBias, scale: weights.stdScale,
+                                 out: stdNormedAll, D: h, numVecs: totalPooled, globalScale: sqrtH)
+    encRMSNormNoScaleFp32(cb, x: stdNormedAll, out: stdNormedAll, D: h, numVecs: totalPooled)
+    encGemvFp32V5(cb, x: stdNormedAll, W: weights.embedVisionProj, out: softTokensAll,
+                    B: totalPooled, Din: h, Dout: weights.textHidden)
+
+    // Slice the batched proj output into per-image buffers (keeps the
+    // [(MTLBuffer, count)] return contract — zero consumer churn).
+    var results: [(MTLBuffer, Int)] = []
+    results.reserveCapacity(B)
+    let sliceBlit = cb.makeBlitCommandEncoder()!
+    for b in 0..<B {
+        let nP = nPooledPer[b]
+        let softTokens = device.makeBuffer(length: max(1, nP) * weights.textHidden * 4,
+                                            options: .storageModeShared)!
+        if nP > 0 {
+            sliceBlit.copy(from: softTokensAll,
+                           sourceOffset: Int(pooledStartPer[b]) * weights.textHidden * 4,
+                           to: softTokens, destinationOffset: 0,
+                           size: nP * weights.textHidden * 4)
+        }
+        results.append((softTokens, nP))
+    }
+    sliceBlit.endEncoding()
 
     return (results, cb)
 }

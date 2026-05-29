@@ -9918,23 +9918,32 @@ kernel void dense_gemv_fp16in_fp32out_v5(
     }
 }
 
+// Batched 2D position-embedding add. One dispatch over ALL B*N rows.
+// Instead of recomputing grid coords from a single per-image nPatchesX
+// (which was wrong across a batch of images with differing gridW, and
+// forced a per-image Swift dispatch loop), this indexes the precomputed
+// per-row grid coordinates posY[row]/posX[row] ([B*N], filled CPU-side
+// from each image's patch positions, (0,0) for padded rows). Correct by
+// construction for any batch composition; B=1 is byte-identical since
+// posY[i]==i/gridW, posX[i]==i%gridW for a single image's real patches.
 kernel void vision_pos_embed_add_fp32(
     device const float* x               [[buffer(0)]],
     device const half* pos_y_table      [[buffer(1)]],
     device const half* pos_x_table      [[buffer(2)]],
     device float* out                   [[buffer(3)]],
-    constant uint& nPatchesX            [[buffer(4)]],
-    constant uint& hidden               [[buffer(5)]],
+    device const uint* posY             [[buffer(4)]],   // [B*N] grid-y per row
+    device const uint* posX             [[buffer(5)]],   // [B*N] grid-x per row
+    constant uint& hidden               [[buffer(6)]],
     uint2 tg                            [[threadgroup_position_in_grid]],
     uint2 lid                           [[thread_position_in_threadgroup]])
 {
-    uint patch = tg.x; uint t = lid.x;
-    uint yi = patch / nPatchesX;
-    uint xi = patch % nPatchesX;
+    uint row = tg.x; uint t = lid.x;
+    uint yi = posY[row];
+    uint xi = posX[row];
     device const half* py = pos_y_table + yi * hidden;
     device const half* px = pos_x_table + xi * hidden;
-    device const float* xi_ptr = x + patch * hidden;
-    device float* out_ptr = out + patch * hidden;
+    device const float* xi_ptr = x + row * hidden;
+    device float* out_ptr = out + row * hidden;
     for (uint i = t; i < hidden; i += 32) {
         out_ptr[i] = xi_ptr[i] + float(py[i]) + float(px[i]);
     }
@@ -11893,19 +11902,33 @@ kernel void vision_ffn_gate_up_gelu_fp32_mma_v3(
 }
 
 // Vision 2D pool fp32 → fp32 (spatial 3×3 average over patches).
+// Batched 2D average-pool. ONE dispatch over ALL pooled tokens across the
+// whole batch (totalPooled = Σ_i nPooled_i). Each global pooled token g maps
+// back to its source image via tokenImage[g]; per-image grid width / output
+// width come from imgGridW/imgOutW; the image's patch rows start at img*N in
+// the batched [B*N, hidden] input. Writes its own disjoint out[g] slot — no
+// shared scratch, no per-image dispatch loop, correct for any batch.
 kernel void vision_pool_2d_fp32in_fp32out(
-    device const float* x               [[buffer(0)]],
-    device float* out                   [[buffer(1)]],
-    constant uint& grid_w               [[buffer(2)]],
-    constant uint& out_w                [[buffer(3)]],
-    constant uint& kernel_size          [[buffer(4)]],
-    constant uint& hidden               [[buffer(5)]],
+    device const float* x               [[buffer(0)]],   // [B*N, hidden]
+    device float* out                   [[buffer(1)]],   // [totalPooled, hidden]
+    device const uint* tokenImage       [[buffer(2)]],   // [totalPooled] -> image idx
+    device const uint* pooledStart      [[buffer(3)]],   // [B] prefix sum of nPooled
+    device const uint* imgGridW         [[buffer(4)]],   // [B]
+    device const uint* imgOutW          [[buffer(5)]],   // [B]
+    constant uint& N                    [[buffer(6)]],    // patches per image (uniform)
+    constant uint& kernel_size          [[buffer(7)]],
+    constant uint& hidden               [[buffer(8)]],
     uint2 tg                            [[threadgroup_position_in_grid]],
     uint2 lid                           [[thread_position_in_threadgroup]])
 {
-    uint out_idx = tg.x; uint t = lid.x;
-    uint oy = out_idx / out_w;
-    uint ox = out_idx % out_w;
+    uint g = tg.x; uint t = lid.x;
+    uint img   = tokenImage[g];
+    uint local = g - pooledStart[img];
+    uint out_w = imgOutW[img];
+    uint gw    = imgGridW[img];
+    uint base  = img * N;                       // patch-row base of this image
+    uint oy = local / out_w;
+    uint ox = local % out_w;
     uint y_start = oy * kernel_size;
     uint x_start = ox * kernel_size;
     float inv_area = 1.0f / float(kernel_size * kernel_size);
@@ -11913,11 +11936,11 @@ kernel void vision_pool_2d_fp32in_fp32out(
         float acc = 0;
         for (uint dy = 0; dy < kernel_size; ++dy) {
             for (uint dx = 0; dx < kernel_size; ++dx) {
-                uint px = (y_start + dy) * grid_w + (x_start + dx);
+                uint px = base + (y_start + dy) * gw + (x_start + dx);
                 acc += x[px * hidden + i];
             }
         }
-        out[out_idx * hidden + i] = acc * inv_area;
+        out[g * hidden + i] = acc * inv_area;
     }
 }
 
