@@ -323,17 +323,11 @@ func gemma4ImagePreprocess(data: Data,
 
 // ---- Vision PSO declarations ----
 let visionPatchEmbedPSO = pso("vision_patch_embed_fp16")
-let visionPosEmbedPSO   = pso("vision_pos_embed_add_fp16")
-let vision2dRopePSO     = pso("vision_2d_rope_neox_fp16")
 let denseGemvFp16V5PSO  = pso("dense_gemv_fp16_v5")
-let visionAttnPrefillPSO = pso("vision_attn_prefill_fp16")
-let visionPool2DPSO      = pso("vision_pool_2d_fp16")
-let visionStdNormPSO     = pso("vision_scaled_std_normalize_fp16")
 let denseGemvFp32OutPSO  = pso("dense_gemv_fp16in_fp32out_v5")
 let visionPosEmbedFp32PSO = pso("vision_pos_embed_add_fp32")
 let rmsNormFp32InPSO     = pso("rms_norm_fp32in")
 let addInplaceFp32PSO    = pso("add_inplace_fp32dst_fp16src")
-let visionPool2DFp32InPSO = pso("vision_pool_2d_fp32in_fp16out")
 let rmsNormFp32OutPSO    = pso("rms_norm_fp16in_fp32out")
 let addInplaceFp32FpPSO  = pso("add_inplace_fp32_fp32")
 
@@ -345,7 +339,6 @@ let rmsNormFp32PSO       = pso("rms_norm_fp32")
 let rmsNormNoScaleFp32PSO = pso("rms_norm_noscale_fp32")
 let denseGemvFp32In32OutPSO = pso("dense_gemv_fp32in_fp32out_v5")
 let vision2dRopeFp32PSO  = pso("vision_2d_rope_neox_fp32")
-let visionAttnPrefillFp32PSO = pso("vision_attn_prefill_fp32")
 let visionAttnFlashFp32PSO   = pso("vision_attn_flash_fp32")
 let visionGemmFp32MmaPSO     = pso("vision_gemm_fp32_mma")
 let visionGemmFp32MmaV2PSO   = pso("vision_gemm_fp32_mma_v2")
@@ -437,55 +430,6 @@ func encGemvFp16V5(_ cb: MTLCommandBuffer, x: MTLBuffer, W: MTLBuffer, out: MTLB
     enc.setBytes(&du, length: 4, index: 3); enc.setBytes(&dou, length: 4, index: 4)
     enc.dispatchThreadgroups(MTLSize(width: Dout / 32, height: B, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
-    enc.endEncoding()
-}
-
-func encVisionPosEmbedAdd(_ cb: MTLCommandBuffer, x: MTLBuffer, posTable: MTLBuffer,
-                           posMax: Int, out: MTLBuffer, N: Int, nPatchesX: Int, hidden: Int) {
-    // Per gemma4v.cpp: X-table at offset 0, Y-table at offset pos_size * nb1.
-    // Kernel binds index 1 → pos_y_table, index 2 → pos_x_table — so Y comes
-    // from offset POS_MAX*hidden and X from offset 0.
-    let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(visionPosEmbedPSO)
-    enc.setBuffer(x, offset: 0, index: 0)
-    enc.setBuffer(posTable, offset: posMax * hidden * 2, index: 1)   // Y-table
-    enc.setBuffer(posTable, offset: 0, index: 2)                     // X-table
-    enc.setBuffer(out, offset: 0, index: 3)
-    var nx = UInt32(nPatchesX), h = UInt32(hidden)
-    enc.setBytes(&nx, length: 4, index: 4); enc.setBytes(&h, length: 4, index: 5)
-    enc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc.endEncoding()
-}
-
-func encVision2DRope(_ cb: MTLCommandBuffer, x: MTLBuffer, posX: MTLBuffer, posY: MTLBuffer,
-                      N: Int, H: Int, HD: Int, theta: Float) {
-    let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(vision2dRopePSO)
-    enc.setBuffer(x, offset: 0, index: 0)
-    enc.setBuffer(posX, offset: 0, index: 1); enc.setBuffer(posY, offset: 0, index: 2)
-    var Hv = UInt32(H), HDv = UInt32(HD), thv = theta
-    enc.setBytes(&Hv, length: 4, index: 3)
-    enc.setBytes(&HDv, length: 4, index: 4)
-    enc.setBytes(&thv, length: 4, index: 5)
-    enc.dispatchThreadgroups(MTLSize(width: N, height: H, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc.endEncoding()
-}
-
-func encVisionAttnPrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, K: MTLBuffer, V: MTLBuffer, O: MTLBuffer,
-                            N: Int, H: Int, HD: Int, qkScale: Float) {
-    let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(visionAttnPrefillPSO)
-    enc.setBuffer(Q, offset: 0, index: 0); enc.setBuffer(K, offset: 0, index: 1)
-    enc.setBuffer(V, offset: 0, index: 2); enc.setBuffer(O, offset: 0, index: 3)
-    var Nv = UInt32(N), Hv = UInt32(H), HDv = UInt32(HD), sc = qkScale
-    enc.setBytes(&Nv, length: 4, index: 4)
-    enc.setBytes(&Hv, length: 4, index: 5)
-    enc.setBytes(&HDv, length: 4, index: 6)
-    enc.setBytes(&sc, length: 4, index: 7)
-    enc.dispatchThreadgroups(MTLSize(width: N, height: H, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
 }
 
@@ -632,36 +576,6 @@ func encVision2DRopeFp32(_ cb: MTLCommandBuffer, x: MTLBuffer, posX: MTLBuffer, 
     enc.endEncoding()
 }
 
-func encVisionAttnPrefillFp32(_ cb: MTLCommandBuffer, Q: MTLBuffer, K: MTLBuffer, V: MTLBuffer, O: MTLBuffer,
-                                N: Int, H: Int, HD: Int, qkScale: Float,
-                                paddingMask: MTLBuffer? = nil) {
-    // Route through the flash-attention port unless explicitly disabled.
-    // Bidirectional (no causal) + optional byte-mask + fp32 I/O with half
-    // MMA inside the kernel. Vision HD is 72 = 9 × 8, a natural fit for
-    // simdgroup_matrix<T, 8, 8>. Falls back to the scalar kernel when
-    // VISION_ATTN_SCALAR=1 so the old path stays reachable for A/B.
-    if ProcessInfo.processInfo.environment["VISION_ATTN_SCALAR"] == nil {
-        return encVisionAttnFlashFp32(cb, Q: Q, K: K, V: V, O: O,
-                                        N: N, H: H, HD: HD, qkScale: qkScale,
-                                        paddingMask: paddingMask)
-    }
-    let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(visionAttnPrefillFp32PSO)
-    enc.setBuffer(Q, offset: 0, index: 0); enc.setBuffer(K, offset: 0, index: 1)
-    enc.setBuffer(V, offset: 0, index: 2); enc.setBuffer(O, offset: 0, index: 3)
-    var Nv = UInt32(N), Hv = UInt32(H), HDv = UInt32(HD), sc = qkScale
-    enc.setBytes(&Nv, length: 4, index: 4)
-    enc.setBytes(&Hv, length: 4, index: 5)
-    enc.setBytes(&HDv, length: 4, index: 6)
-    enc.setBytes(&sc, length: 4, index: 7)
-    enc.setBuffer(paddingMask ?? Q, offset: 0, index: 8)
-    var use: UInt32 = (paddingMask != nil) ? 1 : 0
-    enc.setBytes(&use, length: 4, index: 9)
-    enc.dispatchThreadgroups(MTLSize(width: N, height: H, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc.endEncoding()
-}
-
 // Flash-attention dispatch. Grid: (H, ceil(N/8), B). 32 threads per TG.
 // Slot-parallel batching: buffers are [B, N, H, D], each slot's K/V is
 // distinct memory, so cross-slot attention is impossible by construction.
@@ -684,30 +598,6 @@ func encVisionAttnFlashFp32(_ cb: MTLCommandBuffer, Q: MTLBuffer, K: MTLBuffer, 
     enc.setBytes(&use, length: 4, index: 9)
     let nBlocks = (N + 7) / 8
     enc.dispatchThreadgroups(MTLSize(width: H, height: nBlocks, depth: B),
-                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc.endEncoding()
-}
-
-func encGeluMulFp32(_ cb: MTLCommandBuffer, gate: MTLBuffer, up: MTLBuffer, N: Int, numVecs: Int) {
-    let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(geluMulFp32PSO)
-    enc.setBuffer(gate, offset: 0, index: 0); enc.setBuffer(up, offset: 0, index: 1)
-    var Nv = UInt32(N)
-    enc.setBytes(&Nv, length: 4, index: 2)
-    enc.dispatchThreadgroups(MTLSize(width: numVecs, height: 1, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc.endEncoding()
-}
-
-func encVisionPool2DFp32InFp32Out(_ cb: MTLCommandBuffer, x: MTLBuffer, out: MTLBuffer,
-                                    gridW: Int, outW: Int, outH: Int, kernelSize: Int, hidden: Int) {
-    let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(visionPool2DFp32InFp32OutPSO)
-    enc.setBuffer(x, offset: 0, index: 0); enc.setBuffer(out, offset: 0, index: 1)
-    var gw = UInt32(gridW), ow = UInt32(outW), ks = UInt32(kernelSize), h = UInt32(hidden)
-    enc.setBytes(&gw, length: 4, index: 2); enc.setBytes(&ow, length: 4, index: 3)
-    enc.setBytes(&ks, length: 4, index: 4); enc.setBytes(&h, length: 4, index: 5)
-    enc.dispatchThreadgroups(MTLSize(width: outH * outW, height: 1, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
 }
@@ -743,35 +633,6 @@ func encVisionScaledStdNormFp32(_ cb: MTLCommandBuffer, x: MTLBuffer, bias: MTLB
     enc.endEncoding()
 }
 
-func encVisionPool2D(_ cb: MTLCommandBuffer, x: MTLBuffer, out: MTLBuffer,
-                      gridW: Int, outW: Int, outH: Int, kernelSize: Int, hidden: Int) {
-    let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(visionPool2DPSO)
-    enc.setBuffer(x, offset: 0, index: 0); enc.setBuffer(out, offset: 0, index: 1)
-    var gw = UInt32(gridW), ow = UInt32(outW), ks = UInt32(kernelSize), h = UInt32(hidden)
-    enc.setBytes(&gw, length: 4, index: 2); enc.setBytes(&ow, length: 4, index: 3)
-    enc.setBytes(&ks, length: 4, index: 4); enc.setBytes(&h, length: 4, index: 5)
-    enc.dispatchThreadgroups(MTLSize(width: outH * outW, height: 1, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc.endEncoding()
-}
-
-func encVisionScaledStdNorm(_ cb: MTLCommandBuffer, x: MTLBuffer, bias: MTLBuffer, scale: MTLBuffer,
-                             out: MTLBuffer, D: Int, numVecs: Int, globalScale: Float) {
-    let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(visionStdNormPSO)
-    enc.setBuffer(x, offset: 0, index: 0)
-    enc.setBuffer(bias, offset: 0, index: 1)
-    enc.setBuffer(scale, offset: 0, index: 2)
-    enc.setBuffer(out, offset: 0, index: 3)
-    var Dv = UInt32(D); var gs = globalScale
-    enc.setBytes(&Dv, length: 4, index: 4)
-    enc.setBytes(&gs, length: 4, index: 5)
-    enc.dispatchThreadgroups(MTLSize(width: numVecs, height: 1, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc.endEncoding()
-}
-
 // Local helper: add `src` element-wise into `dst` (fp16). Reuses the
 // text-side `add_inplace` MSL kernel if present. Fallback: walk device
 // buffers as in the pre-existing encAddInplace.
@@ -792,21 +653,6 @@ func encGemvFp16InFp32Out(_ cb: MTLCommandBuffer, x: MTLBuffer, W: MTLBuffer, ou
     let n_blocks = (Dout + 31) / 32
     enc.dispatchThreadgroups(MTLSize(width: n_blocks, height: B, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
-    enc.endEncoding()
-}
-
-func encVisionPosEmbedAddFp32(_ cb: MTLCommandBuffer, x: MTLBuffer, posTable: MTLBuffer,
-                                posMax: Int, out: MTLBuffer, N: Int, nPatchesX: Int, hidden: Int) {
-    let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(visionPosEmbedFp32PSO)
-    enc.setBuffer(x, offset: 0, index: 0)
-    enc.setBuffer(posTable, offset: posMax * hidden * 2, index: 1)   // Y-table
-    enc.setBuffer(posTable, offset: 0, index: 2)                     // X-table
-    enc.setBuffer(out, offset: 0, index: 3)
-    var nx = UInt32(nPatchesX), h = UInt32(hidden)
-    enc.setBytes(&nx, length: 4, index: 4); enc.setBytes(&h, length: 4, index: 5)
-    enc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
 }
 
@@ -856,19 +702,6 @@ func encAddInplaceFp32Fp32(_ cb: MTLCommandBuffer, dst: MTLBuffer, src: MTLBuffe
     enc.setBuffer(src, offset: 0, index: 1)
     var Nv = UInt32(N); enc.setBytes(&Nv, length: 4, index: 2)
     enc.dispatchThreadgroups(MTLSize(width: numVecs, height: 1, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc.endEncoding()
-}
-
-func encVisionPool2DFp32In(_ cb: MTLCommandBuffer, x: MTLBuffer, out: MTLBuffer,
-                             gridW: Int, outW: Int, outH: Int, kernelSize: Int, hidden: Int) {
-    let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(visionPool2DFp32InPSO)
-    enc.setBuffer(x, offset: 0, index: 0); enc.setBuffer(out, offset: 0, index: 1)
-    var gw = UInt32(gridW), ow = UInt32(outW), ks = UInt32(kernelSize), h = UInt32(hidden)
-    enc.setBytes(&gw, length: 4, index: 2); enc.setBytes(&ow, length: 4, index: 3)
-    enc.setBytes(&ks, length: 4, index: 4); enc.setBytes(&h, length: 4, index: 5)
-    enc.dispatchThreadgroups(MTLSize(width: outH * outW, height: 1, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
 }
