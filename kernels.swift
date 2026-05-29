@@ -908,6 +908,49 @@ kernel void softmax_topk(
 // MoE kernels check the sentinel and early-return. Dispatcher passes
 // numActive = TOPK * aB so only the relevant TGs launch — saves
 // 120 wasted TG launches per slab at aB=1.
+// Size the MoE-prefill matmul grid to the ACTUAL routing, not the worst case.
+// Reads group_start[E+1] (per-expert compacted offsets) and writes one
+// MTLDispatchThreadgroupsIndirectArguments triple {gx, gy, gz}:
+//   gx = ceil(maxTokens/32)   — token dim, bounded by the single hottest expert
+//   gy = passed in (ceil(Dout/64))
+//   gz = activeExperts        — non-empty groups only
+// maxTokens = max over experts of group_start[e+1]-group_start[e]. One thread;
+// each MoE matmul re-emits this with its own gy right before dispatching.
+kernel void moe_write_dispatch_args(
+    device const uint* group_start  [[buffer(0)]],   // [E+1]
+    device uint*       args         [[buffer(1)]],   // 3 uints: {gx,gy,gz}
+    constant uint&     gy           [[buffer(2)]],
+    constant uint&     gxCap        [[buffer(3)]],   // structural max token-tiles
+    uint lid                        [[thread_position_in_threadgroup]])
+{
+    if (lid != 0) return;
+    constexpr uint E = 128;
+    // gxCap is the STRUCTURAL ceiling on the X (token-tile) axis: a token
+    // routes to any expert at most once, so an expert holds <= N tokens
+    // (N = numSlots/TOPK) => at most ceil(N/32) tiles. The grid X axis is
+    // GPU-computed here and is otherwise UNBOUNDED. Without this clamp a
+    // single non-monotonic / stale / pre-route-compact group_start value
+    // makes the unsigned subtraction below underflow to ~4.29e9, gx blows
+    // up to ~1e8 threadgroups, and the GPU watchdog can't drain the grid —
+    // WindowServer (shared GPU) hangs and the machine needs a hard reboot.
+    // (RCA 2026-05-28: the kernel-hang-the-whole-box bug.) Every CPU path
+    // this replaced was already numSlots-bounded; this restores that ceiling.
+    uint maxc = 0, active = 0;
+    for (uint e = 0; e < E; ++e) {
+        uint a = group_start[e];
+        uint b = group_start[e + 1];
+        uint c = (b > a) ? (b - a) : 0u;   // saturating: never underflow
+        if (c > maxc) maxc = c;
+        if (c > 0) active += 1;
+    }
+    uint gx = (maxc + 31) / 32;
+    if (gx == 0)     gx = 1;               // never a zero-size dispatch
+    if (gxCap > 0 && gx > gxCap) gx = gxCap;// hard structural ceiling
+    if (active == 0) active = 1;
+    if (active > E)  active = E;            // gz can never exceed E experts
+    args[0] = gx; args[1] = gy; args[2] = active;
+}
+
 kernel void route_compact(
     device const uint* expert_ids   [[buffer(0)]],   // [B*K]
     device uint* group_start        [[buffer(1)]],   // [E+1]

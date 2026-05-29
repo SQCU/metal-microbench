@@ -164,6 +164,8 @@ let prefillMmIdQ80SwizPSO  = pso("prefill_mm_id_q8_0_swiz")
 // because moe_up needs slot_token at buffer(1); sharing the down kernel
 // would shift every subsequent binding index by 1 and read garbage.
 let prefillMmIdQ80UpSwizPSO = pso("prefill_mm_id_q8_0_up_swiz")
+// Sizes the MoE-prefill matmul grid to actual routing (indirect dispatch).
+let moeWriteDispatchArgsPSO = pso("moe_write_dispatch_args")
 
 // F16 weight-streaming kernel zoo. F16 is the IEEE half-precision baseline:
 // no block structure, no dequant, plain row-major [Dout, Din] weights. Used
@@ -806,6 +808,11 @@ let block_table  = device.makeBuffer(length: B * MAX_PAGES_PER_SLOT * 4, options
 
 let active_exp   = device.makeBuffer(length: E_EXP * 4, options: .storageModeShared)!
 let group_start  = device.makeBuffer(length: (E_EXP + 1) * 4, options: .storageModeShared)!
+// MoE-prefill indirect dispatch args: 2 × MTLDispatchThreadgroupsIndirectArguments
+// (3 × uint32 each) — slot [0] = gate/up grid, slot [1] = down grid. Written by
+// moe_write_dispatch_args from group_start so the GPU sizes the grid to the
+// ACTUAL max-per-expert token count + active-expert count (no CPU readback).
+let pre_moe_dispatch_args = device.makeBuffer(length: 2 * 3 * 4, options: .storageModeShared)!
 let slot_token   = device.makeBuffer(length: TOTAL_SLOTS * 4, options: .storageModeShared)!
 let batch_slots  = device.makeBuffer(length: B * TOPK * 4, options: .storageModeShared)!
 let input_tokens = device.makeBuffer(length: B * 4, options: .storageModeShared)!
@@ -1548,7 +1555,10 @@ func encMmIdQ4KSwizPrefill(_ cb: MTLCommandBuffer,
     enc.setBytes(&kC, length: 4, index: 6)
     enc.setBytes(&nC, length: 4, index: 7)
     enc.setThreadgroupMemoryLength(4096 + 2048 + 4096, index: 0)
-    let gx = (numSlots + 31) / 32                  // worst-case slot block count
+    // N-bound: an expert's group holds ≤ N = numSlots/TOPK tokens (a token
+    // routes to each expert at most once), never numSlots. (Dead code as of
+    // 2026-05-28 — superseded by encMoeUpMmPrefill — fixed for revival safety.)
+    let gx = ((numSlots / TOPK) + 31) / 32
     let gy = (Dout + 63) / 64
     enc.dispatchThreadgroups(MTLSize(width: max(gx, 1), height: gy, depth: E),
                               threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
@@ -1573,7 +1583,8 @@ func encMmIdQ51SwizPrefill(_ cb: MTLCommandBuffer,
     enc.setBytes(&kC, length: 4, index: 5)
     enc.setBytes(&nC, length: 4, index: 6)
     enc.setThreadgroupMemoryLength(4096 + 2048 + 4096, index: 0)
-    let gx = (numSlots + 31) / 32
+    // N-bound (see encMmIdQ4KSwizPrefill). Dead code — fixed for revival safety.
+    let gx = ((numSlots / TOPK) + 31) / 32
     let gy = (Dout + 63) / 64
     enc.dispatchThreadgroups(MTLSize(width: max(gx, 1), height: gy, depth: E),
                               threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
@@ -1624,7 +1635,8 @@ func encMoeUpMmPrefill(_ cb: MTLCommandBuffer,
                         x: MTLBuffer, W: MTLBuffer, format: GGMLType, Y: MTLBuffer,
                         slotTokenBuf: MTLBuffer, activeExpBuf: MTLBuffer,
                         groupStartBuf: MTLBuffer,
-                        Din: Int, Dout: Int, numSlots: Int, E: Int) {
+                        Din: Int, Dout: Int, numSlots: Int, E: Int,
+                        dispatchArgsBuf: MTLBuffer? = nil) {
     let psoSel: MTLComputePipelineState
     switch format {
     case .q4_K: psoSel = prefillMmIdQ4KSwizPSO
@@ -1632,6 +1644,10 @@ func encMoeUpMmPrefill(_ cb: MTLCommandBuffer,
     case .q8_0: psoSel = prefillMmIdQ80UpSwizPSO   // slot_token-broadcast variant
     case .f16:  psoSel = prefillMmIdF16UpSwizPSO   // slot_token-broadcast variant
     default: fail("encMoeUpMmPrefill: unsupported format \(format)")
+    }
+    // Tier 2: size the grid to actual routing (must precede the matmul encoder).
+    if let ab = dispatchArgsBuf {
+        encMoeWriteDispatchArgs(cb, groupStartBuf: groupStartBuf, argsBuf: ab, Dout: Dout, numSlots: numSlots)
     }
     let enc = cb.makeComputeCommandEncoder()!
     enc.setComputePipelineState(psoSel)
@@ -1645,17 +1661,36 @@ func encMoeUpMmPrefill(_ cb: MTLCommandBuffer,
     enc.setBytes(&kC, length: 4, index: 6)
     enc.setBytes(&nC, length: 4, index: 7)
     enc.setThreadgroupMemoryLength(4096 + 2048 + 4096, index: 0)
-    let gx = (numSlots + 31) / 32
-    let gy = (Dout + 63) / 64
-    enc.dispatchThreadgroups(MTLSize(width: max(gx, 1), height: gy, depth: E),
-                              threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    // A token routes to any given expert AT MOST ONCE, so an expert's group
+    // holds ≤ N = numSlots/TOPK tokens — never numSlots. Sizing the token-tile
+    // grid to N (not numSlots) is an exact TOPK× shrink that can never drop a
+    // slot. (gMoeGxCap is a further experimental clamp; default Int.max = no-op.)
+    if let ab = dispatchArgsBuf {
+        // Tier 2: GPU-sized grid (actual max-per-expert × active experts).
+        enc.dispatchThreadgroups(indirectBuffer: ab, indirectBufferOffset: 0,
+                                  threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    } else {
+        // Tier 1: N-bound — an expert holds ≤ N = numSlots/TOPK tokens.
+        let gx = min(((numSlots / TOPK) + 31) / 32, gMoeGxCap)
+        let gy = (Dout + 63) / 64
+        enc.dispatchThreadgroups(MTLSize(width: max(gx, 1), height: gy, depth: E),
+                                  threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    }
     enc.endEncoding()
 }
+
+// EXPERIMENT (2026-05-28): cap on the worst-case token-tile count for the MoE
+// prefill matmuls. `gx = numSlots/32` assumes one expert could hold ALL routed
+// slots; with balanced routing each expert holds ~numSlots/numActive. Capping
+// gx tests whether the down kernel is overhead-bound on empty-TG launches.
+// Default Int.max = no-op. Set LM_MOE_GX_CAP=N to clamp.
+let gMoeGxCap: Int = ProcessInfo.processInfo.environment["LM_MOE_GX_CAP"].flatMap { Int($0) } ?? Int.max
 
 func encMoeDownMmPrefill(_ cb: MTLCommandBuffer,
                           x: MTLBuffer, W: MTLBuffer, format: GGMLType, Y: MTLBuffer,
                           activeExpBuf: MTLBuffer, groupStartBuf: MTLBuffer,
-                          Din: Int, Dout: Int, numSlots: Int, E: Int) {
+                          Din: Int, Dout: Int, numSlots: Int, E: Int,
+                          dispatchArgsBuf: MTLBuffer? = nil) {
     let psoSel: MTLComputePipelineState
     switch format {
     case .q5_1: psoSel = prefillMmIdQ51SwizPSO
@@ -1663,6 +1698,9 @@ func encMoeDownMmPrefill(_ cb: MTLCommandBuffer,
     case .q8_0: psoSel = prefillMmIdQ80SwizPSO
     case .f16:  psoSel = prefillMmIdF16SwizPSO
     default: fail("encMoeDownMmPrefill: unsupported format \(format)")
+    }
+    if let ab = dispatchArgsBuf {
+        encMoeWriteDispatchArgs(cb, groupStartBuf: groupStartBuf, argsBuf: ab, Dout: Dout, numSlots: numSlots)
     }
     let enc = cb.makeComputeCommandEncoder()!
     enc.setComputePipelineState(psoSel)
@@ -1675,10 +1713,43 @@ func encMoeDownMmPrefill(_ cb: MTLCommandBuffer,
     enc.setBytes(&kC, length: 4, index: 5)
     enc.setBytes(&nC, length: 4, index: 6)
     enc.setThreadgroupMemoryLength(4096 + 2048 + 4096, index: 0)
-    let gx = (numSlots + 31) / 32
-    let gy = (Dout + 63) / 64
-    enc.dispatchThreadgroups(MTLSize(width: max(gx, 1), height: gy, depth: E),
-                              threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    // A token routes to any given expert AT MOST ONCE, so an expert's group
+    // holds ≤ N = numSlots/TOPK tokens — never numSlots. Sizing the token-tile
+    // grid to N (not numSlots) is an exact TOPK× shrink that can never drop a
+    // slot. (gMoeGxCap is a further experimental clamp; default Int.max = no-op.)
+    if let ab = dispatchArgsBuf {
+        enc.dispatchThreadgroups(indirectBuffer: ab, indirectBufferOffset: 0,
+                                  threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    } else {
+        let gx = min(((numSlots / TOPK) + 31) / 32, gMoeGxCap)
+        let gy = (Dout + 63) / 64
+        enc.dispatchThreadgroups(MTLSize(width: max(gx, 1), height: gy, depth: E),
+                                  threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    }
+    enc.endEncoding()
+}
+
+// Emits the MoE-prefill indirect dispatch triple {ceil(maxExpertTokens/32),
+// ceil(Dout/64), activeExperts} from group_start. One tiny dispatch; called
+// internally by the MoE matmuls right before their indirect dispatch so the
+// grid matches the actual routing (no CPU readback, no worst-case padding).
+func encMoeWriteDispatchArgs(_ cb: MTLCommandBuffer, groupStartBuf: MTLBuffer,
+                              argsBuf: MTLBuffer, Dout: Int, numSlots: Int) {
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(moeWriteDispatchArgsPSO)
+    enc.setBuffer(groupStartBuf, offset: 0, index: 0)
+    enc.setBuffer(argsBuf, offset: 0, index: 1)
+    var gy = UInt32((Dout + 63) / 64)
+    enc.setBytes(&gy, length: 4, index: 2)
+    // Structural ceiling on the GPU-computed X (token-tile) axis: a token
+    // routes to each expert at most once, so an expert holds <= numSlots/TOPK
+    // tokens => ceil((numSlots/TOPK)/32) tiles max. Passed so the kernel can
+    // clamp gx and never emit a runaway grid from a bad group_start (the
+    // 2026-05-28 whole-machine-hang RCA — see moe_write_dispatch_args).
+    var gxCap = UInt32(((numSlots / TOPK) + 31) / 32)
+    enc.setBytes(&gxCap, length: 4, index: 3)
+    enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
     enc.endEncoding()
 }
 
@@ -5048,13 +5119,15 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
                            Y: pre_gate_up_fused,
                            slotTokenBuf: pre_slot_token, activeExpBuf: active_exp,
                            groupStartBuf: pre_group_start,
-                           Din: HIDDEN, Dout: MOE_FUSED_DOUT, numSlots: NS, E: E_EXP)
+                           Din: HIDDEN, Dout: MOE_FUSED_DOUT, numSlots: NS, E: E_EXP,
+                           dispatchArgsBuf: pre_moe_dispatch_args)
         encMoeGeluMulFused(cb, fused: pre_gate_up_fused, out: pre_gate_proj,
                             N_half: MOE_INT, numSlots: NS)
         encMoeDownMmPrefill(cb, x: pre_gate_proj, W: lw.moeDown, format: lw.moeDownFormat,
                              Y: pre_moe_down_out,
                              activeExpBuf: active_exp, groupStartBuf: pre_group_start,
-                             Din: MOE_INT, Dout: HIDDEN, numSlots: NS, E: E_EXP)
+                             Din: MOE_INT, Dout: HIDDEN, numSlots: NS, E: E_EXP,
+                             dispatchArgsBuf: pre_moe_dispatch_args)
         encMoeCombineWriteInto(cb, moeOut: pre_moe_down_out, batchSlots: pre_batch_slots,
                                 gateW: pre_gate_w, outBuf: pre_moe_sum, numVecs: N)
         encRMSNormG(cb, x: pre_moe_sum, gammaBuf: lw.postFfn2Norm, out: pre_moe_sum,
@@ -5420,13 +5493,15 @@ func encodeOnePrefillLayerSplit(_ w: LmWeights, L: Int, qLen: Int, sslot: Int) {
                            Y: pre_gate_up_fused,
                            slotTokenBuf: pre_slot_token, activeExpBuf: active_exp,
                            groupStartBuf: pre_group_start,
-                           Din: HIDDEN, Dout: MOE_FUSED_DOUT, numSlots: NS, E: E_EXP)
+                           Din: HIDDEN, Dout: MOE_FUSED_DOUT, numSlots: NS, E: E_EXP,
+                           dispatchArgsBuf: pre_moe_dispatch_args)
         encMoeGeluMulFused(cb, fused: pre_gate_up_fused, out: pre_gate_proj,
                             N_half: MOE_INT, numSlots: NS)
         encMoeDownMmPrefill(cb, x: pre_gate_proj, W: lw.moeDown, format: lw.moeDownFormat,
                              Y: pre_moe_down_out,
                              activeExpBuf: active_exp, groupStartBuf: pre_group_start,
-                             Din: MOE_INT, Dout: HIDDEN, numSlots: NS, E: E_EXP)
+                             Din: MOE_INT, Dout: HIDDEN, numSlots: NS, E: E_EXP,
+                             dispatchArgsBuf: pre_moe_dispatch_args)
         encMoeCombineWriteInto(cb, moeOut: pre_moe_down_out, batchSlots: pre_batch_slots,
                                 gateW: pre_gate_w, outBuf: pre_moe_sum, numVecs: N)
         encRMSNormG(cb, x: pre_moe_sum, gammaBuf: lw.postFfn2Norm, out: pre_moe_sum,
@@ -5569,13 +5644,15 @@ func encodeOnePrefillLayer(_ cb: MTLCommandBuffer, _ w: LmWeights, L: Int, qLen:
                        Y: pre_gate_up_fused,
                        slotTokenBuf: pre_slot_token, activeExpBuf: active_exp,
                        groupStartBuf: pre_group_start,
-                       Din: HIDDEN, Dout: MOE_FUSED_DOUT, numSlots: NS, E: E_EXP)
+                       Din: HIDDEN, Dout: MOE_FUSED_DOUT, numSlots: NS, E: E_EXP,
+                       dispatchArgsBuf: pre_moe_dispatch_args)
     encMoeGeluMulFused(cb, fused: pre_gate_up_fused, out: pre_gate_proj,
                         N_half: MOE_INT, numSlots: NS)
     encMoeDownMmPrefill(cb, x: pre_gate_proj, W: lw.moeDown, format: lw.moeDownFormat,
                          Y: pre_moe_down_out,
                          activeExpBuf: active_exp, groupStartBuf: pre_group_start,
-                         Din: MOE_INT, Dout: HIDDEN, numSlots: NS, E: E_EXP)
+                         Din: MOE_INT, Dout: HIDDEN, numSlots: NS, E: E_EXP,
+                         dispatchArgsBuf: pre_moe_dispatch_args)
     encMoeCombineWriteInto(cb, moeOut: pre_moe_down_out, batchSlots: pre_batch_slots,
                             gateW: pre_gate_w, outBuf: pre_moe_sum, numVecs: N)
     encRMSNormG(cb, x: pre_moe_sum, gammaBuf: lw.postFfn2Norm, out: pre_moe_sum,
