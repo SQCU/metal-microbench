@@ -928,7 +928,7 @@ private func _kickVisionDispatch(weights: VisionWeights) {
     visionCB.commit()
 }
 
-internal func ensureCachedSofts(data: Data) -> CachedSofts? {
+internal func ensureCachedSofts(data: Data, deferKick: Bool = false) -> CachedSofts? {
     // Hash outside any lock — SHA-256 on ~10–200 KB is microseconds and
     // has no shared state.
     let hash = SHA256.hash(data: data)
@@ -1003,16 +1003,40 @@ internal func ensureCachedSofts(data: Data) -> CachedSofts? {
     _installCachedSofts(hashData: hashData, entry: entry)
 
     let pending = VisionBatchPending(batch: batch, entry: entry)
-    let shouldKick: Bool
+    var shouldKick = false
     gVisionBatchLock.lock()
     gVisionBatchPending.append(pending)
-    shouldKick = !gVisionBatchInFlight
-    if shouldKick { gVisionBatchInFlight = true }
+    // deferKick=true: enqueue only, let the caller fire one kick after ALL of a
+    // request's images are enqueued, so _kickVisionDispatch drains them into a
+    // single B=N forward (true batch isolation via the vision kernels' grid.z +
+    // per-slot regions) instead of one serial B=1 forward per image sharing the
+    // global scratch pool — the multimodal-batch regression.
+    if !deferKick && !gVisionBatchInFlight { gVisionBatchInFlight = true; shouldKick = true }
     gVisionBatchLock.unlock()
     if shouldKick {
         _kickVisionDispatch(weights: visWeights)
     }
     return entry
+}
+
+// Kick a batched vision forward iff none is in flight and images are pending.
+// The batch submit path enqueues all of a request's images with
+// ensureCachedSofts(deferKick: true), then calls this exactly once so they
+// coalesce into ONE B=N forward. Concurrent requests whose images arrive while
+// a forward is in flight are drained by that forward's completion-handler
+// re-kick — also batched.
+internal func kickVisionDispatchIfIdle() {
+    gResidencyLock.lock()
+    let w = gVisionResidency?.weights
+    gResidencyLock.unlock()
+    guard let weights = w else { return }
+    var shouldKick = false
+    gVisionBatchLock.lock()
+    if !gVisionBatchInFlight && !gVisionBatchPending.isEmpty {
+        gVisionBatchInFlight = true; shouldKick = true
+    }
+    gVisionBatchLock.unlock()
+    if shouldKick { _kickVisionDispatch(weights: weights) }
 }
 
 @_cdecl("gemma_vision_cache_entries")

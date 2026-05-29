@@ -57,6 +57,14 @@ private var gIntakeQueue: [DecodedStream] = []
 // Protected by gEngineLock (applyStreamAction runs under it; gemma_poll
 // also holds it). 2026-05-13: added with admission backpressure.
 private var gRejectedAdmissions: [(streamId: UInt64, reason: String)] = []
+// RCA-1 note (no code change): the audit flagged a cancel-before-bind race
+// where a cancel (action=2) could orphan a not-yet-bound session. On review
+// it's NOT live: the bridge queues start (action=0) and cancel into the SAME
+// FIFO gIntakeQueue, so the start always binds before the cancel is drained.
+// A `case 2` with an unbound sid is therefore a cancel-after-close (late
+// client disconnect) — silently returning is correct; recording it would leak
+// sids unboundedly. The bridge-side "fire-and-forget cancel + premature state
+// release" is benign because closeSession is synchronous within the drain.
 // 2026-05-06: lock removal attempted, reverted after bisect — the
 // bridge wedged after admission burst when gemma_poll ran without
 // gEngineLock held across the drive loop. Some path in the engine
@@ -468,6 +476,16 @@ private func applyStreamAction(_ stream: DecodedStream, engine: LmEngine) {
             default: return nil
             }
         }
+        // True vision batching: enqueue ALL of this request's images up front
+        // (deferKick) then fire one kick, so the vision tower runs a single
+        // B=N forward (batch-isolated by grid.z) instead of N serial B=1
+        // forwards sharing the global scratch pool. submitImageSegment below
+        // then hits the cache for each. (Multimodal-batch regression fix.)
+        let imgs0 = stream.segments.compactMap { $0.kind == 1 ? $0.imageBytes : nil }
+        if imgs0.count > 1 {
+            for d in imgs0 { _ = ensureCachedSofts(data: d, deferKick: true) }
+            kickVisionDispatchIfIdle()
+        }
         let admitted = engine.submitRequest(streamId: sid, init: initParams,
                                              segments: segs,
                                              imageSubmit: { s, bytes in
@@ -487,6 +505,13 @@ private func applyStreamAction(_ stream: DecodedStream, engine: LmEngine) {
         guard let s = engine.requestForStream[sid] else {
             print("  [batch_ffi] continue on unknown stream_id \(sid); ignored")
             return
+        }
+        // Same true-batching coalesce as the start path (continue may also
+        // carry multiple images).
+        let imgs1 = stream.segments.compactMap { $0.kind == 1 ? $0.imageBytes : nil }
+        if imgs1.count > 1 {
+            for d in imgs1 { _ = ensureCachedSofts(data: d, deferKick: true) }
+            kickVisionDispatchIfIdle()
         }
         for seg in stream.segments {
             switch seg.kind {
@@ -515,6 +540,9 @@ private func applyStreamAction(_ stream: DecodedStream, engine: LmEngine) {
             s.addControl(c)
         }
     case 2: // cancel
+        // Unbound sid here = cancel-after-close (late disconnect); silently
+        // ignore. See the RCA-1 note at gRejectedAdmissions for why there is
+        // no cancel-before-bind race to guard against (FIFO intake ordering).
         guard let s = engine.requestForStream[sid] else { return }
         engine.closeSession(s)  // also unbinds streamId
     case 3: // touch — re-apply policy without new tokens (same code as continue without submit)
@@ -1474,6 +1502,14 @@ public func gemma_engine_state(_ outBuf: UnsafeMutablePointer<UInt8>?,
 // Idempotent: safe to call multiple times.
 @_cdecl("gemma_shutdown")
 public func gemma_shutdown() -> Int32 {
+    // Take gEngineLock so we cannot free pages / drop the engine while a
+    // concurrent gemma_poll is mid-syncTickStep with a committed CB still
+    // referencing those pages (use-after-free during teardown — e.g. the
+    // pkill-serve.py path in the ops notes). Every other engine entry point
+    // (poll, status) holds this lock; shutdown previously did not.
+    // page_lifecycle_audit_2026-05-28 #5.
+    gEngineLock.lock()
+    defer { gEngineLock.unlock() }
     if let engine = gEngine {
         // closeSession unbinds the streamId; iterate on a snapshot of
         // values to avoid mutating the dict mid-iteration.

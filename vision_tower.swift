@@ -958,7 +958,16 @@ private final class VisionScratchPool {
             posXBuf        = device.makeBuffer(length: BN * 4,    options: .storageModeShared)!
             paddingMaskBuf = device.makeBuffer(length: BN,        options: .storageModeShared)!
             patchesBuf     = device.makeBuffer(length: BN * 768 * 2, options: .storageModeShared)!
-            capBN = BN
+            // DO NOT set capBN here. The three buffer-group checks below
+            // ("BN > capBN || ...") MUST see the OLD capBN so a batch-size
+            // growth (B=1 -> B=2, i.e. BN: N -> 2N at unchanged h/interm)
+            // also resizes x/tmp/q/k/v/attnOut/mlpOut/postNorm/gateAct/upAct.
+            // A premature `capBN = BN` here (the 2026-05 regression) made
+            // BN>capBN false for those groups, so at B=2 they stayed sized for
+            // BN=N while the forward wrote 2N rows -> out-of-bounds GPU writes
+            // every layer -> vision CB faults/hangs (~30-55s stall, the
+            // batched-vision regression). capBN is updated exactly once, last
+            // (see end of func).
         }
         // Buffers scaling with BN*h (resize on either growth).
         if BN > capBN || h != capH {
