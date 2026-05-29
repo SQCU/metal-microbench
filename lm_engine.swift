@@ -1189,9 +1189,19 @@ final class Session {
         // We only want the *new* portion past what we've already adopted.
         let alreadyAdoptedTokens = beforeAdopted * PAGE_SLIDE
         let alignedMatch = match.alignedMatchLength
-        guard alignedMatch >= alreadyAdoptedTokens else {
-            // Nothing new. (Possible if the trie was trimmed by eviction
-            // since the last call; we don't regress already-adopted pages.)
+        guard alignedMatch >= alreadyAdoptedTokens,
+              beforeAdopted <= match.pages.count else {
+            // Nothing new, OR the trie was trimmed by eviction since the last
+            // probe so it now returns FEWER full pages than we've already
+            // adopted (beforeAdopted > match.pages.count). The original guard
+            // compared only aligned TOKENS (alignedMatchLength), which can
+            // exceed match.pages.count*PAGE_SLIDE when the cvec-tag filter drops
+            // matched pages — so `for i in beforeAdopted..<match.pages.count`
+            // below forms an invalid Range (lowerBound > upperBound) and traps
+            // (EXC_BREAKPOINT, observed crashing the server under sustained deep
+            // multimodal refinement at high cache-hit/eviction pressure,
+            // 2026-05-29). Don't regress already-adopted pages; adopt nothing
+            // new on this probe.
             return (0, 0)
         }
         // Adopt the new full pairs.
