@@ -840,6 +840,33 @@ private var gVisionBatchPending: [VisionBatchPending] = []
 // the post-CB queue drain finds nothing left to do.
 private var gVisionBatchInFlight: Bool = false
 
+// Cross-request coalescing window. When the first image of a burst arrives
+// and no forward is running, we arm a short timer instead of dispatching
+// immediately. Any images that arrive within the window — within ONE request
+// OR across SEPARATE concurrent requests (a fan-out of agents / judge renders
+// that don't land in the same microsecond) — accumulate in gVisionBatchPending
+// and fuse into a SINGLE B=N vision forward (batch-isolated by the vision
+// kernels' grid.z + per-slot regions). gVisionKickScheduled (guarded by
+// gVisionBatchLock) ensures exactly one timer is armed per burst.
+private let gVisionWindowQueue = DispatchQueue(label: "vision.batch.window")
+private var gVisionKickScheduled: Bool = false
+private let gVisionBatchWindowMs: Int =
+    ProcessInfo.processInfo.environment["LM_VISION_BATCH_WINDOW_MS"].flatMap { Int($0) } ?? 4
+
+// Deferred-drain target: fires when the coalescing window elapses. Promotes
+// the accumulated pending set into one in-flight forward (if none is already
+// running — otherwise the running forward's completion handler will drain it).
+private func _drainAndKickVision(weights: VisionWeights) {
+    var go = false
+    gVisionBatchLock.lock()
+    gVisionKickScheduled = false
+    if !gVisionBatchInFlight && !gVisionBatchPending.isEmpty {
+        gVisionBatchInFlight = true; go = true
+    }
+    gVisionBatchLock.unlock()
+    if go { _kickVisionDispatch(weights: weights) }
+}
+
 private func _installCachedSofts(hashData: Data, entry: CachedSofts) {
     gVisionCacheLock.lock()
     gVisionCache[hashData] = entry
@@ -928,7 +955,7 @@ private func _kickVisionDispatch(weights: VisionWeights) {
     visionCB.commit()
 }
 
-internal func ensureCachedSofts(data: Data, deferKick: Bool = false) -> CachedSofts? {
+internal func ensureCachedSofts(data: Data) -> CachedSofts? {
     // Hash outside any lock — SHA-256 on ~10–200 KB is microseconds and
     // has no shared state.
     let hash = SHA256.hash(data: data)
@@ -1003,40 +1030,24 @@ internal func ensureCachedSofts(data: Data, deferKick: Bool = false) -> CachedSo
     _installCachedSofts(hashData: hashData, entry: entry)
 
     let pending = VisionBatchPending(batch: batch, entry: entry)
-    var shouldKick = false
+    var armWindow = false
     gVisionBatchLock.lock()
     gVisionBatchPending.append(pending)
-    // deferKick=true: enqueue only, let the caller fire one kick after ALL of a
-    // request's images are enqueued, so _kickVisionDispatch drains them into a
-    // single B=N forward (true batch isolation via the vision kernels' grid.z +
-    // per-slot regions) instead of one serial B=1 forward per image sharing the
-    // global scratch pool — the multimodal-batch regression.
-    if !deferKick && !gVisionBatchInFlight { gVisionBatchInFlight = true; shouldKick = true }
+    // Arm the coalescing window iff no forward is running AND no timer is
+    // already pending for this burst. Images arriving within the window
+    // (same request or separate concurrent requests) accumulate and fuse
+    // into one B=N forward when the timer fires. If a forward IS in flight,
+    // we just enqueue — its completion handler drains us (already batched).
+    if !gVisionBatchInFlight && !gVisionKickScheduled {
+        gVisionKickScheduled = true; armWindow = true
+    }
     gVisionBatchLock.unlock()
-    if shouldKick {
-        _kickVisionDispatch(weights: visWeights)
+    if armWindow {
+        gVisionWindowQueue.asyncAfter(deadline: .now() + .milliseconds(gVisionBatchWindowMs)) {
+            _drainAndKickVision(weights: visWeights)
+        }
     }
     return entry
-}
-
-// Kick a batched vision forward iff none is in flight and images are pending.
-// The batch submit path enqueues all of a request's images with
-// ensureCachedSofts(deferKick: true), then calls this exactly once so they
-// coalesce into ONE B=N forward. Concurrent requests whose images arrive while
-// a forward is in flight are drained by that forward's completion-handler
-// re-kick — also batched.
-internal func kickVisionDispatchIfIdle() {
-    gResidencyLock.lock()
-    let w = gVisionResidency?.weights
-    gResidencyLock.unlock()
-    guard let weights = w else { return }
-    var shouldKick = false
-    gVisionBatchLock.lock()
-    if !gVisionBatchInFlight && !gVisionBatchPending.isEmpty {
-        gVisionBatchInFlight = true; shouldKick = true
-    }
-    gVisionBatchLock.unlock()
-    if shouldKick { _kickVisionDispatch(weights: weights) }
 }
 
 @_cdecl("gemma_vision_cache_entries")
