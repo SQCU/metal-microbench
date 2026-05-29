@@ -152,10 +152,14 @@ if let ggufPath = ProcessInfo.processInfo.environment["GGUF_VALIDATE"] {
 // past the FFI to drive the engine's openSession/submit/closeSession
 // internal lifecycle, freezing the bad two-phase API. Both were
 // deleted under the user mandate "test files which freeze bad api
-// contracts are bad tests." Equivalent coverage is now exercised
-// through the batch FFI (server/test_batch_ffi*.py): cache reuse is
-// verified end-to-end via cache_hits/cache_misses counters returned
-// in the StreamUpdate wire format.
+// contracts are bad tests."
+// 2026-05-28: the below-the-bridge Python FFI tests that replaced them
+// (server/test_batch_ffi*.py et al.) were ALSO deleted — driving the
+// engine directly bypasses bridge.py's text processing (turn-marker
+// stripping, chat templating) and yields misleading raw output. All
+// engine coverage now runs THROUGH the bridge; cache reuse is verified
+// end-to-end via cache_hits/cache_misses surfaced on the bridge's
+// streaming response.
 } // end runEnvDrivenDemos
 
 // Run all the one-time top-level side effects (banners + active_exp fill)
