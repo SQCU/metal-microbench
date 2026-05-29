@@ -1230,59 +1230,45 @@ final class Session {
         // the old direct-incref behavior for A/B comparison.
         var newPartialAdopted = 0
         if let pp = match.partialTail {
-            let cowDisabled = ProcessInfo.processInfo.environment["LM_PARTIAL_COW_DISABLE"] != nil
-            if cowDisabled {
-                // Legacy direct-incref behavior (race-unsafe on concurrent extends).
-                engine.pageManager.incref(physPage: pp.slidePlusFullHead)
-                ownedPages.append(pp.slidePlusFullHead)
-                if let ft = pp.fullTail {
-                    engine.pageManager.incref(physPage: ft)
-                    ownedPages.append(ft)
-                } else {
-                    do {
-                        let fresh = try engine.pageManager.allocFresh()
-                        engine.zeroPhysPageKV(fresh)
-                        ownedPages.append(fresh)
-                    } catch {
-                        engine.pageManager.decref(physPage: pp.slidePlusFullHead)
-                        ownedPages.removeLast()
-                        return (newAlignedAdopted, newAlignedAdopted)
-                    }
-                }
-                newPartialAdopted = pp.validUpTo
-            } else {
-                // CoW path: allocate fresh pair, copy bytes from partial.
-                let freshHead: Int
-                let freshTail: Int
-                do {
-                    freshHead = try engine.pageManager.allocFresh()
-                    engine.zeroPhysPageKV(freshHead)
-                    freshTail = try engine.pageManager.allocFresh()
-                    engine.zeroPhysPageKV(freshTail)
-                } catch {
-                    // Couldn't allocate fresh pages; abandon the partial
-                    // (we already have the full-aligned pages above).
-                    return (newAlignedAdopted, newAlignedAdopted)
-                }
-                // Copy K/V bytes for [0, PAGE_SLIDE) worth of rows
-                // (whole-page copy; positions past validUpTo are either
-                // producer-written-but-soon-overwritten or zero).
-                engine.copyPhysPageKV(srcPhys: pp.slidePlusFullHead,
-                                       dstPhys: freshHead)
-                if let ft = pp.fullTail {
-                    engine.copyPhysPageKV(srcPhys: ft, dstPhys: freshTail)
-                }
-                // Note: we do NOT decref the original partial pages —
-                // the producer (via PageManager.contentIndex / trie
-                // anchor) still holds them; they remain adoptable for
-                // future consumers.
-                ownedPages.append(freshHead)
-                ownedPages.append(freshTail)
-                newPartialAdopted = pp.validUpTo
-                if dbg {
-                    print("  [cache] session \(id) partial-CoW: head \(pp.slidePlusFullHead)→\(freshHead), "
-                          + "tail \(pp.fullTail.map(String.init) ?? "nil")→\(freshTail), validUpTo=\(pp.validUpTo)")
-                }
+            // Always copy-on-write the partial tail: allocate a fresh pair and
+            // copy the partial's K/V bytes, so the consumer never writes into a
+            // page the producer's trie anchor still shares read-only. The old
+            // LM_PARTIAL_COW_DISABLE direct-incref hatch was a confirmed
+            // cross-session-corruption soundness hole — removed 2026-05-28
+            // (docs/page_lifecycle_audit_2026-05-28.md #3).
+            let freshHead: Int
+            do {
+                freshHead = try engine.pageManager.allocFresh()
+                engine.zeroPhysPageKV(freshHead)
+            } catch {
+                // No fresh page; abandon the partial (full-aligned pages kept).
+                return (newAlignedAdopted, newAlignedAdopted)
+            }
+            let freshTail: Int
+            do {
+                freshTail = try engine.pageManager.allocFresh()
+                engine.zeroPhysPageKV(freshTail)
+            } catch {
+                // Leak fix (#1): freshHead is at refcount=1 but not yet in
+                // ownedPages; decref it before bailing or it leaks for the
+                // engine's lifetime — and this fires exactly under the pool
+                // pressure that threw the second alloc.
+                engine.pageManager.decref(physPage: freshHead)
+                return (newAlignedAdopted, newAlignedAdopted)
+            }
+            // Whole-page copy; rows past validUpTo are producer-written-but-
+            // soon-overwritten or zero. Producer keeps its pages (still
+            // adoptable via the trie anchor); we do not decref them.
+            engine.copyPhysPageKV(srcPhys: pp.slidePlusFullHead, dstPhys: freshHead)
+            if let ft = pp.fullTail {
+                engine.copyPhysPageKV(srcPhys: ft, dstPhys: freshTail)
+            }
+            ownedPages.append(freshHead)
+            ownedPages.append(freshTail)
+            newPartialAdopted = pp.validUpTo
+            if dbg {
+                print("  [cache] session \(id) partial-CoW: head \(pp.slidePlusFullHead)→\(freshHead), "
+                      + "tail \(pp.fullTail.map(String.init) ?? "nil")→\(freshTail), validUpTo=\(pp.validUpTo)")
             }
             // Don't bump myPromotedSlidePairCount — the partial isn't a full page
             // yet from this session's perspective.
@@ -1609,6 +1595,14 @@ final class LmEngine {
     // bridge handles all client/consumer disconnect logic on its side
     // and the engine continues regardless. See Session.lastForwardProgressAt.
     static let engineProgressDeadline: TimeInterval = 60.0
+    // RCA-2: minimum forward-progress RATE a wantsSlot session must sustain
+    // over engineProgressDeadline to avoid being reaped. The old reaper
+    // refreshed its deadline on ANY position advance, so a session crawling
+    // (e.g. paging-bound at ~0.2 tok/s) refreshed every pass and was NEVER
+    // reaped. A healthy stream sustains far more than this even under 16-way
+    // batch load (~135 tok/s aggregate ⇒ ~8 tok/s/stream), so this floor only
+    // catches genuinely-wedged sessions, never legitimate slow work.
+    static let minProgressTokPerSec: Double = 0.25
 
     /// Reap sessions whose forward progress has stalled. A session is
     /// stalled when it is in .priming or .generating AND its
@@ -1652,14 +1646,24 @@ final class LmEngine {
             // sessions get caught by the FFI pump's straggler sweep
             // below — see ffi_batch.swift's gemma_poll cleanup.
             guard s.state.wantsSlot else { continue }
-            if s.position > s.lastSeenPosition {
-                // Forward progress — refresh snapshot.
+            let stalled = now.timeIntervalSince(s.lastForwardProgressAt)
+            if stalled <= deadline {
+                continue   // measurement window not yet elapsed
+            }
+            // Window elapsed. RCA-2: the old code refreshed the deadline on
+            // ANY position advance, so a glacial session (e.g. ~1 tok/5s under
+            // host memory pressure) refreshed every pass and was NEVER reaped.
+            // Instead require a MINIMUM advance over the whole window — a
+            // sustained-rate floor. Healthy streams clear it by orders of
+            // magnitude; only genuinely-wedged (sub-floor) sessions are reaped.
+            let advanced = s.position - s.lastSeenPosition
+            let minAdvance = max(1, Int(deadline * LmEngine.minProgressTokPerSec))
+            if advanced >= minAdvance {
                 s.lastSeenPosition = s.position
                 s.lastForwardProgressAt = now
                 continue
             }
-            let stalled = now.timeIntervalSince(s.lastForwardProgressAt)
-            if stalled > deadline {
+            do {
                 print("[engine] expireStalledSessions: "
                     + "sid=\(s.streamId) state=\(s.state) "
                     + "stalled=\(Int(stalled))s position=\(s.position) "
@@ -1786,13 +1790,33 @@ final class LmEngine {
         // full-attention layers, which use PAGE_FULL=8 while slide uses
         // PAGE_SLIDE=16.
         let needed = (kLen + PAGE_FULL - 1) / PAGE_FULL
+        if needed > MAX_PAGES_PER_SLOT {
+            s.state = .done
+            s.doneReason = 3
+            s.errMsg = "context length \(kLen) exceeds engine block-table capacity "
+                + "\(MAX_PAGES_PER_SLOT * PAGE_FULL) tokens "
+                + "(\(MAX_PAGES_PER_SLOT) pages at PAGE_FULL=\(PAGE_FULL)); "
+                + "reduce prompt plus max_tokens"
+            print("  ensurePages: context overflow for session \(s.id): "
+                + "kLen=\(kLen), neededPages=\(needed), "
+                + "maxPages=\(MAX_PAGES_PER_SLOT)")
+            return false
+        }
         while s.ownedPages.count < needed {
             do {
                 let p = try pageManager.allocFresh()
                 zeroPhysPageKV(p)
                 s.ownedPages.append(p)
             } catch {
-                print("  ensurePages: pool exhausted for session \(s.id) at logical page \(s.ownedPages.count)")
+                s.state = .done
+                s.doneReason = 3
+                s.errMsg = "KV page pool exhausted while growing context "
+                    + "for stream_id=\(s.streamId) at page "
+                    + "\(s.ownedPages.count)/\(needed); retry with fewer "
+                    + "concurrent requests or a shorter prompt"
+                print("  ensurePages: pool exhausted for session \(s.id) "
+                    + "at logical page \(s.ownedPages.count) "
+                    + "(needed=\(needed), free=\(pageManager.stats().freePages))")
                 return false
             }
         }
@@ -2147,25 +2171,22 @@ final class LmEngine {
                 // which is the prefix that B's lookup will match against
                 // (B submits its own prefix; trie finds anchor at that depth).
                 let trieDepth = pageStart + partialValid
-                // Register pair with PageManager so contentIndex prevents
-                // premature eviction. Synthetic hash so identical-prefix
-                // partials dedupe across sessions.
                 let synthHash = PageManager.hashPage(
                     s.consumedTokens[0..<trieDepth],
                     cvecDigest: s.cvecDigestForPage(pageStart: pageStart,
                                                      pageSize: partialValid))
-                if let fs = fullSib {
-                    pageManager.markPairContentIndexed(slidePlusFullHead: slidePrim,
-                                                       fullTail: fs,
-                                                       contentHash: synthHash)
-                }
                 let partial = PartialPagePair(
                     slidePlusFullHead: slidePrim,
                     fullTail: (partialValid > PAGE_FULL) ? fullSib : nil,
                     validUpTo: partialValid)
-                prefixTrie.insertPartialAnchor(
+                let inserted = prefixTrie.insertPartialAnchor(
                     tokensCoveringFullPrefix: s.consumedTokens[0..<trieDepth],
                     pair: partial, cvecTag: tag)
+                if inserted, let fs = fullSib {
+                    pageManager.markPairContentIndexed(slidePlusFullHead: slidePrim,
+                                                       fullTail: fs,
+                                                       contentHash: synthHash)
+                }
             }
         }
         // 2026-05-07 (anonymous-pool refactor): caller (this session) is
@@ -2214,20 +2235,23 @@ final class LmEngine {
                                              cvecDigest: digest)
             let pair = SlidePairContents(slidePlusFullHead: s.ownedPages[slideIdx],
                                        fullTail: s.ownedPages[fullIdx])
-            // Followup 3 (2026-05-23): contentIndex deleted; only the
-            // PageInfo bookkeeping (so the eviction callback knows the
-            // pair partner) survives. The radix trie below is the
-            // source of truth for adoption lookups.
-            pageManager.markPairContentIndexed(slidePlusFullHead: pair.slidePlusFullHead,
-                                                fullTail: pair.fullTail,
-                                                contentHash: hash)
             // Track D: insert into the radix trie. The trie is the
             // source-of-truth for adoption lookups.
             let tag = s.cvecAnchorTagForPage(pageStart: pageStart,
                                               pageSize: PAGE_SLIDE)
-            prefixTrie.insertAnchor(
+            let inserted = prefixTrie.insertAnchor(
                 tokensCoveringFullPrefix: s.consumedTokens[0..<end],
                 pair: pair, cvecTag: tag)
+            if inserted {
+                // Followup 3 (2026-05-23): contentIndex deleted; only the
+                // PageInfo bookkeeping (so the eviction callback knows the
+                // pair partner) survives. Do not mark duplicate pages for
+                // an existing trie anchor; they are not reachable by lookup.
+                pageManager.markPairContentIndexed(
+                    slidePlusFullHead: pair.slidePlusFullHead,
+                    fullTail: pair.fullTail,
+                    contentHash: hash)
+            }
             if ProcessInfo.processInfo.environment["LM_CACHE_DEBUG"] != nil {
                 let head = s.consumedTokens[pageStart..<end].prefix(4).map(String.init).joined(separator: ",")
                 print("  [cache] session \(s.id) PROMOTE page \(p) hash=\(String(hash, radix: 16, uppercase: false)) head=[\(head),…]")
@@ -3243,7 +3267,31 @@ final class LmEngine {
             precondition(isFp32, "softTokens fp16 path not yet ported to GPU copy")
             let preCB = queue.makeCommandBuffer()!
             if eventTicket > 0 {
-                preCB.encodeWaitForEvent(gVisionEvent, value: eventTicket)
+                // RCA-3 follow-up (2026-05-29): bound this wait exactly like
+                // prepareSoftPrefill (the multi-slot sibling). The original
+                // code encoded an UNBOUNDED GPU encodeWaitForEvent(eventTicket)
+                // here, then CPU-blocked in the prefill cb.waitUntilCompleted()
+                // under gEngineLock. If the vision ticket never signals (e.g.
+                // the vision-tower CB for a fresh image never completes), the
+                // whole engine deadlocks FOREVER — observed on a serial,
+                // single-stream 2-image judge request (the candidate-render
+                // image misses the cache, reserves a ticket, and the consumer
+                // waited on it forever). The earlier RCA-3 fix bounded only the
+                // multi-slot path and wrongly cited ffi.swift:584 as "the
+                // single-slot path [that] already bounds its wait" — but :584 is
+                // gemma_vision_fetch_softs_by_key, an unrelated CPU read API.
+                // THIS (prepareSinglePrefill) is the real single-slot consumer.
+                // Bound it: CPU-wait with a timeout, add the GPU wait only if it
+                // actually signaled, else mark the ticket failed so
+                // processFailedVisionSessions retires this session and the
+                // engine makes forward progress instead of wedging.
+                let signaled = gVisionEvent.wait(untilSignaledValue: eventTicket, timeoutMS: 30_000)
+                if signaled {
+                    preCB.encodeWaitForEvent(gVisionEvent, value: eventTicket)
+                } else {
+                    FileHandle.standardError.write(Data("[engine] WARN: single-slot vision softs ticket \(eventTicket) not signaled within 30s — proceeding without GPU wait, failing the session (suspected vision-dispatch stall, RCA-3 follow-up)\n".utf8))
+                    markVisionTicketFailed(eventTicket)
+                }
             }
             encVisionSoftsCopyFp32(preCB, src: buf, srcByteOffset: byteOffset,
                                     dst: pre_hidden, dstSlot: sslot, qLen: thisTile)
@@ -4140,8 +4188,21 @@ final class LmEngine {
         for s in slotSession {
             if let s = s, s.pendingPrimingTokenCount == qLen { anyOnFinalTick = true; break }
         }
+        // RCA 2026-05-28: narrow the dispatch to the ACTIVE slots. This path
+        // defaulted numActiveRows=-1 → full B*qLen, so the MoE (the dominant
+        // prefill stage) ran over all 8 slots even for a lone request — an ~8×
+        // penalty and the bulk of the bridge↔forward_graph prefill gap (the
+        // single-slot path at the activeB-aware site already narrows; this
+        // multi-slot path didn't). Active sessions are packed from slot 0
+        // (same as the AR-decode activeB dispatch), so rows [0, activeB*qLen)
+        // cover every active slot; any nil slot below the top computes
+        // discarded rows. activeB*qLen ∈ [qLen, B*qLen], multiple of qLen.
+        var activeB = 0
+        for (slot, s) in slotSession.enumerated() where s != nil { activeB = slot + 1 }
+        if activeB == 0 { activeB = 1 }
         let cb = buildPrefillCB(weights, qLen: qLen, skipEmbed: false,
-                                 skipUnembed: !anyOnFinalTick)
+                                 skipUnembed: !anyOnFinalTick,
+                                 numActiveRows: activeB * qLen)
         return PreparedMultiPrefill(cb: cb, qLen: qLen,
                                      slotSession: slotSession, slotTokens: slotTokens)
     }
@@ -4293,7 +4354,24 @@ final class LmEngine {
         for (_, sr) in slotSoft { maxTicket = max(maxTicket, sr.eventTicket) }
         let preCB = queue.makeCommandBuffer()!
         if maxTicket > 0 {
-            preCB.encodeWaitForEvent(gVisionEvent, value: maxTicket)
+            // RCA-3 ("the wacky deadlock"): this used an UNBOUNDED GPU
+            // encodeWaitForEvent(maxTicket), then CPU-blocked in
+            // cb.waitUntilCompleted() under gEngineLock. If the staged vision
+            // dispatch wedges (the suspected B≈8 multimodal stall — tickets
+            // 2..N are dispatched only by the first vision CB's completion
+            // handler), the whole engine hangs forever. The single-slot path
+            // already bounds its wait (ffi.swift:584); mirror it here: wait
+            // CPU-side with a timeout, add the GPU wait only if the ticket
+            // actually signaled, and on timeout fail the affected slots
+            // (caught by processFailedVisionSessions) so the engine makes
+            // forward progress instead of deadlocking.
+            let signaled = gVisionEvent.wait(untilSignaledValue: maxTicket, timeoutMS: 30_000)
+            if signaled {
+                preCB.encodeWaitForEvent(gVisionEvent, value: maxTicket)
+            } else {
+                FileHandle.standardError.write(Data("[engine] WARN: multi-slot vision softs ticket \(maxTicket) not signaled within 30s — proceeding without GPU wait, failing affected slots (suspected vision-dispatch stall, RCA-3)\n".utf8))
+                for (_, sr) in slotSoft { markVisionTicketFailed(sr.eventTicket) }
+            }
         }
         var ingestSlots: [VisionSoftsIngestSlot] = []
         for b in 0..<B {
@@ -4338,8 +4416,15 @@ final class LmEngine {
         for s in softSessionSlots {
             if let s = s, s.pendingPrimingTokenCount == qLen { anyOnFinalTick = true; break }
         }
+        // RCA 2026-05-28: narrow to active slots (same fix as the text
+        // multi-slot prefill above) — the soft/vision multi-slot prefill also
+        // defaulted to full B*qLen, running the MoE over all 8 slots.
+        var activeB = 0
+        for (slot, s) in softSessionSlots.enumerated() where s != nil { activeB = slot + 1 }
+        if activeB == 0 { activeB = 1 }
         let cb = buildPrefillCB(weights, qLen: qLen, skipEmbed: true,
-                                 skipUnembed: !anyOnFinalTick)
+                                 skipUnembed: !anyOnFinalTick,
+                                 numActiveRows: activeB * qLen)
         return PreparedSoftPrefill(cb: cb, qLen: qLen, slotSoft: slotSoft)
     }
 
@@ -4417,4 +4502,3 @@ final class LmEngine {
         return tokenizer.decode(tokens)
     }
 }
-
