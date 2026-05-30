@@ -74,6 +74,84 @@ The target image is in the kernel as `target`: a numpy array, shape (H, W, 3), d
 
 _SYS_CONTROL = """You reconstruct a target image as an SVG. Look at the image and output your best reconstruction as a single ```svg ... ``` fenced block. One shot."""
 
+# --elicit hard: imperative push to iterate (the "tell" strategy).
+_ELICIT_HARD = """
+
+Before you submit: test at least THREE candidates, measuring the target with numpy between each, and define a reusable helper function rather than re-emitting raw SVG each time."""
+
+# --elicit kshot: "show, don't tell" — two fictional sessions demonstrating
+# 3-turn REPL use (measure -> define helper -> test -> refine -> submit). It
+# never instructs the model that it MUST use the kernel; it only exhibits the
+# pattern in the prefix and lets imitation do the eliciting. The fictional
+# targets are described, not shown (these are transcripts, not real turns).
+_ELICIT_KSHOT = """
+
+## Two example sessions (illustration only — your target is different)
+
+### Example A — target: a yellow star on a navy background
+assistant:
+```python
+h, w, _ = target.shape
+bg = target[:8, :8].mean(axis=(0, 1)); ctr = target[h//2, w//2]
+print("bg", bg.round(), "center", ctr)
+```
+kernel result: {"stdout": "bg [14. 20. 66.] center [241 214 41]"}
+assistant:
+```python
+def star(cx, cy, r, fill):
+    return f'<polygon points="{cx},{cy-r} {cx+r*0.4},{cy+r}" fill="{fill}"/>'
+svg = f'<svg viewBox="0 0 {w} {h}"><rect width="{w}" height="{h}" fill="#0e1442"/>{star(w/2, h/2, h*0.18, "#f1d629")}</svg>'
+```
+kernel result: {"stdout": "", "mse": 0.071, "ssim": 0.43}
+assistant:
+```python
+# SSIM low — the star reads too small vs the target's extent. Reuse the helper, bigger r.
+svg = f'<svg viewBox="0 0 {w} {h}"><rect width="{w}" height="{h}" fill="#0e1442"/>{star(w/2, h/2, h*0.30, "#f1d629")}</svg>'
+```
+kernel result: {"stdout": "", "mse": 0.044, "ssim": 0.62}
+assistant:
+```svg
+<svg viewBox="0 0 W H"><rect width="W" height="H" fill="#0e1442"/><polygon points="..." fill="#f1d629"/></svg>
+```
+
+### Example B — target: three green vertical bars on light gray
+assistant:
+```python
+cols = [target[:, int(w*f)].mean(axis=0).round() for f in (0.2, 0.5, 0.8)]
+print("sampled bar colors", cols)
+```
+kernel result: {"stdout": "sampled bar colors [array([60.,150.,70.]), array([58.,148.,69.]), array([61.,151.,72.])]"}
+assistant:
+```python
+def bar(x, fill, bw): return f'<rect x="{x}" y="0" width="{bw}" height="{h}" fill="{fill}"/>'
+bw = w*0.12
+svg = f'<svg viewBox="0 0 {w} {h}"><rect width="{w}" height="{h}" fill="#dcdcdc"/>' + "".join(bar(w*f-bw/2, "#3c9646", bw) for f in (0.2,0.5,0.8)) + '</svg>'
+```
+kernel result: {"stdout": "", "mse": 0.038, "ssim": 0.66}
+assistant:
+```python
+# widen bars slightly to match coverage
+bw = w*0.16
+svg = f'<svg viewBox="0 0 {w} {h}"><rect width="{w}" height="{h}" fill="#dcdcdc"/>' + "".join(bar(w*f-bw/2, "#3c9646", bw) for f in (0.2,0.5,0.8)) + '</svg>'
+```
+kernel result: {"stdout": "", "mse": 0.026, "ssim": 0.78}
+assistant:
+```svg
+<svg viewBox="0 0 W H"><rect width="W" height="H" fill="#dcdcdc"/>...</svg>
+```
+"""
+
+
+def _system_prompt(arm: str, elicit: str) -> str:
+    if arm == "control":
+        return _SYS_CONTROL
+    p = _SYS_KERNEL + (_SYS_2B if arm == "2b" else "")
+    if elicit == "hard":
+        p += _ELICIT_HARD
+    elif elicit == "kshot":
+        p += _ELICIT_KSHOT
+    return p
+
 
 def _exec_persistent(code: str, ns: dict) -> tuple[bool, str, str]:
     """Exec code in the persistent namespace ns. Returns (ok, stdout, err)."""
@@ -87,25 +165,17 @@ def _exec_persistent(code: str, ns: dict) -> tuple[bool, str, str]:
 
 
 def run_rollout(target: Image.Image, arm: str, max_turns: int, max_tokens: int,
-                temperature: float, seed: int, out_dir: pathlib.Path, prefix: str) -> dict:
+                temperature: float, seed: int, out_dir: pathlib.Path, prefix: str,
+                elicit: str = "plain") -> dict:
     W, H = target.size
     tgt_arr = np.asarray(target.convert("RGB"))
 
-    if arm == "control":
-        messages = [
-            {"role": "system", "content": _SYS_CONTROL},
-            {"role": "user", "content": [
-                {"type": "text", "text": f"Reconstruct this {W}x{H} image as SVG."},
-                {"type": "image_url", "image_url": {"url": image_to_data_url(target)}}]},
-        ]
-    else:
-        sys_prompt = _SYS_KERNEL + (_SYS_2B if arm == "2b" else "")
-        messages = [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": [
-                {"type": "text", "text": f"Reconstruct this {W}x{H} image as SVG."},
-                {"type": "image_url", "image_url": {"url": image_to_data_url(target)}}]},
-        ]
+    messages = [
+        {"role": "system", "content": _system_prompt(arm, elicit)},
+        {"role": "user", "content": [
+            {"type": "text", "text": f"Reconstruct this {W}x{H} image as SVG."},
+            {"type": "image_url", "image_url": {"url": image_to_data_url(target)}}]},
+    ]
 
     ns: dict = {"np": np}
     if arm == "2b":
@@ -192,7 +262,7 @@ def run_rollout(target: Image.Image, arm: str, max_turns: int, max_tokens: int,
             best["render"].save(out_dir / f"{prefix}_best_rendered.png")
 
     rep = {
-        "prefix": prefix, "arm": arm, "size": [W, H],
+        "prefix": prefix, "arm": arm, "elicit": elicit, "size": [W, H],
         "best_mse": best["mse"], "best_ssim": best["ssim"],
         "judge_faithfulness": (judge_res or {}).get("faithfulness"),
         "judge_missing": (judge_res or {}).get("missing"),
@@ -209,6 +279,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--frame", type=pathlib.Path, required=True)
     ap.add_argument("--arm", choices=["control", "2a", "2b"], required=True)
+    ap.add_argument("--elicit", choices=["plain", "hard", "kshot"], default="plain",
+                    help="prompt-strategy ablation for the kernel arms (control ignores): "
+                         "plain=describe-only, hard=imperative iterate, kshot=2-case 3-turn "
+                         "demonstration in the prefix with no 'you must'")
     ap.add_argument("--max-turns", type=int, default=8,
                     help="max kernel turns before forced submit (control ignores; always 1)")
     ap.add_argument("--max-tokens", type=int, default=2048)
@@ -219,11 +293,12 @@ def main():
     args = ap.parse_args()
 
     target = load_target_from_path(str(args.frame))
-    prefix = f"{args.frame.stem}_{args.arm}"
+    prefix = f"{args.frame.stem}_{args.arm}_{args.elicit}"
     rep = run_rollout(target, args.arm, args.max_turns, args.max_tokens,
-                      args.temperature, args.seed, args.out_root, prefix)
-    print(f"[repl_elicit] arm={args.arm} best_ssim={rep['best_ssim']} best_mse={rep['best_mse']} "
-          f"judge={rep['judge_faithfulness']} code={rep['code_calls']}call/{rep['code_errors']}err "
+                      args.temperature, args.seed, args.out_root, prefix, elicit=args.elicit)
+    print(f"[repl_elicit] arm={args.arm} elicit={args.elicit} best_ssim={rep['best_ssim']} "
+          f"best_mse={rep['best_mse']} judge={rep['judge_faithfulness']} "
+          f"code={rep['code_calls']}call/{rep['code_errors']}err "
           f"tests={rep['tests']} turns={rep['turns_used']} -> {args.out_root}")
 
 
