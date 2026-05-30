@@ -56,7 +56,16 @@ def main():
     args = ap.parse_args()
     args.out_root.mkdir(parents=True, exist_ok=True)
 
-    targets = {pathlib.Path(f).stem: load_target_from_path(f) for f in args.frames}
+    # Key by parent/stem so identically-named frames from different source dirs
+    # (e.g. frame_0010.png under four different videos) stay DISTINCT — a bare
+    # stem collapses them into one and silently underfills the batch.
+    def _label(f):
+        p = pathlib.Path(f)
+        return f"{p.parent.name}_{p.stem}"
+    targets = {_label(f): load_target_from_path(f) for f in args.frames}
+    if len(targets) < len(args.frames):
+        print(f"[spec_validate] WARNING: {len(args.frames)} frames collapsed to "
+              f"{len(targets)} distinct keys — duplicate parent/stem labels", flush=True)
     jobs = [(stem, seed) for stem in targets for seed in args.seeds]
 
     def run(job):
