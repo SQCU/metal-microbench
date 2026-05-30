@@ -149,6 +149,65 @@ def feature_score(chat, target_img: Image.Image, cand_img: Image.Image) -> dict 
         return None
 
 
+# ---------------------------------------------------------------------------
+# Joint correspondence judge. A SINGLE comparative call with BOTH images in
+# context (TARGET first, then CANDIDATE) that asks "how well does the SECOND
+# image reproduce the FIRST" on exactly three GENERAL axes — no named
+# structures, no domain content, no hand-coded taxonomy. The three scalars
+# feed back to the model in-loop as inter-turn signal alongside the residual.
+#   composition   = spatial-layout correspondence (where things sit)
+#   forms         = are the first image's distinct shapes/objects present & placed
+#   color_texture = do the first image's colour / texture regions correspond
+CORR_AXES = {
+    "composition":   "spatial-layout correspondence — is the overall arrangement and "
+                     "placement of regions in the SECOND image like the FIRST's",
+    "forms":         "are the FIRST image's distinct shapes / objects present in the "
+                     "SECOND and placed where they belong",
+    "color_texture": "do the colour and texture regions of the SECOND image correspond "
+                     "to those of the FIRST",
+}
+CORR_SYS = ("You are a meticulous, calibrated visual comparator. You will see a FIRST image and a "
+            "SECOND image. For each axis, judge HOW WELL THE SECOND IMAGE REPRODUCES THE FIRST — a "
+            "single comparative judgment per axis, not two independent descriptions. Use the full "
+            "1-5 range: 1 = no correspondence, 3 = partial / approximate, 5 = strong correspondence.")
+
+
+def _corr_ask() -> str:
+    lines = "\n".join(f"  {k}: {v}" for k, v in CORR_AXES.items())
+    return ("Rate, on a 1-5 scale, how well the SECOND image reproduces the FIRST on each axis "
+            "(higher = closer correspondence):\n"
+            f"{lines}\n"
+            'Respond with ONLY JSON: {"composition": <int 1-5>, "forms": <int 1-5>, '
+            '"color_texture": <int 1-5>}.')
+
+
+def correspondence(chat, target_img: Image.Image, cand_img: Image.Image) -> dict | None:
+    """`chat(messages) -> text`. ONE joint/comparative call with BOTH images in
+    context (TARGET then CANDIDATE). Returns {composition:int, forms:int,
+    color_texture:int} (1-5 each, each a COMPARATIVE judgment of how well the
+    candidate reproduces the target on that GENERAL axis) or None on failure."""
+    try:
+        msgs = [{"role": "system", "content": CORR_SYS},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "FIRST image:"},
+                    {"type": "image_url", "image_url": {"url": _durl(target_img)}},
+                    {"type": "text", "text": "SECOND image:"},
+                    {"type": "image_url", "image_url": {"url": _durl(cand_img)}},
+                    {"type": "text", "text": _corr_ask()}]}]
+        m = _JSON_RE.search(chat(msgs))
+        if not m:
+            return None
+        obj = json.loads(m.group(0))
+        out = {}
+        for ax in CORR_AXES:
+            v = obj.get(ax)
+            if isinstance(v, (int, float)):
+                out[ax] = int(round(float(v)))
+        return out or None
+    except Exception:
+        return None
+
+
 def score(chat, target_img: Image.Image, cand_img: Image.Image,
           exemplars: list[dict]) -> dict | None:
     """`chat(messages) -> text`. Returns {faithfulness:1-5, missing:[...],

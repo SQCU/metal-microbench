@@ -4,8 +4,8 @@
 The string-reassignment harness (repl_elicit) made refinement maximally expensive
 (retype the whole SVG to move one feature), so the model settled for a low-LOD
 blob and stopped revising. Here the artifact is a small PYTHON PROGRAM that sets
-`svg` (so it can script repetitive structure — loops for tile grids / repeated
-UI — instead of hand-placing primitives). The program PERSISTS across turns; the
+`svg` (so it can script repetitive or procedural structure with loops instead
+of hand-placing primitives). The program PERSISTS across turns; the
 model does not re-emit it, it EDITS it. Each turn the model sees its line-numbered
 source, its render, and the MSE RESIDUAL map, and issues atomic edits to ADD /
 REVISE / REDACT features, driving the residual toward zero.
@@ -164,7 +164,7 @@ def _run_program(source: str, tgt_arr: np.ndarray | None) -> tuple[str | None, s
     return (svg if isinstance(svg, str) else None), ("" if isinstance(svg, str) else "program did not set `svg` to a string")
 
 
-_SYS = """you're reconstructing a target image as an SVG, but you build it as a small PYTHON PROGRAM that sets the string variable `svg` — so you can SCRIPT repetitive structure (loops for tile grids, repeated UI, gradients) instead of hand-placing every primitive.
+_SYS = """you're reconstructing a target image as an SVG, but you build it as a small PYTHON PROGRAM that sets the string variable `svg` — so you can SCRIPT repetitive or procedural structure with loops instead of hand-placing every primitive.
 
 you keep ONE program across all turns. you do NOT retype it from scratch — you EDIT it. each turn we show you:
   - your current program SOURCE, line-numbered
@@ -236,10 +236,20 @@ def _tools_desc(design: str, verbose: bool) -> str:
 
 def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: int,
                 temperature: float, seed: int, out_dir: pathlib.Path, prefix: str,
-                tool_desc: str = "terse", design: str = "full", recovery: bool = False) -> dict:
+                tool_desc: str = "terse", design: str = "full", recovery: bool = False,
+                judge: bool = True) -> dict:
     W, H = target.size
     tgt_arr = np.asarray(target.convert("RGB"))
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # In-loop joint judge: ONE comparative call per round with BOTH images in
+    # context, three GENERAL axes (composition / forms / color_texture). Same
+    # model as the harness, different query. ON by default for tools mode — its
+    # scalars feed back to the model NEXT turn alongside the residual heatmap.
+    judge_on = judge and edit_mode == "tools"
+
+    def _judge_chat(msgs):
+        return call_lm(msgs, 512, 0.0, seed)[0]
 
     proto = _tools_desc(design, tool_desc == "verbose") if edit_mode == "tools" else _PROTO[edit_mode]
     sys_prompt = _SYS + "\n" + proto
@@ -255,6 +265,7 @@ def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: in
     source: list[str] = []
     traj: list[dict] = []
     best = {"source": None, "mse": None, "ssim": None, "render": None, "round": None}
+    mse_hist: list[float] = []   # per-round mse (None-free) for delta-vs-prev / vs-round-0
 
     def _score_and_feedback(rnd: int, edit_note: str, grep: list[str] | None = None) -> dict:
         nonlocal best
@@ -272,7 +283,28 @@ def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: in
                 render = render_svg(svg, width=W, height=H)
                 m = mse_images(target, render); s = ssim_score(target, render)
                 fb["mse"], fb["ssim"] = round(m, 5), round(s, 4)
-                traj.append({"round": rnd, "mse": round(m, 5), "ssim": round(s, 4), "lines": len(source)})
+                # MSE-DELTA scalars: vs previous round and vs round 0 (the one-shot
+                # ceiling). Negative = improvement (residual driven DOWN).
+                if mse_hist:
+                    fb["mse_delta_prev"] = round(m - mse_hist[-1], 5)
+                    fb["mse_delta_round0"] = round(m - mse_hist[0], 5)
+                mse_hist.append(m)
+                trow = {"round": rnd, "mse": round(m, 5), "ssim": round(s, 4), "lines": len(source)}
+                # In-loop joint judge: 3 general comparative scalars over (target, render).
+                if judge_on:
+                    jr = None
+                    try:
+                        jr = _judge.correspondence(_judge_chat, target, render)
+                    except Exception:
+                        jr = None
+                    if jr:
+                        fb["composition"] = jr.get("composition")
+                        fb["forms"] = jr.get("forms")
+                        fb["color_texture"] = jr.get("color_texture")
+                        trow["composition"] = jr.get("composition")
+                        trow["forms"] = jr.get("forms")
+                        trow["color_texture"] = jr.get("color_texture")
+                traj.append(trow)
                 if best["mse"] is None or m < best["mse"]:
                     best = {"source": "\n".join(source), "mse": m, "ssim": s, "render": render, "round": rnd}
                 (out_dir / f"{prefix}_r{rnd:02d}.py").write_text("\n".join(source))
@@ -280,14 +312,22 @@ def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: in
             except Exception:
                 fb["render_error"] = traceback.format_exc(limit=2)
         # build the user turn: numbered source + render + residual
-        content = [{"type": "text", "text": "result: " + json.dumps(fb)[:900]
+        content = [{"type": "text", "text": "result: " + json.dumps(fb)[:1100]
                     + "\n\nyour current program:\n" + _numbered(source)[:4000]}]
         if render is not None:
+            judge_note = ""
+            if judge_on and "composition" in fb:
+                judge_note = ("  a separate comparison rated how well this render reproduces the target "
+                              "(1=none .. 5=strong): composition (overall arrangement) "
+                              f"{fb.get('composition')}, forms (distinct shapes present & placed) "
+                              f"{fb.get('forms')}, color_texture (colour/texture regions) "
+                              f"{fb.get('color_texture')} — push every axis toward 5 by composing more "
+                              "correct detail.")
             content += [
                 {"type": "text", "text": "current render:"},
                 {"type": "image_url", "image_url": {"url": image_to_data_url(render)}},
                 {"type": "text", "text": "MSE residual (BRIGHT = wrong/missing — edit your program to "
-                                         "darken it; DARK = matched):"},
+                                         "darken it; DARK = matched):" + judge_note},
                 {"type": "image_url", "image_url": {"url": image_to_data_url(diff_heatmap(target, render))}},
             ]
         messages.append({"role": "user", "content": content})
@@ -336,7 +376,8 @@ def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: in
 
     wall = time.time() - t0
 
-    # feature judge on the best render
+    # legacy feature-profile judge on the best render (kept for back-compat; the
+    # JOINT correspondence judge already ran in-loop and is in the trajectory).
     jr = {}
     if best["render"] is not None:
         try:
@@ -351,15 +392,29 @@ def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: in
         if best["render"] is not None:
             best["render"].save(out_dir / f"{prefix}_best_rendered.png")
 
+    # round 0 IS the one-shot ceiling (free baseline); surface the residual the
+    # multi-turn composition is measured against, and the detail-accumulation
+    # (source linecount) delta from round 0 to the end.
+    r0 = traj[0] if traj else {}
+    rN = traj[-1] if traj else {}
     rep = {
-        "prefix": prefix, "edit_mode": edit_mode, "size": [W, H],
+        "prefix": prefix, "edit_mode": edit_mode, "size": [W, H], "judge": judge_on,
         "best_mse": best["mse"], "best_ssim": best["ssim"], "best_round": best["round"],
-        "final_mse": traj[-1]["mse"] if traj else None,
+        "oneshot_mse": r0.get("mse"),        # round-0 ceiling (one-shot baseline)
+        "oneshot_ssim": r0.get("ssim"),
+        "final_mse": rN.get("mse"),
+        # how far multi-turn pushed BELOW its own one-shot, and how much detail it accumulated.
+        "mse_drop_vs_oneshot": (round(r0["mse"] - best["mse"], 5)
+                                if (r0.get("mse") is not None and best["mse"] is not None) else None),
+        "lines_round0": r0.get("lines"), "lines_final": rN.get("lines"),
+        "detail_accumulation": ((rN.get("lines", 0) - r0.get("lines", 0))
+                                if (r0.get("lines") is not None and rN.get("lines") is not None) else None),
         "subject_match": jr.get("subject_match"), "semantic_distance": jr.get("semantic_distance"),
         "profile_mean_delta": jr.get("profile_mean_delta"),
         "n_edits_applied": n_edits, "n_edit_errors": n_edit_errs,
         "rounds": rounds, "wall_s": round(wall, 1),
-        "trajectory": traj,                  # per-round mse/ssim/lines — the velocity
+        # per-round {round, mse, ssim, composition, forms, color_texture, lines} — incl. round 0.
+        "trajectory": traj,
         "feature_deltas": jr.get("feature_deltas"),
     }
     (out_dir / f"{prefix}_report.json").write_text(json.dumps(rep, indent=2, default=str))
@@ -376,7 +431,9 @@ def main():
                     help="(tools mode) full=add/replace/delete, addonly=insert-only (safest op)")
     ap.add_argument("--error-recovery", action="store_true",
                     help="(tools mode) re-state the edit syntax in feedback whenever an edit fails")
-    ap.add_argument("--rounds", type=int, default=6, help="edit rounds after the initial program")
+    ap.add_argument("--rounds", type=int, default=12, help="edit rounds after the initial program")
+    ap.add_argument("--no-judge", dest="judge", action="store_false",
+                    help="(tools mode) disable the in-loop joint correspondence judge (ON by default)")
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=42)
@@ -389,15 +446,20 @@ def main():
     prefix = f"{args.frame.stem}_{args.edit_mode}{suffix}"
     rep = run_rollout(target, args.edit_mode, args.rounds, args.max_tokens,
                       args.temperature, args.seed, args.out_root, prefix, tool_desc=args.tool_desc,
-                      design=args.tool_design, recovery=args.error_recovery)
+                      design=args.tool_design, recovery=args.error_recovery, judge=args.judge)
     tj = rep["trajectory"]
-    print(f"[edit_elicit] mode={args.edit_mode} best_mse={rep['best_mse']} (r{rep['best_round']}) "
-          f"final_mse={rep['final_mse']} best_ssim={rep['best_ssim']} "
-          f"smatch={rep['subject_match']} semdist={rep['semantic_distance']} "
+    print(f"[edit_elicit] mode={args.edit_mode} oneshot_mse={rep['oneshot_mse']} "
+          f"best_mse={rep['best_mse']} (r{rep['best_round']}) "
+          f"final_mse={rep['final_mse']} drop_vs_oneshot={rep['mse_drop_vs_oneshot']} "
+          f"detail+={rep['detail_accumulation']} lines "
           f"edits={rep['n_edits_applied']}/{rep['n_edit_errors']}err -> {args.out_root}")
     if tj:
         print("  mse trajectory:", [t["mse"] for t in tj])
         print("  lines        :", [t["lines"] for t in tj])
+        if rep.get("judge"):
+            print("  composition  :", [t.get("composition") for t in tj])
+            print("  forms        :", [t.get("forms") for t in tj])
+            print("  color_texture:", [t.get("color_texture") for t in tj])
 
 
 if __name__ == "__main__":
