@@ -70,7 +70,8 @@ def main():
         for rep in ex.map(run, jobs):
             results.append(rep)
             print(f"  {rep['frame']:>10}/{rep['label']:<18} s{rep['seed']} "
-                  f"ssim={rep.get('best_ssim')} judge={rep.get('judge_faithfulness')} "
+                  f"ssim={rep.get('best_ssim')} smatch={rep.get('subject_match')} "
+                  f"semdist={rep.get('semantic_distance')} "
                   f"passes={rep.get('accepted_passes')} code={rep.get('code_calls')}/"
                   f"{rep.get('code_errors')}err {rep.get('error','')}", flush=True)
     wall = time.time() - t0
@@ -86,7 +87,8 @@ def main():
             agg[label] = {"n": 0}; continue
         agg[label] = {
             "n": len(rs), "ssim": m(rs, "best_ssim"), "mse": m(rs, "best_mse"),
-            "judge": m(rs, "judge_faithfulness"), "passes": m(rs, "accepted_passes"),
+            "smatch": m(rs, "subject_match"), "semdist": m(rs, "semantic_distance"),
+            "pdelta": m(rs, "profile_mean_delta"), "passes": m(rs, "accepted_passes"),
             "code_calls": m(rs, "code_calls"),
             "code_err_total": sum(r.get("code_errors", 0) for r in rs),
         }
@@ -100,7 +102,8 @@ def main():
     for label, a in agg.items():
         if a.get("n"):
             print(f"  {label:<20} n={a['n']} ssim={a['ssim']} mse={a['mse']} "
-                  f"judge={a['judge']} passes={a['passes']} code_err={a['code_err_total']}")
+                  f"smatch={a['smatch']} semdist={a['semdist']} pdelta={a['pdelta']} "
+                  f"passes={a['passes']} code_err={a['code_err_total']}")
         else:
             print(f"  {label:<20} (no valid results)")
     print(f"-> {args.out_root}/sweep_summary.json")

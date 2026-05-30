@@ -390,11 +390,11 @@ def run_rollout(target: Image.Image, arm: str, max_turns: int, max_tokens: int,
     judge_res = None
     if best["svg"] is not None and best["render"] is not None:
         try:
-            exemplars = _judge.load_exemplars(_REPO, _EXEMPLARS_PATH) if _EXEMPLARS_PATH.exists() else []
-            judge_res = _judge.score(lambda msgs: call_lm(msgs, 256, 0.0, seed)[0],
-                                     target, best["render"], exemplars)
+            judge_res = _judge.feature_score(
+                lambda msgs: call_lm(msgs, 512, 0.0, seed)[0], target, best["render"])
         except Exception:
             judge_res = None
+    jr = judge_res or {}
 
     # persist artifacts (under out_dir, NOT /tmp)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -407,8 +407,12 @@ def run_rollout(target: Image.Image, arm: str, max_turns: int, max_tokens: int,
     rep = {
         "prefix": prefix, "arm": arm, "elicit": elicit, "voice": voice, "size": [W, H],
         "best_mse": best["mse"], "best_ssim": best["ssim"],
-        "judge_faithfulness": (judge_res or {}).get("faithfulness"),
-        "judge_missing": (judge_res or {}).get("missing"),
+        "subject_match": jr.get("subject_match"),            # 1-5 recognizability
+        "profile_mean_delta": jr.get("profile_mean_delta"),  # mean per-feature |Δ| (sensitive)
+        "semantic_distance": jr.get("semantic_distance"),    # 0=identical..1=worst
+        "feature_deltas": jr.get("feature_deltas"),
+        "target_profile": jr.get("target_profile"),
+        "candidate_profile": jr.get("candidate_profile"),
         "code_calls": n_code, "code_errors": n_err,          # capability gating metric
         "code_error_rate": round(n_err / n_code, 3) if n_code else None,
         "min_passes": min_passes, "accepted_passes": accepted_passes,
@@ -450,7 +454,8 @@ def main():
                       args.temperature, args.seed, args.out_root, prefix,
                       elicit=args.elicit, min_passes=args.min_passes, voice=args.voice)
     print(f"[repl_elicit] voice={args.voice} arm={args.arm} elicit={args.elicit} min_passes={args.min_passes} "
-          f"best_ssim={rep['best_ssim']} best_mse={rep['best_mse']} judge={rep['judge_faithfulness']} "
+          f"best_ssim={rep['best_ssim']} best_mse={rep['best_mse']} "
+          f"smatch={rep['subject_match']} semdist={rep['semantic_distance']} pdelta={rep['profile_mean_delta']} "
           f"code={rep['code_calls']}call/{rep['code_errors']}err "
           f"passes={rep['accepted_passes']} rej_finals={rep['rejected_finals']} "
           f"tests={rep['tests']} turns={rep['turns_used']} -> {args.out_root}")
