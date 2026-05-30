@@ -105,11 +105,12 @@ _T_DEL = re.compile(r"<deletelines\s+\"?(\d+)\s*-\s*(\d+)\"?\s*/?\s*>", re.I)
 _T_GREP = re.compile(r"<grepline>\s*(.*?)\s*</grepline>", re.DOTALL | re.I)
 
 
-def _apply_tools(lines: list[str], text: str) -> tuple[list[str], int, list[str], list[str]]:
+def _apply_tools(lines: list[str], text: str, design: str = "full") -> tuple[list[str], int, list[str], list[str]]:
     """Parse the line-addressed toolset. grepline calls are answered (returned in
     `grep`); add/replace/delete are applied to a COPY, syntax-validated, and only
     COMMITTED if the program still compiles — so a malformed edit never freezes
-    the source (the linerange failure mode)."""
+    the source (the linerange failure mode). design='addonly' exposes only
+    addlines+grepline (insert-only is the safest op — it can't orphan a block)."""
     grep: list[str] = []
     for pat in _T_GREP.findall(text):
         hits = [f"{i+1}| {ln}" for i, ln in enumerate(lines) if pat in ln]
@@ -117,14 +118,20 @@ def _apply_tools(lines: list[str], text: str) -> tuple[list[str], int, list[str]
     ops = []
     for a, body in _T_ADD.findall(text):
         ops.append(("insert", int(a), int(a), body.rstrip("\n").split("\n")))
-    for a, b, body in _T_REPL.findall(text):
-        ops.append(("replace", int(a), int(b), body.rstrip("\n").split("\n")))
-    for a, b in _T_DEL.findall(text):
-        ops.append(("delete", int(a), int(b), []))
+    errs0 = []
+    if design == "addonly":
+        if _T_REPL.search(text) or _T_DEL.search(text):
+            errs0.append("replacelines/deletelines are not available in this mode — express revisions "
+                         "as new addlines (and redactions by adding a covering element).")
+    else:
+        for a, b, body in _T_REPL.findall(text):
+            ops.append(("replace", int(a), int(b), body.rstrip("\n").split("\n")))
+        for a, b in _T_DEL.findall(text):
+            ops.append(("delete", int(a), int(b), []))
     if not ops:
-        return lines, 0, [], grep
+        return lines, 0, errs0, grep
     new = list(lines)
-    errs = []
+    errs = list(errs0)
     for (op, a, b, body) in sorted(ops, key=lambda o: -o[1]):
         n = len(new)
         if op == "insert" and 0 <= a <= n:
@@ -138,8 +145,8 @@ def _apply_tools(lines: list[str], text: str) -> tuple[list[str], int, list[str]
     try:
         compile("\n".join(new), "<prog>", "exec")
     except SyntaxError as e:
-        return lines, 0, [f"edit REJECTED — would break the program: {e.msg} near line {e.lineno}. "
-                          f"source unchanged; try again."], grep
+        return lines, 0, errs0 + [f"edit REJECTED — would break the program: {e.msg} near line "
+                                  f"{e.lineno}. source unchanged; try again."], grep
     return new, len(ops), errs, grep
 
 
@@ -208,15 +215,34 @@ _PROTO = {
 }
 
 
+def _tools_desc(design: str, verbose: bool) -> str:
+    add = "  <addlines after=N>\n  new lines\n  </addlines>       insert AFTER line N\n"
+    repl = "  <replacelines A-B>\n  new lines\n  </replacelines>    replace lines A..B\n"
+    dele = "  <deletelines A-B>                                   delete lines A..B\n"
+    grep = "  <grepline>text</grepline>                           list source lines containing 'text'\n"
+    ops = (add + grep) if design == "addonly" else (add + repl + dele + grep)
+    s = ("you edit your program with line-addressing tools (line numbers refer to the numbered source "
+         "shown — you NEVER re-quote existing code, you point at it by number):\n" + ops +
+         "\nemit as many as you like per turn. an edit that would break the program is rejected and your "
+         "source is kept unchanged, so edit boldly.")
+    if design == "addonly":
+        s += (" THIS MODE IS ADD-ONLY: build the image up by inserting elements; you can't replace or "
+              "delete, so layer corrections on top.")
+    if verbose:
+        s += (" tip: use <grepline> to find the exact line number before you edit, and always work the "
+              "BRIGHT regions of the residual — that's where to add what's missing.")
+    return s
+
+
 def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: int,
                 temperature: float, seed: int, out_dir: pathlib.Path, prefix: str,
-                tool_desc: str = "terse") -> dict:
+                tool_desc: str = "terse", design: str = "full", recovery: bool = False) -> dict:
     W, H = target.size
     tgt_arr = np.asarray(target.convert("RGB"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    proto_key = ("tools_verbose" if (edit_mode == "tools" and tool_desc == "verbose") else edit_mode)
-    sys_prompt = _SYS + "\n" + _PROTO[proto_key]
+    proto = _tools_desc(design, tool_desc == "verbose") if edit_mode == "tools" else _PROTO[edit_mode]
+    sys_prompt = _SYS + "\n" + proto
     messages = [
         {"role": "system", "content": sys_prompt},
         {"role": "user", "content": [
@@ -294,9 +320,12 @@ def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: in
             _score_and_feedback(rnd, note)
             continue
         elif edit_mode == "tools":
-            source, na, errs, grep = _apply_tools(source, text)
+            source, na, errs, grep = _apply_tools(source, text, design)
             n_edits += na; n_edit_errs += len(errs)
             note = f"{na} edits" + (f"; errors: {errs}" if errs else "")
+            if recovery and errs:   # error-recovery ablation: re-state the exact syntax
+                note += ("  [reminder — to edit, emit e.g.  <addlines after=12>\\n  <code>\\n"
+                         "  </addlines>  ; use <grepline>text</grepline> first to confirm the line number]")
             _score_and_feedback(rnd, note, grep=grep)
             continue
         else:  # anchored
@@ -343,6 +372,10 @@ def main():
     ap.add_argument("--edit-mode", choices=["rewrite", "linerange", "anchored", "tools"], required=True)
     ap.add_argument("--tool-desc", choices=["terse", "verbose"], default="terse",
                     help="(tools mode) description ablation for the line-addressing toolset")
+    ap.add_argument("--tool-design", choices=["full", "addonly"], default="full",
+                    help="(tools mode) full=add/replace/delete, addonly=insert-only (safest op)")
+    ap.add_argument("--error-recovery", action="store_true",
+                    help="(tools mode) re-state the edit syntax in feedback whenever an edit fails")
     ap.add_argument("--rounds", type=int, default=6, help="edit rounds after the initial program")
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--temperature", type=float, default=1.0)
@@ -351,10 +384,12 @@ def main():
                     default=_REPO / "output_data" / "svg_runs" / f"edit_{int(time.time())}")
     args = ap.parse_args()
     target = load_target_from_path(str(args.frame))
-    suffix = f"_{args.tool_desc}" if args.edit_mode == "tools" else ""
+    suffix = (f"_{args.tool_design}_{args.tool_desc}{'_rec' if args.error_recovery else ''}"
+              if args.edit_mode == "tools" else "")
     prefix = f"{args.frame.stem}_{args.edit_mode}{suffix}"
     rep = run_rollout(target, args.edit_mode, args.rounds, args.max_tokens,
-                      args.temperature, args.seed, args.out_root, prefix, tool_desc=args.tool_desc)
+                      args.temperature, args.seed, args.out_root, prefix, tool_desc=args.tool_desc,
+                      design=args.tool_design, recovery=args.error_recovery)
     tj = rep["trajectory"]
     print(f"[edit_elicit] mode={args.edit_mode} best_mse={rep['best_mse']} (r{rep['best_round']}) "
           f"final_mse={rep['final_mse']} best_ssim={rep['best_ssim']} "
