@@ -35,14 +35,42 @@ from svg_refinement_loop import (                             # noqa: E402
 from elicit import call_lm, ssim_score                        # noqa: E402
 import judge as _judge                                        # noqa: E402
 
-_PROG_RE = re.compile(r"```python\s*(.*?)```", re.DOTALL) or None
 _PROG_TAG_RE = re.compile(r"<prog>\s*(.*?)</prog>", re.DOTALL | re.IGNORECASE)
+_PY_FENCE_RE = re.compile(r"```(?:python|py|python3)?[ \t]*\r?\n(.*?)```", re.DOTALL)
+_ANY_FENCE_RE = re.compile(r"```[a-zA-Z0-9_+.-]*\s*\n?(.*?)```", re.DOTALL)
+_SVG_TAG_RE = re.compile(r"<svg[\s>].*?</svg>", re.DOTALL | re.IGNORECASE)
+_SVG_ASSIGN_RE = re.compile(r"\bsvg\b\s*=")
 _ANCHOR_RE = re.compile(r"<<<OLD\s*\n(.*?)\n<<<NEW\s*\n(.*?)\n<<<END", re.DOTALL)
 
 
 def _extract_program(text: str) -> str | None:
-    m = _PROG_TAG_RE.search(text) or _PROG_RE.search(text)
-    return m.group(1).rstrip() if m else None
+    """Tolerant, fallback-chained program extraction (ported from repl_elicit's
+    reliable parser). Brittle single-delimiter matching was the round-0
+    regression — the model only has to drift off the exact ```python fence once
+    and the old extractor returned None, after which the harness silently
+    substituted a blank `svg=''`. We accept many formats and only give up if
+    NOTHING parses."""
+    # 1. explicit <prog>...</prog> tag
+    m = _PROG_TAG_RE.search(text)
+    if m:
+        return m.group(1).rstrip()
+    # 2. a python-tagged (or bare) fence whose body actually assigns `svg`
+    for m in _PY_FENCE_RE.finditer(text):
+        if _SVG_ASSIGN_RE.search(m.group(1)) or "get_svg" in m.group(1):
+            return m.group(1).rstrip()
+    # 3. ANY fenced block that assigns `svg` (covers ```svg-labelled python etc.)
+    for m in _ANY_FENCE_RE.finditer(text):
+        if _SVG_ASSIGN_RE.search(m.group(1)):
+            return m.group(1).rstrip()
+    # 4. last resort: a bare hand-written <svg>...</svg> -> wrap as an assignment
+    s = _SVG_TAG_RE.search(text)
+    if s:
+        return "svg = " + repr(s.group(0))
+    # 5. any python fence at all beats fabricating a blank
+    m = _PY_FENCE_RE.search(text)
+    if m and m.group(1).strip():
+        return m.group(1).rstrip()
+    return None
 
 
 def _numbered(lines: list[str]) -> str:
@@ -270,6 +298,10 @@ def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: in
     def _score_and_feedback(rnd: int, edit_note: str, grep: list[str] | None = None) -> dict:
         nonlocal best
         svg, err = _run_program("\n".join(source), tgt_arr)
+        # Persist the source EVERY round (even on exec/render error) so a failed
+        # round leaves an auditable .py — the old code only wrote it inside the
+        # render-success branch, silently dropping render-errored rounds.
+        (out_dir / f"{prefix}_r{rnd:02d}.py").write_text("\n".join(source))
         fb: dict = {"round": rnd, "lines": len(source), "edit": edit_note}
         if grep:
             fb["grepline"] = grep
@@ -307,8 +339,7 @@ def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: in
                 traj.append(trow)
                 if best["mse"] is None or m < best["mse"]:
                     best = {"source": "\n".join(source), "mse": m, "ssim": s, "render": render, "round": rnd}
-                (out_dir / f"{prefix}_r{rnd:02d}.py").write_text("\n".join(source))
-                render.save(out_dir / f"{prefix}_r{rnd:02d}_render.png")
+                render.save(out_dir / f"{prefix}_r{rnd:02d}_render.png")  # .py already persisted above
             except Exception:
                 fb["render_error"] = traceback.format_exc(limit=2)
         # build the user turn: numbered source + render + residual
@@ -335,12 +366,28 @@ def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: in
 
     t0 = time.time()
     n_edits = n_edit_errs = 0
-    # round 0: initial program
+    parse_retries = 0
+    # round 0: initial program. Round 0 IS the one-shot ceiling the experiment
+    # measures against, so a parse miss here must NOT be silently scored as a
+    # blank canvas (the old `prog or "svg=''"` corrupted every such baseline).
+    # Re-prompt ONCE with the exact required format before falling back, and
+    # flag a persistent failure as parse_error instead of a fake mse.
     text, _, _ = call_lm(messages, max_tokens, temperature, seed)
     messages.append({"role": "assistant", "content": text})
     prog = _extract_program(text)
+    if prog is None:
+        parse_retries += 1
+        messages.append({"role": "user", "content":
+            "Your message contained no extractable program. Reply with ONLY a "
+            "```python``` code block that assigns an SVG document string to a "
+            "top-level variable named `svg` (e.g. `svg = '''<svg ...>...</svg>'''`)."})
+        text, _, _ = call_lm(messages, max_tokens, temperature, seed + 9973)
+        messages.append({"role": "assistant", "content": text})
+        prog = _extract_program(text)
+    parse_failed = prog is None
     source = (prog or "svg = ''").split("\n")
-    _score_and_feedback(0, "initial program")
+    _score_and_feedback(0, "PARSE FAIL: no program block (blank fallback)"
+                        if parse_failed else "initial program")
 
     for rnd in range(1, rounds + 1):
         text, _, _ = call_lm(messages, max_tokens, temperature, seed + rnd)
@@ -414,6 +461,9 @@ def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: in
         "judge_final": ({k: rN.get(k) for k in ("composition", "forms", "color_texture")}
                         if judge_on else None),
         "n_edits_applied": n_edits, "n_edit_errors": n_edit_errs,
+        # round-0 one-shot baseline integrity: if parse failed, oneshot_mse is a
+        # blank-canvas artifact and must NOT be treated as the model's one-shot.
+        "round0_parse_failed": parse_failed, "round0_parse_retries": parse_retries,
         "rounds": rounds, "wall_s": round(wall, 1),
         # per-round {round, mse, ssim, composition, forms, color_texture, lines} — incl. round 0.
         "trajectory": traj,
