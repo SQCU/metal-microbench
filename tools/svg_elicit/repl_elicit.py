@@ -44,13 +44,17 @@ import judge as _judge                                       # noqa: E402
 BASE = os.environ.get("GEMMA_BASE", "http://127.0.0.1:8001")
 _EXEMPLARS_PATH = pathlib.Path(__file__).resolve().parent / "amongus_onpolicy_exemplars.json"
 
+_PYREPL_RE = re.compile(r"<pyrepl>\s*(.*?)</pyrepl>", re.DOTALL | re.IGNORECASE)
 _CODE_RE = re.compile(r"```python\s*(.*?)```", re.DOTALL)
 _SVG_FENCE_RE = re.compile(r"```svg\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 _SVG_TAG_RE = re.compile(r"<svg.*?</svg>", re.DOTALL | re.IGNORECASE)
 
 
 def _extract_code(resp: str) -> str | None:
-    m = _CODE_RE.search(resp)
+    # Accept the <pyrepl>...</pyrepl> tag notation OR a ```python``` fence, so
+    # prompt VOICE (which delimiter the prose instructs) is a pure prose
+    # ablation and both register variants parse identically.
+    m = _PYREPL_RE.search(resp) or _CODE_RE.search(resp)
     return m.group(1) if m else None
 
 
@@ -142,6 +146,14 @@ assistant:
 """
 
 
+# Grading disclosure — makes "best effort" literally true by stating the
+# judge's AGENDA (not its exact prompt). Present in BOTH voices (content parity;
+# only register differs) so the --voice axis is a clean prose ablation.
+_JUDGE_TERSE = """
+
+Grading: besides MSE/SSIM, a separate vision-language judge rates your best render for SEMANTIC faithfulness to the target — recognizable subject, pose, composition, colour story. So don't trade away recognizable content for a marginally lower MSE; best effort = close in the numbers AND still clearly the thing."""
+
+
 def _forced_clause(n: int) -> str:
     return (f"\n\nThis is a multi-pass task. A \"pass\" = setting `svg` in a ```python``` block "
             f"and reading back its MSE/SSIM. You MUST complete at least {n} passes, and each pass "
@@ -152,15 +164,107 @@ def _forced_clause(n: int) -> str:
             f"accepted.")
 
 
-def _system_prompt(arm: str, elicit: str, min_passes: int = 0) -> str:
+# ===================== user-voice register (--voice user) =====================
+# Authored to model how the harness designer writes: warm, lowercase-
+# conversational, forthright; frames the harness as resources OFFERED to the
+# model; <pyrepl> tag notation; names BOTH pixel error and semantics as
+# objectives; discloses the judge's agenda. This whole register is itself an
+# ablation dimension (does authorial voice change elicitation?).
+_U_KERNEL = """right now we're working on image reconstruction. you'll be passed a reference image to look at through your vision encoding, and we'd like the clearest, most definite recovery of what you can see in it — written as SVG. you can build elements programmatically with a little scripting, 'hand-write' elements directly in svg, or mix both as suits you.
+
+low pixel mean-squared-error is desirable; but with MSE held roughly equal, we'd much rather preserve the image's SEMANTICS — colour, composition, content, narrative significance, whatever you find yourself paying attention to — than shave off a little more error.
+
+this is an exceptionally hard task, out past the frontier of what current ML training covers, so we've prepared a few resources to make it more tractable. the first is an interactive python repl — like a jupyter notebook, but a lot more convenient: <pyrepl>. anything you write between <pyrepl> and </pyrepl> runs in a scratch namespace that PERSISTS across your turns, so you can define a function once and just update its inputs on later turns instead of rewriting it every time. you'd be wise to lean on this. `np` (numpy) is already imported.
+
+to try a candidate, set the string variable `svg` inside a <pyrepl> block; we'll render it and send back its MSE and SSIM against the target (lower MSE / higher SSIM = closer) plus the rendered image, so you can see the gap and close it. when you've got one you're happy with, send it as your final answer in a ```svg ...``` fenced block."""
+
+_U_TARGET = """
+
+a second resource: the reference image is sitting right in the repl as `target` — a numpy array, shape (H, W, 3), uint8, RGB. your vision encoding is a single lossy pass, so for anything fine-grained — exact colours, where an edge actually sits, how many of something there are — you'll do better measuring `target` directly with numpy than trusting your visual impression of it."""
+
+_U_JUDGE = """
+
+so it isn't a mystery how you're graded: besides the pixel scores, a separate vision-language judge looks at your best render beside the target and rates how faithfully it kept the SEMANTICS — is it recognizably the same subject, pose, composition, colour story, the stuff that makes the image what it is. it isn't pixel-peeping; it's asking 'did the meaning survive?'. so don't trade away recognizable content to chase a slightly lower MSE — best effort here is a reconstruction that's both close in the numbers and still clearly the thing."""
+
+
+def _u_forced(n: int) -> str:
+    return (f"\n\nthe repl is here to be used across turns, so we ask for at least {n} refinement passes "
+            f"before you call it done (a pass = setting `svg` inside a <pyrepl> block and reading its "
+            f"scores back). make each one a real attempt to move the numbers — we'll bounce an unchanged "
+            f"candidate, or a final sent before {n} passes, right back to you. genuinely try to improve "
+            f"{n}+ times, then submit your best.")
+
+
+# user-voice kshot — same 2 fictional sessions, <pyrepl> notation, target
+# measurement included only when arm == "2b" (so it never demonstrates a
+# capability a 2a run withholds — fixes the kshot/2a NameError contradiction).
+def _u_kshot(arm: str) -> str:
+    measure_a = ("<pyrepl>\nh, w, _ = target.shape\nprint('bg', target[:8,:8].mean((0,1)).round(), "
+                 "'center', target[h//2, w//2])\n</pyrepl>\nus: {\"stdout\": \"bg [14. 20. 66.] center "
+                 "[241 214 41]\"}\n") if arm == "2b" else ""
+    return f"""
+
+## two example sessions (illustration only — your target will differ)
+
+### A — a yellow star on a navy background
+{measure_a}them:
+<pyrepl>
+def star(cx, cy, r, fill): return f'<polygon points="..." fill="{{fill}}"/>'
+svg = f'<svg viewBox="0 0 {{w}} {{h}}"><rect width="{{w}}" height="{{h}}" fill="#0e1442"/>{{star(w/2,h/2,h*0.18,"#f1d629")}}</svg>'
+</pyrepl>
+us: {{"mse": 0.071, "ssim": 0.43}}
+them:
+<pyrepl>
+# ssim's low — star reads too small. reuse the helper, bigger r.
+svg = f'<svg viewBox="0 0 {{w}} {{h}}"><rect width="{{w}}" height="{{h}}" fill="#0e1442"/>{{star(w/2,h/2,h*0.30,"#f1d629")}}</svg>'
+</pyrepl>
+us: {{"mse": 0.044, "ssim": 0.62}}
+them:
+```svg
+<svg viewBox="0 0 W H">...</svg>
+```
+
+### B — three green bars on light grey (note how they reuse one helper)
+them:
+<pyrepl>
+def bar(x, fill, bw): return f'<rect x="{{x}}" y="0" width="{{bw}}" height="{{h}}" fill="{{fill}}"/>'
+bw = w*0.12
+svg = f'<svg viewBox="0 0 {{w}} {{h}}"><rect width="{{w}}" height="{{h}}" fill="#dcdcdc"/>' + "".join(bar(w*f-bw/2,"#3c9646",bw) for f in (0.2,0.5,0.8)) + '</svg>'
+</pyrepl>
+us: {{"mse": 0.038, "ssim": 0.66}}
+them:
+<pyrepl>
+bw = w*0.16  # widen to match coverage
+svg = f'<svg viewBox="0 0 {{w}} {{h}}"><rect width="{{w}}" height="{{h}}" fill="#dcdcdc"/>' + "".join(bar(w*f-bw/2,"#3c9646",bw) for f in (0.2,0.5,0.8)) + '</svg>'
+</pyrepl>
+us: {{"mse": 0.026, "ssim": 0.78}}
+them:
+```svg
+<svg viewBox="0 0 W H">...</svg>
+```
+"""
+
+
+def _system_prompt(arm: str, elicit: str, min_passes: int = 0, voice: str = "terse") -> str:
     if arm == "control":
         return _SYS_CONTROL
-    p = _SYS_KERNEL + (_SYS_2B if arm == "2b" else "")
+    if voice == "user":
+        p = _U_KERNEL + (_U_TARGET if arm == "2b" else "") + _U_JUDGE
+        if min_passes > 0:
+            p += _u_forced(min_passes)
+        if elicit == "kshot":
+            p += _u_kshot(arm)
+        elif elicit == "hard":
+            p += ("\n\nbefore you submit, please try at least three candidates — measure, "
+                  "adjust, re-test — and reuse a helper function rather than re-typing svg each time.")
+        return p
+    # terse register (default)
+    p = _SYS_KERNEL + (_SYS_2B if arm == "2b" else "") + _JUDGE_TERSE
     if min_passes > 0:
         p += _forced_clause(min_passes)
     if elicit == "hard":
         p += _ELICIT_HARD
-    elif elicit == "kshot":
+    elif elicit == "kshot" and arm == "2b":   # terse kshot uses target; 2b only
         p += _ELICIT_KSHOT
     return p
 
@@ -178,12 +282,12 @@ def _exec_persistent(code: str, ns: dict) -> tuple[bool, str, str]:
 
 def run_rollout(target: Image.Image, arm: str, max_turns: int, max_tokens: int,
                 temperature: float, seed: int, out_dir: pathlib.Path, prefix: str,
-                elicit: str = "plain", min_passes: int = 0) -> dict:
+                elicit: str = "plain", min_passes: int = 0, voice: str = "terse") -> dict:
     W, H = target.size
     tgt_arr = np.asarray(target.convert("RGB"))
 
     messages = [
-        {"role": "system", "content": _system_prompt(arm, elicit, min_passes)},
+        {"role": "system", "content": _system_prompt(arm, elicit, min_passes, voice)},
         {"role": "user", "content": [
             {"type": "text", "text": f"Reconstruct this {W}x{H} image as SVG."},
             {"type": "image_url", "image_url": {"url": image_to_data_url(target)}}]},
@@ -301,7 +405,7 @@ def run_rollout(target: Image.Image, arm: str, max_turns: int, max_tokens: int,
             best["render"].save(out_dir / f"{prefix}_best_rendered.png")
 
     rep = {
-        "prefix": prefix, "arm": arm, "elicit": elicit, "size": [W, H],
+        "prefix": prefix, "arm": arm, "elicit": elicit, "voice": voice, "size": [W, H],
         "best_mse": best["mse"], "best_ssim": best["ssim"],
         "judge_faithfulness": (judge_res or {}).get("faithfulness"),
         "judge_missing": (judge_res or {}).get("missing"),
@@ -320,6 +424,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--frame", type=pathlib.Path, required=True)
     ap.add_argument("--arm", choices=["control", "2a", "2b"], required=True)
+    ap.add_argument("--voice", choices=["terse", "user"], default="terse",
+                    help="prompt-authorship register ablation: terse=clinical default, "
+                         "user=warm/forthright designer voice with <pyrepl> notation + judge "
+                         "disclosure (same content, different register)")
     ap.add_argument("--elicit", choices=["plain", "hard", "kshot"], default="plain",
                     help="prompt-strategy ablation for the kernel arms (control ignores): "
                          "plain=describe-only, hard=imperative iterate, kshot=2-case 3-turn "
@@ -337,11 +445,11 @@ def main():
     args = ap.parse_args()
 
     target = load_target_from_path(str(args.frame))
-    prefix = f"{args.frame.stem}_{args.arm}_{args.elicit}_m{args.min_passes}"
+    prefix = f"{args.frame.stem}_{args.voice}_{args.arm}_{args.elicit}_m{args.min_passes}"
     rep = run_rollout(target, args.arm, args.max_turns, args.max_tokens,
                       args.temperature, args.seed, args.out_root, prefix,
-                      elicit=args.elicit, min_passes=args.min_passes)
-    print(f"[repl_elicit] arm={args.arm} elicit={args.elicit} min_passes={args.min_passes} "
+                      elicit=args.elicit, min_passes=args.min_passes, voice=args.voice)
+    print(f"[repl_elicit] voice={args.voice} arm={args.arm} elicit={args.elicit} min_passes={args.min_passes} "
           f"best_ssim={rep['best_ssim']} best_mse={rep['best_mse']} judge={rep['judge_faithfulness']} "
           f"code={rep['code_calls']}call/{rep['code_errors']}err "
           f"passes={rep['accepted_passes']} rej_finals={rep['rejected_finals']} "
