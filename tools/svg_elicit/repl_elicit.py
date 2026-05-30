@@ -37,7 +37,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # elicit, judg
 import numpy as np                                          # noqa: E402
 from PIL import Image                                        # noqa: E402
 from svg_refinement_loop import (                            # noqa: E402
-    load_target_from_path, render_svg, mse_images, image_to_data_url)
+    load_target_from_path, render_svg, mse_images, image_to_data_url, diff_heatmap)
 from elicit import call_lm, ssim_score                       # noqa: E402
 import judge as _judge                                       # noqa: E402
 
@@ -285,6 +285,7 @@ def run_rollout(target: Image.Image, arm: str, max_turns: int, max_tokens: int,
                 elicit: str = "plain", min_passes: int = 0, voice: str = "terse") -> dict:
     W, H = target.size
     tgt_arr = np.asarray(target.convert("RGB"))
+    out_dir.mkdir(parents=True, exist_ok=True)   # per-pass artifacts saved during the loop
 
     messages = [
         {"role": "system", "content": _system_prompt(arm, elicit, min_passes, voice)},
@@ -374,6 +375,12 @@ def run_rollout(target: Image.Image, arm: str, max_turns: int, max_tokens: int,
                     accepted_passes += 1
                     feedback["pass"] = (f"{accepted_passes}/{min_passes}" if min_passes
                                         else str(accepted_passes))
+                    feedback["svg_bytes"] = len(ns["svg"])   # grows iff appending
+                    try:   # persist this pass so append-vs-rewrite is auditable
+                        (out_dir / f"{prefix}_pass{accepted_passes:02d}.svg").write_text(ns["svg"])
+                        r.save(out_dir / f"{prefix}_pass{accepted_passes:02d}_render.png")
+                    except Exception:
+                        pass
             except Exception:
                 feedback["render_error"] = traceback.format_exc(limit=2)
         if not ok:
@@ -381,7 +388,19 @@ def run_rollout(target: Image.Image, arm: str, max_turns: int, max_tokens: int,
 
         content = [{"type": "text", "text": "kernel result:\n" + json.dumps(feedback)[:1800]}]
         if last_render is not None:            # intra-turn render "look" — both 2a and 2b
+            content.append({"type": "text", "text": "your render:"})
             content.append({"type": "image_url", "image_url": {"url": image_to_data_url(last_render)}})
+            # Residual: where your render differs from the target — the unmodeled
+            # regions. The single most actionable feedback for "what to add next".
+            try:
+                content.append({"type": "text", "text":
+                    "residual |target − your render| (BRIGHT = large error / unmodeled; "
+                    "dark = matched). The bright areas are what you have not captured yet — "
+                    "keep your prior elements and ADD to them there."})
+                content.append({"type": "image_url",
+                                "image_url": {"url": image_to_data_url(diff_heatmap(target, last_render))}})
+            except Exception:
+                pass
         messages.append({"role": "user", "content": content})
 
     wall = time.time() - t0
