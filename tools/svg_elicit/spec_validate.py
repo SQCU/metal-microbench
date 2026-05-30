@@ -52,6 +52,8 @@ def main():
     ap.add_argument("--fill", type=int, default=1,
                     help="overschedule multiplier on the engine kernel width "
                          "(1=saturate; concurrency itself comes from batch_scaler)")
+    ap.add_argument("--turn0", choices=["simple", "rich"], default="rich",
+                    help="round-0 elicitation strategy (default rich: strong first attempt)")
     ap.add_argument("--out-root", type=pathlib.Path, required=True)
     args = ap.parse_args()
     args.out_root.mkdir(parents=True, exist_ok=True)
@@ -73,7 +75,8 @@ def main():
         prefix = f"{stem}_s{seed}"
         try:
             rep = E.run_rollout(targets[stem], "tools", args.rounds, args.max_tokens,
-                                1.0, seed, args.out_root, prefix)   # judge ON by default
+                                1.0, seed, args.out_root, prefix,   # judge ON by default
+                                turn0=args.turn0)
         except Exception as e:
             import traceback
             rep = {"best_mse": None, "error": repr(e), "tb": traceback.format_exc(limit=3)}

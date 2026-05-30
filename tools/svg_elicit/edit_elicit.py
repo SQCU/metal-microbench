@@ -265,7 +265,7 @@ def _tools_desc(design: str, verbose: bool) -> str:
 def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: int,
                 temperature: float, seed: int, out_dir: pathlib.Path, prefix: str,
                 tool_desc: str = "terse", design: str = "full", recovery: bool = False,
-                judge: bool = True) -> dict:
+                judge: bool = True, turn0: str = "simple") -> dict:
     W, H = target.size
     tgt_arr = np.asarray(target.convert("RGB"))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -281,12 +281,30 @@ def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: in
 
     proto = _tools_desc(design, tool_desc == "verbose") if edit_mode == "tools" else _PROTO[edit_mode]
     sys_prompt = _SYS + "\n" + proto
+    # turn-0 elicitation. "simple" = the original minimal-first-attempt prompt
+    # (leaves first-attempt quality on the table). "rich" = a STRONG first attempt
+    # using the full feature set, so round 0 is a real one-shot ceiling and
+    # refinement has a strong base to improve on (best-known elicitation, ported
+    # from elicit.py's SYSTEM_SVG_RICH strategy).
+    if turn0 == "rich":
+        turn0_text = (
+            f"Target image ({W}x{H}). Write your STRONGEST possible reconstruction as your "
+            f"INITIAL ```python``` program that sets `svg` — this first attempt should already "
+            f"look as much like the target as you can make it; you will then refine it by editing. "
+            f"Reproduce EVERYTHING you can see: every distinct region, object, and text string, in "
+            f"the right place, size and colour. Use the FULL SVG feature set wherever it improves "
+            f"faithfulness — linear/radialGradient for shaded or metallic fills, filters "
+            f"(feGaussianBlur) for glow/soft edges, <pattern> for repeated texture, <text> for any "
+            f"legible text, clipPath/opacity/transform — and choose the primitive that matches the "
+            f"IMAGE STRUCTURE. Do not hold back detail for later; make round 0 your best one-shot.")
+    else:
+        turn0_text = (f"Target image ({W}x{H}). Write your INITIAL program now — a "
+                      f"```python``` block that sets `svg`. Keep it simple; you'll "
+                      f"refine it by editing.")
     messages = [
         {"role": "system", "content": sys_prompt},
         {"role": "user", "content": [
-            {"type": "text", "text": f"Target image ({W}x{H}). Write your INITIAL program now — a "
-                                     f"```python``` block that sets `svg`. Keep it simple; you'll "
-                                     f"refine it by editing."},
+            {"type": "text", "text": turn0_text},
             {"type": "image_url", "image_url": {"url": image_to_data_url(target)}}]},
     ]
 
@@ -357,8 +375,17 @@ def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: in
             content += [
                 {"type": "text", "text": "current render:"},
                 {"type": "image_url", "image_url": {"url": image_to_data_url(render)}},
-                {"type": "text", "text": "MSE residual (BRIGHT = wrong/missing — edit your program to "
-                                         "darken it; DARK = matched):" + judge_note},
+                # The residual heatmap LOCALISES what's missing/wrong, but do NOT
+                # chase per-pixel darkness: getting a region's shape, position and
+                # colour RIGHT matters more than pixel-exactness (a correct element
+                # placed slightly off still reads as faithful). Prioritise the
+                # largest missing/wrong STRUCTURES — regions, objects, text — over
+                # nudging already-plausible areas. (MSE is position-rigid; it is a
+                # localiser here, not the objective.)
+                {"type": "text", "text": "residual heatmap (BRIGHT = a region that is missing or wrong) — "
+                                         "use it to find the LARGEST missing/incorrect structures and add or "
+                                         "fix those (right shape, position, colour, and any legible text); "
+                                         "don't micro-optimise already-close areas:" + judge_note},
                 {"type": "image_url", "image_url": {"url": image_to_data_url(diff_heatmap(target, render))}},
             ]
         messages.append({"role": "user", "content": content})
@@ -464,6 +491,7 @@ def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: in
         # round-0 one-shot baseline integrity: if parse failed, oneshot_mse is a
         # blank-canvas artifact and must NOT be treated as the model's one-shot.
         "round0_parse_failed": parse_failed, "round0_parse_retries": parse_retries,
+        "turn0": turn0,
         "rounds": rounds, "wall_s": round(wall, 1),
         # per-round {round, mse, ssim, composition, forms, color_texture, lines} — incl. round 0.
         "trajectory": traj,
@@ -483,6 +511,9 @@ def main():
     ap.add_argument("--error-recovery", action="store_true",
                     help="(tools mode) re-state the edit syntax in feedback whenever an edit fails")
     ap.add_argument("--rounds", type=int, default=12, help="edit rounds after the initial program")
+    ap.add_argument("--turn0", choices=["simple", "rich"], default="simple",
+                    help="round-0 elicitation: 'rich' asks for the strongest full first attempt "
+                         "(real one-shot ceiling) vs 'simple' (minimal, refine-later)")
     ap.add_argument("--no-judge", dest="judge", action="store_false",
                     help="(tools mode) disable the in-loop joint correspondence judge (ON by default)")
     ap.add_argument("--max-tokens", type=int, default=2048)
@@ -497,7 +528,8 @@ def main():
     prefix = f"{args.frame.stem}_{args.edit_mode}{suffix}"
     rep = run_rollout(target, args.edit_mode, args.rounds, args.max_tokens,
                       args.temperature, args.seed, args.out_root, prefix, tool_desc=args.tool_desc,
-                      design=args.tool_design, recovery=args.error_recovery, judge=args.judge)
+                      design=args.tool_design, recovery=args.error_recovery, judge=args.judge,
+                      turn0=args.turn0)
     tj = rep["trajectory"]
     print(f"[edit_elicit] mode={args.edit_mode} oneshot_mse={rep['oneshot_mse']} "
           f"best_mse={rep['best_mse']} (r{rep['best_round']}) "
