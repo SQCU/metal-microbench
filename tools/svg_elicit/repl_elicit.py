@@ -142,10 +142,22 @@ assistant:
 """
 
 
-def _system_prompt(arm: str, elicit: str) -> str:
+def _forced_clause(n: int) -> str:
+    return (f"\n\nThis is a multi-pass task. A \"pass\" = setting `svg` in a ```python``` block "
+            f"and reading back its MSE/SSIM. You MUST complete at least {n} passes, and each pass "
+            f"must be a GENUINE change aimed at lowering MSE / raising SSIM versus your best so "
+            f"far — you are judged on best effort. Re-running an unchanged candidate is rejected "
+            f"and does not count as a pass. A final ```svg``` block submitted before {n} passes is "
+            f"bounced back to you. Only after at least {n} improving passes will your final be "
+            f"accepted.")
+
+
+def _system_prompt(arm: str, elicit: str, min_passes: int = 0) -> str:
     if arm == "control":
         return _SYS_CONTROL
     p = _SYS_KERNEL + (_SYS_2B if arm == "2b" else "")
+    if min_passes > 0:
+        p += _forced_clause(min_passes)
     if elicit == "hard":
         p += _ELICIT_HARD
     elif elicit == "kshot":
@@ -166,12 +178,12 @@ def _exec_persistent(code: str, ns: dict) -> tuple[bool, str, str]:
 
 def run_rollout(target: Image.Image, arm: str, max_turns: int, max_tokens: int,
                 temperature: float, seed: int, out_dir: pathlib.Path, prefix: str,
-                elicit: str = "plain") -> dict:
+                elicit: str = "plain", min_passes: int = 0) -> dict:
     W, H = target.size
     tgt_arr = np.asarray(target.convert("RGB"))
 
     messages = [
-        {"role": "system", "content": _system_prompt(arm, elicit)},
+        {"role": "system", "content": _system_prompt(arm, elicit, min_passes)},
         {"role": "user", "content": [
             {"type": "text", "text": f"Reconstruct this {W}x{H} image as SVG."},
             {"type": "image_url", "image_url": {"url": image_to_data_url(target)}}]},
@@ -185,6 +197,12 @@ def run_rollout(target: Image.Image, arm: str, max_turns: int, max_tokens: int,
     traj: list[dict] = []                    # per-test (turn, mse, ssim) for plateau analysis
     n_code = n_err = 0
     last_render: Image.Image | None = None
+    accepted_passes = 0                       # distinct scored candidates (forced-iter target)
+    rejected_finals = 0                       # premature final submissions bounced back
+    seen_sigs: set[str] = set()               # anti-laziness: unchanged resubmits don't count
+
+    def _sig(svg: str) -> str:
+        return " ".join(svg.split()).lower()  # whitespace-normalized candidate signature
 
     def _consider(svg: str, r: Image.Image, turn: int):
         nonlocal best
@@ -204,6 +222,17 @@ def run_rollout(target: Image.Image, arm: str, max_turns: int, max_tokens: int,
         if arm == "control":
             final = final or (_SVG_TAG_RE.search(text).group(0) if _SVG_TAG_RE.search(text) else None)
         if final:
+            # Forced-iteration gate: refuse a final until min_passes distinct,
+            # genuinely-different candidates have been scored. (control exempt.)
+            if arm != "control" and accepted_passes < min_passes:
+                rejected_finals += 1
+                messages.append({"role": "user", "content":
+                    f"Not accepted: you have completed {accepted_passes} of {min_passes} required "
+                    f"refinement passes. You are judged on best effort. Do NOT submit a final "
+                    f"```svg``` yet — set `svg` in a ```python``` block to test another candidate "
+                    f"that genuinely tries to lower MSE / raise SSIM versus your best so far. "
+                    f"Resubmitting an unchanged result will be rejected and will not count."})
+                continue
             try:
                 r = render_svg(final, width=W, height=H)
                 _consider(final, r, turn)
@@ -226,11 +255,21 @@ def run_rollout(target: Image.Image, arm: str, max_turns: int, max_tokens: int,
             n_err += 1
         feedback: dict = {"stdout": out[:1500]}
         if ok and isinstance(ns.get("svg"), str):
+            sig = _sig(ns["svg"])
             try:
                 r = render_svg(ns["svg"], width=W, height=H)
                 m, s = _consider(ns["svg"], r, turn)
                 feedback["mse"], feedback["ssim"] = round(m, 5), round(s, 4)
                 last_render = r
+                if sig in seen_sigs:
+                    feedback["rejected"] = ("unchanged from a previous candidate — this does NOT "
+                                            "count as a refinement pass; make a substantive change "
+                                            "aimed at improving the score")
+                else:
+                    seen_sigs.add(sig)
+                    accepted_passes += 1
+                    feedback["pass"] = (f"{accepted_passes}/{min_passes}" if min_passes
+                                        else str(accepted_passes))
             except Exception:
                 feedback["render_error"] = traceback.format_exc(limit=2)
         if not ok:
@@ -268,6 +307,8 @@ def run_rollout(target: Image.Image, arm: str, max_turns: int, max_tokens: int,
         "judge_missing": (judge_res or {}).get("missing"),
         "code_calls": n_code, "code_errors": n_err,          # capability gating metric
         "code_error_rate": round(n_err / n_code, 3) if n_code else None,
+        "min_passes": min_passes, "accepted_passes": accepted_passes,
+        "rejected_finals": rejected_finals,                   # forced-iteration enforcement
         "tests": len(traj), "turns_used": turn + 1, "wall_s": round(wall, 1),
         "trajectory": traj,                                   # plateau curve
     }
@@ -285,6 +326,9 @@ def main():
                          "demonstration in the prefix with no 'you must'")
     ap.add_argument("--max-turns", type=int, default=8,
                     help="max kernel turns before forced submit (control ignores; always 1)")
+    ap.add_argument("--min-passes", type=int, default=0,
+                    help="forced-iteration floor: refuse a final SVG until N distinct, "
+                         "genuinely-changed candidates have been scored (0 = voluntary/off)")
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=42)
@@ -293,12 +337,14 @@ def main():
     args = ap.parse_args()
 
     target = load_target_from_path(str(args.frame))
-    prefix = f"{args.frame.stem}_{args.arm}_{args.elicit}"
+    prefix = f"{args.frame.stem}_{args.arm}_{args.elicit}_m{args.min_passes}"
     rep = run_rollout(target, args.arm, args.max_turns, args.max_tokens,
-                      args.temperature, args.seed, args.out_root, prefix, elicit=args.elicit)
-    print(f"[repl_elicit] arm={args.arm} elicit={args.elicit} best_ssim={rep['best_ssim']} "
-          f"best_mse={rep['best_mse']} judge={rep['judge_faithfulness']} "
+                      args.temperature, args.seed, args.out_root, prefix,
+                      elicit=args.elicit, min_passes=args.min_passes)
+    print(f"[repl_elicit] arm={args.arm} elicit={args.elicit} min_passes={args.min_passes} "
+          f"best_ssim={rep['best_ssim']} best_mse={rep['best_mse']} judge={rep['judge_faithfulness']} "
           f"code={rep['code_calls']}call/{rep['code_errors']}err "
+          f"passes={rep['accepted_passes']} rej_finals={rep['rejected_finals']} "
           f"tests={rep['tests']} turns={rep['turns_used']} -> {args.out_root}")
 
 
