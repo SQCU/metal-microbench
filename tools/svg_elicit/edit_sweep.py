@@ -8,10 +8,12 @@ best MSE, semantic_distance, and whether the program APPENDED (lines grew).
 Outputs under output_data/.
 """
 from __future__ import annotations
-import argparse, concurrent.futures as cf, json, pathlib, statistics as st, time
+import argparse, concurrent.futures as cf, json, pathlib, statistics as st, sys, time
 
 import edit_elicit as E                                       # sets sys.path
 from svg_refinement_loop import load_target_from_path         # noqa: E402
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))  # tools/ for batch_scaler
+import batch_scaler as bs                                     # noqa: E402  saturate kernel width
 
 # (label, edit_mode, design, tool_desc, recovery)
 CELLS = [
@@ -29,7 +31,10 @@ def main():
     ap.add_argument("--frames", nargs="+", required=True)
     ap.add_argument("--seeds", type=int, nargs="+", default=[42])
     ap.add_argument("--rounds", type=int, default=6)
-    ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--fill", type=int, default=1,
+                    help="overschedule multiplier on the engine's kernel batch width "
+                         "(1=saturate; 2=keep kernel full despite stragglers). Concurrency "
+                         "comes from the engine via batch_scaler, never guessed.")
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--out-root", type=pathlib.Path, required=True)
     args = ap.parse_args()
@@ -55,10 +60,9 @@ def main():
         rep.update({"label": lbl, "frame": stem, "seed": seed})
         return rep
 
-    print(f"[edit_sweep] {len(jobs)} jobs, {args.workers} concurrent")
+    print(f"[edit_sweep] {len(jobs)} jobs, saturating engine kernel width (fill={args.fill})")
     t0 = time.time(); results = []
-    with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        for r in ex.map(run, jobs):
+    for r in bs.saturated_map(run, jobs, fill=args.fill, ordered=False):
             results.append(r)
             print(f"  {r['frame']:>10}/{r['label']:<20} s{r['seed']} "
                   f"best_mse={r.get('best_mse')} semdist={r.get('semantic_distance')} "

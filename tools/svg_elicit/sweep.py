@@ -17,10 +17,12 @@ Cells isolate one lever each against a full-stack anchor (2b.kshot.user.f3):
 Outputs under output_data/ (never /tmp).
 """
 from __future__ import annotations
-import argparse, concurrent.futures as cf, json, pathlib, statistics as st, time
+import argparse, concurrent.futures as cf, json, pathlib, statistics as st, sys, time
 
 import repl_elicit as R                                   # sets sys.path for svg_refinement_loop
 from svg_refinement_loop import load_target_from_path     # noqa: E402
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))  # tools/ for batch_scaler
+import batch_scaler as bs                                 # noqa: E402  saturate engine kernel width
 
 # (label, arm, elicit, voice, min_passes)
 CELLS = [
@@ -37,7 +39,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--frames", nargs="+", required=True)
     ap.add_argument("--seeds", type=int, nargs="+", default=[42])
-    ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--fill", type=int, default=1,
+                    help="overschedule multiplier on the engine's kernel batch width "
+                         "(1=saturate exactly; 2=keep the kernel full despite stragglers). "
+                         "Concurrency itself comes from the engine via batch_scaler, never guessed.")
     ap.add_argument("--max-turns", type=int, default=8)
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--out-root", type=pathlib.Path, required=True)
@@ -63,11 +68,10 @@ def main():
         rep.update({"label": label, "frame": stem, "seed": seed})
         return rep
 
-    print(f"[sweep] {len(jobs)} jobs, {args.workers} concurrent")
+    print(f"[sweep] {len(jobs)} jobs, saturating engine kernel width (fill={args.fill})")
     t0 = time.time()
     results = []
-    with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        for rep in ex.map(run, jobs):
+    for rep in bs.saturated_map(run, jobs, fill=args.fill, ordered=False):
             results.append(rep)
             print(f"  {rep['frame']:>10}/{rep['label']:<18} s{rep['seed']} "
                   f"ssim={rep.get('best_ssim')} smatch={rep.get('subject_match')} "

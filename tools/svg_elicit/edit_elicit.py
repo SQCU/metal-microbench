@@ -376,15 +376,11 @@ def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: in
 
     wall = time.time() - t0
 
-    # legacy feature-profile judge on the best render (kept for back-compat; the
-    # JOINT correspondence judge already ran in-loop and is in the trajectory).
-    jr = {}
-    if best["render"] is not None:
-        try:
-            jr = _judge.feature_score(lambda msgs: call_lm(msgs, 512, 0.0, seed)[0],
-                                      target, best["render"]) or {}
-        except Exception:
-            jr = {}
+    # NOTE: the discredited post-hoc independent-ratings feature_score judge that
+    # used to run here was removed — it differenced two independent descriptions
+    # (degenerates to pixel statistics) and contradicted the spec's JOINT,
+    # in-loop correspondence judge, which already ran every round and lives in the
+    # trajectory (composition/forms/color_texture). One judge, joint, in-loop.
 
     target.save(out_dir / f"{prefix}_target.png")
     if best["source"] is not None:
@@ -409,13 +405,18 @@ def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: in
         "lines_round0": r0.get("lines"), "lines_final": rN.get("lines"),
         "detail_accumulation": ((rN.get("lines", 0) - r0.get("lines", 0))
                                 if (r0.get("lines") is not None and rN.get("lines") is not None) else None),
-        "subject_match": jr.get("subject_match"), "semantic_distance": jr.get("semantic_distance"),
-        "profile_mean_delta": jr.get("profile_mean_delta"),
+        # Joint-correspondence judge at the one-shot (round 0) vs the final round —
+        # read from the trajectory (NOT a dangling `jr`, which is None when the
+        # last judge call failed or judging is off). Directly answers "did the
+        # composition/forms/color_texture correspondence rise over the turns".
+        "judge_round0": ({k: r0.get(k) for k in ("composition", "forms", "color_texture")}
+                         if judge_on else None),
+        "judge_final": ({k: rN.get(k) for k in ("composition", "forms", "color_texture")}
+                        if judge_on else None),
         "n_edits_applied": n_edits, "n_edit_errors": n_edit_errs,
         "rounds": rounds, "wall_s": round(wall, 1),
         # per-round {round, mse, ssim, composition, forms, color_texture, lines} — incl. round 0.
         "trajectory": traj,
-        "feature_deltas": jr.get("feature_deltas"),
     }
     (out_dir / f"{prefix}_report.json").write_text(json.dumps(rep, indent=2, default=str))
     return rep
