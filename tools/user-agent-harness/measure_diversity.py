@@ -41,8 +41,11 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # tools/ for batch_scaler
+import batch_scaler as bs  # noqa: E402  saturate engine kernel width, never guess it
 
-BRIDGE = os.environ.get("BRIDGE_URL", "http://127.0.0.1:8001").rstrip("/")
+BRIDGE = os.environ["BRIDGE_URL"].rstrip("/")
 MODEL = "gemma-4-a4b"
 
 
@@ -331,7 +334,7 @@ def judge_pair(pair_idx, conv_a, conv_b, label_a, label_b):
     return (label_a, label_b, score, reason)
 
 
-def run_gemma_judge(summaries_by_persona, *, max_workers=4):
+def run_gemma_judge(summaries_by_persona, *, max_workers=None):
     """Pairwise comparison of one conversation per persona-pair.
 
     Conservative budget: take conversation[0] from each persona, do
@@ -344,6 +347,8 @@ def run_gemma_judge(summaries_by_persona, *, max_workers=4):
         for j, pb in enumerate(pids):
             if i < j:
                 pairs.append((pa, pb, summaries_by_persona[pa][0], summaries_by_persona[pb][0]))
+    if max_workers is None:
+        max_workers = bs.target_workers(n_items=len(pairs), base=BRIDGE)
     print(f"[judge] {len(pairs)} pairwise comparisons; running with {max_workers} workers...")
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:

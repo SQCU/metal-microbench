@@ -30,7 +30,10 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-BRIDGE = os.environ.get("BRIDGE_URL", "http://127.0.0.1:8001").rstrip("/")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # tools/ for batch_scaler
+import batch_scaler as bs  # noqa: E402  saturate engine kernel width, never guess it
+
+BRIDGE = os.environ["BRIDGE_URL"].rstrip("/")
 MODEL = "gemma-4-a4b"
 
 PLAYERS_DIR = Path("/Users/mdot/sillytavern-fork/plugins/user-personas/players")
@@ -147,7 +150,7 @@ def summary_call(text, role_label, seed):
     ], seed=seed)
 
 
-def run_vectorized(personas, scringlo_sys, *, n_conversations, n_turns, base_seed, max_workers=12):
+def run_vectorized(personas, scringlo_sys, *, n_conversations, n_turns, base_seed, max_workers=None):
     """Lockstep rounds. All conversations advance one step at a time, in parallel."""
     states = []
     for p_idx, persona in enumerate(personas):
@@ -155,6 +158,10 @@ def run_vectorized(personas, scringlo_sys, *, n_conversations, n_turns, base_see
             states.append(make_conversation_state(persona, scringlo_sys, c,
                                                   base_seed + p_idx * 1_000_000))
 
+    # Each round issues one LLM call per ACTIVE conversation; saturate the
+    # engine's kernel width (clamped to the conversation count), from batch_scaler.
+    if max_workers is None:
+        max_workers = bs.target_workers(n_items=len(states), base=BRIDGE)
     print(f"[vec] {len(states)} conversations, {n_turns} turns each, max_workers={max_workers}")
 
     # Round 0: all user-agents open simultaneously.
@@ -256,8 +263,9 @@ def main():
     p.add_argument("--n-conversations", type=int, default=3)
     p.add_argument("--n-turns", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--max-workers", type=int, default=12,
-                   help="parallelism per lockstep round")
+    p.add_argument("--max-workers", type=int, default=None,
+                   help="parallelism per lockstep round; default = engine kernel width "
+                        "(batch_scaler), so each round saturates one decode step")
     p.add_argument("--out", default="output/diversity_report_vectorized.md")
     args = p.parse_args()
 

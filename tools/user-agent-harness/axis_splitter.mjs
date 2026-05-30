@@ -50,7 +50,8 @@ async function registerDerivedAxis({ name, kind, def, derived_from }) {
     return card.axis || card;
 }
 
-const OUT_DIR = '/Users/mdot/metal-microbench/data/axis_splits';
+const OUT_DIR = process.env.USER_PERSONAS_AXIS_SPLITS_DIR
+    || '/Users/mdot/metal-microbench/data/axis_splits';
 
 const SEPARATION_THRESHOLD = 0.8;   // Cohen's d ≥ 0.8 = "large effect"
 const N_HYPOTHESES = 3;
@@ -251,14 +252,14 @@ function cohensD(arrA, arrB) {
 async function evaluateSplit(hypothesis, byCtx, contextLabels) {
     const evals = {};  // ctxLabel → { name1: [scores], name2: [scores] }
     for (const ctx of contextLabels) evals[ctx] = { [hypothesis.name1]: [], [hypothesis.name2]: [] };
-    // Re-judge every turn in parallel (one bridge call each)
-    const tasks = [];
+    // Re-judge every turn (one bridge call each), bounded to the engine kernel
+    // width via saturatedMap — the old pre-started Promise.all fired all at once.
+    const work = [];
     for (const ctx of contextLabels) {
-        for (const t of byCtx.get(ctx)) {
-            tasks.push(judgeOnPair(t.turn, hypothesis).then(j => ({ ctx, t, j })));
-        }
+        for (const t of byCtx.get(ctx)) work.push({ ctx, t });
     }
-    const results = await Promise.all(tasks);
+    const results = await L.saturatedMap(work,
+        ({ ctx, t }) => judgeOnPair(t.turn, hypothesis).then(j => ({ ctx, t, j })));
     const perTurn = [];
     for (const { ctx, t, j } of results) {
         evals[ctx][hypothesis.name1].push(j.sig[hypothesis.name1]);

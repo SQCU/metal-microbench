@@ -7,16 +7,22 @@
 
 // 2026-05-24: env-driven URLs. Hardcoded host:port literals here would
 // (and did) silently break every deployment that isn't the local-canonical
-// 8001/8002 setup. The plugin that spawns this harness exports its own
-// resolved URLs as env vars so the child inherits them. Defaults match
-// the canonical local setup so legacy ad-hoc shell invocations still work.
+// setup. The plugin that spawns this harness exports its own resolved URLs
+// as env vars so the child inherits them. There are intentionally no default
+// ports here: ad-hoc shell invocations must pass ST_URL and BRIDGE_URL.
 //
 // Lint rule (scripts/lint_port_hardcodes.mjs) forbids new literal
 // `127.0.0.1:80\d+` / `localhost:80\d+` in any source file under
 // /plugins/user-personas/ or /tools/user-agent-harness/. Add new URL
 // surfaces here, not at the literal-use site.
-const ST     = process.env.ST_URL     || 'http://127.0.0.1:8002';
-const BRIDGE = process.env.BRIDGE_URL || 'http://127.0.0.1:8001';
+function requireEnv(name) {
+    const value = process.env[name];
+    if (!value) throw new Error(`[harness_lib] missing required ${name}`);
+    return value.replace(/\/+$/, '');
+}
+
+const ST     = requireEnv('ST_URL');
+const BRIDGE = requireEnv('BRIDGE_URL');
 const PLUGIN = process.env.PLUGIN_URL || `${ST}/api/plugins/user-personas`;
 const MODEL  = process.env.GEMMA_MODEL_NAME || 'gemma-4-a4b';
 
@@ -94,6 +100,68 @@ export async function bridgeCall(messages, { max_tokens = null, temperature = 1.
     if (seed != null) body.seed = seed;  // OpenAI-compatible field, threads through to bridge sampler
     const r = await http('POST', `${BRIDGE}/v1/chat/completions`, body);
     return (r.choices?.[0]?.message?.content || '').trim();
+}
+
+// ── batch saturation ─────────────────────────────────────────────────
+// The engine decodes through a fixed-width kernel (B=8 streams/step,
+// bootstrap.swift:431) behind an M=64 session cap. Running fewer than B
+// concurrent calls wastes the kernel; an UNBOUNDED Promise.all (one call
+// per turn/bio, dozens at once) oversubscribes it. Both are the same
+// "guessed a concurrency number" bug the Python tools/batch_scaler.py
+// kills — this is its JS twin. The width comes from the engine
+// (/health capabilities.kernel_batch), cached, with env + default fallback.
+let _batchShape = null;
+async function _resolveBatchShape() {
+    if (_batchShape) return _batchShape;
+    let kb = 8, ms = 64, source = 'default';
+    const env = process.env.GEMMA_KERNEL_BATCH;
+    if (env && Number(env) > 0) { kb = Number(env); source = 'env'; }
+    else {
+        try {
+            const h = await http('GET', `${BRIDGE}/health`);
+            const caps = h?.capabilities || {};
+            if (Number(caps.kernel_batch) > 0) { kb = Number(caps.kernel_batch); source = 'health'; }
+            if (Number(caps.max_sessions) > 0) ms = Number(caps.max_sessions);
+        } catch { /* old/dead engine → keep defaults */ }
+    }
+    ms = Math.max(ms, kb);
+    _batchShape = { kernelBatch: kb, maxSessions: ms, source };
+    process.stderr.write(`[batch_scaler] saturating at kernel_batch=${kb} `
+        + `(max_sessions=${ms}, source=${source}) base=${BRIDGE}\n`);
+    return _batchShape;
+}
+
+export async function kernelBatch() { return (await _resolveBatchShape()).kernelBatch; }
+export async function maxSessions() { return (await _resolveBatchShape()).maxSessions; }
+
+// How many concurrent calls to run for nItems of work: clamp(kernelBatch*fill,
+// 1, maxSessions), then down to nItems. The ONE place JS clients get a
+// concurrency number.
+export async function targetWorkers(nItems = null, { fill = 1 } = {}) {
+    const s = await _resolveBatchShape();
+    let w = Math.min(s.kernelBatch * Math.max(1, fill), s.maxSessions);
+    if (nItems != null) w = Math.min(w, Math.max(1, nItems));
+    return Math.max(1, w);
+}
+
+// Drop-in replacement for `Promise.all(items.map(fn))` that bounds concurrency
+// to the engine's kernel width instead of firing all at once. Preserves input
+// order in the result array; fn is (item, index) => Promise. Rejections
+// propagate (like Promise.all) — wrap fn in try/catch for per-item capture.
+export async function saturatedMap(items, fn, { fill = 1 } = {}) {
+    const arr = [...items];
+    const out = new Array(arr.length);
+    const width = await targetWorkers(arr.length, { fill });
+    let next = 0;
+    async function worker() {
+        while (true) {
+            const i = next++;
+            if (i >= arr.length) return;
+            out[i] = await fn(arr[i], i);
+        }
+    }
+    await Promise.all(Array.from({ length: width }, worker));
+    return out;
 }
 
 // ── persistence ──────────────────────────────────────────────────────

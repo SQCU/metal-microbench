@@ -39,6 +39,7 @@ import {
     judgeOnAxis,
     meanStd,
     fetchAxes,
+    saturatedMap,
 } from './harness_lib.mjs';
 const { ST, BRIDGE, PLUGIN } = ENDPOINTS;
 
@@ -54,7 +55,8 @@ async function registerDerivedAxis({ name, kind, def, derived_from }) {
     return card.axis || card;
 }
 
-const OUT_DIR = '/Users/mdot/metal-microbench/data/cluster_disambig';
+const OUT_DIR = process.env.USER_PERSONAS_CLUSTER_DISAMBIG_DIR
+    || '/Users/mdot/metal-microbench/data/cluster_disambig';
 
 // ── tunables (see §6 Acceptance Thresholds) ──────────────────────────
 const N_TRAJ_PER_BIO     = 2;
@@ -146,7 +148,7 @@ async function tightnessPreflight(bios, trajs, nominalAxisName) {
     const perBio = {};
     for (const bio of bios) {
         const turns = trajs[bio.canonical_key].flatMap(userTurns);
-        const scores = await Promise.all(turns.map(t => judgeOnAxis(t, axis.name, axis.def)));
+        const scores = await saturatedMap(turns, t => judgeOnAxis(t, axis.name, axis.def));
         perBio[bio.canonical_key] = meanStd(scores);
     }
     const means = Object.values(perBio).map(s => s.mean).filter(Number.isFinite);
@@ -192,10 +194,10 @@ async function judgeSimilarity(promptLabel, defText, blockA, blockB) {
 
 async function pairwiseProseSim(bios) {
     const ps = pairs(bios);
-    const scores = await Promise.all(ps.map(([a, b]) => judgeSimilarity(
+    const scores = await saturatedMap(ps, ([a, b]) => judgeSimilarity(
         'prose-similarity',
         '1: completely different (unrelated topics, registers, or content); 3: same topic, different presentation; 5: paraphrases of each other (same content, different wording)',
-        a.prose, b.prose)));
+        a.prose, b.prose));
     return { mean: scores.filter(Number.isFinite).reduce((x, y) => x + y, 0) / scores.length,
              pairs: ps.map(([a, b], i) => ({ a: a.name, b: b.name, score: scores[i] })) };
 }
@@ -204,10 +206,10 @@ async function pairwiseBehaviorSim(bios, trajs) {
     const ps = pairs(bios);
     const sample = bio => userTurns(trajs[bio.canonical_key][0]).slice(0, 2)
         .map((t, i) => `  (${i+1}) ${t.slice(0, 250)}`).join('\n');
-    const scores = await Promise.all(ps.map(([a, b]) => judgeSimilarity(
+    const scores = await saturatedMap(ps, ([a, b]) => judgeSimilarity(
         'behavioral-similarity',
         '1: completely different behaviors / moves / strategies; 3: overlapping but distinguishable behavioral repertoires; 5: behaviorally interchangeable (same moves, same strategies, same dispositional expression)',
-        sample(a), sample(b))));
+        sample(a), sample(b)));
     return { mean: scores.filter(Number.isFinite).reduce((x, y) => x + y, 0) / scores.length,
              pairs: ps.map(([a, b], i) => ({ a: a.name, b: b.name, score: scores[i] })) };
 }
@@ -216,17 +218,20 @@ async function pairwiseBehaviorSim(bios, trajs) {
 
 async function evaluateSpread(hypothesis, bios, trajs) {
     const perBioRaw = {};   // bio_id → [score per turn]
-    const tasks = [];
+    // Build the work-list of (bio, turn) judgements first, THEN run them through
+    // saturatedMap so concurrency is bounded to the engine kernel width. The old
+    // pre-started Promise.all fired every (bio×turn) call at once.
+    const work = [];
     for (const bio of bios) {
         const turns = trajs[bio.canonical_key].flatMap(userTurns);
         perBioRaw[bio.canonical_key] = new Array(turns.length).fill(null);
         for (let i = 0; i < turns.length; i++) {
-            const idx = i;
-            tasks.push(judgeOnAxis(turns[i], hypothesis.name, hypothesis.def)
-                .then(score => { perBioRaw[bio.canonical_key][idx] = score; }));
+            work.push({ key: bio.canonical_key, idx: i, turn: turns[i] });
         }
     }
-    await Promise.all(tasks);
+    await saturatedMap(work, ({ key, idx, turn }) =>
+        judgeOnAxis(turn, hypothesis.name, hypothesis.def)
+            .then(score => { perBioRaw[key][idx] = score; }));
     const perBio = {};
     for (const bio of bios) {
         perBio[bio.canonical_key] = meanStd(perBioRaw[bio.canonical_key]);
@@ -262,19 +267,20 @@ async function runDisambiguator(specPath) {
     console.log(`\n[disambig] running ${N_TRAJ_PER_BIO} trajectories × ${N_TURNS_PER_TRAJ} turns per bio…`);
     const trajs = {};
     const tChat0 = Date.now();
-    const chatTasks = [];
+    // Work-list of chats, run through saturatedMap so at most kernel-width chats
+    // are in flight at once (each chat is itself a sequential call-chain). The
+    // old pre-started Promise.all launched every bio×trajectory chat at once.
+    const chatWork = [];
     for (const bio of spec.bios) {
         trajs[bio.canonical_key] = [];
         for (let r = 0; r < N_TRAJ_PER_BIO; r++) {
             const taskIdx = trajs[bio.canonical_key].push(null) - 1;
-            const bioRef = bio;
-            chatTasks.push(
-                runChat(bioRef, agentIds[bioRef.canonical_key].id, cp, N_TURNS_PER_TRAJ)
-                    .then(chat => { trajs[bioRef.canonical_key][taskIdx] = chat; })
-            );
+            chatWork.push({ bioRef: bio, taskIdx });
         }
     }
-    await Promise.all(chatTasks);
+    await saturatedMap(chatWork, ({ bioRef, taskIdx }) =>
+        runChat(bioRef, agentIds[bioRef.canonical_key].id, cp, N_TURNS_PER_TRAJ)
+            .then(chat => { trajs[bioRef.canonical_key][taskIdx] = chat; }));
     // LINT-OK-PREFIX-SAFE: stderr-style timing log, not prompt content.
     console.log(`[disambig] chats done in ${((Date.now()-tChat0)/1000).toFixed(1)}s`);
 

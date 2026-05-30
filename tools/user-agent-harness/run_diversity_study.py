@@ -15,7 +15,7 @@ If rows are visibly distinct → the architecture works; we can scale
 up the persona count and conversation count, and graduate the
 summarizer from this inline LLM call to a real toolcard.
 
-Talks to the bridge directly at $BRIDGE_URL (default http://127.0.0.1:8001).
+Talks to the bridge directly at $BRIDGE_URL.
 No SillyTavern in the loop — we're measuring user-agent diversity,
 not ST integration. (ST e2e gets its own Playwright test once the
 diversity invariant holds.)
@@ -31,7 +31,10 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-BRIDGE = os.environ.get("BRIDGE_URL", "http://127.0.0.1:8001").rstrip("/")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # tools/ for batch_scaler
+import batch_scaler as bs  # noqa: E402  saturate engine kernel width, never guess it
+
+BRIDGE = os.environ["BRIDGE_URL"].rstrip("/")
 MODEL = "gemma-4-a4b"
 
 PLAYERS_DIR = Path("/Users/mdot/sillytavern-fork/plugins/user-personas/players")
@@ -174,7 +177,7 @@ def run_conversation(persona, scringlo_sys, *, n_turns, seed):
 def run_all(personas, scringlo_sys, *, n_conversations, n_turns, base_seed):
     """For each persona × n_conversations independent runs, in parallel."""
     futures = {}
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=bs.target_workers(base=BRIDGE)) as pool:
         for p_idx, persona in enumerate(personas):
             for conv_i in range(n_conversations):
                 seed = base_seed + p_idx * 1_000_000 + conv_i * 1000

@@ -208,7 +208,7 @@ async function exploreOneIteration(state, iter, rng, cp, kCandidates) {
         const r = allAxes().find(a => a.name === n);
         return { name: n, def: r.def };
     });
-    const judged = await Promise.all(turns.map(t => L.judgeOnAxes(t, axisRecords)));
+    const judged = await L.saturatedMap(turns, t => L.judgeOnAxes(t, axisRecords));
     const perAxis = {};
     for (const a of BIO_AXIS_NAMES) {
         const vs = judged.map(j => j.sig[a]).filter(Number.isFinite);

@@ -23,7 +23,10 @@ from collections import defaultdict
 from pathlib import Path
 
 import os as _os_for_bridge_base
-BRIDGE_BASE = _os_for_bridge_base.environ.get("BRIDGE_URL", "http://127.0.0.1:8001")
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # tools/ for batch_scaler
+import batch_scaler as bs  # noqa: E402  saturate engine kernel width, never guess it
+BRIDGE_BASE = _os_for_bridge_base.environ["BRIDGE_URL"]
 LIKERT_AXES = [
     "curious", "terse", "warm", "deferential", "performative",
     "in_character", "affective_intensity", "probe_depth", "goal_clarity",
@@ -114,13 +117,15 @@ def judge_turn(turn_text: str) -> dict | None:
     return out if len(out) >= 14 else None
 
 
-def judge_trajectory(trajectory: list[dict], max_concurrent: int = 8) -> dict:
+def judge_trajectory(trajectory: list[dict], max_concurrent: int | None = None) -> dict:
     """Judge every user turn in the trajectory in parallel, then compute
     drift over the resulting 14-axis sequence. Parallelism matches the
-    bridge engine's max_b so the judge calls share KV-page prefix without
-    over-saturating the pool."""
+    bridge engine's kernel batch width (from batch_scaler) so the judge calls
+    share KV-page prefix without over-saturating the pool."""
     user_turns = [t for t in trajectory
                   if t.get("kind") == "user" and (t.get("text") or "").strip()]
+    if max_concurrent is None:
+        max_concurrent = bs.target_workers(n_items=len(user_turns), base=BRIDGE_BASE)
     sig_vecs: list[list[float]] = []
     with cf.ThreadPoolExecutor(max_workers=max_concurrent) as ex:
         futures = [ex.submit(judge_turn, t["text"]) for t in user_turns]
