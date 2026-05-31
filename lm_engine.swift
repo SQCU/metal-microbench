@@ -1383,7 +1383,14 @@ final class Session {
         for p in 0..<count {
             // Mix imgHash with position so each soft position is distinct.
             let mixed = imgHash &+ UInt64(p) &* 0x9E3779B97F4A7C15
-            consumedTokens.append(UInt32(truncatingIfNeeded: mixed))
+            // consumedTokens is [UInt32] (real vocab fits in 32 bits), so the
+            // placeholder must fit too — but a plain truncation DISCARDS the high
+            // 32 bits, i.e. exactly the image-identity entropy. XOR-fold the full
+            // 64 bits into the slot so a different image's placeholder reflects all
+            // 64 bits of `mixed` and is far less likely to alias in the prefix walk.
+            // (The hard cross-image guarantee is the 64-bit imageContentDigest in
+            // the partition tag; this keeps the per-position hashes honest too.)
+            consumedTokens.append(UInt32(truncatingIfNeeded: mixed ^ (mixed >> 32)))
         }
         if state != .done { state = .priming }
         promptEndPosition = consumedTokens.count
