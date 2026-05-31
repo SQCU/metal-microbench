@@ -368,3 +368,95 @@ def checklist_match(chat, ref_img: Image.Image, render_img: Image.Image,
                 "partial": [e for e, s in scores.items() if s == 1]}
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# COMPARATIVE judge designs — the fix for the crushed dynamic range. Absolute
+# judges (correspondence/feature_residual) floor every SVG at the same low score
+# because the raster reference is unreachable, so the SCALE has no resolution for
+# refinement. Comparative designs put the renders side-by-side and force the model
+# to DISCRIMINATE, which recovers dynamic range.
+
+def rank_renders(chat, ref_img: Image.Image, renders: list[Image.Image]) -> list[int] | None:
+    """Show the reference and ALL N trajectory renders at once; force a DISTINCT
+    ordinal rank 1..N (N = most faithful) for each. Spread is guaranteed by
+    construction; the per-turn rank trajectory is the (directional) refinement
+    signal. Returns a list of N ranks aligned to `renders`."""
+    n = len(renders)
+    if n < 2:
+        return None
+    content = [{"type": "text", "text": "REFERENCE image:"},
+               {"type": "image_url", "image_url": {"url": _durl(ref_img)}}]
+    for i, im in enumerate(renders):
+        content += [{"type": "text", "text": f"RECONSTRUCTION {i}:"},
+                    {"type": "image_url", "image_url": {"url": _durl(im)}}]
+    keys = ", ".join(f'"{i}": <int>' for i in range(n))
+    content += [{"type": "text", "text":
+                 f"These are {n} attempts to reconstruct the REFERENCE. Rank them by FAITHFULNESS "
+                 f"to the reference: assign each a DISTINCT integer from 1 (least faithful) to {n} "
+                 f"(most faithful) — use every rank exactly once. ONLY JSON: {{{keys}}}."}]
+    try:
+        sys = ("You rank reconstructions by how faithfully each reproduces a reference image. "
+               "Use the FULL ordinal range; every rank from 1 to N must be used exactly once.")
+        m = _JSON_RE.search(chat([{"role": "system", "content": sys},
+                                   {"role": "user", "content": content}]))
+        if not m:
+            return None
+        obj = json.loads(m.group(0))
+        out = [int(round(float(obj.get(str(i), obj.get(i, 0))))) for i in range(n)]
+        return out if any(out) else None
+    except Exception:
+        return None
+
+
+def pairwise_improve(chat, ref_img: Image.Image, prev_img: Image.Image,
+                     cur_img: Image.Image) -> int | None:
+    """Did reconstruction B (current) reproduce the reference BETTER, the same, or
+    WORSE than A (previous)? Returns +1 / 0 / -1. Directional per-turn signal; the
+    cumulative sum is a non-flat trajectory."""
+    content = [{"type": "text", "text": "REFERENCE:"},
+               {"type": "image_url", "image_url": {"url": _durl(ref_img)}},
+               {"type": "text", "text": "reconstruction A (previous):"},
+               {"type": "image_url", "image_url": {"url": _durl(prev_img)}},
+               {"type": "text", "text": "reconstruction B (current):"},
+               {"type": "image_url", "image_url": {"url": _durl(cur_img)}},
+               {"type": "text", "text":
+                'Does B reproduce the REFERENCE better, the same, or worse than A overall? '
+                'ONLY JSON: {"verdict": "better"|"same"|"worse"}.'}]
+    try:
+        sys = "You compare two reconstructions of a reference and judge which is more faithful."
+        m = _JSON_RE.search(chat([{"role": "system", "content": sys},
+                                   {"role": "user", "content": content}]))
+        if not m:
+            return None
+        v = (json.loads(m.group(0)).get("verdict") or "").lower()
+        return {"better": 1, "same": 0, "worse": -1}.get(v)
+    except Exception:
+        return None
+
+
+def anchored_score(chat, ref_img: Image.Image, render_img: Image.Image,
+                   good: Image.Image, bad: Image.Image) -> float | None:
+    """Absolute 1-10 score, but the SCALE is anchored by two exemplar renders shown
+    in-context (a strong one = 9, a weak one = 2). Anchoring spreads the absolute
+    scale that an un-anchored rubric crushes (the 'calibrate the old judge' path)."""
+    content = [{"type": "text", "text": "REFERENCE image:"},
+               {"type": "image_url", "image_url": {"url": _durl(ref_img)}},
+               {"type": "text", "text": "ANCHOR — this reconstruction scores 9/10:"},
+               {"type": "image_url", "image_url": {"url": _durl(good)}},
+               {"type": "text", "text": "ANCHOR — this reconstruction scores 2/10:"},
+               {"type": "image_url", "image_url": {"url": _durl(bad)}},
+               {"type": "text", "text": "Now score THIS reconstruction on the same 1-10 scale:"},
+               {"type": "image_url", "image_url": {"url": _durl(render_img)}},
+               {"type": "text", "text": 'Use the anchors to calibrate. ONLY JSON: {"score": <int 1-10>}.'}]
+    try:
+        sys = ("You score how faithfully a reconstruction reproduces a reference on a 1-10 scale, "
+               "calibrated against two anchor reconstructions whose scores are given. Use the full range.")
+        m = _JSON_RE.search(chat([{"role": "system", "content": sys},
+                                   {"role": "user", "content": content}]))
+        if not m:
+            return None
+        s = json.loads(m.group(0)).get("score")
+        return float(s) if isinstance(s, (int, float)) else None
+    except Exception:
+        return None
