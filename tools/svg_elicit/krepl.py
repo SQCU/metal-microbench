@@ -47,20 +47,23 @@ SYSTEM = (
 )
 
 
-def _feedback(turn, source, render, stats, jv, err, ref, prev):
+def _feedback(turn, source, render, stats, cl, err, ref, prev):
     if render is None:
         return [{"type": "text", "text":
                  f"turn {turn}: your program FAILED ({err}). Fix it and emit a full working "
                  f"```python``` program. Your current program:\n" + _numbered(source)[:4000]}]
-    j = jv or {}
-    axes = ", ".join(f"{k}={j.get(k)}" for k in _judge.RESIDUAL_AXES)
-    worst = j.get("worst", "?")
+    c = cl or {}
+    missing = c.get("missing") or []
+    partial = c.get("partial") or []
+    cov = f"{c.get('present_count')}/{c.get('total')}" if c else "?"
     txt = (f"turn {turn}: mse={stats['mse']} ssim={stats['ssim']} "
            f"changed_since_prev(mse)={stats.get('mse_vs_prev')}.\n"
-           f"match (1-5): {axes}.  weakest axis: {worst}.\n"
+           f"reference-content reconstructed: {cov}.\n"
+           f"STILL MISSING (add these): {missing}\n"
+           f"only PARTIAL (fix colour/place/size): {partial}\n"
            "Below: current render, then RESIDUAL (bright = wrong/missing), then DELTA (what you "
-           "changed). Make a SUBSTANTIAL revision that darkens the brightest residual regions and "
-           "lifts your weakest axes — not a cosmetic tweak. Your current program:\n"
+           "changed). Make a SUBSTANTIAL revision this turn that ADDS the missing elements and "
+           "fixes the partial ones — not a cosmetic tweak. Your current program:\n"
            + _numbered(source)[:4000])
     return [
         {"type": "text", "text": txt},
@@ -82,6 +85,12 @@ def refine(target, rounds, seed, out_dir, prefix, max_tokens=16000):
 
     def jchat(msgs):
         return call_lm(msgs, 512, 0.0, seed)[0]
+
+    # fixed per-image checklist of salient reference elements (computed ONCE, seed-0
+    # so it is IDENTICAL across seeds of the same image -> coverage is comparable).
+    # The per-turn matching uses the run seed, so its variance is what we study.
+    checklist = _judge.salient_checklist(lambda m: call_lm(m, 512, 0.0, 0)[0], target) or []
+    (out_dir / f"{prefix}_checklist.json").write_text(json.dumps(checklist, ensure_ascii=False, indent=2))
 
     messages = [
         {"role": "system", "content": SYSTEM},
@@ -113,33 +122,50 @@ def refine(target, rounds, seed, out_dir, prefix, max_tokens=16000):
                 err = repr(e)[:200]
         # ---- DUMP EVERYTHING ----
         (out_dir / f"{prefix}_t{t:02d}.py").write_text("\n".join(source))
-        stats, jv = {"mse": None, "ssim": None}, None
+        stats, jv, cl = {"mse": None, "ssim": None}, None, None
         if render is not None:
             render.save(out_dir / f"{prefix}_t{t:02d}_render.png")
             R.false_color_residual(target, render).save(out_dir / f"{prefix}_t{t:02d}_residual.png")
             R.false_color_delta(prev_render, render).save(out_dir / f"{prefix}_t{t:02d}_delta.png")
             stats = R.residual_stats(target, render, prev_render)
-            jv = _judge.feature_residual(jchat, target, render)
+            cl = _judge.checklist_match(jchat, target, render, checklist) if checklist else None
+            jv = _judge.feature_residual(jchat, target, render)     # OLD 9-axis, kept for collapse comparison
         row = {"turn": t, "out_tokens": usage.get("completion_tokens"),
                "finish": finish, "lines": len(source), "err": (err[:160] if err else None),
-               **stats, "judge": jv, "judge_mean": (jv or {}).get("mean")}
+               **stats,
+               "checklist_present": (cl or {}).get("present_count"),
+               "checklist_total": (cl or {}).get("total"),
+               "checklist_fraction": (cl or {}).get("fraction"),
+               "checklist_scores": (cl or {}).get("scores"),
+               "judge9": jv, "judge9_mean": (jv or {}).get("mean")}
         traj.append(row)
         if t < rounds:
             messages.append({"role": "user", "content":
-                             _feedback(t, source, render, stats, jv, err, target, prev_render)})
+                             _feedback(t, source, render, stats, cl, err, target, prev_render)})
         if render is not None:
             prev_render = render
 
-    # trajectory deltas: residual should DROP, change-vs-prev should be LARGE, judge should RISE
+    # trajectory: residual should DROP, checklist coverage should RISE, change-vs-prev LARGE.
+    # We record BOTH judges so the collapse is explicit: judge9 (absolute, expected flat)
+    # vs checklist (expected to climb as detail is composed).
     mses = [r["mse"] for r in traj if isinstance(r["mse"], (int, float))]
-    jms = [r["judge_mean"] for r in traj if isinstance(r["judge_mean"], (int, float))]
+    cps = [r["checklist_present"] for r in traj if isinstance(r.get("checklist_present"), (int, float))]
+    j9 = [r["judge9_mean"] for r in traj if isinstance(r.get("judge9_mean"), (int, float))]
+
+    def _spread(xs):
+        return round(max(xs) - min(xs), 3) if xs else None
     report = {
-        "prefix": prefix, "rounds": rounds, "trajectory": traj,
-        "oneshot_mse": traj[0]["mse"], "final_mse": traj[-1]["mse"],
-        "best_mse": (min(mses) if mses else None),
+        "prefix": prefix, "seed": seed, "rounds": rounds, "trajectory": traj,
+        "checklist": checklist,
+        "oneshot_mse": traj[0]["mse"], "final_mse": traj[-1]["mse"], "best_mse": (min(mses) if mses else None),
         "mse_drop_oneshot_to_best": (round(traj[0]["mse"] - min(mses), 6)
                                      if (mses and traj[0]["mse"] is not None) else None),
-        "judge_mean_first": (jms[0] if jms else None), "judge_mean_last": (jms[-1] if jms else None),
+        # the headline comparison: does the NEW judge move while the OLD one stays flat?
+        "checklist_present_traj": cps,
+        "checklist_first_last": ([cps[0], cps[-1]] if cps else None),
+        "checklist_spread": _spread(cps),           # >0 means informative (non-collapsed)
+        "judge9_mean_traj": j9,
+        "judge9_spread": _spread(j9),               # ~0 means collapsed (the bug we're fixing)
         "mean_change_between_turns": (round(float(np.mean(
             [r["mse_vs_prev"] for r in traj if isinstance(r.get("mse_vs_prev"), (int, float))])), 6)
             if any(isinstance(r.get("mse_vs_prev"), (int, float)) for r in traj) else None),
@@ -153,28 +179,29 @@ def main():
     ap.add_argument("--frames", nargs="+", required=True)
     ap.add_argument("--rounds", type=int, default=4, help="edit turns after the one-shot")
     ap.add_argument("--max-tokens", type=int, default=16000)
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--seeds", type=int, nargs="+", default=[42, 7, 13],
+                    help="multiple seeds per image -> trajectory statistics + judge-collapse view")
     ap.add_argument("--out-root", type=pathlib.Path, required=True)
     args = ap.parse_args()
     args.out_root.mkdir(parents=True, exist_ok=True)
     frames = [(f"{pathlib.Path(f).parent.name}_{pathlib.Path(f).stem}", load_target_from_path(f))
               for f in args.frames]
+    jobs = [(stem, tgt, s) for stem, tgt in frames for s in args.seeds]
 
     def run(item):
-        stem, tgt = item
-        return refine(tgt, args.rounds, args.seed, args.out_root, stem, args.max_tokens)
+        stem, tgt, s = item
+        return refine(tgt, args.rounds, s, args.out_root, f"{stem}_s{s}", args.max_tokens)
 
-    print(f"[krepl] {len(frames)} images, {args.rounds+1} turns, max_tokens={args.max_tokens}", flush=True)
+    print(f"[krepl] {len(frames)} images x {len(args.seeds)} seeds = {len(jobs)} runs, "
+          f"{args.rounds+1} turns, max_tokens={args.max_tokens}", flush=True)
     t0 = time.time()
-    for rep in bs.saturated_map(run, frames, ordered=False):
-        tj = rep["trajectory"]
-        mtraj = " -> ".join(f"{r['mse']}" for r in tj)
-        jtraj = " -> ".join(f"{r['judge_mean']}" for r in tj)
+    for rep in bs.saturated_map(run, jobs, ordered=False):
         print(f"\n  {rep['prefix']}", flush=True)
-        print(f"    mse:   {mtraj}", flush=True)
-        print(f"    judge: {jtraj}", flush=True)
-        print(f"    change-between-turns(mse): {rep['mean_change_between_turns']}  "
-              f"drop oneshot->best: {rep['mse_drop_oneshot_to_best']}", flush=True)
+        print(f"    mse:       {' -> '.join(str(r['mse']) for r in rep['trajectory'])}", flush=True)
+        print(f"    checklist: {rep['checklist_present_traj']}  (spread {rep['checklist_spread']}, "
+              f"/{rep['trajectory'][0].get('checklist_total')})", flush=True)
+        print(f"    judge9:    {rep['judge9_mean_traj']}  (spread {rep['judge9_spread']})", flush=True)
+        print(f"    change-between-turns(mse): {rep['mean_change_between_turns']}", flush=True)
     print(f"\n[krepl] wall {time.time()-t0:.0f}s -> {args.out_root}", flush=True)
 
 

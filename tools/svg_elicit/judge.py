@@ -288,3 +288,83 @@ def feature_residual(chat, ref_img: Image.Image, render_img: Image.Image) -> dic
         return out
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Checklist judge — the FIX for judge collapse. The absolute "how faithful is
+# this SVG to a pixel-perfect reference" task floors every reconstruction at the
+# same low score (the reference is unreachable by SVG, so 0.62 vs 0.64 faithful
+# is below the model's discrimination). Instead: enumerate the reference's
+# salient elements ONCE (a fixed per-image checklist), then each turn check how
+# many of THOSE elements the render contains. As the writer composes more detail,
+# the present-count RISES — a sensitive, non-collapsing signal that directly
+# measures "is more of the reference's content reconstructed".
+_CHECKLIST_SYS = (
+    "You are itemising the visible content of an image so a reconstruction can be checked "
+    "against it. List the SALIENT, DISTINCT, individually-checkable elements — objects, "
+    "regions, text strings, distinctive colours/patterns — that a faithful reconstruction "
+    "must contain. Be concrete and visual (e.g. \"a man's face, upper-right\", \"green panel, "
+    "left third\", \"the text '麻雀'\"), not abstract.")
+
+
+def salient_checklist(chat, ref_img: Image.Image, n: int = 10) -> list[str] | None:
+    """`chat(messages) -> text`. Enumerate ~n salient, checkable elements of the
+    reference (computed ONCE per image). Returns a list of short element phrases."""
+    try:
+        msgs = [{"role": "system", "content": _CHECKLIST_SYS},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Image:"},
+                    {"type": "image_url", "image_url": {"url": _durl(ref_img)}},
+                    {"type": "text", "text":
+                        f"List the {n} most salient distinct elements this image contains. "
+                        f'Respond with ONLY JSON: {{"elements": ["<short phrase>", ...]}}.'}]}]
+        m = _JSON_RE.search(chat(msgs))
+        if not m:
+            return None
+        els = json.loads(m.group(0)).get("elements")
+        els = [str(e).strip() for e in els if str(e).strip()] if isinstance(els, list) else None
+        return els[:n] if els else None
+    except Exception:
+        return None
+
+
+_MATCH_SYS = (
+    "You check a RECONSTRUCTION against a REFERENCE using a fixed checklist of the reference's "
+    "elements. For each checklist item, judge whether the reconstruction contains it: "
+    "0 = absent, 1 = attempted but partial / wrong colour / misplaced, 2 = clearly present and "
+    "roughly correct. Judge only presence/correspondence of that element, not overall quality.")
+
+
+def checklist_match(chat, ref_img: Image.Image, render_img: Image.Image,
+                    checklist: list[str]) -> dict | None:
+    """`chat(messages) -> text`. Score each fixed checklist element 0/1/2 in the
+    render. Returns {scores: {item: 0-2}, present_count(weighted sum), total(2*len),
+    fraction}. Rises as the writer composes more of the reference's content."""
+    try:
+        items = "\n".join(f"  {i}: {e}" for i, e in enumerate(checklist))
+        keys = ", ".join(f'"{i}": <0-2>' for i in range(len(checklist)))
+        msgs = [{"role": "system", "content": _MATCH_SYS},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "REFERENCE:"},
+                    {"type": "image_url", "image_url": {"url": _durl(ref_img)}},
+                    {"type": "text", "text": "RECONSTRUCTION:"},
+                    {"type": "image_url", "image_url": {"url": _durl(render_img)}},
+                    {"type": "text", "text":
+                        "Checklist of reference elements:\n" + items + "\n"
+                        f'For each, score 0/1/2 in the reconstruction. ONLY JSON: {{{keys}}}.'}]}]
+        m = _JSON_RE.search(chat(msgs))
+        if not m:
+            return None
+        obj = json.loads(m.group(0))
+        scores = {}
+        for i, e in enumerate(checklist):
+            v = obj.get(str(i), obj.get(i))
+            scores[e] = int(round(float(v))) if isinstance(v, (int, float)) else 0
+        total = 2 * len(checklist)
+        psum = sum(scores.values())
+        return {"scores": scores, "present_count": psum, "total": total,
+                "fraction": round(psum / total, 3) if total else None,
+                "missing": [e for e, s in scores.items() if s == 0],
+                "partial": [e for e, s in scores.items() if s == 1]}
+    except Exception:
+        return None
