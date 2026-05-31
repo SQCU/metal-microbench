@@ -3295,11 +3295,15 @@ final class LmEngine {
                 // actually signaled, else mark the ticket failed so
                 // processFailedVisionSessions retires this session and the
                 // engine makes forward progress instead of wedging.
-                let signaled = gVisionEvent.wait(untilSignaledValue: eventTicket, timeoutMS: 30_000)
+                // NON-BLOCKING: pickChainPath only routes a soft session here
+                // once its ticket has signaled, so this is an immediate read —
+                // NEVER a CPU block under gEngineLock (the old .wait(timeoutMS:)
+                // froze every stream; that was the multimodal-stall root cause).
+                let signaled = gVisionEvent.signaledValue >= eventTicket
                 if signaled {
                     preCB.encodeWaitForEvent(gVisionEvent, value: eventTicket)
                 } else {
-                    FileHandle.standardError.write(Data("[engine] WARN: single-slot vision softs ticket \(eventTicket) not signaled within 30s — proceeding without GPU wait, failing the session (suspected vision-dispatch stall, RCA-3 follow-up)\n".utf8))
+                    FileHandle.standardError.write(Data("[engine] WARN: single-slot vision softs ticket \(eventTicket) not signaled (unexpected post-gate) — failing the session\n".utf8))
                     markVisionTicketFailed(eventTicket)
                 }
             }
@@ -3787,6 +3791,10 @@ final class LmEngine {
     var sched_textMultiCount: Int = 0
     var sched_textSingleCount: Int = 0
     var sched_arCount: Int = 0
+    var sched_softDeferredCount: Int = 0
+    // ticket -> first DispatchTime we saw it not-yet-signaled, for a NON-blocking
+    // wall-clock deadline (preserves the old 30s safety without freezing the lock).
+    var visionWaitSince: [UInt64: DispatchTime] = [:]
     // 2026-05-23 (.primed kernel-pair fix): count of recover-prefill
     // dispatches scheduled. Should equal the number of adopted-prefix
     // sessions admitted; trivially small.
@@ -3809,8 +3817,35 @@ final class LmEngine {
                 continue
             }
             switch s.primingQueue.first {
-            case .some(.softTokens):
-                softBusy.append(s)
+            case .some(.softTokens(_, _, _, _, let ticket)):
+                // NON-BLOCKING vision-readiness gate (root-cause fix for the
+                // multimodal 250x per-step stall). Routing a not-yet-signaled
+                // image to soft-prefill makes prepare*SoftPrefill CPU-block on
+                // gVisionEvent.wait() while gEngineLock is held — freezing ALL
+                // streams (active=0, 7.4s "steps"). Instead, only route a soft
+                // session once its vision ticket has signaled; otherwise DEFER
+                // it (other AR/text/ready-soft sessions run this tick; this one
+                // is re-picked once vision signals). ticket==0 => cache hit /
+                // pre-signaled. Preserve the old 30s safety non-blockingly: if a
+                // ticket never signals (a broken vision-dispatch chain), fail the
+                // session so processFailedVisionSessions retires it next tick.
+                if ticket == 0 || gVisionEvent.signaledValue >= ticket {
+                    visionWaitSince[ticket] = nil
+                    softBusy.append(s)
+                } else {
+                    sched_softDeferredCount += 1
+                    let now = DispatchTime.now()
+                    if let since = visionWaitSince[ticket] {
+                        if now.uptimeNanoseconds &- since.uptimeNanoseconds > 30_000_000_000 {
+                            FileHandle.standardError.write(Data("[engine] WARN: vision ticket \(ticket) not signaled within 30s — failing session (non-blocking gate; suspected vision-dispatch stall)\n".utf8))
+                            markVisionTicketFailed(ticket)
+                            visionWaitSince[ticket] = nil
+                        }
+                    } else {
+                        visionWaitSince[ticket] = now
+                    }
+                    // not added to softBusy -> deferred this tick
+                }
             case .some(.tokens(let ts)) where ts.count >= 2:
                 textPrefillBusy.append(s)
             default:
@@ -4375,11 +4410,14 @@ final class LmEngine {
             // actually signaled, and on timeout fail the affected slots
             // (caught by processFailedVisionSessions) so the engine makes
             // forward progress instead of deadlocking.
-            let signaled = gVisionEvent.wait(untilSignaledValue: maxTicket, timeoutMS: 30_000)
+            // NON-BLOCKING: pickChainPath only batches soft sessions whose
+            // tickets have signaled, so maxTicket is already signaled here —
+            // immediate read, never a CPU block under gEngineLock.
+            let signaled = gVisionEvent.signaledValue >= maxTicket
             if signaled {
                 preCB.encodeWaitForEvent(gVisionEvent, value: maxTicket)
             } else {
-                FileHandle.standardError.write(Data("[engine] WARN: multi-slot vision softs ticket \(maxTicket) not signaled within 30s — proceeding without GPU wait, failing affected slots (suspected vision-dispatch stall, RCA-3)\n".utf8))
+                FileHandle.standardError.write(Data("[engine] WARN: multi-slot vision softs ticket \(maxTicket) not signaled (unexpected post-gate) — failing affected slots\n".utf8))
                 for (_, sr) in slotSoft { markVisionTicketFailed(sr.eventTicket) }
             }
         }
