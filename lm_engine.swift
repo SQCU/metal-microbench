@@ -492,8 +492,12 @@ func computeCvecDigest(activeControls: [ActiveControl],
 // perturbation over the page is provably identical (modulo the
 // quantization tolerance).
 func computeCvecAnchorTag(activeControls: [ActiveControl],
-                           pageStart: Int, pageSize: Int) -> CvecAnchorTag {
-    if activeControls.isEmpty { return .unsteered }
+                           pageStart: Int, pageSize: Int,
+                           imageDigest: UInt64 = 0) -> CvecAnchorTag {
+    // Even an UNSTEERED session must partition by image: two image streams with
+    // identical text and no controls would otherwise share the .unsteered tag and
+    // adopt each other's soft-token pages. Carry the image digest through.
+    if activeControls.isEmpty { return CvecAnchorTag(entries: [], imageDigest: imageDigest) }
     let pageEnd = pageStart + pageSize
     @inline(__always) func quantF32(_ f: Float) -> Int64 {
         // Q16.16 fixed point. 1.5e-5 grid, well within fp16 noise.
@@ -603,7 +607,7 @@ func computeCvecAnchorTag(activeControls: [ActiveControl],
         if a.cvecId != b.cvecId { return a.cvecId < b.cvecId }
         return (a.startAnchor ?? Int.min) < (b.startAnchor ?? Int.min)
     }
-    return CvecAnchorTag(entries: entries)
+    return CvecAnchorTag(entries: entries, imageDigest: imageDigest)
 }
 
 // Phase C-Read: measurement direction attached to a session. Each tick,
@@ -761,6 +765,10 @@ final class Session {
     //   (b) post-prefill promotion: announce newly-written pages to the
     //       content index so the NEXT session with the same prefix hits.
     fileprivate var consumedTokens: [UInt32] = []
+    // Running 64-bit digest of all images prefilled in this session, folded into
+    // the trie partition tag so different-image sessions never share pages even
+    // if their 32-bit soft-token placeholders collide. See submit(softTokens:).
+    fileprivate var imageContentDigest: UInt64 = 0
     // Logical pages already published to the prefix trie. Kept so we
     // don't re-promote on every prefill tile commit. (Pre-Followup 3:
     // tracked promotion into the deleted PageManager.contentIndex.)
@@ -852,7 +860,8 @@ final class Session {
     // perturbs K/V at this page.
     func cvecAnchorTagForPage(pageStart: Int, pageSize: Int) -> CvecAnchorTag {
         return computeCvecAnchorTag(activeControls: activeControls,
-                                     pageStart: pageStart, pageSize: pageSize)
+                                     pageStart: pageStart, pageSize: pageSize,
+                                     imageDigest: imageContentDigest)
     }
 
     // Apply a client-provided seed to both host and GPU sampling state.
@@ -1362,6 +1371,12 @@ final class Session {
         // gives a stable, identical key across iters of the same image.
         // Caller passes contentHash from gVisionCache's image-bytes key.
         let imgHash = contentHash != 0 ? contentHash : 0xcbf29ce484222325
+        // Fold the FULL 64-bit image identity into the session's partition digest.
+        // The per-position placeholders below truncate to 32 bits and can collide
+        // across images; this digest keeps all 64 bits and is folded into the trie
+        // partition tag (cvecAnchorTagForPage -> computeCvecAnchorTag) so a
+        // different image can never adopt this session's soft-token K/V pages.
+        imageContentDigest = (imageContentDigest ^ imgHash) &* 0x100000001b3
         if ProcessInfo.processInfo.environment["LM_CACHE_DEBUG"] != nil {
             print("  [cache] session \(id) submit(softs) imgHash=\(String(imgHash, radix: 16, uppercase: false)) count=\(count) (pre-consumedTokens.count=\(consumedTokens.count))")
         }

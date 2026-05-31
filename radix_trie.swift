@@ -47,6 +47,13 @@ struct CvecAnchorTag: Hashable {
         let transportOffsetQ: Int64?
     }
     let entries: [Entry]
+    // Full 64-bit digest of the IMAGE(s) prefilled into this page's prefix.
+    // Folded into the partition key so two streams with byte-identical TEXT but
+    // DIFFERENT images get different tags and can NEVER adopt each other's
+    // soft-token K/V pages (cross-stream image-leak fix) — even when the 32-bit
+    // soft-token placeholders in consumedTokens collide. 0 = no image (text-only),
+    // which preserves all existing text-prefix sharing unchanged.
+    var imageDigest: UInt64 = 0
 
     static let unsteered = CvecAnchorTag(entries: [])
 
@@ -133,7 +140,12 @@ final class RadixTrie {
         let tag: CvecAnchorTag
         let isPartial: Bool
     }
-    private var anchorByPhys: [Int: AnchorBack] = [:]
+    // Multi-valued (page_lifecycle_audit_2026-05-28 #4): a phys page can be
+    // referenced by more than one anchor (a full-pair AND a partial-pair at
+    // different depths). A single-valued map let the 2nd insert clobber the
+    // 1st, so eviction unlinked only one anchor and the other served a
+    // reallocated page (stale adoption). Track ALL backs per phys.
+    private var anchorByPhys: [Int: [AnchorBack]] = [:]
 
     init(pageSlide: Int = 16) {
         self.pageSlide = pageSlide
@@ -179,39 +191,49 @@ final class RadixTrie {
     // along the path matching those tokens. Walks the trie, splitting
     // edges as needed; lands at (or creates) an anchor node at the
     // target depth and records the pair under cvecTag.
+    @discardableResult
     func insertAnchor(tokensCoveringFullPrefix: ArraySlice<UInt32>,
                        pair: SlidePairContents,
-                       cvecTag: CvecAnchorTag) {
+                       cvecTag: CvecAnchorTag) -> Bool {
         let target = tokensCoveringFullPrefix.count
-        guard target > 0 else { return }
+        guard target > 0 else { return false }
         let anchor = walkToAnchor(tokens: tokensCoveringFullPrefix,
                                   createIfMissing: true, targetDepth: target)
-        guard let anchor = anchor else { return }
+        guard let anchor = anchor else { return false }
+        if anchor.byCvecAnchorTag[cvecTag] != nil {
+            return false
+        }
         anchor.byCvecAnchorTag[cvecTag] = pair
-        anchorByPhys[pair.slidePlusFullHead] = AnchorBack(
-            anchor: anchor, tag: cvecTag, isPartial: false)
-        anchorByPhys[pair.fullTail] = AnchorBack(
-            anchor: anchor, tag: cvecTag, isPartial: false)
+        anchorByPhys[pair.slidePlusFullHead, default: []].append(
+            AnchorBack(anchor: anchor, tag: cvecTag, isPartial: false))
+        anchorByPhys[pair.fullTail, default: []].append(
+            AnchorBack(anchor: anchor, tag: cvecTag, isPartial: false))
+        return true
     }
 
     // Insert a partial-pair anchor. Same walk as full; lands at anchor
     // whose depth equals tokensCoveringFullPrefix.count (NOT necessarily
     // a PAGE_SLIDE multiple — partials sit at end-of-prefix).
+    @discardableResult
     func insertPartialAnchor(tokensCoveringFullPrefix: ArraySlice<UInt32>,
                               pair: PartialPagePair,
-                              cvecTag: CvecAnchorTag) {
+                              cvecTag: CvecAnchorTag) -> Bool {
         let target = tokensCoveringFullPrefix.count
-        guard target > 0 else { return }
+        guard target > 0 else { return false }
         let anchor = walkToAnchor(tokens: tokensCoveringFullPrefix,
                                   createIfMissing: true, targetDepth: target)
-        guard let anchor = anchor else { return }
-        anchor.byCvecAnchorTagPartial[cvecTag] = pair
-        anchorByPhys[pair.slidePlusFullHead] = AnchorBack(
-            anchor: anchor, tag: cvecTag, isPartial: true)
-        if let ft = pair.fullTail {
-            anchorByPhys[ft] = AnchorBack(
-                anchor: anchor, tag: cvecTag, isPartial: true)
+        guard let anchor = anchor else { return false }
+        if anchor.byCvecAnchorTagPartial[cvecTag] != nil {
+            return false
         }
+        anchor.byCvecAnchorTagPartial[cvecTag] = pair
+        anchorByPhys[pair.slidePlusFullHead, default: []].append(
+            AnchorBack(anchor: anchor, tag: cvecTag, isPartial: true))
+        if let ft = pair.fullTail {
+            anchorByPhys[ft, default: []].append(
+                AnchorBack(anchor: anchor, tag: cvecTag, isPartial: true))
+        }
+        return true
     }
 
     // Walk the trie consuming tokens. If `createIfMissing` is true,
@@ -348,12 +370,7 @@ final class RadixTrie {
                 if let anchor = child as? TrieAnchor {
                     let pageStart = ((anchor.depth - 1) / pageSlide) * pageSlide
                     if lastAdoptedDepth == pageStart {
-                        var usable = divergeDepth - pageStart
-                        // Convention (test contract): partial never
-                        // consumes the LAST token of the caller's prompt
-                        // — leave ≥ 1 token for the consumer's prefill.
-                        let maxUsable = totalLen - 1 - pageStart
-                        if usable > maxUsable { usable = maxUsable }
+                        let usable = divergeDepth - pageStart
                         if usable > 0 && usable < pageSlide {
                             let tag = cvecTagFor(pageStart)
                             // Prefer explicit partial-pair entry; fall
@@ -410,17 +427,16 @@ final class RadixTrie {
                     let tag = cvecTagFor(partialPageStart)
                     if let pp = anchor.byCvecAnchorTagPartial[tag] {
                         if anchor.depth - lastAdoptedDepth == pp.validUpTo {
-                            // Test contract: never consume the LAST
-                            // token of the caller's prompt.
-                            let maxUsable = totalLen - 1 - lastAdoptedDepth
-                            if maxUsable > 0 {
-                                let trimmed = min(pp.validUpTo, maxUsable)
-                                if trimmed > 0 {
-                                    partialTail = PartialPagePair(
-                                        slidePlusFullHead: pp.slidePlusFullHead,
-                                        fullTail: pp.fullTail,
-                                        validUpTo: trimmed)
-                                }
+                            // Track A's .primed recover step handles
+                            // fully-cached prompts, so partial lookup no
+                            // longer needs to leave one prompt token behind
+                            // purely to force a prefill tick.
+                            let trimmed = pp.validUpTo
+                            if trimmed > 0 {
+                                partialTail = PartialPagePair(
+                                    slidePlusFullHead: pp.slidePlusFullHead,
+                                    fullTail: pp.fullTail,
+                                    validUpTo: trimmed)
                             }
                         }
                     }
@@ -444,21 +460,42 @@ final class RadixTrie {
     // We must unlink the anchor that referenced this page so future
     // lookups don't return stale pointers.
     func invalidateAnchorFor(physPage: Int) {
-        guard let back = anchorByPhys.removeValue(forKey: physPage),
-              let anchor = back.anchor else { return }
-        if back.isPartial {
-            if let pp = anchor.byCvecAnchorTagPartial.removeValue(forKey: back.tag) {
-                anchorByPhys.removeValue(forKey: pp.slidePlusFullHead)
-                if let ft = pp.fullTail { anchorByPhys.removeValue(forKey: ft) }
+        // Unlink ALL anchors referencing this phys (see #4 above). The evicted
+        // page's own back-list is removed here; each referenced anchor's pair
+        // is dropped, and the PARTNER phys's matching back is pruned (the
+        // partner may carry other backs, so remove only the matching one).
+        guard let backs = anchorByPhys.removeValue(forKey: physPage) else { return }
+        var touched: [TrieAnchor] = []
+        for back in backs {
+            guard let anchor = back.anchor else { continue }
+            if back.isPartial {
+                if let pp = anchor.byCvecAnchorTagPartial.removeValue(forKey: back.tag) {
+                    removeBack(phys: pp.slidePlusFullHead, anchor: anchor, tag: back.tag, isPartial: true)
+                    if let ft = pp.fullTail {
+                        removeBack(phys: ft, anchor: anchor, tag: back.tag, isPartial: true)
+                    }
+                }
+            } else {
+                if let pair = anchor.byCvecAnchorTag.removeValue(forKey: back.tag) {
+                    removeBack(phys: pair.slidePlusFullHead, anchor: anchor, tag: back.tag, isPartial: false)
+                    removeBack(phys: pair.fullTail, anchor: anchor, tag: back.tag, isPartial: false)
+                }
             }
-        } else {
-            if let pair = anchor.byCvecAnchorTag.removeValue(forKey: back.tag) {
-                anchorByPhys.removeValue(forKey: pair.slidePlusFullHead)
-                anchorByPhys.removeValue(forKey: pair.fullTail)
-            }
+            touched.append(anchor)
         }
-        // Try to prune up the chain: if this anchor has no pairs AND
-        // no children AND isn't root, unlink it from its parent.
+        for anchor in touched { pruneAnchorChain(anchor) }
+    }
+
+    // Remove the single AnchorBack matching (anchor, tag, isPartial) from the
+    // partner phys's back-list; drop the key when the list empties.
+    private func removeBack(phys: Int, anchor: TrieAnchor, tag: CvecAnchorTag, isPartial: Bool) {
+        guard var arr = anchorByPhys[phys] else { return }
+        arr.removeAll { $0.anchor === anchor && $0.tag == tag && $0.isPartial == isPartial }
+        if arr.isEmpty { anchorByPhys.removeValue(forKey: phys) } else { anchorByPhys[phys] = arr }
+    }
+
+    // Prune empty anchors up to (not including) root.
+    private func pruneAnchorChain(_ anchor: TrieAnchor) {
         var n: TrieNode = anchor
         while n !== root {
             let canPrune: Bool
@@ -592,9 +629,10 @@ func runRadixTrieTests() {
         let mB = t.findLongestPrefix(tokens: b[0..<32]) { _ in .unsteered }
         check("after split: A still adopts 32",
               mA.alignedMatchLength == 32 && mA.pages.count == 2)
-        check("after split: B adopts 16 (page 0 only — page 1 differs)",
-              mB.alignedMatchLength == 16 && mB.pages.count == 1 &&
-              mB.pages[0].slidePlusFullHead == 600)
+        check("after split: B adopts its own 32-token branch",
+              mB.alignedMatchLength == 32 && mB.pages.count == 2 &&
+              mB.pages[0].slidePlusFullHead == 600 &&
+              mB.pages[1].slidePlusFullHead == 604)
     }
     // (8) Partial pair: insert short partial, lookup returns it.
     do {
