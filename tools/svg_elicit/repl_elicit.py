@@ -40,11 +40,23 @@ from svg_refinement_loop import (                            # noqa: E402
     load_target_from_path, render_svg, mse_images, image_to_data_url, diff_heatmap)
 from elicit import call_lm, ssim_score                       # noqa: E402
 import judge as _judge                                       # noqa: E402
+# Shared, validated core: <pyrepl> tag extraction + the persistent-namespace
+# container. We route the protocol PLUMBING through it (extraction -> the clean
+# tag parser; the persistent kernel -> PyRepl.ns) while PRESERVING this harness's
+# distinctive research semantics unchanged: the dual <pyrepl>|```python``` voice
+# ablation, the test-cell-vs-final-```svg``` submission protocol, stdout capture
+# in feedback, and the intentionally NON-transactional exec (a raising cell still
+# mutates state and counts as a code_error — the capability-gating metric).
+from pyrepl import extract_pyrepl, PyRepl, PYREPL_TAG_HELP    # noqa: E402
 
 BASE = os.environ.get("GEMMA_BASE", "http://127.0.0.1:8001")
 _EXEMPLARS_PATH = pathlib.Path(__file__).resolve().parent / "amongus_onpolicy_exemplars.json"
 
-_PYREPL_RE = re.compile(r"<pyrepl>\s*(.*?)</pyrepl>", re.DOTALL | re.IGNORECASE)
+# First-CLOSED-block <pyrepl> matcher — identical pattern to the pre-migration
+# _PYREPL_RE — used ONLY to preserve the original first-match selection when a
+# reply has several <pyrepl> blocks. Tag detection itself is delegated to the
+# shared pyrepl.extract_pyrepl (so the truncated-final-tag case is shared too).
+_PYREPL_FIRST_RE = re.compile(r"<pyrepl>\s*(.*?)</pyrepl>", re.DOTALL | re.IGNORECASE)
 _CODE_RE = re.compile(r"```python\s*(.*?)```", re.DOTALL)
 _SVG_FENCE_RE = re.compile(r"```svg\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 _SVG_TAG_RE = re.compile(r"<svg.*?</svg>", re.DOTALL | re.IGNORECASE)
@@ -54,7 +66,23 @@ def _extract_code(resp: str) -> str | None:
     # Accept the <pyrepl>...</pyrepl> tag notation OR a ```python``` fence, so
     # prompt VOICE (which delimiter the prose instructs) is a pure prose
     # ablation and both register variants parse identically.
-    m = _PYREPL_RE.search(resp) or _CODE_RE.search(resp)
+    #
+    # Migrated: the <pyrepl> path now goes through the shared, validated
+    # pyrepl.extract_pyrepl for clean tag detection and the truncated-final-tag
+    # case, then PRESERVES this harness's original FIRST-match semantics: when a
+    # reply contains several <pyrepl> blocks (observed on real replies — the
+    # model emits an exploratory cell then a build cell in one turn), the old
+    # _PYREPL_RE.search took the FIRST block, and that selection is part of the
+    # studied behavior (the dual-delimiter voice ablation), so we keep it. The
+    # ```python``` fence fallback is KEPT verbatim — it is the terse-voice
+    # delimiter; dropping it would collapse the --voice ablation.
+    if extract_pyrepl(resp) is not None:
+        m = _PYREPL_FIRST_RE.search(resp)            # FIRST <pyrepl> block (behavior-preserving)
+        if m:
+            return m.group(1)                        # exact pre-migration output (no strip)
+        # only the truncated unclosed-final-tag case reaches here:
+        return extract_pyrepl(resp)
+    m = _CODE_RE.search(resp)
     return m.group(1) if m else None
 
 
@@ -270,7 +298,17 @@ def _system_prompt(arm: str, elicit: str, min_passes: int = 0, voice: str = "ter
 
 
 def _exec_persistent(code: str, ns: dict) -> tuple[bool, str, str]:
-    """Exec code in the persistent namespace ns. Returns (ok, stdout, err)."""
+    """Exec code in the persistent namespace ns. Returns (ok, stdout, err).
+
+    Migrated: `ns` is now the live namespace OWNED by a shared pyrepl.PyRepl
+    (created once per rollout — see run_rollout), so persistence is provided by
+    the same validated container every other harness uses. We deliberately do
+    NOT call PyRepl.run_cell here: this harness is intentionally NON-transactional
+    (a raising cell leaves the namespace partially mutated and is counted in the
+    code_errors capability-gating metric) and it surfaces print() stdout in the
+    feedback (run_cell rolls back and captures no stdout). So we exec directly
+    INTO repl.ns, preserving both behaviors byte-for-byte from the pre-migration
+    harness while borrowing PyRepl purely as the persistence container."""
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
@@ -294,9 +332,18 @@ def run_rollout(target: Image.Image, arm: str, max_turns: int, max_tokens: int,
             {"type": "image_url", "image_url": {"url": image_to_data_url(target)}}]},
     ]
 
-    ns: dict = {"np": np}
+    # Persistent kernel: a shared, validated pyrepl.PyRepl OWNS the namespace
+    # (variables defined one turn survive to the next — intervention 1). We exec
+    # the model's cells directly into repl.ns (see _exec_persistent) rather than
+    # via run_cell, to keep this harness's intentionally non-transactional,
+    # stdout-surfacing semantics; PyRepl is used here as the persistence
+    # container the rest of the suite shares. `out_var="svg"` matches the
+    # variable the model is told to set.
+    seed_vars: dict = {"np": np}
     if arm == "2b":
-        ns["target"] = tgt_arr.copy()        # intervention 2b: numerical target access
+        seed_vars["target"] = tgt_arr.copy()  # intervention 2b: numerical target access
+    repl = PyRepl(seed_vars=seed_vars, out_var="svg")
+    ns = repl.ns
 
     best = {"svg": None, "mse": None, "ssim": None, "render": None}
     traj: list[dict] = []                    # per-test (turn, mse, ssim) for plateau analysis

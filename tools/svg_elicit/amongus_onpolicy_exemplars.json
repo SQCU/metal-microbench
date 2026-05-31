@@ -1,0 +1,22 @@
+[
+  {"target": "test_data/amongus_frames/frame_00.png",
+   "candidate": "output_data/svg_runs/amongus_candidates/amongus_frames_frame_00_svg_r01_iter_00_rendered.png",
+   "score": 5,
+   "reason": "faithful: the yellow Among Us crewmate in the bent twerk pose, with visor and backpack, all present and correctly placed",
+   "name": "onpolicy_high"},
+  {"target": "test_data/amongus_frames/frame_00.png",
+   "candidate": "output_data/svg_runs/amongus_candidates/amongus_frames_frame_00_svg_r00_iter_02_rendered.png",
+   "score": 4,
+   "reason": "clearly the same crewmate and pose; the body is recolored and shifted so pixel error (MSE) is high, but the SUBJECT is faithfully reproduced — judge subject recognizability, not pixel-exactness",
+   "name": "onpolicy_dissociation_highMSE"},
+  {"target": "test_data/amongus_frames/frame_00.png",
+   "candidate": "output_data/svg_runs/amongus_candidates/amongus_frames_frame_00_svg_r00_iter_00_rendered.png",
+   "score": 3,
+   "reason": "the crewmate is recognizable but the shapes are rough and detail/proportion is lost",
+   "name": "onpolicy_mid"},
+  {"target": "test_data/amongus_frames/frame_00.png",
+   "candidate": "output_data/svg_runs/elicit_retro_demo/KCrfDHS_YUw_frame_0000_svg_r00_best_rendered.png",
+   "score": 1,
+   "reason": "unrelated image (stylized text on a grid); the Among Us crewmate subject is entirely absent",
+   "name": "onpolicy_unrelated"}
+]

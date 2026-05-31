@@ -34,6 +34,11 @@ from svg_refinement_loop import (                             # noqa: E402
     load_target_from_path, render_svg, mse_images, image_to_data_url, diff_heatmap)
 from elicit import call_lm, ssim_score                        # noqa: E402
 import judge as _judge                                        # noqa: E402
+# Shared, validated core: <pyrepl> extraction + namespace exec. We route the
+# protocol plumbing (extraction, program exec) through it while KEEPING the
+# tolerant fallback chain and the legacy (svg_or_None, err) contract the six
+# importing harnesses depend on.
+from pyrepl import extract_pyrepl, PyRepl, PYREPL_TAG_HELP     # noqa: E402
 
 _PROG_TAG_RE = re.compile(r"<prog>\s*(.*?)</prog>", re.DOTALL | re.IGNORECASE)
 _PY_FENCE_RE = re.compile(r"```(?:python|py|python3)?[ \t]*\r?\n(.*?)```", re.DOTALL)
@@ -44,12 +49,22 @@ _ANCHOR_RE = re.compile(r"<<<OLD\s*\n(.*?)\n<<<NEW\s*\n(.*?)\n<<<END", re.DOTALL
 
 
 def _extract_program(text: str) -> str | None:
-    """Tolerant, fallback-chained program extraction (ported from repl_elicit's
-    reliable parser). Brittle single-delimiter matching was the round-0
-    regression — the model only has to drift off the exact ```python fence once
-    and the old extractor returned None, after which the harness silently
-    substituted a blank `svg=''`. We accept many formats and only give up if
-    NOTHING parses."""
+    """Tolerant, fallback-chained program extraction. Brittle single-delimiter
+    matching was the round-0 regression — the model only has to drift off the
+    exact ```python fence once and the old extractor returned None, after which
+    the harness silently substituted a blank `svg=''`. We accept many formats and
+    only give up if NOTHING parses.
+
+    Migrated: the PRIMARY path is now the shared pyrepl protocol — a single
+    <pyrepl>...</pyrepl> block (pyrepl.extract_pyrepl, clean/unambiguous). If the
+    model used that tag we take it verbatim; otherwise we fall through to the
+    historical tolerant chain (<prog>, ```python``` fences, bare <svg>) UNCHANGED,
+    so the six harnesses that import this function keep byte-identical behavior on
+    every non-<pyrepl> reply."""
+    # 0. shared pyrepl protocol: a single <pyrepl> ... </pyrepl> block.
+    code = extract_pyrepl(text)
+    if code is not None:
+        return code
     # 1. explicit <prog>...</prog> tag
     m = _PROG_TAG_RE.search(text)
     if m:
@@ -179,20 +194,49 @@ def _apply_tools(lines: list[str], text: str, design: str = "full") -> tuple[lis
 
 
 def _run_program(source: str, tgt_arr: np.ndarray | None) -> tuple[str | None, str]:
-    ns: dict = {"np": np}
+    """Exec the model's program via the shared pyrepl namespace, returning the
+    legacy (svg_or_None, err) tuple.
+
+    Migrated to pyrepl.PyRepl for the exec layer while PRESERVING this harness's
+    stateless, fresh-namespace semantics: a NEW PyRepl is built per call (seed = np
+    [+ target only when given], exactly as before), so each round re-execs the
+    whole program string from scratch — the program persists as TEXT in `source`,
+    never as a live namespace. PyRepl's transactional rollback is invisible here (a
+    fresh repl has nothing to roll back to), so the round-scoring behavior is
+    unchanged.
+
+    Result mapping keeps every legacy edge case identical:
+      • ok                       -> (svg, "")
+      • cell raised              -> (None, "<ExcType>: <msg>")  [pyrepl 1-liner; its
+                                    last line == the legacy traceback's last line,
+                                    which is what consumers slice]
+      • svg is '' (empty string) -> ('', "")  [legacy ACCEPTED empty svg]
+      • svg missing / non-string -> (None, "program did not set `svg` to a string")
+    """
+    seed_vars: dict = {"np": np}
     if tgt_arr is not None:
-        ns["target"] = tgt_arr.copy()
+        seed_vars["target"] = tgt_arr            # PyRepl deepcopy-snapshots seeds per cell
+    repl = PyRepl(seed_vars=seed_vars, out_var="svg")
     buf = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(buf):
-            exec(source, ns)        # noqa: S102 — research harness, model-authored
-    except Exception:
-        return None, traceback.format_exc(limit=3)
-    svg = ns.get("svg")
-    return (svg if isinstance(svg, str) else None), ("" if isinstance(svg, str) else "program did not set `svg` to a string")
+    with contextlib.redirect_stdout(buf):
+        res = repl.run_cell(source)              # noqa: S102 — research harness, model-authored
+    if res["ok"]:
+        return res["svg"], ""
+    # The cell did not "ok". pyrepl rolled the namespace back, so we disambiguate
+    # from its error string (not the restored ns). Three legacy-distinct outcomes:
+    err = res["error"] or ""
+    if err == "cell ran but `svg` is not a non-empty string (got str)":
+        # ran without raising but left an EMPTY string -> legacy ACCEPTED it: ('', "").
+        return "", ""
+    if err.startswith("cell ran but"):
+        # ran clean but `svg` missing / non-string -> the exact legacy message.
+        return None, "program did not set `svg` to a string"
+    # exec raised inside the cell -> pyrepl's "<ExcType>: <msg>"; its last line
+    # matches the legacy traceback's last line, which is what consumers slice.
+    return None, err
 
 
-_SYS = """you're reconstructing a target image as an SVG, but you build it as a small PYTHON PROGRAM that sets the string variable `svg` — so you can SCRIPT repetitive or procedural structure with loops instead of hand-placing every primitive.
+_SYS = """you're reconstructing a target image as an SVG, but you build it as a small PYTHON PROGRAM that sets the string variable `svg` — so you can SCRIPT repetitive or procedural structure with loops instead of hand-placing every primitive. emit that program inside ONE  <pyrepl> ... </pyrepl>  block (`np` and the reference array `target` are pre-defined; your code must leave the finished picture in the string variable `svg`).
 
 you keep ONE program across all turns. you do NOT retype it from scratch — you EDIT it. each turn we show you:
   - your current program SOURCE, line-numbered
@@ -206,7 +250,7 @@ your single goal: drive the MSE RESIDUAL toward zero by editing your program —
 """
 
 _PROTO = {
-    "rewrite": "to update your program, re-emit the FULL revised program in a single ```python``` block.",
+    "rewrite": "to update your program, re-emit the FULL revised program in a single <pyrepl> ... </pyrepl> block.",
     "linerange": ("to update your program, emit one or more edit commands (line numbers refer to the "
                   "source shown):\n  EDIT replace A-B   then the new lines, then a line `END`\n"
                   "  EDIT insert A      then the new lines (inserted AFTER line A), then `END`\n"
@@ -289,7 +333,7 @@ def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: in
     if turn0 == "rich":
         turn0_text = (
             f"Target image ({W}x{H}). Write your STRONGEST possible reconstruction as your "
-            f"INITIAL ```python``` program that sets `svg` — this first attempt should already "
+            f"INITIAL <pyrepl> ... </pyrepl> program that sets `svg` — this first attempt should already "
             f"look as much like the target as you can make it; you will then refine it by editing. "
             f"Reproduce EVERYTHING you can see: every distinct region, object, and text string, in "
             f"the right place, size and colour. Use the FULL SVG feature set wherever it improves "
@@ -299,7 +343,7 @@ def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: in
             f"IMAGE STRUCTURE. Do not hold back detail for later; make round 0 your best one-shot.")
     else:
         turn0_text = (f"Target image ({W}x{H}). Write your INITIAL program now — a "
-                      f"```python``` block that sets `svg`. Keep it simple; you'll "
+                      f"<pyrepl> ... </pyrepl> block that sets `svg`. Keep it simple; you'll "
                       f"refine it by editing.")
     messages = [
         {"role": "system", "content": sys_prompt},
@@ -406,7 +450,7 @@ def run_rollout(target: Image.Image, edit_mode: str, rounds: int, max_tokens: in
         parse_retries += 1
         messages.append({"role": "user", "content":
             "Your message contained no extractable program. Reply with ONLY a "
-            "```python``` code block that assigns an SVG document string to a "
+            "<pyrepl> ... </pyrepl> block that assigns an SVG document string to a "
             "top-level variable named `svg` (e.g. `svg = '''<svg ...>...</svg>'''`)."})
         text, _, _ = call_lm(messages, max_tokens, temperature, seed + 9973)
         messages.append({"role": "assistant", "content": text})

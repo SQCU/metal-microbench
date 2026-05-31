@@ -3,7 +3,10 @@
 
 One clean harness, composed from the canonical pieces (no inlined dupes):
   render  : svg_render.render_svg (headless Chromium, full SVG spec)
-  exec    : edit_elicit._extract_program (tolerant) + _run_program (in-process)
+  protocol: shared pyrepl tag (<pyrepl> ... </pyrepl>) — the model emits its FULL
+            program in one block each turn (full re-emission is this harness's design)
+  exec    : edit_elicit._extract_program (pyrepl-primary, tolerant fallback) +
+            _run_program (fresh pyrepl.PyRepl per turn -> stateless full-rewrite)
   metrics : hresidual (mse/ssim + false-color residual & delta)
   judge   : judge.feature_residual (9-axis comparative vector, >6 dims)
   client  : elicit.call_lm (streaming + usage)
@@ -24,6 +27,12 @@ import numpy as np
 
 import edit_elicit as _E                                            # sets sys.path
 from edit_elicit import _extract_program, _run_program, _numbered   # noqa: E402
+# Shared pyrepl core: _extract_program/_run_program (imported above) ALREADY route
+# their extraction + program-exec through pyrepl (extract_pyrepl primary path; a
+# FRESH PyRepl per call -> krepl's full-rewrite, stateless-per-turn semantics are
+# preserved). We additionally switch the MODEL-FACING PROTOCOL to the <pyrepl> tag
+# so the model emits the clean, unambiguous block the shared extractor captures.
+from pyrepl import PYREPL_TAG_HELP                                  # noqa: E402
 from svg_refinement_loop import render_svg, image_to_data_url, load_target_from_path  # noqa: E402
 from elicit import call_lm                                          # noqa: E402
 import judge as _judge                                              # noqa: E402
@@ -50,7 +59,9 @@ SYSTEM = (
     "Recolour, move, resize, add, or remove shapes as needed. Do NOT make cosmetic tweaks: if a "
     "region is bright in the residual, change it decisively this turn. `np` and the reference "
     "array `target` (H,W,3 uint8 RGB) are available — measure it rather than guessing. "
-    "Emit your FULL updated program in one ```python``` block."
+    "Emit your FULL updated program in one <pyrepl> ... </pyrepl> block (this is a full "
+    "RE-EMISSION every turn — restate the entire program, not a delta).\n\n"
+    + PYREPL_TAG_HELP
 )
 
 
@@ -58,7 +69,8 @@ def _feedback(turn, source, render, stats, cl, aq, err, ref, prev):
     if render is None:
         return [{"type": "text", "text":
                  f"turn {turn}: your program FAILED ({err}). Fix it and emit a full working "
-                 f"```python``` program. Your current program:\n" + _numbered(source)[:4000]}]
+                 f"program in one <pyrepl> ... </pyrepl> block. Your current program:\n"
+                 + _numbered(source)[:4000]}]
     c = cl or {}
     missing = c.get("missing") or []
     partial = c.get("partial") or []
@@ -113,7 +125,8 @@ def refine(target, rounds, seed, out_dir, prefix, max_tokens=16000):
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": [
             {"type": "text", "text": f"REFERENCE image ({W}x{H}). Write your first Python program "
-             f"that sets `svg` — your strongest one-shot reconstruction. You will then refine it."},
+             f"that sets `svg`, inside one <pyrepl> ... </pyrepl> block — your strongest one-shot "
+             f"reconstruction. You will then refine it (re-emitting the FULL program each turn)."},
             {"type": "image_url", "image_url": {"url": image_to_data_url(target)}}]},
     ]
     source: list[str] = ["svg = ''"]
@@ -124,7 +137,7 @@ def refine(target, rounds, seed, out_dir, prefix, max_tokens=16000):
         prog = _extract_program(text)
         if prog is None and t == 0:                     # never start blank: retry once
             messages.append({"role": "user", "content":
-                "No program found. Reply with ONLY a ```python``` block that sets `svg`."})
+                "No program found. Reply with ONLY a <pyrepl> ... </pyrepl> block that sets `svg`."})
             text, finish, usage = call_lm(messages, max_tokens, 1.0, seed + 9000 + t)
             messages.append({"role": "assistant", "content": text})
             prog = _extract_program(text)
