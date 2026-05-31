@@ -18,6 +18,7 @@ DATA_ROOT="$HERE/_data"
 # checkout, so pull doesn't require network.
 ST_SRC="${ST_SRC:-$HERE/sillytavern-fork}"
 ST_PORT="${ST_PORT:-8002}"
+BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:8001}"
 BG="${1:-}"
 
 if [[ ! -d "$ST_SRC" ]]; then
@@ -52,14 +53,21 @@ sleep 0.5
 "$HERE/scripts/cleanup_playwright.sh" --apply 2>&1 | sed 's/^/[run] /' || true
 
 # Sanity: is the bridge reachable? (warn-only; ST will start regardless)
-if ! curl -sS --max-time 2 http://127.0.0.1:8001/health > /dev/null 2>&1; then
-    echo "[run] WARN: bridge at http://127.0.0.1:8001 unreachable — chat will 500"
+if ! curl -sS --max-time 2 "$BRIDGE_URL/health" > /dev/null 2>&1; then
+    echo "[run] WARN: bridge at $BRIDGE_URL unreachable — chat will 500"
 fi
 
 cd "$ST_SRC"
 LOG="$DATA_ROOT/_run.log"
+export ST_PORT
+export SERVER_PORT="$ST_PORT"
+export USER_PERSONAS_ST_URL="http://127.0.0.1:$ST_PORT"
+export ST_URL="$USER_PERSONAS_ST_URL"
+export USER_PERSONAS_BRIDGE_URL="$BRIDGE_URL"
+export BRIDGE_URL
 echo "[run] starting ST on port $ST_PORT (dataRoot=$DATA_ROOT)"
 echo "[run]   UI:   http://127.0.0.1:$ST_PORT"
+echo "[run]   bridge: $BRIDGE_URL"
 echo "[run]   log:  $LOG"
 
 # --disableCsrf is REQUIRED for autonomous (curl/Playwright/MCP) clients

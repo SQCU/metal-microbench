@@ -47,8 +47,12 @@ const RUN_ID = process.env.LOCK_IN_RUN_ID
     || `${EXPERIMENT_ID}-${new Date().toISOString().replace(/[:.]/g, '-')}-oo`;
 
 const HARNESS_DIR = path.dirname(new URL(import.meta.url).pathname);
-const LOCK_IN_OUT = `/Users/mdot/metal-microbench/data/lock_in_iterative`;
-const OUT_DIR = `/Users/mdot/metal-microbench/data/outer_outer/${EXPERIMENT_ID}`;
+const LOCK_IN_OUT = process.env.USER_PERSONAS_LOCK_IN_OUT
+    || process.env.USER_PERSONAS_LOCK_IN_DATA_DIR
+    || '/Users/mdot/metal-microbench/data/lock_in_iterative';
+const OUTER_OUTER_OUT_BASE = process.env.USER_PERSONAS_OUTER_OUTER_DIR
+    || '/Users/mdot/metal-microbench/data/outer_outer';
+const OUT_DIR = path.join(OUTER_OUTER_OUT_BASE, EXPERIMENT_ID);
 fs.mkdirSync(OUT_DIR, { recursive: true });
 
 // Defense-in-depth k-ceiling (mirrors the validator + lock_in_iterative
@@ -224,7 +228,9 @@ async function autoDispatchSweep(originalSpec, completedTrajectories, axesNow) {
     let disambResult = null;
     if (collapsedPairs.length > 0) {
         console.log(`[outer_outer]   ${collapsedPairs.length} bio pairs within ε=${CLUSTER_DISTANCE_EPS} → dispatching cluster_disambiguator`);
-        const specPath = `/Users/mdot/sillytavern-fork/plugins/user-personas/experiments/${originalSpec.id}.json`;
+        const pluginDir = process.env.USER_PERSONAS_PLUGIN_DIR
+            || '/Users/mdot/metal-microbench/tools/st-debug/sillytavern-fork/plugins/user-personas';
+        const specPath = path.join(pluginDir, 'experiments', `${originalSpec.id}.json`);
         disambResult = await spawnAndWait(
             'cluster_disambiguator.mjs', [specPath],
             'cluster_disambiguator', { LOCK_IN_RUN_ID: RUN_ID });
@@ -236,7 +242,11 @@ async function autoDispatchSweep(originalSpec, completedTrajectories, axesNow) {
 // ── main ─────────────────────────────────────────────────────────────
 
 const originalSpec = await L.fetchExperiment(EXPERIMENT_ID);
-const K_OUTER_OUTER = clampK('k_max_outer_outer', originalSpec.loop_control?.k_max_outer_outer, 3);
+// K_OUTER_OUTER_OVERRIDE env var allows CLI override without editing the spec card.
+// Pass K_OUTER_OUTER_OVERRIDE=2 to run exactly pass 0 + one ΔPR spur pass.
+const _kFromEnv = process.env.K_OUTER_OUTER_OVERRIDE ? Number(process.env.K_OUTER_OUTER_OVERRIDE) : NaN;
+const K_OUTER_OUTER = clampK('k_max_outer_outer',
+    Number.isInteger(_kFromEnv) ? _kFromEnv : originalSpec.loop_control?.k_max_outer_outer, 3);
 console.log(`[outer_outer] experiment=${EXPERIMENT_ID} run_id=${RUN_ID}`);
 console.log(`[outer_outer] K_OUTER_OUTER=${K_OUTER_OUTER} (predeclared bios pass 0 + ${K_OUTER_OUTER - 1} ΔPR passes)`);
 
@@ -278,7 +288,9 @@ for (let k = 1; k < K_OUTER_OUTER; k++) {
 
     // Materialize a transient one-bio spec at the picked target
     // LINT-OK-PREFIX-SAFE: transient experiment id (filesystem + DB key), not prompt content.
-    const transientId = `${EXPERIMENT_ID}_oo_pass${k}_${Date.now().toString(36)}`;
+    // Prefix with "outer-outer-" so bio provenance.experiment_id is unambiguously
+    // traceable to this outer-outer run (acceptance check: startsWith("outer-outer-")).
+    const transientId = `outer-outer-${EXPERIMENT_ID}-pass${k}-${Date.now().toString(36)}`;
     const newBioSlug = `oo-${EXPERIMENT_ID}-pass${k}`;
     const newBio = {
         canonical_key: `user-personas-${newBioSlug}.png`,

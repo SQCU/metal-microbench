@@ -35,7 +35,7 @@ from probe_persist import parse_elementwise, stage1_summary, stage2_likert
 from signature import mahalanobis
 
 import os as _os_for_bridge_url
-BRIDGE_URL = _os_for_bridge_url.environ.get("BRIDGE_URL", "http://localhost:8001") + "/v1/chat/completions"
+BRIDGE_URL = _os_for_bridge_url.environ["BRIDGE_URL"] + "/v1/chat/completions"
 PLUGIN_PLAYERS_DIR = Path("/Users/mdot/sillytavern-fork/plugins/user-personas/players")
 
 

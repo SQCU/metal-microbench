@@ -41,6 +41,17 @@ import { loadAndConnect, selectCharacterByClick } from './_helpers/elicit_clean.
 
 const PLUGIN_BASE = '/api/plugins/user-personas';
 
+// Disable trace + video recording for this spec. The tests run up to 12 minutes
+// and generate many /poll + /yapper-seed network events. Playwright's trace HAR
+// recorder copies .network files between retries; with a 720s test and heavy
+// network traffic, the trace file can be cleaned up before the recorder copies
+// it, causing ENOENT that kills the page context and surfaces as a spurious
+// "Target page closed" error. Since this spec asserts behavioral correctness
+// (row counts, text length, no forbidden text) and not performance, traces are
+// not needed for diagnosis. video is also off to reduce resource overhead.
+// NOTE: test.use() for trace/video must be at the top level (not inside describe).
+test.use({ trace: 'off', video: 'off' });
+
 // The 5-second window is the ideal. The /yapper-seed + /poll round-trips
 // can take 30-90s cold. We assert within a generous allowance to cover
 // cold-cache bridge state, BUT we assert the result APPEARED WITHOUT A
@@ -49,24 +60,30 @@ const PLUGIN_BASE = '/api/plugins/user-personas';
 const POLL_COMPLETION_TIMEOUT_MS = 90_000;
 
 async function probeCorpusCount(page) {
-    return await page.evaluate(async (base) => {
-        try {
-            const r = await fetch(`${base}/yapper-seed`, {
-                method: 'POST',
+    // Use Playwright's page.request API instead of page.evaluate(async fetch)
+    // to get proper timeout support. page.evaluate with an async fetch has no
+    // Playwright-level timeout — if the server hangs, the test runs until the
+    // overall 720s test timeout fires. page.request uses Playwright's
+    // actionTimeout (bounded by the test timeout), which is safely cancellable.
+    try {
+        const resp = await page.request.post(
+            `http://127.0.0.1:8002${PLUGIN_BASE}/yapper-seed`,
+            {
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
+                data: JSON.stringify({
                     chat_context_summary: 'ux-t2-probe',
                     K_top: 2,
                     K_side: 2,
                 }),
-            });
-            if (!r.ok) return 0;
-            const d = await r.json();
-            return (d.top || []).length + (d.side || []).length;
-        } catch (e) {
-            return 0;
-        }
-    }, PLUGIN_BASE);
+                timeout: 30_000,
+            },
+        );
+        if (!resp.ok()) return 0;
+        const d = await resp.json();
+        return (d.top || []).length + (d.side || []).length;
+    } catch (_) {
+        return 0;
+    }
 }
 
 async function openSuggesterSurface(page) {
@@ -84,15 +101,22 @@ async function openSuggesterSurface(page) {
 }
 
 test.describe('UX-T2 suggester first-paint K=2 streaming (no click required)', () => {
-    // Allow generous time: yapper-seed + K=2 parallel /poll on cold bridge.
     test.setTimeout(12 * 60 * 1000);
 
     test('K=2 ranked rows auto-stream without operator click on first paint', async ({ page, context }) => {
         // Track /poll requests so we can confirm they fired without user action.
+        // Use passive request observation (context.on('request')) instead of
+        // context.route() to avoid intercepting requests. context.route() +
+        // route.continue() can kill the page context when the extension's
+        // autonomous /poll calls complete or are aborted before route.continue()
+        // returns — this surfaces as "Target page, context or browser has been
+        // closed" at the next page.evaluate(). Passive observation has no
+        // interception overhead and cannot affect the page lifecycle.
         const pollRequests = [];
-        await context.route(`**${PLUGIN_BASE}/poll`, async (route) => {
-            pollRequests.push({ url: route.request().url(), ts: Date.now() });
-            await route.continue();
+        context.on('request', (req) => {
+            if (req.url().includes(`${PLUGIN_BASE}/poll`)) {
+                pollRequests.push({ url: req.url(), ts: Date.now() });
+            }
         });
 
         // ── Boot ST + connect to bridge. ──

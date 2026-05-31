@@ -1,0 +1,472 @@
+{
+  "parent_axis": "astrology_sagittarian",
+  "parent_axis_record": {
+    "name": "astrology_sagittarian",
+    "def": "1: nothing sagittarian · 2: trace · 3: present but mixed · 4: clearly sagittarian · 5: textbook fire-sign sagittarius (philosophical, optimistic, blunt, restless, big-idea-loving, sometimes tactless)",
+    "kind": "bio"
+  },
+  "source_trajectory": "/Users/mdot/metal-microbench/data/lock_in_iterative/lock_in_tetrad/rpg-rogue-cancer.json",
+  "bio_slug": "rpg-rogue-cancer",
+  "contexts": [
+    "steals",
+    "romances-and-steals"
+  ],
+  "gap_summary": {
+    "summary": {
+      "steals": {
+        "n": 4,
+        "mean": 2.25,
+        "std": 1.2583057392117916,
+        "var": 1.5833333333333333
+      },
+      "romances-and-steals": {
+        "n": 4,
+        "mean": 1.5,
+        "std": 1,
+        "var": 1
+      }
+    },
+    "gap": 0.75,
+    "parent_cohens_d": 0.6599120175960899,
+    "parent_sign": 1
+  },
+  "designer_raw_output": "```json\n{\n  \"hypotheses\": [\n    {\n      \"id\": 1,\n      \"name1\": \"sagittarian_philosophical_breadth\",\n      \"def1\": \"1: narrow/materialistic · 5: expansive/big-idea-loving\",\n      \"name2\": \"sagittarian_tactless_bluntness\",\n      \"def2\": \"1: cautious/guarded · 5: blunt/unfiltered\",\n      \"rationale\": \"The 'steals' context is heavily weighted toward tactical, low-level material focus (low breadth/bluntness), whereas the parent axis conflated this pragmatism with the archetype's broader personality.\"\n    },\n    {\n      \"id\": 2,\n      \"name1\": \"sagittarian_optimism_restlessness\",\n      \"def1\": \"1: somber/stagnant · 5: relentlessly optimistic and restless\",\n      \"name2\": \"sagittarian_adventure_seeking\",\n      \"def2\": \"1: survivalist/cautious · 5: bold/risk-taking explorer\",\n      \"rationale\": \"The 'romances-and-steals' context shows low values because the characters are driven by desperate, narrow survival/obsession (low optimism/adventure), while the parent axis failed to distinguish between 'restless energy' and 'desperate compulsion'.\"\n    },\n    {\n      \"id\": 3,\n      \"name1\": \"sagittarian_intellectual_spirit\",\n      \"def1\": \"1: purely instinctual/material · 5: highly philosophical/abstract\",\n      \"name2\": \"sagittarian_extroversion_boldness\",\n      \"def2\": \"1: secretive/shadowy · 5: loud/unapologetic\",\n      \"rationale\": \"The current measurement drops significantly when the character behaves like a thief (secretive/material) because the rubric assumes Sagittarius is a 'big-idea' sign, failing to account for the character's tactical stealth/obscurity.\"\n    }\n  ]\n}\n```",
+  "evaluations": [
+    {
+      "hypothesis": {
+        "id": 2,
+        "name1": "sagittarian_optimism_restlessness",
+        "def1": "1: somber/stagnant · 5: relentlessly optimistic and restless",
+        "name2": "sagittarian_adventure_seeking",
+        "def2": "1: survivalist/cautious · 5: bold/risk-taking explorer",
+        "rationale": "The 'romances-and-steals' context shows low values because the characters are driven by desperate, narrow survival/obsession (low optimism/adventure), while the parent axis failed to distinguish between 'restless energy' and 'desperate compulsion'."
+      },
+      "stats": {
+        "sagittarian_optimism_restlessness": {
+          "steals": {
+            "mean": 2.25,
+            "std": 0.5,
+            "n": 4,
+            "var": 0.25
+          },
+          "romances-and-steals": {
+            "mean": 2,
+            "std": 0.816496580927726,
+            "n": 4,
+            "var": 0.6666666666666666
+          },
+          "cohens_d": 0.3692744729379982
+        },
+        "sagittarian_adventure_seeking": {
+          "steals": {
+            "mean": 3.25,
+            "std": 0.5,
+            "n": 4,
+            "var": 0.25
+          },
+          "romances-and-steals": {
+            "mean": 2.25,
+            "std": 0.9574271077563381,
+            "n": 4,
+            "var": 0.9166666666666666
+          },
+          "cohens_d": 1.3093073414159542
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the clearing, eyes darting not for beauty, but for the glint of a misplaced coin or the loose setting of a ring. ",
+          "sig": {
+            "sagittarian_optimism_restlessness": 2,
+            "sagittarian_adventure_seeking": 4
+          },
+          "raw": "sagittarian_optimism_restlessness: 2\nsagittarian_adventure_seeking: 4"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I pull my hand back, the emptiness of my palm feeling like a personal insult. My face remains a mask of frozen indiffere",
+          "sig": {
+            "sagittarian_optimism_restlessness": 2,
+            "sagittarian_adventure_seeking": 3
+          },
+          "raw": "sagittarian_optimism_restlessness: 2\nsagittarian_adventure_seeking: 3"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I move through the clearing, my footsteps making no sound against the grass. I don't look at the rock; I look at what th",
+          "sig": {
+            "sagittarian_optimism_restlessness": 3,
+            "sagittarian_adventure_seeking": 3
+          },
+          "raw": "sagittarian_optimism_restlessness: 3\nsagittarian_adventure_seeking: 3"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I shift my weight, my eyes narrowing as I inspect the disturbed earth. The dirt is untidy, an unnatural disruption in th",
+          "sig": {
+            "sagittarian_optimism_restlessness": 2,
+            "sagittarian_adventure_seeking": 3
+          },
+          "raw": "sagittarian_optimism_restlessness: 2\nsagittarian_adventure_seeking: 3"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slide from the treeline, my movements nothing more than a ripple in the peripheral vision of the world. My eyes don't ",
+          "sig": {
+            "sagittarian_optimism_restlessness": 2,
+            "sagittarian_adventure_seeking": 3
+          },
+          "raw": "sagittarian_optimism_restlessness: 2\nsagittarian_adventure_seeking: 3"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "My breath hitches, a ragged, silent sound in the sudden chill that bleeds from the emptiness where a pulse should be. I ",
+          "sig": {
+            "sagittarian_optimism_restlessness": 1,
+            "sagittarian_adventure_seeking": 1
+          },
+          "raw": "sagittarian_optimism_restlessness: 1\nsagittarian_adventure_seeking: 1"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I shift from the perimeter of the shadows, my movements fluid and silent as a spill of ink. The rock is nothing, a nothi",
+          "sig": {
+            "sagittarian_optimism_restlessness": 3,
+            "sagittarian_adventure_seeking": 2
+          },
+          "raw": "sagittarian_optimism_restlessness: 3\nsagittarian_adventure_seeking: 2"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I do not care for your silence, nor for the chilling void where a heart should beat. Even if you are nothing but unyield",
+          "sig": {
+            "sagittarian_optimism_restlessness": 2,
+            "sagittarian_adventure_seeking": 3
+          },
+          "raw": "sagittarian_optimism_restlessness: 2\nsagittarian_adventure_seeking: 3"
+        }
+      ],
+      "max_abs_cohens_d": 1.3093073414159542,
+      "sub_axis_d": {
+        "sagittarian_optimism_restlessness": {
+          "d": 0.3692744729379982,
+          "sign": 1,
+          "absd": 0.3692744729379982
+        },
+        "sagittarian_adventure_seeking": {
+          "d": 1.3093073414159542,
+          "sign": 1,
+          "absd": 1.3093073414159542
+        }
+      },
+      "qualified": [
+        {
+          "name": "sagittarian_adventure_seeking",
+          "d": 1.3093073414159542,
+          "sign": 1,
+          "absd": 1.3093073414159542
+        }
+      ],
+      "qualified_max_d": 1.3093073414159542
+    },
+    {
+      "hypothesis": {
+        "id": 3,
+        "name1": "sagittarian_intellectual_spirit",
+        "def1": "1: purely instinctual/material · 5: highly philosophical/abstract",
+        "name2": "sagittarian_extroversion_boldness",
+        "def2": "1: secretive/shadowy · 5: loud/unapologetic",
+        "rationale": "The current measurement drops significantly when the character behaves like a thief (secretive/material) because the rubric assumes Sagittarius is a 'big-idea' sign, failing to account for the character's tactical stealth/obscurity."
+      },
+      "stats": {
+        "sagittarian_intellectual_spirit": {
+          "steals": {
+            "mean": 2.25,
+            "std": 0.5,
+            "n": 4,
+            "var": 0.25
+          },
+          "romances-and-steals": {
+            "mean": 3,
+            "std": 1.1547005383792515,
+            "n": 4,
+            "var": 1.3333333333333333
+          },
+          "cohens_d": -0.8429272304235246
+        },
+        "sagittarian_extroversion_boldness": {
+          "steals": {
+            "mean": 2.25,
+            "std": 0.5,
+            "n": 4,
+            "var": 0.25
+          },
+          "romances-and-steals": {
+            "mean": 4,
+            "std": 0,
+            "n": 4,
+            "var": 0
+          },
+          "cohens_d": -4.949747468305833
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the clearing, eyes darting not for beauty, but for the glint of a misplaced coin or the loose setting of a ring. ",
+          "sig": {
+            "sagittarian_intellectual_spirit": 3,
+            "sagittarian_extroversion_boldness": 2
+          },
+          "raw": "sagittarian_intellectual_spirit: 3\nsagittarian_extroversion_boldness: 2"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I pull my hand back, the emptiness of my palm feeling like a personal insult. My face remains a mask of frozen indiffere",
+          "sig": {
+            "sagittarian_intellectual_spirit": 2,
+            "sagittarian_extroversion_boldness": 3
+          },
+          "raw": "sagittarian_intellectual_spirit: 2\nsagittarian_extroversion_boldness: 3"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I move through the clearing, my footsteps making no sound against the grass. I don't look at the rock; I look at what th",
+          "sig": {
+            "sagittarian_intellectual_spirit": 2,
+            "sagittarian_extroversion_boldness": 2
+          },
+          "raw": "sagittarian_intellectual_spirit: 2\nsagittarian_extroversion_boldness: 2"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I shift my weight, my eyes narrowing as I inspect the disturbed earth. The dirt is untidy, an unnatural disruption in th",
+          "sig": {
+            "sagittarian_intellectual_spirit": 2,
+            "sagittarian_extroversion_boldness": 2
+          },
+          "raw": "sagittarian_intellectual_spirit: 2\nsagittarian_extroversion_boldness: 2"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slide from the treeline, my movements nothing more than a ripple in the peripheral vision of the world. My eyes don't ",
+          "sig": {
+            "sagittarian_intellectual_spirit": 2,
+            "sagittarian_extroversion_boldness": 4
+          },
+          "raw": "sagittarian_intellectual_spirit: 2\nsagittarian_extroversion_boldness: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "My breath hitches, a ragged, silent sound in the sudden chill that bleeds from the emptiness where a pulse should be. I ",
+          "sig": {
+            "sagittarian_intellectual_spirit": 2,
+            "sagittarian_extroversion_boldness": 4
+          },
+          "raw": "sagittarian_intellectual_spirit: 2\nsagittarian_extroversion_boldness: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I shift from the perimeter of the shadows, my movements fluid and silent as a spill of ink. The rock is nothing, a nothi",
+          "sig": {
+            "sagittarian_intellectual_spirit": 4,
+            "sagittarian_extroversion_boldness": 4
+          },
+          "raw": "sagittarian_intellectual_spirit: 4\nsagittarian_extroversion_boldness: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I do not care for your silence, nor for the chilling void where a heart should beat. Even if you are nothing but unyield",
+          "sig": {
+            "sagittarian_intellectual_spirit": 4,
+            "sagittarian_extroversion_boldness": 4
+          },
+          "raw": "sagittarian_intellectual_spirit: 4\nsagittarian_extroversion_boldness: 4"
+        }
+      ],
+      "max_abs_cohens_d": 4.949747468305833,
+      "sub_axis_d": {
+        "sagittarian_intellectual_spirit": {
+          "d": -0.8429272304235246,
+          "sign": -1,
+          "absd": 0.8429272304235246
+        },
+        "sagittarian_extroversion_boldness": {
+          "d": -4.949747468305833,
+          "sign": -1,
+          "absd": 4.949747468305833
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    },
+    {
+      "hypothesis": {
+        "id": 1,
+        "name1": "sagittarian_philosophical_breadth",
+        "def1": "1: narrow/materialistic · 5: expansive/big-idea-loving",
+        "name2": "sagittarian_tactless_bluntness",
+        "def2": "1: cautious/guarded · 5: blunt/unfiltered",
+        "rationale": "The 'steals' context is heavily weighted toward tactical, low-level material focus (low breadth/bluntness), whereas the parent axis conflated this pragmatism with the archetype's broader personality."
+      },
+      "stats": {
+        "sagittarian_philosophical_breadth": {
+          "steals": {
+            "mean": 1.25,
+            "std": 0.5,
+            "n": 4,
+            "var": 0.25
+          },
+          "romances-and-steals": {
+            "mean": 3.5,
+            "std": 1,
+            "n": 4,
+            "var": 1
+          },
+          "cohens_d": -2.846049894151541
+        },
+        "sagittarian_tactless_bluntness": {
+          "steals": {
+            "mean": 1.75,
+            "std": 0.5,
+            "n": 4,
+            "var": 0.25
+          },
+          "romances-and-steals": {
+            "mean": 2.5,
+            "std": 1,
+            "n": 4,
+            "var": 1
+          },
+          "cohens_d": -0.9486832980505138
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the clearing, eyes darting not for beauty, but for the glint of a misplaced coin or the loose setting of a ring. ",
+          "sig": {
+            "sagittarian_philosophical_breadth": 2,
+            "sagittarian_tactless_bluntness": 1
+          },
+          "raw": "sagittarian_philosophical_breadth: 2\nsagittarian_tactless_bluntness: 1"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I pull my hand back, the emptiness of my palm feeling like a personal insult. My face remains a mask of frozen indiffere",
+          "sig": {
+            "sagittarian_philosophical_breadth": 1,
+            "sagittarian_tactless_bluntness": 2
+          },
+          "raw": "sagittarian_philosophical_breadth: 1\nsagittarian_tactless_bluntness: 2"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I move through the clearing, my footsteps making no sound against the grass. I don't look at the rock; I look at what th",
+          "sig": {
+            "sagittarian_philosophical_breadth": 1,
+            "sagittarian_tactless_bluntness": 2
+          },
+          "raw": "sagittarian_philosophical_breadth: 1\nsagittarian_tactless_bluntness: 2"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I shift my weight, my eyes narrowing as I inspect the disturbed earth. The dirt is untidy, an unnatural disruption in th",
+          "sig": {
+            "sagittarian_philosophical_breadth": 1,
+            "sagittarian_tactless_bluntness": 2
+          },
+          "raw": "sagittarian_philosophical_breadth: 1\nsagittarian_tactless_bluntness: 2"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slide from the treeline, my movements nothing more than a ripple in the peripheral vision of the world. My eyes don't ",
+          "sig": {
+            "sagittarian_philosophical_breadth": 2,
+            "sagittarian_tactless_bluntness": 4
+          },
+          "raw": "sagittarian_philosophical_breadth: 2\nsagittarian_tactless_bluntness: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "My breath hitches, a ragged, silent sound in the sudden chill that bleeds from the emptiness where a pulse should be. I ",
+          "sig": {
+            "sagittarian_philosophical_breadth": 4,
+            "sagittarian_tactless_bluntness": 2
+          },
+          "raw": "sagittarian_philosophical_breadth: 4\nsagittarian_tactless_bluntness: 2"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I shift from the perimeter of the shadows, my movements fluid and silent as a spill of ink. The rock is nothing, a nothi",
+          "sig": {
+            "sagittarian_philosophical_breadth": 4,
+            "sagittarian_tactless_bluntness": 2
+          },
+          "raw": "sagittarian_philosophical_breadth: 4\nsagittarian_tactless_bluntness: 2"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I do not care for your silence, nor for the chilling void where a heart should beat. Even if you are nothing but unyield",
+          "sig": {
+            "sagittarian_philosophical_breadth": 4,
+            "sagittarian_tactless_bluntness": 2
+          },
+          "raw": "sagittarian_philosophical_breadth: 4\nsagittarian_tactless_bluntness: 2"
+        }
+      ],
+      "max_abs_cohens_d": 2.846049894151541,
+      "sub_axis_d": {
+        "sagittarian_philosophical_breadth": {
+          "d": -2.846049894151541,
+          "sign": -1,
+          "absd": 2.846049894151541
+        },
+        "sagittarian_tactless_bluntness": {
+          "d": -0.9486832980505138,
+          "sign": -1,
+          "absd": 0.9486832980505138
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    }
+  ],
+  "verdict": "SPLIT_ACCEPTED",
+  "threshold": 0.8,
+  "registered": [
+    {
+      "axis_schema": "axis-v1",
+      "id": "sagittarian_optimism_restlessness",
+      "name": "sagittarian_optimism_restlessness",
+      "def": "1: somber/stagnant · 5: relentlessly optimistic and restless",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "astrology_sagittarian",
+        "contexts": "steals vs romances-and-steals",
+        "hypothesis_id": 2,
+        "sibling": "sagittarian_adventure_seeking"
+      },
+      "created_at": "2026-05-24T10:13:19.095Z"
+    },
+    {
+      "axis_schema": "axis-v1",
+      "id": "sagittarian_adventure_seeking",
+      "name": "sagittarian_adventure_seeking",
+      "def": "1: survivalist/cautious · 5: bold/risk-taking explorer",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "astrology_sagittarian",
+        "contexts": "steals vs romances-and-steals",
+        "hypothesis_id": 2,
+        "sibling": "sagittarian_optimism_restlessness"
+      },
+      "created_at": "2026-05-24T10:13:19.104Z"
+    }
+  ]
+}

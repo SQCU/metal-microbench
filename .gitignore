@@ -60,3 +60,6 @@ study-logs/
 test_data/frames_v2/**/source.mp4
 test_data/frames_v2/**/source.mkv
 test_data/frames_v2/**/source.webm
+test_data/frames_v2/
+test_data/video_rips/
+test_data/extracted_frames/

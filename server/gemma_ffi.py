@@ -231,6 +231,42 @@ class ServerStats:
 # ----------------------------------------------------------------------
 _MAGIC_REQ = 0x424D4547   # 'GEMB'
 _MAGIC_RESP = 0x52454D47  # 'GEMR'
+_U32_MAX = (1 << 32) - 1
+_U64_MAX = (1 << 64) - 1
+_I32_MIN = -(1 << 31)
+_I32_MAX = (1 << 31) - 1
+
+
+def _wire_u8(name: str, value: int) -> int:
+    iv = int(value)
+    if iv < 0 or iv > 0xff:
+        raise ValueError(f"{name}={iv} outside uint8 range")
+    return iv
+
+
+def _wire_u32(name: str, value: int) -> int:
+    iv = int(value)
+    if iv < 0 or iv > _U32_MAX:
+        raise ValueError(f"{name}={iv} outside uint32 range")
+    return iv
+
+
+def _wire_u64(name: str, value: int) -> int:
+    iv = int(value)
+    if iv < 0:
+        if name == "sampling.seed":
+            return 0
+        raise ValueError(f"{name}={iv} outside uint64 range")
+    if iv > _U64_MAX:
+        raise ValueError(f"{name}={iv} outside uint64 range")
+    return iv
+
+
+def _wire_i32(name: str, value: int) -> int:
+    iv = int(value)
+    if iv < _I32_MIN or iv > _I32_MAX:
+        raise ValueError(f"{name}={iv} outside int32 range")
+    return iv
 
 
 def _encode_request(streams: list[StreamSpec]) -> bytes:
@@ -389,20 +425,33 @@ def _encode_request(streams: list[StreamSpec]) -> bytes:
     # silently mis-reading the new fields as zeros.
     out += struct.pack("<IIII", _MAGIC_REQ, 4, len(streams), heap_base)
     for i, s in enumerate(streams):
+        stream_id = _wire_u64("stream_id", s.stream_id)
+        action = _wire_u8("action", s.action)
+        flags = _wire_u8("flags", s.flags)
+        top_k = _wire_u32("sampling.top_k", s.sampling.top_k)
+        max_new_tokens = _wire_u32(
+            "sampling.max_new_tokens", s.sampling.max_new_tokens)
+        seed = _wire_u64("sampling.seed", s.sampling.seed)
+        eos_token_id = _wire_i32("sampling.eos_token_id",
+                                 s.sampling.eos_token_id)
+        stop_count = _wire_u32("sampling.stop_tokens.count",
+                               len(s.sampling.stop_tokens))
+        top_logprobs = _wire_u32("sampling.top_logprobs",
+                                 s.sampling.top_logprobs)
         out += struct.pack(
             "<QBBHIII"           # 24 bytes (header)
             "ffIfIQiII"          # 40 bytes (sampling: T,topP,topK,repPen,maxN,seed,eos,stopCount,stopOff)
             "III"                # 12 bytes (sampling: topLogprobs, lbCount, lbOffset)
             "fIIII"              # 20 bytes (sampling: minP, cotCount, cotOff, ssqCount, ssqOff)
             "II",                # 8 bytes (StreamSpec extension: cv_count, cvs_offset)
-            s.stream_id, s.action, s.flags, 0,
+            stream_id, action, flags, 0,
             seg_counts[i], seg_offsets[i], 0,
             s.sampling.temperature, s.sampling.top_p,
-            s.sampling.top_k, s.sampling.repetition_penalty,
-            s.sampling.max_new_tokens, s.sampling.seed,
-            s.sampling.eos_token_id, len(s.sampling.stop_tokens),
+            top_k, s.sampling.repetition_penalty,
+            max_new_tokens, seed,
+            eos_token_id, stop_count,
             stop_offsets[i],
-            s.sampling.top_logprobs, lb_counts[i], lb_offsets[i],
+            top_logprobs, lb_counts[i], lb_offsets[i],
             s.sampling.min_p, cot_counts[i], cot_offsets[i],
             ssq_counts[i], ssq_offsets[i],
             cv_counts[i], cv_offsets[i],

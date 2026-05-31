@@ -214,7 +214,8 @@ func runLmPrefillProfile(ggufPath: String) {
                                    Y: pre_gate_up_fused,
                                    slotTokenBuf: pre_slot_token, activeExpBuf: active_exp,
                                    groupStartBuf: pre_group_start,
-                                   Din: HIDDEN, Dout: MOE_FUSED_DOUT, numSlots: NS, E: E_EXP)
+                                   Din: HIDDEN, Dout: MOE_FUSED_DOUT, numSlots: NS, E: E_EXP,
+                                   dispatchArgsBuf: pre_moe_dispatch_args)
             })
             stages.append(runStage("moe_gelu", layer: L) { cb in
                 encMoeGeluMulFused(cb, fused: pre_gate_up_fused, out: pre_gate_proj,
@@ -225,7 +226,8 @@ func runLmPrefillProfile(ggufPath: String) {
                 encMoeDownMmPrefill(cb, x: pre_gate_proj, W: lw.moeDown, format: lw.moeDownFormat,
                                      Y: pre_moe_down_out,
                                      activeExpBuf: active_exp, groupStartBuf: pre_group_start,
-                                     Din: MOE_INT, Dout: HIDDEN, numSlots: NS, E: E_EXP)
+                                     Din: MOE_INT, Dout: HIDDEN, numSlots: NS, E: E_EXP,
+                                     dispatchArgsBuf: pre_moe_dispatch_args)
             })
             stages.append(runStage("moe_tail", layer: L) { cb in
                 encMoeCombineWriteInto(cb, moeOut: pre_moe_down_out, batchSlots: pre_batch_slots,
@@ -265,6 +267,20 @@ func runLmPrefillProfile(ggufPath: String) {
 
     print("  warmup pass (discarded)..."); fflush(stdout)
     _ = onePass()
+
+    // Correctness fingerprint: argmax + checksum of slot-0 logits after the
+    // forward. Used to prove kernel changes (e.g. MoE-down re-tile) are
+    // bit-safe — argmax must match, sum must agree to fp tolerance.
+    do {
+        let lp = logits.contents().bindMemory(to: Float16.self, capacity: activeSlots * VOCAB)
+        var best = -Float.infinity; var bestIdx = -1; var sum = 0.0
+        for v in 0..<VOCAB {
+            let x = Float(lp[v]); sum += Double(x)
+            if x > best { best = x; bestIdx = v }
+        }
+        print(String(format: "  [fingerprint] slot0 argmax=%d  maxLogit=%.4f  sumLogits=%.3f",
+                     bestIdx, best, sum)); fflush(stdout)
+    }
 
     // Aggregate over reps.
     var aggGpu: [String: Double] = [:]

@@ -40,7 +40,8 @@ function allAxes() { return _AXES_CACHE; }
 
 const DEFAULT_K_ACTIVE = 2;
 const DEFAULT_K_DISABLED = 2;
-const DATA_ROOT = '/Users/mdot/metal-microbench/data';
+const DATA_ROOT = process.env.USER_PERSONAS_DATA_DIR
+    || '/Users/mdot/metal-microbench/data';
 const OUT_DIR = path.join(DATA_ROOT, 'context_suggester');
 
 // ── manifest loader: scan data/ files for measured signatures ────────

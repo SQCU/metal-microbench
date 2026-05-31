@@ -92,6 +92,24 @@ VISION_SAFETENSORS = (
     or ""
 )
 MODEL_NAME = os.environ.get("GEMMA_MODEL_NAME", "gemma-4-a4b")
+# Gemma-4 has both sliding-window and full-attention layers. The slide
+# layers can address MAX_PAGES_PER_SLOT * PAGE_SLIDE = 131072 tokens, but
+# the full-attention block table is PAGE_FULL-granular: 8192 * 8 = 65536.
+# Advertise the binding public context limit so clients do not submit a
+# prompt the engine cannot index safely.
+CONTEXT_LENGTH = 65536
+
+# Batch shape the engine decodes through, advertised so CLIENTS STOP GUESSING
+# IT. The kernel runs KERNEL_BATCH streams per decode step (bootstrap.swift:431
+# `let B = 8`, "K=B=8 kernel-batch positions") behind an admission cap of
+# MAX_SESSIONS logical sessions (M=64). The kernel pays its full B-wide dispatch
+# cost regardless of occupancy, so a client running fewer than KERNEL_BATCH
+# concurrent streams wastes the kernel. These MUST mirror bootstrap.swift; they
+# are surfaced in /health so tools/batch_scaler.py can read the width from the
+# engine instead of every experiment re-deriving it. (FFI accessors would fully
+# single-source this; until then this constant is the declared mirror.)
+KERNEL_BATCH = int(os.environ.get("GEMMA_KERNEL_BATCH", "8"))
+MAX_SESSIONS = int(os.environ.get("GEMMA_MAX_SESSIONS", "64"))
 
 
 # ----------------------------------------------------------------------
@@ -382,7 +400,8 @@ async def _wait_until_disconnected(request: Request) -> None:
 
 
 async def _consume_engine_stream(stream_id: int, request: Request,
-                                   from_offset: int = 0):
+                                   from_offset: int = 0,
+                                   retain_on_clean_close: bool = True):
     """Single shared coroutine that owns engine-stream lifecycle.
 
     Yields `(offset, StreamUpdate)` tuples in order, starting at
@@ -405,6 +424,11 @@ async def _consume_engine_stream(stream_id: int, request: Request,
         keeps appending; subsequent reconnect via
         `GET /v1/streams/{id}/sse?since={N}` can replay from any prior
         offset.
+      - If retain_on_clean_close is true, the log is preserved after
+        natural completion via the completed-idle LRU. Non-streaming
+        aggregate calls pass false because there is no useful reconnect
+        surface for their stream id; retaining those logs only accumulates
+        bridge-side resources.
       - The log is preserved past the disconnect via the completed-idle
         LRU (`_completed_stream_lru`) — bounded by bytes + count, not
         wallclock. See `_mark_stream_completed_for_eviction` and
@@ -494,15 +518,21 @@ async def _consume_engine_stream(stream_id: int, request: Request,
         # have to "preserve the queue" any more — the log captures
         # everything regardless of consumer presence.
         #
-        # To restore the pre-2026-05-23 aggressive-cancel behavior, set
-        # BRIDGE_CANCEL_ON_DISCONNECT=1.
+        # Default behavior: cancel engine work when the HTTP client goes
+        # away. Long harness runs can otherwise leave abandoned non-stream
+        # completions burning AR indefinitely after their Node child has
+        # exited. Set BRIDGE_CANCEL_ON_DISCONNECT=0 only for explicit SSE
+        # reconnect experiments that need orphan streams to continue.
         import os as _os
         if clean_close:
             # Natural completion: caller observed state==2. Move into
             # the completed-idle LRU so a reconnect can still replay
             # the full sequence — the LRU evictor (count + bytes
             # bounds, no wallclock) decides when to free.
-            _mark_stream_completed_for_eviction(stream_id)
+            if retain_on_clean_close:
+                _mark_stream_completed_for_eviction(stream_id)
+            else:
+                _release_stream_log(stream_id)
         else:
             if last_yielded_update is not None:
                 u = last_yielded_update
@@ -522,10 +552,10 @@ async def _consume_engine_stream(stream_id: int, request: Request,
                       f"log_len={len(log)}); session continues — log "
                       f"keeps appending for any reconnect",
                       flush=True)
-            if _os.environ.get("BRIDGE_CANCEL_ON_DISCONNECT") == "1":
+            if _os.environ.get("BRIDGE_CANCEL_ON_DISCONNECT", "1") != "0":
                 try:
                     g.submit([g.StreamSpec(stream_id=stream_id, action=2)])
-                    print(f"[bridge] BRIDGE_CANCEL_ON_DISCONNECT=1: "
+                    print(f"[bridge] BRIDGE_CANCEL_ON_DISCONNECT: "
                           f"cancel submitted (stream_id={stream_id})",
                           flush=True)
                 except Exception as e:
@@ -785,6 +815,13 @@ def _parse_sampling(body: dict, max_tokens: int) -> g.SamplingParams:
     top_k = int(body.get("top_k", 0))
     seed = body.get("seed")
     seed_int = int(seed) if seed is not None else 0
+    # SillyTavern/OpenAI-compatible clients commonly use seed=-1 as a
+    # "random/default seed" sentinel. The native sampler expects a
+    # non-negative seed; letting -1 cross the FFI boundary produces an
+    # immediate 500 before any token work happens. Treat negative values
+    # as omitted/default.
+    if seed_int < 0:
+        seed_int = 0
     rep_pen = float(body.get("repetition_penalty",
                               body.get("frequency_penalty", 1.0)))
     # OpenAI's `stop` is a list of text strings (or a single string).
@@ -1488,13 +1525,23 @@ def health() -> JSONResponse:
         # over active streams.
         "aggregate_tok_per_sec": _compute_aggregate_tok_per_sec(),
         "active_stream_count": s.active_streams,
+        "bridge_stream_logs": {
+            "tracked": len(_stream_logs),
+            "retained_completed": len(_completed_stream_lru),
+            "retained_bytes_est": _retained_log_bytes(),
+            "background_drains": len(_background_drains),
+        },
         "capabilities": {
             # Renamed from max_q_len (2026-05-24): this is the GPU prefill
             # CHUNK size (256 tokens per kernel dispatch), NOT the context
             # window.  The old name caused clients that scraped /health to
             # cap their context budget at 256.
             "prefill_chunk_size": g.max_q_len(),
-            "context_length": 131072,
+            "context_length": CONTEXT_LENGTH,
+            # Declared batch shape so clients saturate the kernel instead of
+            # guessing a worker count. See tools/batch_scaler.py.
+            "kernel_batch": KERNEL_BATCH,
+            "max_sessions": MAX_SESSIONS,
         },
     })
 
@@ -1553,8 +1600,10 @@ async def tokenize_endpoint(req: Request) -> JSONResponse:
 def _models_payload() -> dict:
     # context_length must be present so that clients (e.g. SillyTavern) do not
     # fall through to their hard-coded legacy default (max_4k = 4095).  The
-    # true per-session budget is MAX_PAGES_PER_SLOT(8192) × PAGE_SLIDE(16) =
-    # 131 072 tokens (slide-attention layers) which is the binding limit.
+    # true per-session budget is bounded by full-attention pages:
+    # MAX_PAGES_PER_SLOT(8192) × PAGE_FULL(8) = 65 536 tokens. Slide
+    # layers can address 131 072, but full-attention is the binding
+    # block-table limit.
     return {
         "object": "list",
         "data": [{
@@ -1562,7 +1611,7 @@ def _models_payload() -> dict:
             "object": "model",
             "created": int(time.time()),
             "owned_by": "metal-microbench",
-            "context_length": 131072,
+            "context_length": CONTEXT_LENGTH,
         }],
     }
 
@@ -1829,7 +1878,16 @@ async def chat_completions(req: Request) -> Any:
         except Exception as _e:
             print(f"[bridge DEBUG] dump failed: {_e}", flush=True)
     stream_id = await _next_stream_id_alloc()
-    spec, _ = _build_stream_spec(
+    # 2026-05-28: optional exact-token recording. When the client sets
+    # `return_token_ids: true`, the non-streaming response carries the raw
+    # emitted completion token ids AND the assembled prompt token layout
+    # (per-segment text token ids — incl. BOS/turn markers since they come
+    # from the applied chat template — plus image soft-token span counts).
+    # Lets harnesses log token-in/token-out indices (incl. image soft tokens)
+    # without re-tokenizing or scraping the bridge log. See
+    # tools/svg_elicit/recorder.py.
+    return_token_ids = bool(body.get("return_token_ids", False))
+    spec, delta_segments = _build_stream_spec(
         stream_id, messages, sampling, capture_logits, tools=tools,
         enable_thinking=enable_thinking,
         capture_cvec_activations=capture_cvec,
@@ -1856,7 +1914,11 @@ async def chat_completions(req: Request) -> Any:
     # thread if it's currently in gemma_poll's cond_wait branch
     # (engine-idle), so cold-start submission latency is signal
     # speed, not the driver's poll deadline.
-    rc = g.submit([spec])
+    try:
+        rc = g.submit([spec])
+    except ValueError as e:
+        _release_stream_log(stream_id)
+        raise HTTPException(400, f"invalid engine request: {e}") from e
     if rc != 0:
         _release_stream_log(stream_id)
         raise HTTPException(500, f"engine submit failed: rc={rc}")
@@ -1876,7 +1938,8 @@ async def chat_completions(req: Request) -> Any:
         collected_logprobs: list[g.TokenLogprob] = []
         terminal: g.StreamUpdate | None = None
         # The aggregate branch ignores offsets — it just accumulates.
-        async for _offset, u in _consume_engine_stream(stream_id, req):
+        async for _offset, u in _consume_engine_stream(
+                stream_id, req, retain_on_clean_close=False):
             all_tokens.extend(u.new_tokens)
             all_thinking_tokens.extend(u.new_thinking_tokens)
             if u.logprobs:
@@ -1987,13 +2050,39 @@ async def chat_completions(req: Request) -> Any:
         if capture_logits:
             choice["logprobs"] = {
                 "content": [{
+                    "id": lp.token,  # raw token id (was dropped — only the str was returned)
                     "token": g.detokenize([lp.token]),
                     "logprob": lp.sampled_logprob,
                     "top_logprobs": [
-                        {"token": g.detokenize([t]), "logprob": p}
+                        {"id": t, "token": g.detokenize([t]), "logprob": p}
                         for t, p in lp.top_logprobs
                     ],
                 } for lp in collected_logprobs]
+            }
+        if return_token_ids:
+            # Exact token-out: raw emitted ids (and thinking ids, if any).
+            choice["token_ids"] = list(all_tokens)
+            if all_thinking_tokens:
+                choice["thinking_token_ids"] = list(all_thinking_tokens)
+            # Exact token-in layout: per-segment text token ids (BOS/turn
+            # markers included — they come from render_chat) interleaved with
+            # image segments. Image soft-tokens are continuous vision
+            # embeddings (no discrete ids); their count = prompt_tokens_total
+            # - total text tokens, reported here so a recorder can place the
+            # exact [start,end) soft-token spans.
+            _text_ids = [t for s in delta_segments if s.kind == 0 for t in s.tokens]
+            _n_img = sum(1 for s in delta_segments if s.kind != 0)
+            choice["prompt_token_layout"] = {
+                "segments": [
+                    ({"kind": "text", "n": len(s.tokens), "token_ids": list(s.tokens)}
+                     if s.kind == 0 else {"kind": "image"})
+                    for s in delta_segments
+                ],
+                "text_token_ids": _text_ids,
+                "n_text_tokens": len(_text_ids),
+                "n_images": _n_img,
+                "prompt_tokens_total": usage["prompt_tokens"],
+                "image_soft_tokens_total": usage["prompt_tokens"] - len(_text_ids),
             }
         return JSONResponse(
             {
@@ -2309,6 +2398,32 @@ async def chat_completions(req: Request) -> Any:
 # recently used). Eviction happens only when NEW completed streams
 # push the LRU over budget; the oldest tail entry gets freed.
 # ----------------------------------------------------------------------
+@app.post("/v1/streams/{stream_id}/cancel")
+async def stream_cancel(stream_id: int) -> JSONResponse:
+    """Explicitly RELEASE an in-flight engine session.
+
+    The engine's default policy is "the session continues after the HTTP client
+    disconnects" (so a flaky/reconnecting client doesn't lose its generation —
+    see the disconnect path's BRIDGE_CANCEL_ON_DISCONNECT comment). The
+    corollary is that a client which is genuinely DONE — or a test harness that
+    wants the engine to stop NOW rather than run to max_tokens with no consumer
+    — must say so explicitly instead of relying on socket teardown. This is
+    that signal.
+
+    Submits the engine cancel opcode (action=2 → closeSession → frees the slot
+    + KV pages within one poll tick) and drops the bridge-side stream log. The
+    stream_id is the value surfaced in the `X-Stream-Id` response header of the
+    original /v1/chat/completions call. Idempotent: cancelling an unknown or
+    already-finished stream is a 200 no-op, so clients can fire-and-forget.
+    """
+    try:
+        g.submit([g.StreamSpec(stream_id=stream_id, action=2)])
+    except Exception as e:
+        raise HTTPException(500, f"cancel submit failed: {e}") from e
+    _release_stream_log(stream_id)
+    return JSONResponse({"stream_id": stream_id, "cancelled": True})
+
+
 @app.get("/v1/streams/{stream_id}/sse")
 async def stream_reconnect_sse(stream_id: int, req: Request,
                                   since: int = 0):

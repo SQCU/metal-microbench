@@ -99,7 +99,10 @@ const EPS_PER_AXIS    = spec.loop_control.eps_per_axis;
 const STALL_WINDOW    = spec.loop_control.stall_window;
 const STALL_THRESHOLD = spec.loop_control.stall_threshold;
 
-const OUT_DIR = `/Users/mdot/metal-microbench/data/lock_in_iterative/${EXPERIMENT_ID}`;
+const LOCK_IN_OUT_BASE = process.env.USER_PERSONAS_LOCK_IN_OUT
+    || process.env.USER_PERSONAS_LOCK_IN_DATA_DIR
+    || '/Users/mdot/metal-microbench/data/lock_in_iterative';
+const OUT_DIR = path.join(LOCK_IN_OUT_BASE, EXPERIMENT_ID);
 
 // ── judge ────────────────────────────────────────────────────────────
 //

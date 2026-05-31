@@ -520,6 +520,103 @@ kernel void moe_proj_m16_gathered(
     }
 }
 
+// ----- M_TILE=16, K-contiguous weight layout (the down-shape fix) -----
+// Identical compute to moe_proj_m16, but the weight Wt is stored
+// [E, D_out, D_in] (contraction axis D_in innermost/contiguous) instead of
+// [E, D_in, D_out]. The B-tile is loaded with a transposed simdgroup_load,
+// so the K-walk strides by D_in (small) rather than D_out (large). For the
+// down projection (D_in=704 << D_out=2816) this restores the gate/up-shape's
+// memory locality; the original kernel contracts along the strided axis and
+// collapses to ~13 GB/s whenever D_out is large.
+kernel void moe_proj_m16_kt(
+    device const half* hidden       [[buffer(0)]],
+    device const half* Wt           [[buffer(1)]],   // [E, D_out, D_in]  (transposed)
+    device const uint* group_start  [[buffer(2)]],
+    device const uint* slot_token   [[buffer(3)]],
+    device half* output             [[buffer(4)]],
+    constant uint& D_in             [[buffer(5)]],
+    constant uint& D_out            [[buffer(6)]],
+    uint3 tg_pos                    [[threadgroup_position_in_grid]],
+    uint3 lid3                      [[thread_position_in_threadgroup]],
+    uint sg_id                      [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint M_TILE = 16;
+    constexpr uint N_TILE = 64;
+    constexpr uint K_TILE = 32;
+    constexpr uint N_SIMDS = 4;
+    constexpr uint THREADS = 128;
+
+    const uint n_block = tg_pos.x;
+    const uint expert = tg_pos.y;
+    const uint lid = lid3.x;
+
+    const uint g_begin = group_start[expert];
+    const uint g_end   = group_start[expert + 1];
+    const uint g_size  = g_end - g_begin;
+    if (g_size == 0) return;
+
+    threadgroup half A_tile[M_TILE * K_TILE];
+    threadgroup half B_tile[K_TILE * N_TILE];
+
+    const uint sg_col = sg_id * 16;        // 0, 16, 32, 48
+    const uint n_out_base = n_block * N_TILE;
+
+    for (uint m_start = 0; m_start < g_size; m_start += M_TILE) {
+        const uint rows = min(M_TILE, g_size - m_start);
+
+        simdgroup_half8x8 C_acc[2][2];
+        for (int i = 0; i < 2; ++i)
+            for (int j = 0; j < 2; ++j)
+                C_acc[i][j] = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+
+        for (uint k_base = 0; k_base < D_in; k_base += K_TILE) {
+            for (uint i = 0; i < 4; ++i) {
+                const uint flat = i * THREADS + lid;
+                const uint r = flat / K_TILE;
+                const uint c = flat % K_TILE;
+                half v = 0.0h;
+                if (r < rows) {
+                    const uint tok = slot_token[g_begin + m_start + r];
+                    v = hidden[tok * D_in + k_base + c];
+                }
+                A_tile[r * K_TILE + c] = v;
+            }
+
+            // B-tile from transposed weight: src block is [n][k] with row
+            // stride D_in; transposed load yields [k][n] subtiles. Reads run
+            // along contiguous k → coalesced regardless of D_out.
+            simdgroup_half8x8 btmp;
+            for (uint s = sg_id; s < 32; s += N_SIMDS) {
+                const uint br = (s / 8) * 8;   // K offset within tile
+                const uint bc = (s % 8) * 8;   // N offset within tile
+                simdgroup_load(btmp,
+                    Wt + (expert * D_out + n_out_base + bc) * D_in + k_base + br,
+                    D_in, ulong2(0, 0), /*transpose=*/true);
+                simdgroup_store(btmp, B_tile + br * N_TILE + bc, N_TILE);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint k_sub = 0; k_sub < K_TILE; k_sub += 8) {
+                simdgroup_half8x8 a[2], b[2];
+                for (int i = 0; i < 2; ++i)
+                    simdgroup_load(a[i], A_tile + i * 8 * K_TILE + k_sub, K_TILE);
+                for (int j = 0; j < 2; ++j)
+                    simdgroup_load(b[j], B_tile + k_sub * N_TILE + sg_col + j * 8, N_TILE);
+                for (int i = 0; i < 2; ++i)
+                    for (int j = 0; j < 2; ++j)
+                        simdgroup_multiply_accumulate(C_acc[i][j], a[i], b[j], C_acc[i][j]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        for (int i = 0; i < 2; ++i)
+            for (int j = 0; j < 2; ++j)
+                simdgroup_store(C_acc[i][j],
+                                output + (g_begin + m_start + i * 8) * D_out + n_out_base + sg_col + j * 8,
+                                D_out);
+    }
+}
+
 // ----- M_TILE=8 variant: 8 SGs × 1 acc (8×8), 256 threads/TG -----
 kernel void moe_proj_m8(
     device const half* hidden       [[buffer(0)]],
@@ -824,6 +921,7 @@ guard let m8Fn       = library.makeFunction(name: "moe_proj_m8"),
       let m16Fn      = library.makeFunction(name: "moe_proj_m16"),
       let m16pFn     = library.makeFunction(name: "moe_proj_m16_pipe"),
       let m16gFn     = library.makeFunction(name: "moe_proj_m16_gathered"),
+      let m16ktFn    = library.makeFunction(name: "moe_proj_m16_kt"),
       let gatherFn   = library.makeFunction(name: "moe_gather_hidden"),
       let gemvFpFn   = library.makeFunction(name: "moe_gemv_fp16"),
       let gemvQ4Fn   = library.makeFunction(name: "moe_gemv_q4"),
@@ -835,6 +933,7 @@ let m8PSO       = try! device.makeComputePipelineState(function: m8Fn)
 let m16PSO      = try! device.makeComputePipelineState(function: m16Fn)
 let m16pPSO     = try! device.makeComputePipelineState(function: m16pFn)
 let m16gPSO     = try! device.makeComputePipelineState(function: m16gFn)
+let m16ktPSO    = try! device.makeComputePipelineState(function: m16ktFn)
 let gatherPSO   = try! device.makeComputePipelineState(function: gatherFn)
 let gemvFpPSO   = try! device.makeComputePipelineState(function: gemvFpFn)
 let gemvQ4PSO   = try! device.makeComputePipelineState(function: gemvQ4Fn)
@@ -884,9 +983,9 @@ func buildUniformRouting(nTokens: Int, topK: Int, E: Int)
     return (groupStartBuf, slotTokenBuf, totalSlots, groupSize)
 }
 
-enum Variant { case m8, m16, m16p, m16g }
+enum Variant { case m8, m16, m16p, m16g, m16kt }
 
-struct ProjRun { let time: Double; let flops: Double; let wBytes: Double }
+struct ProjRun { let time: Double; let flops: Double; let wBytes: Double; var outSum: Double = 0 }
 
 func runProj(variant: Variant,
              nTokens: Int, Din: Int, Dout: Int, E: Int, topK: Int,
@@ -898,18 +997,37 @@ func runProj(variant: Variant,
     let output = device.makeBuffer(length: totalSlots * Dout * 2, options: .storageModeShared)!
 
     precondition(Dout % 64 == 0, "N_TILE=64 requires D_out divisible by 64")
-    if variant == .m16 || variant == .m16p || variant == .m16g {
+    if variant == .m16 || variant == .m16p || variant == .m16g || variant == .m16kt {
         precondition(gSize % 16 == 0, "m16 requires group size divisible by 16")
     }
 
     let pso: MTLComputePipelineState
     let threads: Int
     switch variant {
-    case .m8:   pso = m8PSO;   threads = 256
-    case .m16:  pso = m16PSO;  threads = 128
-    case .m16p: pso = m16pPSO; threads = 128
-    case .m16g: pso = m16gPSO; threads = 128
+    case .m8:    pso = m8PSO;    threads = 256
+    case .m16:   pso = m16PSO;   threads = 128
+    case .m16p:  pso = m16pPSO;  threads = 128
+    case .m16g:  pso = m16gPSO;  threads = 128
+    case .m16kt: pso = m16ktPSO; threads = 128
     }
+
+    // m16kt contracts along the contiguous axis, so it needs the weight stored
+    // [E, D_out, D_in] (transposed from the [E, D_in, D_out] the others use).
+    // Built once here, outside the timed loop.
+    let Wkt: MTLBuffer = {
+        guard variant == .m16kt else { return W }
+        let t = device.makeBuffer(length: E * Din * Dout * 2, options: .storageModeShared)!
+        let src = W.contents().bindMemory(to: Float16.self, capacity: E * Din * Dout)
+        let dst = t.contents().bindMemory(to: Float16.self, capacity: E * Din * Dout)
+        for e in 0..<E {
+            let base = e * Din * Dout
+            for k in 0..<Din {
+                let srow = base + k * Dout
+                for n in 0..<Dout { dst[base + n * Din + k] = src[srow + n] }
+            }
+        }
+        return t
+    }()
 
     // For m16g: pre-gather hidden into expert-grouped rows. Includes both
     // the gather and the projection in the timed window, so the reported
@@ -948,7 +1066,7 @@ func runProj(variant: Variant,
             enc.setBytes(&Do, length: 4, index: 5)
         } else {
             enc.setBuffer(hidden, offset: 0, index: 0)
-            enc.setBuffer(W, offset: 0, index: 1)
+            enc.setBuffer(Wkt, offset: 0, index: 1)
             enc.setBuffer(gStart, offset: 0, index: 2)
             enc.setBuffer(slotTok, offset: 0, index: 3)
             enc.setBuffer(output, offset: 0, index: 4)
@@ -968,7 +1086,26 @@ func runProj(variant: Variant,
     let t = times.min()!
     let flops = 2.0 * Double(totalSlots) * Double(Din) * Double(Dout)
     let wBytes = Double(E) * Double(Din) * Double(Dout) * 2.0
-    return ProjRun(time: t, flops: flops, wBytes: wBytes)
+    // checksum the output (first 4096 slots' col 0..63) for cross-variant verify
+    let op = output.contents().bindMemory(to: Float16.self, capacity: totalSlots * Dout)
+    var sum = 0.0
+    let nCheck = min(totalSlots, 4096)
+    for r in 0..<nCheck { for c in 0..<min(64, Dout) { sum += Double(op[r * Dout + c]) } }
+    return ProjRun(time: t, flops: flops, wBytes: wBytes, outSum: sum)
+}
+
+// Correctness: m16 and m16kt must agree (same W seed; kt transposes it).
+do {
+    let a = runProj(variant: .m16,   nTokens: 256, Din: 2816, Dout: 704, E: 128, topK: 8, iters: 1, warmup: 0)
+    let b = runProj(variant: .m16kt, nTokens: 256, Din: 2816, Dout: 704, E: 128, topK: 8, iters: 1, warmup: 0)
+    let rel = abs(a.outSum - b.outSum) / max(1e-6, abs(a.outSum))
+    print(String(format: "[verify] gate/up  m16 outSum=%.3f  m16kt=%.3f  rel=%.2e  %@",
+                 a.outSum, b.outSum, rel, rel < 1e-2 ? "OK" : "MISMATCH!"))
+    let c = runProj(variant: .m16,   nTokens: 256, Din: 704, Dout: 2816, E: 128, topK: 8, iters: 1, warmup: 0)
+    let d = runProj(variant: .m16kt, nTokens: 256, Din: 704, Dout: 2816, E: 128, topK: 8, iters: 1, warmup: 0)
+    let rel2 = abs(c.outSum - d.outSum) / max(1e-6, abs(c.outSum))
+    print(String(format: "[verify] down     m16 outSum=%.3f  m16kt=%.3f  rel=%.2e  %@",
+                 c.outSum, d.outSum, rel2, rel2 < 1e-2 ? "OK" : "MISMATCH!"))
 }
 
 print("=== Gemma-4 MoE token-grouped projection — top-8 of 128 ===")
@@ -1191,10 +1328,12 @@ for (label, Din, Dout) in [
     line("N=256  g=16  m16",      runProj(variant: .m16,  nTokens: 256,  Din: Din, Dout: Dout, E: E, topK: topK))
     line("N=256  g=16  m16_pipe", runProj(variant: .m16p, nTokens: 256,  Din: Din, Dout: Dout, E: E, topK: topK))
     line("N=256  g=16  m16_gath", runProj(variant: .m16g, nTokens: 256,  Din: Din, Dout: Dout, E: E, topK: topK))
+    line("N=256  g=16  m16_KT  ", runProj(variant: .m16kt, nTokens: 256, Din: Din, Dout: Dout, E: E, topK: topK), "K-contiguous W")
     // N=2048 (g=128): heavy W reuse.
     line("N=2048 g=128 m8",       runProj(variant: .m8,   nTokens: 2048, Din: Din, Dout: Dout, E: E, topK: topK))
     line("N=2048 g=128 m16",      runProj(variant: .m16,  nTokens: 2048, Din: Din, Dout: Dout, E: E, topK: topK))
     line("N=2048 g=128 m16_pipe", runProj(variant: .m16p, nTokens: 2048, Din: Din, Dout: Dout, E: E, topK: topK))
     line("N=2048 g=128 m16_gath", runProj(variant: .m16g, nTokens: 2048, Din: Din, Dout: Dout, E: E, topK: topK))
+    line("N=2048 g=128 m16_KT  ", runProj(variant: .m16kt, nTokens: 2048, Din: Din, Dout: Dout, E: E, topK: topK), "K-contiguous W")
     print("")
 }

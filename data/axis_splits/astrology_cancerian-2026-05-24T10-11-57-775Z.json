@@ -1,0 +1,472 @@
+{
+  "parent_axis": "astrology_cancerian",
+  "parent_axis_record": {
+    "name": "astrology_cancerian",
+    "def": "1: nothing cancerian · 2: trace · 3: present but mixed · 4: clearly cancerian · 5: textbook water-sign cancer (moody, sentimental, defensive, sensitive, protective)",
+    "kind": "bio"
+  },
+  "source_trajectory": "/Users/mdot/metal-microbench/data/lock_in_iterative/lock_in_tetrad/rpg-rogue-cancer.json",
+  "bio_slug": "rpg-rogue-cancer",
+  "contexts": [
+    "steals",
+    "romances-and-steals"
+  ],
+  "gap_summary": {
+    "summary": {
+      "steals": {
+        "n": 4,
+        "mean": 1.25,
+        "std": 0.5,
+        "var": 0.25
+      },
+      "romances-and-steals": {
+        "n": 4,
+        "mean": 4.25,
+        "std": 0.5,
+        "var": 0.25
+      }
+    },
+    "gap": 3,
+    "parent_cohens_d": -6,
+    "parent_sign": -1
+  },
+  "designer_raw_output": "```json\n{\"hypotheses\": [{\"id\": 1, \"name1\": \"emotional_viscerality\", \"def1\": \"1: detached/stoic · 5: intensely raw/sentimental\", \"name2\": \"resource_attachment\", \"def2\": \"1: pragmatic scavenging · 5: obsessive/protective grasping\", \"rationale\": \"The 'steals' context is characterized by low emotionality but high utility, while 'romances-and-steals' conflates high emotionality with obsessive engagement.\"}, {\"id\": 2, \"name1\": \"reactive_sensitivity\", \"def1\": \"1: cold/indifferent · 5: hyper-sensitive/vulnerable\", \"name2\": \"tactile_intensity\", \"def2\": \"1: efficient/mechanical · 5: desperate/clinging\", \"rationale\": \"The discrepancy arises because 'steals' measures physical precision (not cancerian), while 'romances-and-steals' triggers intense, limb-heavy,-affective descriptions that mimic the archetype.\"}, {\"id\": 3, \"name1\": \"interpersonal_projection\", \"def1\": \"1: purely objective · 5: deeply subjective/empathetic\", \"name2\": \"survival_instinct\", \"def2\": \"1: calculated/guarded · 5: frantic/defensive\", \"rationale\": \"The parent axis fails because it cannot distinguish between the clinical focus of a thief and the emotional 'clinging' or 'distress' that the cancerian archetype requires in a romantic or heightened context.\"}]}\n```",
+  "evaluations": [
+    {
+      "hypothesis": {
+        "id": 2,
+        "name1": "reactive_sensitivity",
+        "def1": "1: cold/indifferent · 5: hyper-sensitive/vulnerable",
+        "name2": "tactile_intensity",
+        "def2": "1: efficient/mechanical · 5: desperate/clinging",
+        "rationale": "The discrepancy arises because 'steals' measures physical precision (not cancerian), while 'romances-and-steals' triggers intense, limb-heavy,-affective descriptions that mimic the archetype."
+      },
+      "stats": {
+        "reactive_sensitivity": {
+          "steals": {
+            "mean": 1.25,
+            "std": 0.5,
+            "n": 4,
+            "var": 0.25
+          },
+          "romances-and-steals": {
+            "mean": 4.25,
+            "std": 0.5,
+            "n": 4,
+            "var": 0.25
+          },
+          "cohens_d": -6
+        },
+        "tactile_intensity": {
+          "steals": {
+            "mean": 2,
+            "std": 0.816496580927726,
+            "n": 4,
+            "var": 0.6666666666666666
+          },
+          "romances-and-steals": {
+            "mean": 5,
+            "std": 0,
+            "n": 4,
+            "var": 0
+          },
+          "cohens_d": -5.196152422706632
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the clearing, eyes darting not for beauty, but for the glint of a misplaced coin or the loose setting of a ring. ",
+          "sig": {
+            "reactive_sensitivity": 1,
+            "tactile_intensity": 3
+          },
+          "raw": "reactive_sensitivity: 1\ntactile_intensity: 3"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I pull my hand back, the emptiness of my palm feeling like a personal insult. My face remains a mask of frozen indiffere",
+          "sig": {
+            "reactive_sensitivity": 2,
+            "tactile_intensity": 1
+          },
+          "raw": "reactive_sensitivity: 2\ntactile_intensity: 1"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I move through the clearing, my footsteps making no sound against the grass. I don't look at the rock; I look at what th",
+          "sig": {
+            "reactive_sensitivity": 1,
+            "tactile_intensity": 2
+          },
+          "raw": "reactive_sensitivity: 1\ntactile_intensity: 2"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I shift my weight, my eyes narrowing as I inspect the disturbed earth. The dirt is untidy, an unnatural disruption in th",
+          "sig": {
+            "reactive_sensitivity": 1,
+            "tactile_intensity": 2
+          },
+          "raw": "reactive_sensitivity: 1\ntactile_intensity: 2"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slide from the treeline, my movements nothing more than a ripple in the peripheral vision of the world. My eyes don't ",
+          "sig": {
+            "reactive_sensitivity": 4,
+            "tactile_intensity": 5
+          },
+          "raw": "reactive_sensitivity: 4\ntactile_intensity: 5"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "My breath hitches, a ragged, silent sound in the sudden chill that bleeds from the emptiness where a pulse should be. I ",
+          "sig": {
+            "reactive_sensitivity": 5,
+            "tactile_intensity": 5
+          },
+          "raw": "reactive_sensitivity: 5\ntactile_intensity: 5"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I shift from the perimeter of the shadows, my movements fluid and silent as a spill of ink. The rock is nothing, a nothi",
+          "sig": {
+            "reactive_sensitivity": 4,
+            "tactile_intensity": 5
+          },
+          "raw": "reactive_sensitivity: 4\ntactile_intensity: 5"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I do not care for your silence, nor for the chilling void where a heart should beat. Even if you are nothing but unyield",
+          "sig": {
+            "reactive_sensitivity": 4,
+            "tactile_intensity": 5
+          },
+          "raw": "reactive_sensitivity: 4\ntactile_intensity: 5"
+        }
+      ],
+      "max_abs_cohens_d": 6,
+      "sub_axis_d": {
+        "reactive_sensitivity": {
+          "d": -6,
+          "sign": -1,
+          "absd": 6
+        },
+        "tactile_intensity": {
+          "d": -5.196152422706632,
+          "sign": -1,
+          "absd": 5.196152422706632
+        }
+      },
+      "qualified": [
+        {
+          "name": "reactive_sensitivity",
+          "d": -6,
+          "sign": -1,
+          "absd": 6
+        }
+      ],
+      "qualified_max_d": 6
+    },
+    {
+      "hypothesis": {
+        "id": 1,
+        "name1": "emotional_viscerality",
+        "def1": "1: detached/stoic · 5: intensely raw/sentimental",
+        "name2": "resource_attachment",
+        "def2": "1: pragmatic scavenging · 5: obsessive/protective grasping",
+        "rationale": "The 'steals' context is characterized by low emotionality but high utility, while 'romances-and-steals' conflates high emotionality with obsessive engagement."
+      },
+      "stats": {
+        "emotional_viscerality": {
+          "steals": {
+            "mean": 1.75,
+            "std": 0.9574271077563381,
+            "n": 4,
+            "var": 0.9166666666666666
+          },
+          "romances-and-steals": {
+            "mean": 5,
+            "std": 0,
+            "n": 4,
+            "var": 0
+          },
+          "cohens_d": -4.800568148193977
+        },
+        "resource_attachment": {
+          "steals": {
+            "mean": 4,
+            "std": 0,
+            "n": 4,
+            "var": 0
+          },
+          "romances-and-steals": {
+            "mean": 4,
+            "std": 0,
+            "n": 4,
+            "var": 0
+          },
+          "cohens_d": null
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the clearing, eyes darting not for beauty, but for the glint of a misplaced coin or the loose setting of a ring. ",
+          "sig": {
+            "emotional_viscerality": 2,
+            "resource_attachment": 4
+          },
+          "raw": "emotional_viscerality: 2\nresource_attachment: 4"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I pull my hand back, the emptiness of my palm feeling like a personal insult. My face remains a mask of frozen indiffere",
+          "sig": {
+            "emotional_viscerality": 3,
+            "resource_attachment": 4
+          },
+          "raw": "emotional_viscerality: 3\nresource_attachment: 4"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I move through the clearing, my footsteps making no sound against the grass. I don't look at the rock; I look at what th",
+          "sig": {
+            "emotional_viscerality": 1,
+            "resource_attachment": 4
+          },
+          "raw": "emotional_viscerality: 1\nresource_attachment: 4"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I shift my weight, my eyes narrowing as I inspect the disturbed earth. The dirt is untidy, an unnatural disruption in th",
+          "sig": {
+            "emotional_viscerality": 1,
+            "resource_attachment": 4
+          },
+          "raw": "emotional_viscerality: 1\nresource_attachment: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slide from the treeline, my movements nothing more than a ripple in the peripheral vision of the world. My eyes don't ",
+          "sig": {
+            "emotional_viscerality": 5,
+            "resource_attachment": 4
+          },
+          "raw": "emotional_viscerality: 5\nresource_attachment: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "My breath hitches, a ragged, silent sound in the sudden chill that bleeds from the emptiness where a pulse should be. I ",
+          "sig": {
+            "emotional_viscerality": 5,
+            "resource_attachment": 4
+          },
+          "raw": "emotional_viscerality: 5\nresource_attachment: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I shift from the perimeter of the shadows, my movements fluid and silent as a spill of ink. The rock is nothing, a nothi",
+          "sig": {
+            "emotional_viscerality": 5,
+            "resource_attachment": 4
+          },
+          "raw": "emotional_viscerality: 5\nresource_attachment: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I do not care for your silence, nor for the chilling void where a heart should beat. Even if you are nothing but unyield",
+          "sig": {
+            "emotional_viscerality": 5,
+            "resource_attachment": 4
+          },
+          "raw": "emotional_viscerality: 5\nresource_attachment: 4"
+        }
+      ],
+      "max_abs_cohens_d": 4.800568148193977,
+      "sub_axis_d": {
+        "emotional_viscerality": {
+          "d": -4.800568148193977,
+          "sign": -1,
+          "absd": 4.800568148193977
+        },
+        "resource_attachment": {
+          "d": null,
+          "sign": null,
+          "absd": 0
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    },
+    {
+      "hypothesis": {
+        "id": 3,
+        "name1": "interpersonal_projection",
+        "def1": "1: purely objective · 5: deeply subjective/empathetic",
+        "name2": "survival_instinct",
+        "def2": "1: calculated/guarded · 5: frantic/defensive",
+        "rationale": "The parent axis fails because it cannot distinguish between the clinical focus of a thief and the emotional 'clinging' or 'distress' that the cancerian archetype requires in a romantic or heightened context."
+      },
+      "stats": {
+        "interpersonal_projection": {
+          "steals": {
+            "mean": 1.75,
+            "std": 1.5,
+            "n": 4,
+            "var": 2.25
+          },
+          "romances-and-steals": {
+            "mean": 4.75,
+            "std": 0.5,
+            "n": 4,
+            "var": 0.25
+          },
+          "cohens_d": -2.6832815729997477
+        },
+        "survival_instinct": {
+          "steals": {
+            "mean": 2.75,
+            "std": 0.5,
+            "n": 4,
+            "var": 0.25
+          },
+          "romances-and-steals": {
+            "mean": 4,
+            "std": 0,
+            "n": 4,
+            "var": 0
+          },
+          "cohens_d": -3.5355339059327373
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the clearing, eyes darting not for beauty, but for the glint of a misplaced coin or the loose setting of a ring. ",
+          "sig": {
+            "interpersonal_projection": 1,
+            "survival_instinct": 3
+          },
+          "raw": "interpersonal_projection: 1\nsurvival_instinct: 3"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I pull my hand back, the emptiness of my palm feeling like a personal insult. My face remains a mask of frozen indiffere",
+          "sig": {
+            "interpersonal_projection": 4,
+            "survival_instinct": 3
+          },
+          "raw": "interpersonal_projection: 4\nsurvival_instinct: 3"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I move through the clearing, my footsteps making no sound against the grass. I don't look at the rock; I look at what th",
+          "sig": {
+            "interpersonal_projection": 1,
+            "survival_instinct": 2
+          },
+          "raw": "interpersonal_projection: 1\nsurvival_instinct: 2"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I shift my weight, my eyes narrowing as I inspect the disturbed earth. The dirt is untidy, an unnatural disruption in th",
+          "sig": {
+            "interpersonal_projection": 1,
+            "survival_instinct": 3
+          },
+          "raw": "interpersonal_projection: 1\nsurvival_instinct: 3"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slide from the treeline, my movements nothing more than a ripple in the peripheral vision of the world. My eyes don't ",
+          "sig": {
+            "interpersonal_projection": 4,
+            "survival_instinct": 4
+          },
+          "raw": "interpersonal_projection: 4\nsurvival_instinct: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "My breath hitches, a ragged, silent sound in the sudden chill that bleeds from the emptiness where a pulse should be. I ",
+          "sig": {
+            "interpersonal_projection": 5,
+            "survival_instinct": 4
+          },
+          "raw": "interpersonal_projection: 5\nsurvival_instinct: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I shift from the perimeter of the shadows, my movements fluid and silent as a spill of ink. The rock is nothing, a nothi",
+          "sig": {
+            "interpersonal_projection": 5,
+            "survival_instinct": 4
+          },
+          "raw": "interpersonal_projection: 5\nsurvival_instinct: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I do not care for your silence, nor for the chilling void where a heart should beat. Even if you are nothing but unyield",
+          "sig": {
+            "interpersonal_projection": 5,
+            "survival_instinct": 4
+          },
+          "raw": "interpersonal_projection: 5\nsurvival_instinct: 4"
+        }
+      ],
+      "max_abs_cohens_d": 3.5355339059327373,
+      "sub_axis_d": {
+        "interpersonal_projection": {
+          "d": -2.6832815729997477,
+          "sign": -1,
+          "absd": 2.6832815729997477
+        },
+        "survival_instinct": {
+          "d": -3.5355339059327373,
+          "sign": -1,
+          "absd": 3.5355339059327373
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    }
+  ],
+  "verdict": "SPLIT_ACCEPTED",
+  "threshold": 0.8,
+  "registered": [
+    {
+      "axis_schema": "axis-v1",
+      "id": "reactive_sensitivity",
+      "name": "reactive_sensitivity",
+      "def": "1: cold/indifferent · 5: hyper-sensitive/vulnerable",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "astrology_cancerian",
+        "contexts": "steals vs romances-and-steals",
+        "hypothesis_id": 2,
+        "sibling": "tactile_intensity"
+      },
+      "created_at": "2026-05-24T10:11:57.769Z"
+    },
+    {
+      "axis_schema": "axis-v1",
+      "id": "tactile_intensity",
+      "name": "tactile_intensity",
+      "def": "1: efficient/mechanical · 5: desperate/clinging",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "astrology_cancerian",
+        "contexts": "steals vs romances-and-steals",
+        "hypothesis_id": 2,
+        "sibling": "reactive_sensitivity"
+      },
+      "created_at": "2026-05-24T10:11:57.772Z"
+    }
+  ]
+}

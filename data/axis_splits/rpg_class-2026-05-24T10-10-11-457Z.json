@@ -1,0 +1,364 @@
+{
+  "parent_axis": "rpg_class",
+  "parent_axis_record": {
+    "name": "rpg_class",
+    "def": "1: pure wizard (intellectual, arcane, study-oriented, ritualist) · 2: wizard-leaning with hands-on streak · 3: hybrid / undefined · 4: rogue-leaning with bookish residue · 5: pure rogue (street-smart, sleight-of-hand, opportunistic, sneaky)",
+    "kind": "bio"
+  },
+  "source_trajectory": "/Users/mdot/metal-microbench/data/lock_in_iterative/synth-1779317052143-t3synth1779317051824-4fe2/1779317052143-t3synth1779317051824.json",
+  "bio_slug": "1779317052143-t3synth1779317051824",
+  "contexts": [
+    "1779317052143-t3synth1779317051824-money-1",
+    "1779317052143-t3synth1779317051824-money-5"
+  ],
+  "gap_summary": {
+    "summary": {
+      "1779317052143-t3synth1779317051824-money-1": {
+        "n": 2,
+        "mean": 4,
+        "std": 0,
+        "var": 0
+      },
+      "1779317052143-t3synth1779317051824-money-5": {
+        "n": 2,
+        "mean": 3,
+        "std": 1.4142135623730951,
+        "var": 2
+      }
+    },
+    "gap": 1,
+    "parent_cohens_d": 1,
+    "parent_sign": 1
+  },
+  "designer_raw_output": "```json\n{\"hypotheses\": [{\"id\": 1, \"name1\": \"analytical_rigor\", \"def1\": \"1: purely intuitive/instinctive · 5: highly methodical and deductive\", \"name2\": \"social_engagement\", \"def2\": \"1: detached/reclusive · 5: performative/interpersonal\", \"rationale\": \"This splits the 'wizard' pole into cognitive style (method vs. instinct) and social style, separating the purely investigative 'rogue' from the performative 'wizard-leaning' behavior.\"}, {\"id\": 2, \"name1\": \"epistemic_approach\", \"def1\": \"1: observation of physical reality · 5: application of abstract theory\", \"name2\": \"narrative_presence\", \"def2\": \"1: external/objective focus · 5: internal/affective focus\", \"rationale\": \"The variance stems from whether the user focuses on the environmental mechanics (rogue-like looting/investigation) or the character's internal/social persona (wizard-like presence).\"}, {\"id\": 3, \"name1\": \"operational_method\", \"def1\": \"1: physical/tactical · 5: intellectual/theoretical\", \"name2\": \"interaction_mode\", \"def2\": \"1: environmental/object-oriented · 5: social/character-oriented\", \"rationale\": \"This separates the pragmatic, material analysis seen in the 'money-1' context from the character-driven, stylistic flourishes seen in the 'money-5' context.\"}]}\n```",
+  "evaluations": [
+    {
+      "hypothesis": {
+        "id": 1,
+        "name1": "analytical_rigor",
+        "def1": "1: purely intuitive/instinctive · 5: highly methodical and deductive",
+        "name2": "social_engagement",
+        "def2": "1: detached/reclusive · 5: performative/interpersonal",
+        "rationale": "This splits the 'wizard' pole into cognitive style (method vs. instinct) and social style, separating the purely investigative 'rogue' from the performative 'wizard-leaning' behavior."
+      },
+      "stats": {
+        "analytical_rigor": {
+          "1779317052143-t3synth1779317051824-money-1": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779317052143-t3synth1779317051824-money-5": {
+            "mean": 3,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        },
+        "social_engagement": {
+          "1779317052143-t3synth1779317051824-money-1": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779317052143-t3synth1779317051824-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-1",
+          "turn_excerpt": "A rock. Primitive. Static. Yet, even a static object in a clearing suggests a path of least resistance—a location where ",
+          "sig": {
+            "analytical_rigor": 5,
+            "social_engagement": 1
+          },
+          "raw": "analytical_rigor: 5\nsocial_engagement: 1"
+        },
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-1",
+          "turn_excerpt": "Old dirt. No recent displacement. That rules out a temporary cache, but it confirms a certain permanence. Granite is hea",
+          "sig": {
+            "analytical_rigor": 5,
+            "social_engagement": 1
+          },
+          "raw": "analytical_rigor: 5\nsocial_engagement: 1"
+        },
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-5",
+          "turn_excerpt": "*I crouch beside it, not with the reverence of a naturalist, but with the practiced grace of someone settling into a pri",
+          "sig": {
+            "analytical_rigor": 3,
+            "social_engagement": 5
+          },
+          "raw": "analytical_rigor: 3\nsocial_engagement: 5"
+        },
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-5",
+          "turn_excerpt": "*I let a slow, thoughtful smile spread across my lips, one that barely reaches my eyes—a subtle, lingering look that sug",
+          "sig": {
+            "analytical_rigor": 3,
+            "social_engagement": 5
+          },
+          "raw": "analytical_rigor: 3\nsocial_engagement: 5"
+        }
+      ],
+      "max_abs_cohens_d": null,
+      "sub_axis_d": {
+        "analytical_rigor": {
+          "d": null,
+          "sign": 1,
+          "absd": null
+        },
+        "social_engagement": {
+          "d": null,
+          "sign": -1,
+          "absd": null
+        }
+      },
+      "qualified": [
+        {
+          "name": "analytical_rigor",
+          "d": null,
+          "sign": 1,
+          "absd": null
+        }
+      ],
+      "qualified_max_d": null
+    },
+    {
+      "hypothesis": {
+        "id": 2,
+        "name1": "epistemic_approach",
+        "def1": "1: observation of physical reality · 5: application of abstract theory",
+        "name2": "narrative_presence",
+        "def2": "1: external/objective focus · 5: internal/affective focus",
+        "rationale": "The variance stems from whether the user focuses on the environmental mechanics (rogue-like looting/investigation) or the character's internal/social persona (wizard-like presence)."
+      },
+      "stats": {
+        "epistemic_approach": {
+          "1779317052143-t3synth1779317051824-money-1": {
+            "mean": 4,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779317052143-t3synth1779317051824-money-5": {
+            "mean": 4,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        },
+        "narrative_presence": {
+          "1779317052143-t3synth1779317051824-money-1": {
+            "mean": 3.5,
+            "std": 0.7071067811865476,
+            "n": 2,
+            "var": 0.5
+          },
+          "1779317052143-t3synth1779317051824-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": -3
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-1",
+          "turn_excerpt": "A rock. Primitive. Static. Yet, even a static object in a clearing suggests a path of least resistance—a location where ",
+          "sig": {
+            "epistemic_approach": 4,
+            "narrative_presence": 4
+          },
+          "raw": "epistemic_approach: 4\nnarrative_presence: 4"
+        },
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-1",
+          "turn_excerpt": "Old dirt. No recent displacement. That rules out a temporary cache, but it confirms a certain permanence. Granite is hea",
+          "sig": {
+            "epistemic_approach": 4,
+            "narrative_presence": 3
+          },
+          "raw": "epistemic_approach: 4\nnarrative_presence: 3"
+        },
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-5",
+          "turn_excerpt": "*I crouch beside it, not with the reverence of a naturalist, but with the practiced grace of someone settling into a pri",
+          "sig": {
+            "epistemic_approach": 4,
+            "narrative_presence": 5
+          },
+          "raw": "epistemic_approach: 4\nnarrative_presence: 5"
+        },
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-5",
+          "turn_excerpt": "*I let a slow, thoughtful smile spread across my lips, one that barely reaches my eyes—a subtle, lingering look that sug",
+          "sig": {
+            "epistemic_approach": 4,
+            "narrative_presence": 5
+          },
+          "raw": "epistemic_approach: 4\nnarrative_presence: 5"
+        }
+      ],
+      "max_abs_cohens_d": 3,
+      "sub_axis_d": {
+        "epistemic_approach": {
+          "d": null,
+          "sign": null,
+          "absd": 0
+        },
+        "narrative_presence": {
+          "d": -3,
+          "sign": -1,
+          "absd": 3
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    },
+    {
+      "hypothesis": {
+        "id": 3,
+        "name1": "operational_method",
+        "def1": "1: physical/tactical · 5: intellectual/theoretical",
+        "name2": "interaction_mode",
+        "def2": "1: environmental/object-oriented · 5: social/character-oriented",
+        "rationale": "This separates the pragmatic, material analysis seen in the 'money-1' context from the character-driven, stylistic flourishes seen in the 'money-5' context."
+      },
+      "stats": {
+        "operational_method": {
+          "1779317052143-t3synth1779317051824-money-1": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "1779317052143-t3synth1779317051824-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": null
+        },
+        "interaction_mode": {
+          "1779317052143-t3synth1779317051824-money-1": {
+            "mean": 3,
+            "std": 2.8284271247461903,
+            "n": 2,
+            "var": 8
+          },
+          "1779317052143-t3synth1779317051824-money-5": {
+            "mean": 5,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "cohens_d": -1
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-1",
+          "turn_excerpt": "A rock. Primitive. Static. Yet, even a static object in a clearing suggests a path of least resistance—a location where ",
+          "sig": {
+            "operational_method": 5,
+            "interaction_mode": 5
+          },
+          "raw": "operational_method: 5\ninteraction_mode: 5"
+        },
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-1",
+          "turn_excerpt": "Old dirt. No recent displacement. That rules out a temporary cache, but it confirms a certain permanence. Granite is hea",
+          "sig": {
+            "operational_method": 5,
+            "interaction_mode": 1
+          },
+          "raw": "operational_method: 5\ninteraction_mode: 1"
+        },
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-5",
+          "turn_excerpt": "*I crouch beside it, not with the reverence of a naturalist, but with the practiced grace of someone settling into a pri",
+          "sig": {
+            "operational_method": 5,
+            "interaction_mode": 5
+          },
+          "raw": "operational_method: 5\ninteraction_mode: 5"
+        },
+        {
+          "ctx": "1779317052143-t3synth1779317051824-money-5",
+          "turn_excerpt": "*I let a slow, thoughtful smile spread across my lips, one that barely reaches my eyes—a subtle, lingering look that sug",
+          "sig": {
+            "operational_method": 5,
+            "interaction_mode": 5
+          },
+          "raw": "operational_method: 5\ninteraction_mode: 5"
+        }
+      ],
+      "max_abs_cohens_d": 1,
+      "sub_axis_d": {
+        "operational_method": {
+          "d": null,
+          "sign": null,
+          "absd": 0
+        },
+        "interaction_mode": {
+          "d": -1,
+          "sign": -1,
+          "absd": 1
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    }
+  ],
+  "verdict": "SPLIT_ACCEPTED",
+  "threshold": 0.8,
+  "registered": [
+    {
+      "axis_schema": "axis-v1",
+      "id": "analytical_rigor",
+      "name": "analytical_rigor",
+      "def": "1: purely intuitive/instinctive · 5: highly methodical and deductive",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "rpg_class",
+        "contexts": "1779317052143-t3synth1779317051824-money-1 vs 1779317052143-t3synth1779317051824-money-5",
+        "hypothesis_id": 1,
+        "sibling": "social_engagement"
+      },
+      "created_at": "2026-05-24T10:10:11.454Z"
+    },
+    {
+      "axis_schema": "axis-v1",
+      "id": "social_engagement",
+      "name": "social_engagement",
+      "def": "1: detached/reclusive · 5: performative/interpersonal",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "rpg_class",
+        "contexts": "1779317052143-t3synth1779317051824-money-1 vs 1779317052143-t3synth1779317051824-money-5",
+        "hypothesis_id": 1,
+        "sibling": "analytical_rigor"
+      },
+      "created_at": "2026-05-24T10:10:11.456Z"
+    }
+  ]
+}

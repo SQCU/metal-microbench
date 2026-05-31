@@ -164,7 +164,12 @@ export async function selectCharacterByClick(page, nameSubstr) {
         const row = rows.nth(i);
         const txt = (await row.innerText()).trim();
         if (txt.toLowerCase().includes(needle)) {
-            await row.click();
+            // Scroll into view before clicking — the character list may be
+            // partially off-screen (e.g., list is long and dicemother is below
+            // the viewport fold). Without this, Playwright retries the click
+            // for the full actionTimeout (120s default), consuming the test budget.
+            await row.scrollIntoViewIfNeeded().catch(() => {});
+            await row.click({ timeout: 10_000 });
             // Close the drawer so it doesn't cover the chat in video
             await page.locator('#rightNavDrawerIcon').click().catch(() => {});
             await page.waitForFunction((name) => {

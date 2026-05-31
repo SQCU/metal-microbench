@@ -1,5 +1,6 @@
 # the ST dataRoot is regenerable — do not commit it
 _data/
+_matrix/
 
 # st-debug's own clone of sillytavern-fork — has its own git history
 # (origin = /Users/mdot/sillytavern-fork as a local path). NEVER commit

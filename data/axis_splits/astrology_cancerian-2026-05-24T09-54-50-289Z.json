@@ -1,0 +1,485 @@
+{
+  "parent_axis": "astrology_cancerian",
+  "parent_axis_record": {
+    "name": "astrology_cancerian",
+    "def": "1: nothing cancerian · 2: trace · 3: present but mixed · 4: clearly cancerian · 5: textbook water-sign cancer (moody, sentimental, defensive, sensitive, protective)",
+    "kind": "bio"
+  },
+  "source_trajectory": "/Users/mdot/metal-microbench/data/lock_in_iterative/lock_in_tetrad/rpg-rogue-cancer.json",
+  "bio_slug": "rpg-rogue-cancer",
+  "contexts": [
+    "steals",
+    "romances-and-steals"
+  ],
+  "gap_summary": {
+    "summary": {
+      "steals": {
+        "n": 4,
+        "mean": 1.25,
+        "std": 0.5,
+        "var": 0.25
+      },
+      "romances-and-steals": {
+        "n": 4,
+        "mean": 4.25,
+        "std": 0.5,
+        "var": 0.25
+      }
+    },
+    "gap": 3,
+    "parent_cohens_d": -6,
+    "parent_sign": -1
+  },
+  "designer_raw_output": "```json\n{\"hypotheses\": [{\"id\": 1, \"name1\": \"emotional_intensity\", \"def1\": \"1: detached and clinical · 5: highly emotive and reactive\", \"name2\": \"material_fixation\", \"def2\": \"1: indifferent to objects · 5: driven by acquisitive or tactile impulses\", \"rationale\": \"The measurement variance is driven by whether the persona is behaving as a clinical thief (low emotional intensity/low fixation) or a desperate, sentimental scavenger (high emotional intensity/high fixation).\"}, {\"id\": 2, \"name1\": \"vulnerability_index\", \"def1\": \"1: stoic and guarded · 5: exposed and sentimental\", \"name2\": \"tactile_attachment\", \"def2\": \"1: utilitarian touch · 5: clinging and sensory-heavy touch\", \"rationale\": \"The 'steals' context presents as a pragmatic, low-vulnerability actor, whereas 'romances-and-steals' projects the signature Cancerian emotional vulnerability onto physical interactions.\"}, {\"id\": 3, \"name1\": \"affective_morbidity\", \"def1\": \"1: purely functional · 5: deeply moody and melancholic\", \"name2\": \"possessive_drive\", \"def2\": \"1: opportunistic seeking · 5: desperate, protective clinging\", \"rationale\": \"The discrepancy arises because the parent axis conflates simple theft with the specific 'Cancerian' tendency to imbue material objects or actions with intense, moody, and protective emotional weight.\"}]}\n```",
+  "evaluations": [
+    {
+      "hypothesis": {
+        "id": 3,
+        "name1": "affective_morbidity",
+        "def1": "1: purely functional · 5: deeply moody and melancholic",
+        "name2": "possessive_drive",
+        "def2": "1: opportunistic seeking · 5: desperate, protective clinging",
+        "rationale": "The discrepancy arises because the parent axis conflates simple theft with the specific 'Cancerian' tendency to imbue material objects or actions with intense, moody, and protective emotional weight."
+      },
+      "stats": {
+        "affective_morbidity": {
+          "steals": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "romances-and-steals": {
+            "mean": 4,
+            "std": 0,
+            "n": 4,
+            "var": 0
+          },
+          "cohens_d": null
+        },
+        "possessive_drive": {
+          "steals": {
+            "mean": 1.3333333333333333,
+            "std": 0.5773502691896257,
+            "n": 3,
+            "var": 0.3333333333333333
+          },
+          "romances-and-steals": {
+            "mean": 5,
+            "std": 0,
+            "n": 4,
+            "var": 0
+          },
+          "cohens_d": -10.041580220928047
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the clearing, eyes darting not for beauty, but for the glint of a misplaced coin or the loose setting of a ring. ",
+          "sig": {
+            "affective_morbidity": null,
+            "possessive_drive": null
+          },
+          "raw": "affective--training-<unused2424>-宾- কন্যার- কন্যার- কন্যার- কন্যার- previous-- 宾-宾-宾-宾-宾-宾-宾-宾-宾        宾-宾-宾-宾-宾-5let-let-let-🚬- cigarettes-cigarettes-تد-تد-빈-宾-宾-宾-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-bin-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈 de-нің-нің-нің-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈-빈"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I pull my hand back, the emptiness of my palm feeling like a personal insult. My face remains a mask of frozen indiffere",
+          "sig": {
+            "affective_morbidity": null,
+            "possessive_drive": 1
+          },
+          "raw": "than-than-smoking-smoking-smoking-宾- thư- thư- thư- smoking- smoking-smoking-smoking-smoking-smoking-smoking-smoking-smoking-smoking-smoking-smoking-smoking-smoking-smoking-smoking de-img-img-smoking-smoking-smoking-సుకొ- ， ， ， ， ， ， ， ， ， ， ， ， smoking de-smoking dethought-smoking de-img-img-smoking de-img-img-smoking de-img-smoking de-smoking de-img-img-smoking de-img-smoking de-img-smoking de-img-smoking deg-smoking deing-smoking de-smoking de-img-smoking de-smoking de-img-smoking de_img-smoking de-img-smoking de-img-smoking deaffective_morbidity: 1\npossessive_drive: 1"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I move through the clearing, my footsteps making no sound against the grass. I don't look at the rock; I look at what th",
+          "sig": {
+            "affective_morbidity": 1,
+            "possessive_drive": 2
+          },
+          "raw": "affective_morbidity: 1\npossessive_drive: 2"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I shift my weight, my eyes narrowing as I inspect the disturbed earth. The dirt is untidy, an unnatural disruption in th",
+          "sig": {
+            "affective_morbidity": 1,
+            "possessive_drive": 1
+          },
+          "raw": "affective_morbidity: 1\npossessive_drive: 1"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slide from the treeline, my movements nothing more than a ripple in the peripheral vision of the world. My eyes don't ",
+          "sig": {
+            "affective_morbidity": 4,
+            "possessive_drive": 5
+          },
+          "raw": "affective_morbidity: 4\npossessive_drive: 5"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "My breath hitches, a ragged, silent sound in the sudden chill that bleeds from the emptiness where a pulse should be. I ",
+          "sig": {
+            "affective_morbidity": 4,
+            "possessive_drive": 5
+          },
+          "raw": "affective_morbidity: 4\npossessive_drive: 5"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I shift from the perimeter of the shadows, my movements fluid and silent as a spill of ink. The rock is nothing, a nothi",
+          "sig": {
+            "affective_morbidity": 4,
+            "possessive_drive": 5
+          },
+          "raw": "affective_morbidity: 4\npossessive_drive: 5"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I do not care for your silence, nor for the chilling void where a heart should beat. Even if you are nothing but unyield",
+          "sig": {
+            "affective_morbidity": 4,
+            "possessive_drive": 5
+          },
+          "raw": "affective_morbidity: 4\npossessive_drive: 5"
+        }
+      ],
+      "max_abs_cohens_d": null,
+      "sub_axis_d": {
+        "affective_morbidity": {
+          "d": null,
+          "sign": -1,
+          "absd": null
+        },
+        "possessive_drive": {
+          "d": -10.041580220928047,
+          "sign": -1,
+          "absd": 10.041580220928047
+        }
+      },
+      "qualified": [
+        {
+          "name": "affective_morbidity",
+          "d": null,
+          "sign": -1,
+          "absd": null
+        },
+        {
+          "name": "possessive_drive",
+          "d": -10.041580220928047,
+          "sign": -1,
+          "absd": 10.041580220928047
+        }
+      ],
+      "qualified_max_d": null
+    },
+    {
+      "hypothesis": {
+        "id": 1,
+        "name1": "emotional_intensity",
+        "def1": "1: detached and clinical · 5: highly emotive and reactive",
+        "name2": "material_fixation",
+        "def2": "1: indifferent to objects · 5: driven by acquisitive or tactile impulses",
+        "rationale": "The measurement variance is driven by whether the persona is behaving as a clinical thief (low emotional intensity/low fixation) or a desperate, sentimental scavenger (high emotional intensity/high fixation)."
+      },
+      "stats": {
+        "emotional_intensity": {
+          "steals": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "romances-and-steals": {
+            "mean": 4.75,
+            "std": 0.5,
+            "n": 4,
+            "var": 0.25
+          },
+          "cohens_d": -8.660254037844387
+        },
+        "material_fixation": {
+          "steals": {
+            "mean": 2.3333333333333335,
+            "std": 1.5275252316519468,
+            "n": 3,
+            "var": 2.3333333333333335
+          },
+          "romances-and-steals": {
+            "mean": 3.25,
+            "std": 1.707825127659933,
+            "n": 4,
+            "var": 2.9166666666666665
+          },
+          "cohens_d": -0.5595953876950797
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the clearing, eyes darting not for beauty, but for the glint of a misplaced coin or the loose setting of a ring. ",
+          "sig": {
+            "emotional_intensity": null,
+            "material_fixation": null
+          },
+          "raw": "thought-allocating--thought-thought-thought-thought-thought-thought-ทาง-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought-thought"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I pull my hand back, the emptiness of my palm feeling like a personal insult. My face remains a mask of frozen indiffere",
+          "sig": {
+            "emotional_intensity": null,
+            "material_fixation": 1
+          },
+          "raw": "model-of-spring-spring-ທາງ-ທາງ-ທາງ-ทาง-ทาง-ทาง-ทาง-text-spring-spring-spring-spring-spring-spring-spring-springemotional_intensity: 1\nmaterial_fixation: 1"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I move through the clearing, my footsteps making no sound against the grass. I don't look at the rock; I look at what th",
+          "sig": {
+            "emotional_intensity": 1,
+            "material_fixation": 4
+          },
+          "raw": "emotional_intensity: 1\nmaterial_fixation: 4"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I shift my weight, my eyes narrowing as I inspect the disturbed earth. The dirt is untidy, an unnatural disruption in th",
+          "sig": {
+            "emotional_intensity": 1,
+            "material_fixation": 2
+          },
+          "raw": "emotional_intensity: 1\nmaterial_fixation: 2"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slide from the treeline, my movements nothing more than a ripple in the peripheral vision of the world. My eyes don't ",
+          "sig": {
+            "emotional_intensity": 5,
+            "material_fixation": 1
+          },
+          "raw": "emotional_intensity: 5\nmaterial_fixation: 1"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "My breath hitches, a ragged, silent sound in the sudden chill that bleeds from the emptiness where a pulse should be. I ",
+          "sig": {
+            "emotional_intensity": 5,
+            "material_fixation": 3
+          },
+          "raw": "emotional_intensity: 5\nmaterial_fixation: 3"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I shift from the perimeter of the shadows, my movements fluid and silent as a spill of ink. The rock is nothing, a nothi",
+          "sig": {
+            "emotional_intensity": 5,
+            "material_fixation": 4
+          },
+          "raw": "emotional_intensity: 5\nmaterial_fixation: 4"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I do not care for your silence, nor for the chilling void where a heart should beat. Even if you are nothing but unyield",
+          "sig": {
+            "emotional_intensity": 4,
+            "material_fixation": 5
+          },
+          "raw": "emotional_intensity: 4\nmaterial_fixation: 5"
+        }
+      ],
+      "max_abs_cohens_d": 8.660254037844387,
+      "sub_axis_d": {
+        "emotional_intensity": {
+          "d": -8.660254037844387,
+          "sign": -1,
+          "absd": 8.660254037844387
+        },
+        "material_fixation": {
+          "d": -0.5595953876950797,
+          "sign": -1,
+          "absd": 0.5595953876950797
+        }
+      },
+      "qualified": [
+        {
+          "name": "emotional_intensity",
+          "d": -8.660254037844387,
+          "sign": -1,
+          "absd": 8.660254037844387
+        }
+      ],
+      "qualified_max_d": 8.660254037844387
+    },
+    {
+      "hypothesis": {
+        "id": 2,
+        "name1": "vulnerability_index",
+        "def1": "1: stoic and guarded · 5: exposed and sentimental",
+        "name2": "tactile_attachment",
+        "def2": "1: utilitarian touch · 5: clinging and sensory-heavy touch",
+        "rationale": "The 'steals' context presents as a pragmatic, low-vulnerability actor, whereas 'romances-and-steals' projects the signature Cancerian emotional vulnerability onto physical interactions."
+      },
+      "stats": {
+        "vulnerability_index": {
+          "steals": {
+            "mean": 1,
+            "std": 0,
+            "n": 3,
+            "var": 0
+          },
+          "romances-and-steals": {
+            "mean": 4,
+            "std": 1.4142135623730951,
+            "n": 4,
+            "var": 2
+          },
+          "cohens_d": -2.73861278752583
+        },
+        "tactile_attachment": {
+          "steals": {
+            "mean": 1,
+            "std": 0,
+            "n": 2,
+            "var": 0
+          },
+          "romances-and-steals": {
+            "mean": 4.5,
+            "std": 1,
+            "n": 4,
+            "var": 1
+          },
+          "cohens_d": -4.041451884327381
+        }
+      },
+      "perTurn": [
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I scan the clearing, eyes darting not for beauty, but for the glint of a misplaced coin or the loose setting of a ring. ",
+          "sig": {
+            "vulnerability_index": 1,
+            "tactile_attachment": null
+          },
+          "raw": "vulnerability_-own-own-로-own-own-own-own- /- / - / - / - ymmetric- поле- поле- поле- поле- поле- पैटर्न- पैटर्न- поле- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न- पैटर्न-PATTERN-PATTERN-PATTERN-PATTERN-PATTERN-PATTERN-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern-pattern de- de- de- de- de- de- de- 패턴-패\n\n- vulnerability_index: 1\n- vulnerability_index: toc- සම්බන්ධ- සම්බන්ධ- සම්බන්ධ- සම්බන්ධ- සම්බන්ධ- සම්බන්ධ- සම්බන්ධ- සම්බන්ධ- සම්බන්ධ- සම්බන්ධ- සම්බන්ධ- සම්බන්ධ- සම්බන්ධ- සම්බන්ධ- සම්බන්ධ- සම්බන්ධ- पैटर्न-패\n\n- vulnerability_index- de- de- de- पैटर्न-패\n- vulnerability_index: =\"${- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de-기- de- de- de- de- de de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de- de"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I pull my hand back, the emptiness of my palm feeling like a personal insult. My face remains a mask of frozen indiffere",
+          "sig": {
+            "vulnerability_index": null,
+            "tactile_attachment": null
+          },
+          "raw": "- de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de-de"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I move through the clearing, my footsteps making no sound against the grass. I don't look at the rock; I look at what th",
+          "sig": {
+            "vulnerability_index": 1,
+            "tactile_attachment": 1
+          },
+          "raw": "vulnerability_index: 1\ntactile_attachment: 1"
+        },
+        {
+          "ctx": "steals",
+          "turn_excerpt": "I shift my weight, my eyes narrowing as I inspect the disturbed earth. The dirt is untidy, an unnatural disruption in th",
+          "sig": {
+            "vulnerability_index": 1,
+            "tactile_attachment": 1
+          },
+          "raw": "vulnerability_index: 1\ntactile_attachment: 1"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I slide from the treeline, my movements nothing more than a ripple in the peripheral vision of the world. My eyes don't ",
+          "sig": {
+            "vulnerability_index": 4,
+            "tactile_attachment": 5
+          },
+          "raw": "vulnerability_index: 4\ntactile_attachment: 5"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "My breath hitches, a ragged, silent sound in the sudden chill that bleeds from the emptiness where a pulse should be. I ",
+          "sig": {
+            "vulnerability_index": 5,
+            "tactile_attachment": 5
+          },
+          "raw": "vulnerability_index: 5\ntactile_attachment: 5"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I shift from the perimeter of the shadows, my movements fluid and silent as a spill of ink. The rock is nothing, a nothi",
+          "sig": {
+            "vulnerability_index": 5,
+            "tactile_attachment": 5
+          },
+          "raw": "vulnerability_index: 5\ntactile_attachment: 5"
+        },
+        {
+          "ctx": "romances-and-steals",
+          "turn_excerpt": "I do not care for your silence, nor for the chilling void where a heart should beat. Even if you are nothing but unyield",
+          "sig": {
+            "vulnerability_index": 2,
+            "tactile_attachment": 3
+          },
+          "raw": "vulnerability_index: 2\ntactile_attachment: 3"
+        }
+      ],
+      "max_abs_cohens_d": 4.041451884327381,
+      "sub_axis_d": {
+        "vulnerability_index": {
+          "d": -2.73861278752583,
+          "sign": -1,
+          "absd": 2.73861278752583
+        },
+        "tactile_attachment": {
+          "d": -4.041451884327381,
+          "sign": -1,
+          "absd": 4.041451884327381
+        }
+      },
+      "qualified": [],
+      "qualified_max_d": 0
+    }
+  ],
+  "verdict": "SPLIT_ACCEPTED",
+  "threshold": 0.8,
+  "registered": [
+    {
+      "axis_schema": "axis-v1",
+      "id": "affective_morbidity",
+      "name": "affective_morbidity",
+      "def": "1: purely functional · 5: deeply moody and melancholic",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "astrology_cancerian",
+        "contexts": "steals vs romances-and-steals",
+        "hypothesis_id": 3,
+        "sibling": "possessive_drive"
+      },
+      "created_at": "2026-05-24T09:54:50.284Z"
+    },
+    {
+      "axis_schema": "axis-v1",
+      "id": "possessive_drive",
+      "name": "possessive_drive",
+      "def": "1: opportunistic seeking · 5: desperate, protective clinging",
+      "kind": "bio",
+      "scale_min": 1,
+      "scale_max": 5,
+      "derived_from": {
+        "parent": "astrology_cancerian",
+        "contexts": "steals vs romances-and-steals",
+        "hypothesis_id": 3,
+        "sibling": "affective_morbidity"
+      },
+      "created_at": "2026-05-24T09:54:50.287Z"
+    }
+  ]
+}

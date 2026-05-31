@@ -45,7 +45,12 @@ mkdir -p "$DATA_ROOT"
 if [[ ! -f "$DATA_ROOT/default-user/settings.json" ]]; then
     echo "[bootstrap] seeding defaults via ST first-launch (this takes ~5s)..."
     cd "$ST_SRC"
-    node server.js --dataRoot "$DATA_ROOT" --port "$ST_PORT" > "$DATA_ROOT/_first_launch.log" 2>&1 &
+    SERVER_PORT="$ST_PORT" \
+    USER_PERSONAS_ST_URL="http://127.0.0.1:$ST_PORT" \
+    ST_URL="http://127.0.0.1:$ST_PORT" \
+    USER_PERSONAS_BRIDGE_URL="$BRIDGE_URL" \
+    BRIDGE_URL="$BRIDGE_URL" \
+        node server.js --dataRoot "$DATA_ROOT" --port "$ST_PORT" > "$DATA_ROOT/_first_launch.log" 2>&1 &
     SEED_PID=$!
     # Wait for settings.json to appear (signal that defaults are written).
     for i in $(seq 1 30); do
@@ -117,15 +122,54 @@ s["oai_settings"] = existing
 # Also surface at top-level for any code path that reads there.
 for k, v in oai.items():
     s[k] = v
-# username left as default ("User") — chat UI uses it for the user-side
-# avatar; doesn't affect bridge traffic.
+# username / persona: the scringlo scrambler persona should be active
+# so the welcome chat's user turns render with the right avatar.
+s["username"] = "scringlo scrambler"
+s["user_avatar"] = "1779035204660-scringloscrambler.png"
+# active_character: dicemother is the default character for st-debug.
+# The welcome chat lives under chats/dicemother/ so this must match.
+s["active_character"] = "dicemother.png"
+# auto_load_chat: ST will restore the last-active character + its most
+# recent chat on startup. Without this, the operator sees a blank
+# character-selection screen and the suggester has no chat to score
+# against — a P-NO-EMPTY-FIRST-PAINT violation.
+pu = s.setdefault("power_user", {})
+pu["auto_load_chat"] = True
 with open(p, "w") as f:
     json.dump(s, f, indent=2)
 print(f"  oai_settings.chat_completion_source = {existing['chat_completion_source']}")
 print(f"  oai_settings.custom_url             = {existing['custom_url']}")
 print(f"  oai_settings.function_calling       = {existing['function_calling']}")
 print(f"  firstRun                            = False (welcome popup suppressed)")
+print(f"  active_character                    = dicemother.png")
+print(f"  power_user.auto_load_chat           = True (P-NO-EMPTY-FIRST-PAINT)")
 PY
+
+# UX-T4 P-NO-EMPTY-FIRST-PAINT: seed the welcome chat so a fresh install
+# opens ST with an active chat already loaded.  The content-manager does
+# not handle "chat" type seeds (no case in getTargetByType), so we copy
+# manually here.  The file lives in default/content/chats/dicemother/
+# (alongside the existing seed_accusation / seed_cistern / seed_geas files).
+# Timestamp in the filename is 2026-05-24T10:00:00 — after all existing
+# dicemother session timestamps — so it sorts as the most recent chat
+# and ST loads it first on startup when active_character = dicemother.png.
+#
+# Idempotent: we skip the copy if the file already exists in _data/.
+WELCOME_SRC="$ST_SRC/default/content/chats/dicemother/welcome_suggester_demo.jsonl"
+WELCOME_DEST_DIR="$DATA_ROOT/default-user/chats/dicemother"
+WELCOME_DEST="$WELCOME_DEST_DIR/dicemother - 2026-05-24@10h00m00s000ms.jsonl"
+if [[ -f "$WELCOME_SRC" ]]; then
+    mkdir -p "$WELCOME_DEST_DIR"
+    if [[ ! -f "$WELCOME_DEST" ]]; then
+        cp "$WELCOME_SRC" "$WELCOME_DEST"
+        echo "[bootstrap] welcome chat seeded: $WELCOME_DEST"
+    else
+        echo "[bootstrap] welcome chat already present (idempotent skip)"
+    fi
+else
+    echo "[bootstrap] WARN: welcome chat source missing at $WELCOME_SRC"
+    echo "[bootstrap]       sync: cd $ST_SRC && git pull"
+fi
 
 # Example personas use the upstream SillyTavern content-manager seed:
 # they live at $ST_SRC/default/content/<persona>.png and are listed in

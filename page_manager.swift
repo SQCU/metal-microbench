@@ -115,17 +115,16 @@ final class PageManager {
     // can be looked up; only the [basePage, basePage+numPoolPages)
     // range will ever be referenced through alloc/free paths.
     private var pages: [PageInfo]
-    // Free list of phys pages with refcount==0. LIFO (cache-warm reuse).
-    private var freeList: [Int] = []
-    // 2026-05-07: parallel index map for O(1) removal from freeList by
-    // physPage value. Previous shareExisting used `freeList.firstIndex(of:)`
-    // which was O(|freeList|) — at numPoolPages=8192 with 10 page adoptions
-    // per session admission, that was 80K linear ops per admission. With
-    // freeListPos[physPage] = currentIndexInFreeList, both removal paths
-    // (allocFresh's `remove(at:)` and shareExisting's `firstIndex(of:)
-    // + remove(at:)`) become O(1) via the swap-with-last-and-pop helper
-    // freeListPop(at:).
-    private var freeListPos: [Int: Int] = [:]
+    // Free pages split by whether they still carry reusable K/V content.
+    // The previous single mixed freeList made allocFresh scan O(freePages)
+    // for every new logical page to find an uncached entry. Long repeated
+    // swipe/prefix-cache workloads turned that into pages_needed*freePages
+    // allocator CPU. These two stacks preserve the policy preference
+    // (uncached first, cached only under pressure) with O(1) pop/remove.
+    private var freeUncached: [Int] = []
+    private var freeCached: [Int] = []
+    private var freeUncachedPos: [Int: Int] = [:]
+    private var freeCachedPos: [Int: Int] = [:]
     // Followup 3 (2026-05-23): contentIndex deleted. The radix trie
     // (radix_trie.swift, RadixTrie) is now the sole source of truth
     // for adoption lookups; PageManager only tracks refcounts +
@@ -164,36 +163,75 @@ final class PageManager {
         }
         // Free list spans only the pool range. Push in reverse so the
         // lowest-indexed pool page pops first (cache-warm-friendly).
-        self.freeList = Array((basePage..<(basePage + poolCount)).reversed())
-        // Build the position-tracking map (parallel structure for O(1)
-        // freeList membership lookups + swap-and-pop removal).
-        self.freeListPos.reserveCapacity(self.freeList.count)
-        for (i, phys) in self.freeList.enumerated() {
-            self.freeListPos[phys] = i
+        self.freeUncached = Array((basePage..<(basePage + poolCount)).reversed())
+        self.freeUncachedPos.reserveCapacity(self.freeUncached.count)
+        self.freeCachedPos.reserveCapacity(poolCount)
+        for (i, phys) in self.freeUncached.enumerated() {
+            self.freeUncachedPos[phys] = i
         }
     }
 
-    // O(1) removal from `freeList` at a known index. Uses the
+    // O(1) removal from a free stack at a known index. Uses the
     // swap-with-last-then-pop pattern so removal doesn't shift the
-    // tail; freeListPos for the swapped element is updated. Caller is
-    // responsible for clearing freeListPos for the removed value.
-    private func freeListPop(at idx: Int) -> Int {
-        let last = freeList.count - 1
-        let removed = freeList[idx]
+    // tail; the position map for the swapped element and removed value is
+    // updated here.
+    private func freeStackPop(_ list: inout [Int],
+                              _ pos: inout [Int: Int],
+                              at idx: Int) -> Int {
+        let last = list.count - 1
+        let removed = list[idx]
         if idx != last {
-            let movedPhys = freeList[last]
-            freeList[idx] = movedPhys
-            freeListPos[movedPhys] = idx
+            let movedPhys = list[last]
+            list[idx] = movedPhys
+            pos[movedPhys] = idx
         }
-        freeList.removeLast()
-        freeListPos.removeValue(forKey: removed)
+        list.removeLast()
+        pos.removeValue(forKey: removed)
         return removed
     }
 
-    // O(1) push onto freeList with position-tracking maintained.
-    private func freeListPush(_ phys: Int) {
-        freeListPos[phys] = freeList.count
-        freeList.append(phys)
+    private func freeUncachedPop(at idx: Int) -> Int {
+        return freeStackPop(&freeUncached, &freeUncachedPos, at: idx)
+    }
+
+    private func freeCachedPop(at idx: Int) -> Int {
+        return freeStackPop(&freeCached, &freeCachedPos, at: idx)
+    }
+
+    // O(1) push onto the appropriate free stack with position tracking.
+    private func freePush(_ phys: Int) {
+        if pages[phys].contentHash == nil {
+            freeUncachedPos[phys] = freeUncached.count
+            freeUncached.append(phys)
+        } else {
+            freeCachedPos[phys] = freeCached.count
+            freeCached.append(phys)
+        }
+    }
+
+    private func removeFromFreeStacksIfPresent(_ phys: Int) {
+        if let idx = freeUncachedPos[phys] {
+            _ = freeUncachedPop(at: idx)
+        }
+        if let idx = freeCachedPos[phys] {
+            _ = freeCachedPop(at: idx)
+        }
+    }
+
+    private func moveFreePageToCachedIfPresent(_ phys: Int) {
+        if let idx = freeUncachedPos[phys] {
+            _ = freeUncachedPop(at: idx)
+            freeCachedPos[phys] = freeCached.count
+            freeCached.append(phys)
+        }
+    }
+
+    private func moveFreePageToUncachedIfPresent(_ phys: Int) {
+        if let idx = freeCachedPos[phys] {
+            _ = freeCachedPop(at: idx)
+            freeUncachedPos[phys] = freeUncached.count
+            freeUncached.append(phys)
+        }
     }
 
     // FNV-1a over a page's token IDs, optionally mixed with a cvec-state
@@ -251,35 +289,27 @@ final class PageManager {
     // hashes. Returns a phys page with refcount=1; caller MUST call
     // decref(physPage:) when done with it.
     func allocFresh() throws -> Int {
-        guard !freeList.isEmpty else {
+        guard !freeUncached.isEmpty || !freeCached.isEmpty else {
             throw PageManagerError.outOfPages(needed: 1, available: 0)
         }
-        // Step 1: find the LRU-oldest uncached page on the free list.
-        var bestUncached: (idx: Int, tick: UInt64)? = nil
-        for (i, phys) in freeList.enumerated() {
-            if pages[phys].contentHash == nil {
-                let tick = pages[phys].lastAccessTick
-                if bestUncached == nil || tick < bestUncached!.tick {
-                    bestUncached = (i, tick)
-                }
-            }
-        }
         let phys: Int
-        if let pick = bestUncached {
-            // Pop the LRU-oldest uncached page. No hash to drop.
-            phys = freeListPop(at: pick.idx)
+        if !freeUncached.isEmpty {
+            // Prefer uncached pages. No prefix-cache entry is dropped.
+            phys = freeUncachedPop(at: freeUncached.count - 1)
         } else {
-            // Forced eviction: free list is all-cached. Pick LRU-oldest
-            // cached entry and drop its hash.
-            var oldest: (idx: Int, tick: UInt64)? = nil
-            for (i, p) in freeList.enumerated() {
-                let tick = pages[p].lastAccessTick
-                if oldest == nil || tick < oldest!.tick {
-                    oldest = (i, tick)
-                }
+            // Forced eviction: every free page is cached. Drop the LRU
+            // (lowest lastAccessTick) cached page — NOT the stack top.
+            // The prior code popped most-recently-freed (MRU), evicting the
+            // hottest cache entries first and defeating the prefix cache
+            // under pressure (page_lifecycle_audit_2026-05-28 #7). O(n) scan
+            // is fine: forced eviction only fires when freeUncached is empty.
+            var lruIdx = 0
+            var lruTick = UInt64.max
+            for (i, ph) in freeCached.enumerated() {
+                let t = pages[ph].lastAccessTick
+                if t < lruTick { lruTick = t; lruIdx = i }
             }
-            let pick = oldest!  // freeList non-empty guaranteed above
-            phys = freeListPop(at: pick.idx)
+            phys = freeCachedPop(at: lruIdx)
             // Drop the now-orphaned content hash + its pair.
             // Followup 3 (2026-05-23): contentIndex deleted; only the
             // PageInfo bookkeeping + eviction callback into the trie
@@ -298,6 +328,7 @@ final class PageManager {
                    pages[partner].contentHash == h {
                     pages[partner].contentHash = nil
                     pages[partner].pairMate = nil
+                    moveFreePageToUncachedIfPresent(partner)
                 }
                 p.contentHash = nil
                 p.pairMate = nil
@@ -323,9 +354,7 @@ final class PageManager {
         if p.refcount == 0 {
             // Page is in free list but still has valid content. Pull it
             // back out before handing out the new reference.
-            if let idx = freeListPos[physPage] {
-                _ = freeListPop(at: idx)
-            }
+            removeFromFreeStacksIfPresent(physPage)
         }
         p.refcount += 1
         p.lastAccessTick = clockTick
@@ -358,6 +387,8 @@ final class PageManager {
         p2.pairMate = slidePlusFullHead
         pages[slidePlusFullHead] = p1
         pages[fullTail]  = p2
+        if p1.refcount == 0 { moveFreePageToCachedIfPresent(slidePlusFullHead) }
+        if p2.refcount == 0 { moveFreePageToCachedIfPresent(fullTail) }
     }
 
     // Decrement refcount. If it drops to 0, the page goes on the free
@@ -372,16 +403,37 @@ final class PageManager {
     // Caller is responsible for not double-decref'ing or decref'ing
     // pages they didn't incref.
     func decref(physPage: Int) {
+        guard physPage >= 0 && physPage < pages.count else {
+            if !PageManager.warnedBadDecref {
+                PageManager.warnedBadDecref = true
+                FileHandle.standardError.write(Data("[pagemgr] WARN: decref out-of-range phys=\(physPage) (pool=\(pages.count)) — balance bug; see page_lifecycle_audit #2\n".utf8))
+            }
+            return
+        }
         var p = pages[physPage]
         if p.refcount > 0 {
             p.refcount -= 1
             if p.refcount == 0 {
-                freeListPush(physPage)
+                pages[physPage] = p
+                freePush(physPage)
                 // contentHash preserved for potential cache hit later.
+                return
             }
             pages[physPage] = p
+        } else {
+            // decref of an already-free page = a balance bug (double-free /
+            // duplicate ownedPages entry). The old code silently swallowed
+            // this, masking every page-leak/double-free in the engine. Log
+            // ONCE (not a hard precondition — a latent double-free should be
+            // surfaced, not crash production). page_lifecycle_audit #2.
+            if !PageManager.warnedDoubleFree {
+                PageManager.warnedDoubleFree = true
+                FileHandle.standardError.write(Data("[pagemgr] WARN: decref of free page \(physPage) (refcount already 0) — double-free / balance bug; see page_lifecycle_audit #2\n".utf8))
+            }
         }
     }
+    static var warnedDoubleFree = false
+    static var warnedBadDecref = false
 
     func pageRefcount(_ phys: Int) -> Int {
         guard phys >= 0 && phys < pages.count else { return 0 }
@@ -409,9 +461,9 @@ final class PageManager {
         var cached = 0
         for p in pages { if p.contentHash != nil { cached += 1 } }
         return Stats(totalPages: numPhysPages,
-                     freePages: freeList.count,
+                     freePages: freeUncached.count + freeCached.count,
                      cachedHashes: cached,
-                     pagesInUse: numPoolPages - freeList.count)
+                     pagesInUse: numPoolPages - freeUncached.count - freeCached.count)
     }
 
     // Per-page diagnostic record (used by the engine-state endpoint that

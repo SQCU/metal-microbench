@@ -50,8 +50,11 @@ const CELLS = [
     { id: 'lock_in_tetrad_verbatim', label: 'verbatim'  },
     { id: 'lock_in_tetrad',          label: 'expanded'  },
 ];
-const ITER_OUT_DIR = '/Users/mdot/metal-microbench/data/lock_in_iterative';
-const ABLATION_OUT_DIR = '/Users/mdot/metal-microbench/data/seed_ablation';
+const ITER_OUT_DIR = process.env.USER_PERSONAS_LOCK_IN_OUT
+    || process.env.USER_PERSONAS_LOCK_IN_DATA_DIR
+    || '/Users/mdot/metal-microbench/data/lock_in_iterative';
+const ABLATION_OUT_DIR = process.env.USER_PERSONAS_SEED_ABLATION_DIR
+    || '/Users/mdot/metal-microbench/data/seed_ablation';
 
 // ── helpers ────────────────────────────────────────────────────────────
 
@@ -61,23 +64,24 @@ async function dispatchRun(experimentId) {
 }
 
 async function waitForLogfileDone(runId, expectedExperimentId) {
-    // The plugin's /experiments/runs/:run_id endpoint doesn't expose a
-    // terminal status field (it drops once the child exits). So we
-    // watch the logfile for the "[lock_in_iterative] done." line plus
-    // the CHILD EXIT marker. Poll every 15s; timeout after 30 min.
-    const logfile = path.join(
-        '/Users/mdot/sillytavern-fork/plugins/user-personas/data/runs',
-        `${runId}.log`);
+    // Follow the active plugin instance instead of assuming root
+    // sillytavern-fork's on-disk run directory. st-debug and root ST have
+    // distinct plugin data roots, while /experiments/runs/:run_id is the
+    // canonical status/log facade for whichever instance we dispatched to.
     const deadline = Date.now() + 30 * 60 * 1000;
     while (Date.now() < deadline) {
         try {
-            const buf = fs.readFileSync(logfile, 'utf8');
+            const status = await L.http('GET', `${PLUGIN}/experiments/runs/${encodeURIComponent(runId)}`);
+            if (status?.run?.experiment_id && status.run.experiment_id !== expectedExperimentId) {
+                throw new Error(`run ${runId} belongs to ${status.run.experiment_id}, expected ${expectedExperimentId}`);
+            }
+            const buf = status?.log || '';
             if (buf.includes('CHILD EXIT')) {
                 const elapsed = (Date.now() - parseDispatchTs(runId)) / 1000;
                 return { ok: !buf.includes('Uncaught'), tailLines: buf.split('\n').slice(-30), wall_s: elapsed };
             }
         } catch (_) {
-            // logfile not yet written — keep polling
+            // Status record/log not visible yet — keep polling.
         }
         await sleep(15_000);
     }

@@ -1,0 +1,140 @@
+{
+  "experiment_id": "synth-1779035204660-scringloscrambler-f135",
+  "run_id": "synth-1779035204660-scringloscrambler-f135-2026-05-24T10-08-04-828Z-eec3",
+  "started_at": "2026-05-24T10:08:05.285Z",
+  "K_OUTER_OUTER": 3,
+  "passes": [
+    {
+      "pass": 0,
+      "inner_result": {
+        "code": 1,
+        "signal": null,
+        "elapsed_s": 0.1
+      },
+      "sweep": {
+        "splitterResults": [],
+        "collapsedPairs": [],
+        "disambResult": null
+      }
+    },
+    {
+      "pass": 1,
+      "target": {
+        "rpg_class": 3,
+        "star_sign": 5
+      },
+      "inner_result": {
+        "code": 1,
+        "signal": null,
+        "elapsed_s": 0.1
+      },
+      "sweep": {
+        "splitterResults": [],
+        "collapsedPairs": [],
+        "disambResult": null
+      }
+    },
+    {
+      "pass": 2,
+      "target": {
+        "rpg_class": 3,
+        "star_sign": 1
+      },
+      "inner_result": {
+        "code": 1,
+        "signal": null,
+        "elapsed_s": 0.1
+      },
+      "sweep": {
+        "splitterResults": [],
+        "collapsedPairs": [],
+        "disambResult": null
+      }
+    }
+  ],
+  "final_axes": 17,
+  "derived_axes": [
+    {
+      "id": "affective_morbidity",
+      "derived_from": {
+        "parent": "astrology_cancerian",
+        "contexts": "steals vs romances-and-steals",
+        "hypothesis_id": 3,
+        "sibling": "possessive_drive"
+      }
+    },
+    {
+      "id": "extractive_drive",
+      "derived_from": {
+        "parent": "rpg_class",
+        "contexts": "1779316847915-t3synth1779316847585-money-1 vs 1779316847915-t3synth1779316847585-money-5",
+        "hypothesis_id": 3,
+        "sibling": "relational_engagement"
+      }
+    },
+    {
+      "id": "extractive_resourcefulness",
+      "derived_from": {
+        "parent": "star_sign",
+        "contexts": "1779316847915-t3synth1779316847585-money-1 vs 1779316847915-t3synth1779316847585-money-5",
+        "hypothesis_id": 1,
+        "sibling": "interpersonal_intimacy"
+      }
+    },
+    {
+      "id": "intellectual_application",
+      "derived_from": {
+        "parent": "rpg_class",
+        "contexts": "1779317052143-t3synth1779317051824-money-1 vs 1779317052143-t3synth1779317051824-money-5",
+        "hypothesis_id": 3,
+        "sibling": "interpersonal_presence"
+      }
+    },
+    {
+      "id": "interpersonal_intimacy",
+      "derived_from": {
+        "parent": "star_sign",
+        "contexts": "1779316847915-t3synth1779316847585-money-1 vs 1779316847915-t3synth1779316847585-money-5",
+        "hypothesis_id": 1,
+        "sibling": "extractive_resourcefulness"
+      }
+    },
+    {
+      "id": "interpersonal_presence",
+      "derived_from": {
+        "parent": "rpg_class",
+        "contexts": "1779317052143-t3synth1779317051824-money-1 vs 1779317052143-t3synth1779317051824-money-5",
+        "hypothesis_id": 3,
+        "sibling": "intellectual_application"
+      }
+    },
+    {
+      "id": "possessive_drive",
+      "derived_from": {
+        "parent": "astrology_cancerian",
+        "contexts": "steals vs romances-and-steals",
+        "hypothesis_id": 3,
+        "sibling": "affective_morbidity"
+      }
+    },
+    {
+      "id": "relational_engagement",
+      "derived_from": {
+        "parent": "rpg_class",
+        "contexts": "1779316847915-t3synth1779316847585-money-1 vs 1779316847915-t3synth1779316847585-money-5",
+        "hypothesis_id": 3,
+        "sibling": "extractive_drive"
+      }
+    },
+    {
+      "id": "rpg_class_combat_intensity",
+      "derived_from": {
+        "parent": "rpg_class",
+        "sibling": "rpg_class_resource_management",
+        "hypothesis": "The parent rpg_class axis entangles two orthogonal sub-behaviors: (a) how a persona prepares for conflict (study-heavy vs. tactical reflex), and (b) how they manage limited resources (conserve/optimize vs. exploit freely). This split factorizes the preparation-style sub-behavior.",
+        "contexts": "Within rpg_class=1 (wizard-leaning), some bios were judged high on careful-ritual (preparation-focused) in combat contexts but low in high-stakes negotiation contexts. Within rpg_class=5 (rogue-leaning), some bios were judged high on reflex-driven (improvisational) in combat but lower in planning-heavy social contexts. The parent score was conflating these context-dependent shifts. This split separates them.",
+        "hypothesis_id": 1
+      }
+    }
+  ]
+}

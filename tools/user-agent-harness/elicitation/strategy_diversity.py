@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import os as _os_for_bridge_url
-BRIDGE_URL = _os_for_bridge_url.environ.get("BRIDGE_URL", "http://localhost:8001") + "/v1/chat/completions"
+BRIDGE_URL = _os_for_bridge_url.environ["BRIDGE_URL"] + "/v1/chat/completions"
 
 
 def bridge_chat(messages, max_tokens=None, temperature=1.0):

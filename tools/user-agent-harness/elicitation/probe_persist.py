@@ -39,7 +39,7 @@ from pathlib import Path
 from axes import AXIS_NAMES, LIKERT_AXES, N_AXES
 
 import os as _os_for_bridge_url
-BRIDGE_URL = _os_for_bridge_url.environ.get("BRIDGE_URL", "http://localhost:8001") + "/v1/chat/completions"
+BRIDGE_URL = _os_for_bridge_url.environ["BRIDGE_URL"] + "/v1/chat/completions"
 SCHEMA_VERSION = 1
 
 
@@ -117,8 +117,7 @@ def get_judge_metadata():
     JSONL store records what produced each judgment. Different GGUFs =
     different distributions; we want to be able to filter by them."""
     try:
-        _bridge_health_url = _os_for_bridge_url.environ.get(
-            "BRIDGE_URL", "http://localhost:8001") + "/health"
+        _bridge_health_url = _os_for_bridge_url.environ["BRIDGE_URL"] + "/health"
         with urllib.request.urlopen(_bridge_health_url, timeout=5) as r:
             h = json.loads(r.read())
         model = h.get("model", "unknown")

@@ -15,7 +15,7 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-BRIDGE = os.environ.get("BRIDGE_URL", "http://127.0.0.1:8001").rstrip("/")
+BRIDGE = os.environ["BRIDGE_URL"].rstrip("/")
 
 # Identical small request so per-call work is constant.
 BODY = {

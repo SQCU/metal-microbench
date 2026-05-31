@@ -144,6 +144,65 @@ struct LmWeights {
 // GGUF. Q8_0 dense weights get swizzled for the v6 kernel; Q4_K / Q5_1 MoE
 // weights get per-expert-swizzled; norms load f32→f16; routing scales and
 // layer scalars stay f32. Allocates per-layer paged K/V caches (zero-filled).
+// ─────────────────────────────────────────────────────────────────────
+// Persistent weight residency set (2026-05-28).
+//
+// Profiling the bridge showed generation was SUBMIT-bound, not compute-bound:
+// the Metal CommandQueueDispatch thread sat ~100% in
+// IOGPUCommandQueueSubmitCommandBuffers → iokit_user_client_trap, while
+// waitUntilCompleted (actual GPU compute) barely registered and the bridge's
+// asyncio thread was idle. Cause: every command buffer re-walks the residency
+// list of the ~660 weight buffers (which are fully indexed on every forward
+// pass and never change). Pin them ONCE in a persistent MTLResidencySet
+// attached to the LM queue so per-CB submission skips them. The KV pool stays
+// on the narrowed per-CB useResource path — its working set changes per CB and
+// must not be made fully/permanently resident. macOS 15+ only; older systems
+// fall back to the prior per-CB residency behavior.
+private var gWeightResidencySet: AnyObject?
+
+extension LmWeights {
+    /// Every static weight buffer — fully indexed each forward, immutable.
+    /// EXCLUDES the KV chunk pool (K_chunks/V_chunks); includes the static
+    /// per-layer argument buffers (encoded once, read every CB).
+    var allWeightBuffers: [MTLBuffer] {
+        var bufs: [MTLBuffer] = [embedTable, unembedW, outputNorm, embedScaleBuf]
+        for L in layers {
+            bufs.append(contentsOf: [
+                L.attnQ, L.attnK, L.attnOut, L.ffnGate, L.ffnUp, L.ffnDown,
+                L.moeGateUp, L.moeDown,
+                L.attnNorm, L.postAttnNorm, L.attnQNorm, L.attnKNorm,
+                L.ffnNorm, L.postFfn1Norm, L.preFfn2Norm, L.postFfn2Norm, L.postFfnNorm,
+                L.routerW, L.routerScale, L.expertScale, L.layerOutputScale])
+            if let v = L.attnV { bufs.append(v) }
+        }
+        bufs.append(contentsOf: K_chunks_argbuf)
+        bufs.append(contentsOf: V_chunks_argbuf)
+        return bufs
+    }
+}
+
+func installWeightResidencySet(_ w: LmWeights) {
+    if #available(macOS 15.0, *) {
+        do {
+            let set = try device.makeResidencySet(descriptor: MTLResidencySetDescriptor())
+            let bufs = w.allWeightBuffers
+            for b in bufs { set.addAllocation(b) }
+            set.commit()
+            set.requestResidency()
+            queue.addResidencySet(set)
+            gWeightResidencySet = set   // retain for process lifetime
+            FileHandle.standardError.write(Data(
+                "[residency] pinned \(bufs.count) weight buffers in a persistent MTLResidencySet (attached to LM queue)\n".utf8))
+        } catch {
+            FileHandle.standardError.write(Data(
+                "[residency] WARN: MTLResidencySet failed (\(error)) — per-CB useResource fallback\n".utf8))
+        }
+    } else {
+        FileHandle.standardError.write(Data(
+            "[residency] macOS < 15: no MTLResidencySet; per-CB useResource path\n".utf8))
+    }
+}
+
 func loadLmWeights(ggufPath: String) throws -> LmWeights {
     let t0 = Date()
     print("  loading GGUF: \(ggufPath)")
@@ -735,11 +794,13 @@ func loadLmWeights(ggufPath: String) throws -> LmWeights {
     print("  spot-check: L0 attn_q[col=0,kb=0,32B] \(match ? "✓ matches" : "✗ MISMATCH") post-swizzle (\(L0.attnQFormat))")
 
     print(String(format: "  == TOTAL load: %.2f sec ==", Date().timeIntervalSince(t0)))
-    return LmWeights(layers: layers, embedTable: embedTable, unembedW: unembedW,
+    let w = LmWeights(layers: layers, embedTable: embedTable, unembedW: unembedW,
                       outputNorm: outputNorm, embedScaleBuf: embedScaleBuf,
                       K_chunks: K_chunks, V_chunks: V_chunks,
                       K_chunks_argbuf: K_chunks_argbuf, V_chunks_argbuf: V_chunks_argbuf,
                       kvChunkPages: kvChunkPages,
                       bosTokenId: bosTokenId, eosTokenId: eosTokenId,
                       addBosToken: addBosToken, vocabTokens: vocabTokens, merges: merges)
+    installWeightResidencySet(w)
+    return w
 }
