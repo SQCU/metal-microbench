@@ -224,3 +224,67 @@ def score(chat, target_img: Image.Image, cand_img: Image.Image,
                 "biggest_fix": obj.get("biggest_fix")}
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Residual feature vector — a >6-dim comparative judge for the k-shot harness.
+# A 3-scalar judge can't tell the model WHAT to fix; this decomposes "how well
+# does the SECOND image reproduce the FIRST" into 9 named axes, each 1-5. It is
+# BOTH elicitation (the model is told to raise its lowest axes) AND scoring (we
+# track all 9 + their mean over turns). One joint/comparative call, both images
+# in context (FIRST = reference, SECOND = current render).
+RESIDUAL_AXES = {
+    "layout":          "overall spatial arrangement of regions matches",
+    "large_forms":     "the major shapes / objects are present and placed correctly",
+    "fine_detail":     "small details and texture are captured",
+    "color_palette":   "the set of colours present matches",
+    "color_placement": "colours are in the right places",
+    "edges_contours":  "shape boundaries / edges line up",
+    "proportions":     "relative sizes and positions are correct",
+    "text":            "any legible text is reproduced (presence and accuracy)",
+    "completeness":    "nothing major is missing or spuriously added",
+}
+RESIDUAL_SYS = (
+    "You are a meticulous visual comparator. You see a FIRST image (the reference) and a "
+    "SECOND image (a reconstruction). For each axis rate, 1-5, HOW WELL THE SECOND REPRODUCES "
+    "THE FIRST on that axis — a single comparative judgment. 1 = absent/wrong, 3 = partial, "
+    "5 = strong match. Use the full range; be strict so improvement has room to show.")
+
+
+def _residual_ask() -> str:
+    lines = "\n".join(f"  {k}: {v}" for k, v in RESIDUAL_AXES.items())
+    keys = ", ".join(f'"{k}": <int 1-5>' for k in RESIDUAL_AXES)
+    return ("Rate how well the SECOND image reproduces the FIRST on each axis (1-5):\n"
+            f"{lines}\n"
+            f'Respond with ONLY JSON: {{{keys}, "worst": "<the single axis most worth fixing next>"}}.')
+
+
+def feature_residual(chat, ref_img: Image.Image, render_img: Image.Image) -> dict | None:
+    """`chat(messages) -> text`. ONE comparative call, both images in context
+    (FIRST = reference, SECOND = render). Returns {<9 axes>: int 1-5, worst: str,
+    mean: float} or None on failure."""
+    try:
+        msgs = [{"role": "system", "content": RESIDUAL_SYS},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "FIRST image (reference):"},
+                    {"type": "image_url", "image_url": {"url": _durl(ref_img)}},
+                    {"type": "text", "text": "SECOND image (current reconstruction):"},
+                    {"type": "image_url", "image_url": {"url": _durl(render_img)}},
+                    {"type": "text", "text": _residual_ask()}]}]
+        m = _JSON_RE.search(chat(msgs))
+        if not m:
+            return None
+        obj = json.loads(m.group(0))
+        out = {}
+        for ax in RESIDUAL_AXES:
+            v = obj.get(ax)
+            if isinstance(v, (int, float)):
+                out[ax] = int(round(float(v)))
+        if len(out) < 6:                       # require a usable >6-dim vector
+            return None
+        out["mean"] = round(sum(out.values()) / len(out), 3)
+        if isinstance(obj.get("worst"), str):
+            out["worst"] = obj["worst"]
+        return out
+    except Exception:
+        return None
