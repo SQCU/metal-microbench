@@ -39,7 +39,8 @@ const PLUGIN_WRAPPER_IDS = [
     'user-suggester-button',
     'user-corpus-button',
     'user-fixed-point-button',
-    'user-axes-button',
+    // 'user-axes-button' retired 2026-06: the Axes tab was folded into
+    // corpus.html (Corpus tab), so the standalone wrapper no longer exists.
 ];
 
 test.use({ viewport: { width: 375, height: 812 } });

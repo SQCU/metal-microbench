@@ -13,7 +13,9 @@ import { test, expect } from '@playwright/test';
 import fs from 'node:fs';
 
 const PLUGIN_BASE = '/api/plugins/user-personas';
-const STATIC_AXES = `${PLUGIN_BASE}/static/axes.html`;
+// Axis registry now lives in the bottom section of corpus.html (the
+// standalone axes.html was retired in the 2026-06 consolidation).
+const STATIC_CORPUS = `${PLUGIN_BASE}/static/corpus.html`;
 const STATIC_SUGGESTER = `${PLUGIN_BASE}/static/suggester.html`;
 const STATIC_DIR = '/Users/mdot/metal-microbench/tools/st-debug/sillytavern-fork/plugins/user-personas/static';
 
@@ -155,7 +157,7 @@ test.describe('axis provenance no-delete invariants - desktop only', () => {
 
     test('Axis Registry: lineage roots, immutable edit fields, confirmed delete warning, and orphan signatures', async ({ page }) => {
         await installStaticPageGlobals(page);
-        await routeStaticHtml(page, STATIC_AXES, 'axes.html');
+        await routeStaticHtml(page, STATIC_CORPUS, 'corpus.html');
 
         const fixture = axisFixtures();
         let deleteCalls = 0;
@@ -203,8 +205,8 @@ test.describe('axis provenance no-delete invariants - desktop only', () => {
             await fulfillJson(route, { error: 'unexpected method' }, 405);
         });
 
-        await page.goto(STATIC_AXES);
-        await expect(page.locator('#status')).toContainText('3 axes loaded');
+        await page.goto(STATIC_CORPUS);
+        await expect(page.locator('#axes-status')).toContainText('3 axes loaded');
 
         const root = page.locator('.axis-card[data-axis-id="temperament"]');
         const derived = page.locator('.axis-card[data-axis-id="temperament_heat"]');

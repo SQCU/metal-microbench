@@ -30,7 +30,8 @@ import { test, expect } from '@playwright/test';
 
 const ST_URL = 'http://127.0.0.1:8002';
 const SURFACES = [
-    `${ST_URL}/api/plugins/user-personas/static/axes.html`,
+    // axes.html retired 2026-06 — its registry folded into corpus.html,
+    // which is audited below (and carries the same P-EMPTY-FORM contract).
     `${ST_URL}/api/plugins/user-personas/static/corpus.html`,
     `${ST_URL}/api/plugins/user-personas/static/fixed_point.html`,
 ];
@@ -171,15 +172,8 @@ test.describe('P-EMPTY-FORM compliance on axes / corpus / fixed_point surfaces',
     }
 
     // Specific assertions: the deleted affordances must not return.
-    test('axes.html: "+ Add axis" button + #add-form must NOT exist', async ({ page }) => {
-        await page.goto(`${ST_URL}/api/plugins/user-personas/static/axes.html`);
-        await page.waitForTimeout(800);
-        await expect(page.locator('#add-axis-btn'), '"+ Add axis" button is removed').toHaveCount(0);
-        await expect(page.locator('#add-form'), '#add-form inline form is removed').toHaveCount(0);
-        await expect(page.locator('#add-id'), '#add-id bare input is removed').toHaveCount(0);
-        await expect(page.locator('#add-def'), '#add-def bare textarea is removed').toHaveCount(0);
-    });
-
+    // (axes.html retired 2026-06; its registry — and this P-EMPTY-FORM
+    // contract — moved into corpus.html, asserted below.)
     test('corpus.html: "+ Add axis" button + #add-form must NOT exist', async ({ page }) => {
         await page.goto(`${ST_URL}/api/plugins/user-personas/static/corpus.html`);
         await page.waitForTimeout(800);

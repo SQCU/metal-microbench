@@ -116,25 +116,16 @@ test.describe('session surface screenshots', () => {
         // ── (6) Corpus dashboard — eff-dim PR + per-axis bar chart.
         // Open via hamburger popover (corpus menu item always present).
         await openPersonaSurface(page, 'corpus');
-        const corpIframe = page.frameLocator('iframe[src*="corpus_dashboard.html"]');
+        const corpIframe = page.frameLocator('iframe[src*="corpus.html"]');
         await expect(corpIframe.locator('h1, h2').first()).toBeVisible({ timeout: 15_000 });
         await page.waitForTimeout(1000);
         await page.screenshot({
             path: path.join(OUT_DIR, '07_corpus_dashboard.png'),
             fullPage: false,
         });
-        // No explicit close — openPersonaSurface for axes auto-closes corpus.
-        await page.waitForTimeout(300);
-
-        // ── (7) Axis registry — tree of axes.
-        await openPersonaSurface(page, 'axes');
-        const axesIframe = page.frameLocator('iframe[src*="axes.html"]');
-        await expect(axesIframe.locator('h1, h2').first()).toBeVisible({ timeout: 15_000 });
-        await page.waitForTimeout(800);
-        await page.screenshot({
-            path: path.join(OUT_DIR, '08_axis_registry.png'),
-            fullPage: false,
-        });
+        // ── (7) Axis registry — now the bottom section of corpus.html
+        // (the standalone Axes tab was retired in the 2026-06
+        // consolidation), captured within the corpus screenshot above.
         await page.waitForTimeout(300);
 
         // ── (8) Manifest of captured artifacts for the operator to inspect.

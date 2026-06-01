@@ -30,9 +30,9 @@ test.describe('corpus dashboard — desktop only', () => {
         // Open via hamburger popover — .drawer-toggle is display:none after
         // sillytavern-fork e2973179d; direct click on wrapper is invalid.
         await openPersonaSurface(page, 'corpus');
-        const iframe = page.frameLocator('iframe[src*="corpus_dashboard.html"]');
+        const iframe = page.frameLocator('iframe[src*="corpus.html"]');
         await expect(iframe.locator('h1').first(),
-            'corpus_dashboard.html renders inside the drawer iframe').toBeVisible({ timeout: 15_000 });
+            'corpus.html renders inside the drawer iframe').toBeVisible({ timeout: 15_000 });
         // Wait for the PR tile to leave the loading sentinel "—".
         await expect.poll(async () => {
             return await iframe.locator('#pr-value').textContent();
@@ -139,9 +139,9 @@ test.describe('corpus dashboard — desktop only', () => {
 
         // (9) Empty-state: navigate the iframe to ?empty=1, dashboard
         // should still render (with an empty-state message) and not crash.
-        const iframeEl = page.locator('iframe[src*="corpus_dashboard.html"]').first();
+        const iframeEl = page.locator('iframe[src*="corpus.html"]').first();
         await iframeEl.evaluate((el) => {
-            el.src = '/api/plugins/user-personas/static/corpus_dashboard.html?empty=1';
+            el.src = '/api/plugins/user-personas/static/corpus.html?empty=1';
         });
         await expect(iframe.locator('h1').first()).toBeVisible({ timeout: 15_000 });
         await expect(iframe.locator('#axis-empty-state')).toBeVisible({ timeout: 10_000 });

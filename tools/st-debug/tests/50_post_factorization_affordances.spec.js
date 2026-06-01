@@ -43,9 +43,10 @@ test.describe('post-factorization affordance audit', () => {
     test('E1: derived axes render in axis registry with lineage treatment', async ({ page }) => {
         await loadAndConnect(page);
         // Open via hamburger popover — .drawer-toggle is display:none after
-        // sillytavern-fork e2973179d; direct click on #user-axes-button is invalid.
-        await openPersonaSurface(page, 'axes');
-        const iframe = page.frameLocator('iframe[src*="axes.html"]');
+        // sillytavern-fork e2973179d; direct click on the wrapper is invalid.
+        // Axis registry now lives in corpus.html (Axes tab retired 2026-06).
+        await openPersonaSurface(page, 'corpus');
+        const iframe = page.frameLocator('iframe[src*="corpus.html"]');
         await expect(iframe.locator('h1, h2').first()).toBeVisible({ timeout: 15_000 });
 
         // Wait for the registry's "N axes loaded" counter to populate.
@@ -71,7 +72,7 @@ test.describe('post-factorization affordance audit', () => {
         // Open via hamburger popover — .drawer-toggle is display:none after
         // sillytavern-fork e2973179d; direct click on #user-corpus-button is invalid.
         await openPersonaSurface(page, 'corpus');
-        const iframe = page.frameLocator('iframe[src*="corpus_dashboard.html"]');
+        const iframe = page.frameLocator('iframe[src*="corpus.html"]');
         await expect(iframe.locator('h1, h2').first()).toBeVisible({ timeout: 15_000 });
         await page.waitForTimeout(800);
 

@@ -28,15 +28,18 @@ test.describe('B4 axis registry — desktop only', () => {
     async function openAxesTab(page) {
         await loadAndConnect(page);
         // (1) Open via hamburger popover — .drawer-toggle is display:none after
-        // sillytavern-fork e2973179d; direct click on #user-axes-button is invalid.
-        await openPersonaSurface(page, 'axes');
-        // (2) Iframe loads with axes.html.
-        const iframeEl = page.locator('iframe[src*="axes.html"]').first();
+        // sillytavern-fork e2973179d; direct click on the wrapper is invalid.
+        // The standalone Axes tab was retired in the 2026-06 consolidation;
+        // the axis registry now lives in the bottom section of corpus.html
+        // (opened via the Corpus tab).
+        await openPersonaSurface(page, 'corpus');
+        // (2) Iframe loads with corpus.html (combined dashboard + registry).
+        const iframeEl = page.locator('iframe[src*="corpus.html"]').first();
         await expect(iframeEl).toBeVisible({ timeout: 15_000 });
-        const iframe = page.frameLocator('iframe[src*="axes.html"]');
+        const iframe = page.frameLocator('iframe[src*="corpus.html"]');
         await expect(iframe.locator('h1').first()).toBeVisible({ timeout: 15_000 });
-        // Status flips from "Loading…" to "N axes loaded".
-        await expect(iframe.locator('#status')).toContainText(/loaded/i, { timeout: 15_000 });
+        // Registry status flips from "Loading…" to "N axes loaded".
+        await expect(iframe.locator('#axes-status')).toContainText(/loaded/i, { timeout: 15_000 });
         return iframe;
     }
 
