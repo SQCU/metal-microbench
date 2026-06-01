@@ -55,17 +55,27 @@ enum PageManagerError: Error {
 // content hash used for prefix-cache lookups.
 //
 // Pair bookkeeping: Gemma-4 uses PAGE_SLIDE=16 for sliding-window layers
-// and PAGE_FULL=8 for full-attention layers, but shares one block_table
-// per slot. That means each 16-token slide page spans TWO full-attn
-// pages in the full-K/V cache (the first-half lives at the same phys
-// index as the slide page, the second-half lives at block_table[index+1]).
-// To share a slide-page worth of K/V correctly across sessions, the
-// content index has to track BOTH members as a pair — adopting one
-// without the other leaves the full-attn K/V at positions [page_start+8,
-// page_start+15] as zeros (or stale data), producing KL~0.38 divergence
-// vs. fresh compute. `pairMate` is the phys index of the other member
-// of this content-hash pair (nil when this page isn't part of a promoted
-// pair).
+// and PAGE_FULL=8 for full-attention layers, but shares ONE flat block_table
+// per slot, addressed at PAGE_FULL=8 granularity (ownedPages is sized
+// ceil(kLen/8)). Each layer's K/V lives in its own per-layer buffer, but
+// both layer types index the SAME flat ownedPages array by their per-layer
+// logical page ordinal: full layers read ownedPages[pos/8], slide layers
+// read ownedPages[pos/16].
+//
+// So one 16-token slide page P spans TWO full-attn pages in the
+// full-attention layers' K/V: ownedPages[2P] holds full K/V for positions
+// [16P..16P+7], ownedPages[2P+1] holds full K/V for [16P+8..16P+15].
+// (The slide-LAYER K/V for slide-page P is a DIFFERENT page, ownedPages[P];
+// it is NOT part of this pair — it is shared implicitly by aligned adoption,
+// and CoW-privatized for the slide-divergent half ownedPages[N..2N-1] in
+// adoptSharedPrefixPages, commit 16b5416. See promoteFinishedPages.)
+//
+// To share slide-page P's FULL-attn K/V correctly across sessions, the
+// content index must track BOTH full-attn pages as a pair — adopting one
+// without the other leaves the full-attn K/V at positions [16P+8, 16P+15]
+// as zeros (or stale data), producing KL~0.38 divergence vs. fresh compute.
+// `pairMate` is the phys index of the OTHER full-attn page of this
+// content-hash pair (nil when this page isn't part of a promoted pair).
 private struct PageInfo {
     // 2026-05-07 (anonymous-pool refactor): pages are no longer tagged
     // with the set of session IDs that own them. The pool is a uniform
@@ -76,24 +86,33 @@ private struct PageInfo {
     // owners.count) but no per-session bookkeeping inside PageManager.
     var refcount: Int           // number of live page references
     var contentHash: UInt64?    // nil = page isn't content-indexed (fresh/dirty)
-    var pairMate: Int?          // other phys page sharing this hash (see header)
+    var pairMate: Int?          // other FULL-attn page (ownedPages[2P]/[2P+1]) sharing this hash (see header)
     var lastAccessTick: UInt64
 }
 
-// SlidePairContents — pair of phys page IDs representing the K/V backing
-// for a 16-token slide page. `slidePlusFullHead` corresponds to block_table[P]
-// (slide cache for 16 tokens + full cache for first 8); `fullTail`
-// corresponds to block_table[P+1] (full cache for the second 8 tokens
-// at that 16-token slide-page range, plus whatever slide data gets
-// written there by a later prefill tile).
+// SlidePairContents — the pair of phys page IDs capturing the FULL-attention
+// K/V backing for one 16-token slide page P. Both members come from the flat
+// ownedPages array (PAGE_FULL=8 granularity):
+//   `slidePlusFullHead` == ownedPages[2P]   — full-attn K/V for positions [16P..16P+7]
+//   `fullTail`          == ownedPages[2P+1]  — full-attn K/V for positions [16P+8..16P+15]
+//
+// NOTE on the field name: `slidePlusFullHead` is a historical misnomer. It
+// does NOT hold any slide-layer K/V. The SLIDE-layer K/V for slide-page P
+// lives at a SEPARATE page, ownedPages[P] (slide layers index ownedPages[pos/16]),
+// which is not stored in this struct — it is shared implicitly by aligned
+// adoption (consumers reconstruct ownedPages page-for-page in order), and the
+// slide-divergent half ownedPages[N..2N-1] is refcount-gated copy-on-write
+// privatized in adoptSharedPrefixPages (commit 16b5416). This struct exists
+// only to carry the full-attn pair, whose two members are non-adjacent in
+// slide-page space and so must be tracked together for correct adoption.
 //
 // Followup 3 (2026-05-23): PageManager.contentIndex was deleted; the
 // radix trie (radix_trie.swift) is the sole source of truth for
 // adoption lookups. This struct survives as the value type stored at
 // each trie anchor.
 struct SlidePairContents {
-    let slidePlusFullHead: Int
-    let fullTail: Int
+    let slidePlusFullHead: Int   // ownedPages[2P]: full-attn K/V [16P..16P+7]  (name is historical; no slide K/V here)
+    let fullTail: Int            // ownedPages[2P+1]: full-attn K/V [16P+8..16P+15]
 }
 
 final class PageManager {
@@ -368,9 +387,11 @@ final class PageManager {
     // content hash + partner phys so the eviction callback in
     // allocFresh can notify the trie about the pair as a unit.
     //
-    // `slidePlusFullHead` is block_table[P] (slide K/V for tokens
-    // [P*16..P*16+15] + full K/V for [P*16..P*16+7]); `fullTail`
-    // is block_table[P+1] (full K/V for [P*16+8..P*16+15]).
+    // Both arguments are FULL-attention pages for slide-page P, drawn from
+    // the flat ownedPages array: `slidePlusFullHead` == ownedPages[2P]
+    // (full K/V for [16P..16P+7]); `fullTail` == ownedPages[2P+1] (full K/V
+    // for [16P+8..16P+15]). Neither holds slide-layer K/V (the slide page
+    // ownedPages[P] is never passed here — see SlidePairContents header).
     //
     // Idempotent: re-stamping with the same hash is a no-op modulo
     // lastAccessTick refresh; re-stamping with a DIFFERENT hash

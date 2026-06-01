@@ -1934,9 +1934,13 @@ final class LmEngine {
     // Followup 2 (LM_KV_OVERWRITE_CHECK assertion): compute a content
     // hash over the K/V row(s) at a single logical position across all
     // layers, walking the session's ownedPages map to find the right
-    // phys page per layer (slide layers use ownedPages[2*P], full
-    // layers may use ownedPages[2*P] or ownedPages[2*P+1] depending on
-    // position % 16 < 8 vs ≥ 8).
+    // phys page per layer. Both layer types index the SAME flat ownedPages
+    // array by their per-layer logical page ordinal: full layers use
+    // ownedPages[position/PAGE_FULL] (=pos/8), slide layers use
+    // ownedPages[position/PAGE_SLIDE] (=pos/16). (Corrected 2026-06-01: the
+    // old text claimed slide layers use ownedPages[2*P] — that was the
+    // detector-geometry bug that made this very check blind to the shared-
+    // slide-page overwrite. See the per-layer indexing below.)
     //
     // Used to verify the .primed recover-step's "benign overwrite"
     // property: the K/V write at position lands in pages shared with
@@ -1954,9 +1958,10 @@ final class LmEngine {
         var h: UInt64 = 0xcbf29ce484222325
         let logSlide = position / PAGE_SLIDE       // logical slide page index
         let logFull = position / PAGE_FULL          // logical full page index
-        // Slide-layer phys: ownedPages[2 * logSlide]
-        // Full-layer phys: ownedPages[logFull] (full layers index block_table
-        // directly by logFull, which corresponds to ownedPages[logFull])
+        // Slide-layer phys: ownedPages[logSlide] (flat; slide kernel reads
+        //   bt_s[pos/16] = ownedPages[pos/16]).
+        // Full-layer phys: ownedPages[logFull]  (flat; full kernel reads
+        //   block_table[pos/8] = ownedPages[pos/8]).
         for L in 0..<NUM_LAYERS {
             let lw = weights.layers[L]
             let pg = lw.isFull ? PAGE_FULL : PAGE_SLIDE
@@ -2306,12 +2311,17 @@ final class LmEngine {
             // only when a submit staged tokens in primingQueue that were
             // consumed without being added to consumedTokens), skip.
             let end = (p + 1) * PAGE_SLIDE
-            // Each slide page P occupies TWO phys pages in ownedPages:
-            // ownedPages[2P] is the slide primary (holds slide K/V for
-            // positions [P*16, P*16+15] + full K/V for [P*16, P*16+7]),
-            // and ownedPages[2P+1] is the full sibling (holds full K/V
-            // for [P*16+8, P*16+15]).  Skip promotion until both are
-            // allocated.
+            // The SlidePairContents we promote for slide-page P is the
+            // FULL-attention page PAIR: ownedPages[2P] holds full-attn K/V for
+            // positions [P*16, P*16+7], ownedPages[2P+1] holds full-attn K/V
+            // for [P*16+8, P*16+15]. (Historical names `slideIdx`/
+            // `slidePlusFullHead` are misnomers — neither holds slide-layer
+            // K/V. The slide-layer K/V for slide-page P lives at the SEPARATE
+            // page ownedPages[P], which the slide kernel reads at pos/16; it is
+            // shared implicitly by in-order aligned adoption and CoW-privatized
+            // for the divergent half ownedPages[N..2N-1] in
+            // adoptSharedPrefixPages, commit 16b5416.) Skip promotion until
+            // both full-attn pages are allocated.
             let slideIdx = 2 * p
             let fullIdx  = 2 * p + 1
             guard end <= s.consumedTokens.count,

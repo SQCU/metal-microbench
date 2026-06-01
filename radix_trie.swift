@@ -61,20 +61,24 @@ struct CvecAnchorTag: Hashable {
 }
 
 // PartialPagePair — a (slidePlusFullHead, optional fullTail, validUpTo)
-// triple used by Track B (partial-page promotion at teardown). The
-// underlying physical pages are valid for positions [pageStart,
-// pageStart + validUpTo).
+// triple used by Track B (partial-page promotion at teardown). As with
+// SlidePairContents (see page_manager.swift), the two phys members are the
+// FULL-attention page pair for slide-page P (ownedPages[2P], ownedPages[2P+1]),
+// NOT slide-layer pages — the name `slidePlusFullHead` is a historical
+// misnomer carrying no slide K/V. The slide-layer page ownedPages[P] is
+// shared/CoW'd separately by adoptSharedPrefixPages. The underlying full-attn
+// pages are valid for positions [pageStart, pageStart + validUpTo).
 //
 // `validUpTo` is in [1, PAGE_SLIDE-1]: 0 means "no progress" (no
 // partial pair worth promoting), PAGE_SLIDE means "full pair" (use
 // SlidePairContents instead).
 //
 // `fullTail` is nil when validUpTo ≤ PAGE_FULL (8): the second
-// full-attn page (block_table[2P+1]) hasn't been touched at all,
+// full-attn page (ownedPages[2P+1]) hasn't been touched at all,
 // so we don't reference any sibling phys page.
 struct PartialPagePair {
-    let slidePlusFullHead: Int    // phys @ block_table[2P]
-    let fullTail: Int?             // phys @ block_table[2P+1], nil if validUpTo ≤ 8
+    let slidePlusFullHead: Int    // ownedPages[2P]: full-attn K/V [16P..16P+7] (name is historical; no slide K/V)
+    let fullTail: Int?             // ownedPages[2P+1]: full-attn K/V [16P+8..16P+15], nil if validUpTo ≤ 8
     let validUpTo: Int             // 1..PAGE_SLIDE-1
 }
 
@@ -82,10 +86,15 @@ struct PartialPagePair {
 // MUST decref each on session teardown. `partialTail` is set when
 // the deepest matched anchor carries a partial pair; the caller is
 // expected to CoW the partial bytes onto a fresh page.
+//
+// Each `pages` entry is the FULL-attn page pair for one 16-token slide
+// page (ownedPages[2P], ownedPages[2P+1]); the matching slide-layer pages
+// ownedPages[0..2N-1] are adopted implicitly in order by the consumer,
+// which CoW-privatizes the slide-divergent half ownedPages[N..2N-1].
 struct PrefixMatch {
-    let alignedMatchLength: Int    // multiple of PAGE_SLIDE; pages.count*2*PAGE_SLIDE/2
+    let alignedMatchLength: Int    // == pages.count * PAGE_SLIDE (one slide page per entry)
     let trieMatchLength: Int       // longest token-walk; reported for telemetry
-    let pages: [SlidePairContents]    // page-pairs covering [0, alignedMatchLength)
+    let pages: [SlidePairContents]    // full-attn page-pairs covering [0, alignedMatchLength)
     let partialTail: PartialPagePair?
 }
 

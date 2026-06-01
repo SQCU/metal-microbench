@@ -134,6 +134,50 @@ lock-split that does not exist yet; a speculative blocking gate adds deadlock
 surface to guard a non-live hazard. **Prerequisite for any lock-split**, to be
 implemented *with* that refactor and validated on a quiet host.
 
+## Update 2026-05-31 — defect #8 went LIVE on the serving path; fixed (16b5416)
+
+Defect #8 ("no enforced invariant that shared (refcount>1) pages are immutable")
+was not merely a latent convention gap: it FIRED on the production serving path.
+Root cause: ONE flat block_table per slot serves both layer geometries —
+full-attention layers (PAGE_FULL=8) address `ownedPages[pos/8]`, sliding-window
+layers (PAGE_SLIDE=16) address `ownedPages[pos/16]`. Aligned adoption of N
+slide-pairs incref-shares `ownedPages[0..2N-1]` read-only. For the FULL layers
+every shared page [8k..8k+7] sits inside the shared prefix [0..16N-1] (sound),
+but for the SLIDE layers pages k ∈ [N..2N-1] map to positions [16N..32N-1] —
+PAST the shared prefix, i.e. this session's own divergent generation region.
+Once the consumer generated past 16N it WROTE its divergent slide K/V into
+`ownedPages[N..2N-1]`, pages the producer and sibling adopters still referenced
+read-only → cross-session slide-K/V clobber → off-manifold activations →
+Gemma-4 absorbing-state collapse ("multilingual token soup", running to the
+max-tokens cap, no EOS) on the SillyTavern shareable-prefix /poll suggester.
+State-dependent and concurrency-exposed: 0/40 serial, 12.5% at conc4, 17.7% at
+conc8; direct-to-bridge with identical messages never collapsed.
+
+Fix (commit 16b5416, 2026-05-31): refcount-gated copy-on-write of the
+slide-divergent half `ownedPages[N..2N-1]` in `adoptSharedPrefixPages`
+(lm_engine.swift). Whole-page copy preserves the still-valid shared FULL K/V
+[8N..16N-1] while privatizing the slide rows the consumer is about to overwrite;
+a no-op when refcount==1 (producer already released); degrades to prior shared
+behavior on `allocFresh` pool-pressure failure rather than crashing. The
+partial-tail path was independently re-verified sound under the same fix (slide
+layers read the privatized `ownedPages[N]`; the partial-CoW's wrong slide
+content at `ownedPages[2N]` is dead-for-slide and its full K/V is correct).
+
+Also fixed in the same change: the `LM_KV_OVERWRITE_CHECK` detector
+(`hashSessionKVAtPosition`) was itself mis-indexing slide layers at
+`ownedPages[2*logSlide]` instead of the flat `ownedPages[logSlide]` — so the
+very detector meant to catch a shared-page overwrite was hashing the WRONG
+physical page and was BLIND to exactly this clobber. Corrected to the flat
+per-layer ordinal (slide pos/16, full pos/8); re-run `LM_KV_OVERWRITE_CHECK=1`
+as the regression guard for any future block_table sharing change. Validation:
+conc8 reproducer 17.7% → 1.0% (below the 1.6% no-sharing floor; the residual is
+baseline temp=1.0 sampling variance), slide-CoW fired on exactly [N..2N-1],
+ZERO `KV BYTES CHANGED` in the divergent range, 0 leaks/double-frees, sharing
+preserved. The geometry-vocabulary docs (SlidePairContents / PartialPagePair /
+promoteFinishedPages / the detector comments) were also corrected — the field
+name `slidePlusFullHead` is a historical misnomer carrying NO slide K/V; the
+slide-layer page for slide-page P is the separate `ownedPages[P]`.
+
 Cross-ref: `docs/kv_cache_correlation_finding.md` + `…_diagnosis.md` (the
 2026-05-08 flat-dict era), `radix_trie.swift` (current match index),
 `page_manager.swift`, `lm_engine.swift`, `ffi_batch.swift`.
