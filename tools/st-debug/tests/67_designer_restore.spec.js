@@ -103,10 +103,10 @@ test.describe('R-2: designer restore', () => {
             'src', /designer\.html/, { timeout: 5_000 });
         await openToolsPopover(page);
         await page.locator('.user-personas-tools-menuitem[data-surface-key="suggester"]').click();
-        await expect(page.locator('#user-personas-surface-suggester iframe')).toHaveAttribute(
+        await expect(page.locator('#user-suggester-button iframe')).toHaveAttribute(
             'src', /suggester\.html/, { timeout: 5_000 });
 
-        const sug = page.frameLocator('#user-personas-surface-suggester iframe');
+        const sug = page.frameLocator('#user-suggester-button iframe');
 
         // The suggester only renders rows when an active chat with content
         // is present. In an empty/fresh ST instance no rows render —
@@ -123,11 +123,11 @@ test.describe('R-2: designer restore', () => {
             const f = document.querySelector(frameId);
             try { return f && f.contentWindow && typeof f.contentWindow.openDesignerTab === 'function'; }
             catch { return false; }
-        }, { frameId: '#user-personas-surface-suggester iframe' }, { timeout: 10_000 });
+        }, { frameId: '#user-suggester-button iframe' }, { timeout: 10_000 });
         await page.evaluate(({ frameId, key }) => {
             const f = document.querySelector(frameId);
             f.contentWindow.openDesignerTab({ bio: key });
-        }, { frameId: '#user-personas-surface-suggester iframe', key: bioKey });
+        }, { frameId: '#user-suggester-button iframe', key: bioKey });
 
         // After openDesignerTab fires, the designer iframe's src should
         // carry ?bio=<bioKey>.
