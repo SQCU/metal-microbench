@@ -1230,6 +1230,57 @@ final class Session {
                       + "\(match.pages.count * PAGE_SLIDE) tokens; trie matched \(match.trieMatchLength))")
             }
         }
+        // ── Slide/full geometry copy-on-write (absorbing-state-collapse fix, 2026-06-01) ──
+        //
+        // ONE block_table per slot serves BOTH the full-attention layers
+        // (PAGE_FULL=8) and the sliding-window layers (PAGE_SLIDE=16). For a
+        // position P, full layers address ownedPages[P/8] and slide layers
+        // address ownedPages[P/16] — so physical page index k is aliased onto
+        // TWO different absolute position ranges: full positions [8k..8k+7]
+        // and slide positions [16k..16k+15].
+        //
+        // Aligned adoption of N slide-pairs (match.pages.count == N) incref-
+        // shares ownedPages[0..2N-1] (= the producer's full-pages 0..2N-1).
+        // For the FULL layers every one of those covers [8k..8k+7] ⊆ the shared
+        // prefix [0..16N-1] (k ≤ 2N-1), so read-only sharing is sound. But the
+        // SLIDE layers read/write ownedPages[k] for slide-page k = positions
+        // [16k..16k+15], and for k ∈ [N..2N-1] that is [16N..32N-1] — PAST the
+        // shared prefix, i.e. THIS session's own (divergent) generation region.
+        // Once the session generates past 16N it writes its divergent slide K/V
+        // into ownedPages[N..2N-1] — pages the producer (and any sibling adopter)
+        // still references read-only. That cross-session slide-K/V clobber is
+        // audit defect #8 firing on the serving path, and it surfaces as the
+        // off-manifold "multilingual token soup" absorbing-state collapse on the
+        // shareable-prefix suggester path.
+        //
+        // Fix: keep sharing the fully-safe half ownedPages[0..N-1]; copy-on-write
+        // the slide-divergent half ownedPages[N..2N-1] into private pages. The
+        // whole-page copy preserves the still-valid shared FULL K/V (positions
+        // [8N..16N-1]); the slide rows it also copies are this session's to
+        // overwrite during generation before it ever reads them. Refcount-gated:
+        // a no-op when the page is already this session's alone (refcount==1,
+        // e.g. the producer already released), since then there is no other
+        // reader to corrupt. allocFresh failure (pool pressure) degrades to the
+        // prior shared behavior rather than crashing.
+        let nAdopted = match.pages.count
+        if nAdopted > 0 {
+            var k = nAdopted
+            while k < 2 * nAdopted && k < ownedPages.count {
+                let phys = ownedPages[k]
+                if engine.pageManager.pageRefcount(phys) > 1 {
+                    if let fresh = try? engine.pageManager.allocFresh() {
+                        engine.copyPhysPageKV(srcPhys: phys, dstPhys: fresh)
+                        engine.pageManager.decref(physPage: phys)
+                        ownedPages[k] = fresh
+                        if dbg {
+                            print("  [cache] session \(id) slide-CoW idx \(k): \(phys)→\(fresh) "
+                                  + "(slide-divergent half [N..2N-1], full-K/V preserved)")
+                        }
+                    }
+                }
+                k += 1
+            }
+        }
         // Partial-pair adoption (Track B fold-in): if the trie returned
         // a partial extension past the aligned match, allocate FRESH
         // pages and CoW-copy the partial's K/V bytes onto them. The
@@ -1909,7 +1960,14 @@ final class LmEngine {
         for L in 0..<NUM_LAYERS {
             let lw = weights.layers[L]
             let pg = lw.isFull ? PAGE_FULL : PAGE_SLIDE
-            let physOwnedIdx = lw.isFull ? logFull : (2 * logSlide)
+            // Geometry fix (2026-06-01): the slide kernel addresses slide-page
+            // P at block_table[P] = ownedPages[P] (flat, PAGE_SLIDE=16), NOT
+            // ownedPages[2P]. The prior `2 * logSlide` hashed the WRONG physical
+            // page, so this LM_KV_OVERWRITE_CHECK detector was blind to exactly
+            // the shared-slide-page write that drives the absorbing-state
+            // collapse. Both layer types index the same flat block_table by
+            // their per-layer logical page ordinal (full: pos/8, slide: pos/16).
+            let physOwnedIdx = lw.isFull ? logFull : logSlide
             guard physOwnedIdx < s.ownedPages.count else { continue }
             let phys = s.ownedPages[physOwnedIdx]
             let chunkIdx = phys / weights.kvChunkPages
