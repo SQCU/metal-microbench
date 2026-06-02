@@ -626,10 +626,29 @@ let KV_NUM_CHUNKS = 4
 // Bumping from 8192 → 11776 gives us 43% more capacity for free
 // — no refactor, no risk. Worth taking now; the split refactor
 // becomes a "if we need >50% growth" trigger later.
-let SCRATCH_PAGE_BASE = 16000   // ~52 GB KV — sized for Q8_0 (27GB model) on 128GB box. Was 33000 (~108GB KV) for the 17GB Q4_K_M model; uniform-Q8_0 + 108GB KV exceeded physical RAM and triggered AR-step page faults (4s/tok). 16000 pages leaves ~85GB headroom for model + page cache + system.
+let SCRATCH_PAGE_BASE = 16000   // ~52 GB KV — sized for Q8_0 (27GB model) on 128GB box. Was 33000 (~108GB KV) for the 17GB Q4_K_M model; uniform-Q8_0 + 108GB KV exceeded physical RAM and triggered AR-step page faults (4s/tok). 16000 pages leaves ~85GB headroom for model + page cache + system. This is now the per-layer K/V buffer SIZE (the HARD geometry cap); the USABLE pool grows on demand up to a memory-budget-derived cap (≤ this), see KV_MEM_BUDGET_FRAC + LmEngine pool-cap computation.
 let REAL_PAGE_BASE = 0
 let PHYS_POOL_PAGES = SCRATCH_PAGE_BASE
 let TOTAL_PAGES = SCRATCH_PAGE_BASE + SCRATCH_STRIP
+
+// G2 dynamic-pool budget (2026-06 KV-retention decoupling). The per-layer K/V
+// device buffers are allocated at SCRATCH_PAGE_BASE pages (lazy-committed —
+// virtual address space, zero resident RAM until a page is first written by
+// zeroPhysPageKV). The PageManager's USABLE pool grows on demand, one page at
+// a time, up to a HARD CAP = min(SCRATCH_PAGE_BASE, budgetPages), where
+// budgetPages = floor((KV_MEM_BUDGET_FRAC · physicalMemory − model footprint)
+// / perPageBytes). This MUST NOT OOM the 128 GB box: the cap keeps resident KV
+// (which only grows with the actual working set, since pages commit lazily on
+// first write) below the budget even if every exposed page is touched.
+// Default 0.90 of system RAM. Override with env KV_MEM_BUDGET_FRAC.
+let KV_MEM_BUDGET_FRAC_DEFAULT = 0.90
+func kvMemBudgetFrac() -> Double {
+    if let s = ProcessInfo.processInfo.environment["KV_MEM_BUDGET_FRAC"],
+       let v = Double(s), v > 0, v <= 1.0 {
+        return v
+    }
+    return KV_MEM_BUDGET_FRAC_DEFAULT
+}
 
 // Admission-backpressure floor. submitRequest refuses to admit a new
 // session when fewer than this many pages are free in the pool. The

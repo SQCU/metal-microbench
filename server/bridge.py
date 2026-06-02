@@ -222,15 +222,19 @@ _DRIVER_POLL_DEADLINE_MS = 50  # 2026-05-23: bisected from 1000 — long deadlin
 _RESPONSE_Q_HIGH_WATER = 65536
 _DISCONNECT_POLL_INTERVAL_S = 0.25
 
-# 2026-05-23 (append-log refactor; 2026-05-24 retention-policy revision):
-# Completed-stream LRU cache. When the engine emits state==2 AND no wire
-# consumer is attached, the stream's log moves into this OrderedDict
-# (newest at the END). It stays there — addressable by reconnect — until
-# pushed out by NEWER completed streams crossing a resource budget. NO
-# WALLCLOCK TIMERS: eviction is bounded by RESOURCES (bytes + count),
-# not by elapsed time. This matches the operator's preference and is
-# easier to reason about under load (no "what time is it" coupling, no
-# timer firing while busy doing something else).
+# B5 — Bounded TRANSPORT replay buffer for completed streams. This is
+# NOT "engine warmth" or session retention — it is purely the tail of
+# the transport double-buffer: once the engine emits state==2 and no wire
+# consumer is attached, the stream's append-log moves into this
+# OrderedDict (newest at the END) so a reconnect can still replay its
+# bytes (GET /v1/streams/{id}/sse?since=N). The engine session itself is
+# already gone (it closed itself on natural termination); all that
+# remains here is the recorded byte stream, held only so a flaky client
+# can resume. It stays addressable until pushed out by NEWER completed
+# streams crossing a resource budget. NO WALLCLOCK TIMERS: eviction is
+# bounded by RESOURCES (bytes + count), not by elapsed time — easier to
+# reason about under load (no "what time is it" coupling, no timer firing
+# while busy doing something else).
 #
 # Two bounds, both checked on every new addition:
 #   - BRIDGE_MAX_RETAINED_BYTES (default 64MB) — bytes-budget across
@@ -503,27 +507,29 @@ async def _consume_engine_stream(stream_id: int, request: Request,
         # Always cancel the per-stream disconnect watcher we own. Idempotent.
         try: disc_task.cancel()
         except Exception: pass
-        # 2026-05-23 OPERATOR DIRECTIVE: client disconnects no longer
-        # cancel the engine session. Rationale: "session should continue
-        # even if disconnected 20 times a second as long as the api
-        # server is there on the other side." The engine keeps prefilling
-        # and generating; the prefix cache populates fully — next
-        # identical request hits warm.
+        # B5 — BRIDGE = TRANSPORT DOUBLE-BUFFER. The TCP socket is PURELY
+        # a transport for the append-log: connect/disconnect/reconnect/
+        # streaming/replay are reads over `_stream_logs[stream_id]`. The
+        # bridge NEVER submits action=2/closeSession and NEVER retains or
+        # frees engine resources based on a socket signal. A disconnected-
+        # but-running generation keeps writing to the log; a subsequent
+        # reconnect (GET /v1/streams/{id}/sse?since=N) replays it in full.
         #
-        # 2026-05-23 APPEND-LOG REFACTOR: the per-stream log captures
-        # everything the engine emits. On clean_close we mark the log
-        # for retention so a reconnect within the retention window can
-        # still replay. On disconnect, the background drain task just
-        # monitors for state==2 and triggers retention; it does NOT
-        # have to "preserve the queue" any more — the log captures
-        # everything regardless of consumer presence.
+        # Resource pressure is handled by ADMISSION CONTROL, not socket
+        # teardown: the engine refuses new sessions when its residency cap
+        # is hit (surfaced as HTTP 503 admission backpressure), and the
+        # engine's own forward-progress reaper (lm_engine
+        # expireStalledSessions) closes a genuinely-wedged session. A
+        # client that is truly DONE with a running generation must say so
+        # explicitly via POST /v1/streams/{id}/cancel — the only bridge
+        # path that submits action=2.
         #
-        # Default behavior: cancel engine work when the HTTP client goes
-        # away. Long harness runs can otherwise leave abandoned non-stream
-        # completions burning AR indefinitely after their Node child has
-        # exited. Set BRIDGE_CANCEL_ON_DISCONNECT=0 only for explicit SSE
-        # reconnect experiments that need orphan streams to continue.
-        import os as _os
+        # APPEND-LOG: the per-stream log captures everything the engine
+        # emits regardless of consumer presence. On clean_close we add the
+        # log to the bounded transport replay buffer so a reconnect can
+        # still replay it. On disconnect with the engine still running, the
+        # background drain task just watches for state==2 and then moves
+        # the log into that buffer; it does NOT cancel anything.
         if clean_close:
             # Natural completion: caller observed state==2. Move into
             # the completed-idle LRU so a reconnect can still replay
@@ -552,22 +558,12 @@ async def _consume_engine_stream(stream_id: int, request: Request,
                       f"log_len={len(log)}); session continues — log "
                       f"keeps appending for any reconnect",
                       flush=True)
-            if _os.environ.get("BRIDGE_CANCEL_ON_DISCONNECT", "1") != "0":
-                try:
-                    g.submit([g.StreamSpec(stream_id=stream_id, action=2)])
-                    print(f"[bridge] BRIDGE_CANCEL_ON_DISCONNECT: "
-                          f"cancel submitted (stream_id={stream_id})",
-                          flush=True)
-                except Exception as e:
-                    print(f"[bridge] cancel-on-disconnect submit failed "
-                          f"(stream_id={stream_id}): {e}", flush=True)
-                # Pop everything immediately in legacy-cancel mode.
-                _release_stream_log(stream_id)
-            else:
-                # The log keeps appending regardless. Spawn (or refresh)
-                # the background-drain monitor so we trigger retention
-                # when the engine emits state==2 naturally.
-                _spawn_background_drain(stream_id)
+            # Disconnect is a transport event only — the engine session is
+            # never cancelled or freed here. The log keeps appending; spawn
+            # (or refresh) the background-drain monitor so the log moves
+            # into the bounded transport replay buffer once the engine
+            # emits state==2 naturally.
+            _spawn_background_drain(stream_id)
         # Release the single-consumer slot if we held it (the initial
         # POST does not claim it; the reconnect handler does).
         _active_consumer_token.pop(stream_id, None)
@@ -653,8 +649,8 @@ def _mark_stream_completed_for_eviction(stream_id: int) -> None:
         # the disconnect handler will call us again.
         return
     if stream_id not in _stream_logs:
-        # Log already freed (e.g. legacy BRIDGE_CANCEL_ON_DISCONNECT=1
-        # path); nothing to track.
+        # Log already freed (LRU eviction, or an explicit
+        # POST /v1/streams/{id}/cancel); nothing to track.
         return
     # Move-to-end if already present; otherwise append.
     _completed_stream_lru.pop(stream_id, None)
@@ -663,15 +659,257 @@ def _mark_stream_completed_for_eviction(stream_id: int) -> None:
 
 
 def _release_stream_log(stream_id: int) -> None:
-    """Pop ALL per-stream state. Called by the LRU evictor and from
-    legacy BRIDGE_CANCEL_ON_DISCONNECT=1 mode where the log is freed
-    immediately on disconnect."""
+    """Pop ALL per-stream transport state. Called by the LRU evictor
+    (bounded transport replay buffer overflow) and by an explicit
+    POST /v1/streams/{id}/cancel. NEVER called on a bare socket
+    disconnect — disconnect is a transport event only."""
     _stream_logs.pop(stream_id, None)
     _response_qs.pop(stream_id, None)
     _drop_counts.pop(stream_id, None)
     _stream_rate_samples.pop(stream_id, None)
     _completed_stream_lru.pop(stream_id, None)
     _active_consumer_token.pop(stream_id, None)
+
+
+# ----------------------------------------------------------------------
+# ADMISSION-PRESSURE-CANCEL (2026-06, KV-retention/connection-decoupling).
+#
+# The contract: under page pressure with NO free/evictable pages, the
+# engine refuses a new session (admission backpressure). Rather than
+# bouncing the caller with a bare 503 while zombie generations (running
+# but with no wire consumer — a disconnected client whose engine session
+# the B5 transport-double-buffer kept alive) squat KV pages, the bridge
+# SHEDS the lowest-value such generation: a WHOLE generation killed +
+# freed via the existing /cancel action=2 path (kill+free, NEVER pause).
+#
+# Why kill, never pause: re-prefill is NOT bit-exact (lm_engine qLen/tile
+# reduction-order dependent), so pausing-and-reprefilling a live generation
+# would change its output bytes. Killing is bit-exact-safe — the partial
+# output already produced stays addressable in the transport append-log,
+# so a reconnect (GET /v1/streams/{id}/sse?since=N) still replays every
+# byte the engine emitted before the kill, and the client can resume from
+# there via continue_final_message.
+#
+# VALUE / ELIGIBILITY (bridge-side proxy for the engine's decayed-citation
+# value function): the bridge cannot see per-page citation scores, but it
+# CAN see which generations have an active wire consumer. The eligible set
+# is generations that are:
+#   - LIVE in the engine (engine_state reports them with pages_owned > 0
+#     and state != "done"), AND
+#   - have NO active wire consumer (stream_id not in _active_consumer_token)
+#       — i.e. the socket dropped and B5 kept the engine session alive.
+# These are exactly the "no-active-consumer" generations the spec targets.
+# A generation with a live wire consumer is NEVER shed (a watching client's
+# working set is protected). Among the eligible set we pick the LOWEST
+# value: the engine-reported decayed-citation score if it surfaces one
+# (`value` / `decayed_citation` field on the active_streams entry), else
+# the least-recently-active generation (oldest bridge rate-sample
+# timestamp), with most-pages-owned as the final tiebreak (free the most
+# under one kill). expireStalledSessions (engine forward-progress KILL)
+# remains the independent backstop for genuinely-wedged sessions.
+# ----------------------------------------------------------------------
+def _shed_lowest_value_generation() -> int | None:
+    """Kill+free the single lowest-value no-active-consumer generation.
+
+    Returns the stream_id that was shed, or None if there was no eligible
+    victim (every live generation has an attached wire consumer, or the
+    engine reports no live generations). Synchronous: reads engine_state,
+    submits action=2, releases the bridge log. Safe to call from a handler
+    coroutine (engine_state + submit are thread-safe FFI calls).
+    """
+    try:
+        snap = g.engine_state()
+    except Exception as e:
+        print(f"[bridge] admission-pressure-cancel: engine_state() failed "
+              f"({e}); cannot pick a victim", flush=True)
+        return None
+    live = snap.get("active_streams") or []
+    candidates: list[tuple[float, int, int]] = []  # (value_key, -pages, sid)
+    now = time.monotonic()
+    for entry in live:
+        try:
+            sid = int(entry.get("stream_id"))
+        except (TypeError, ValueError):
+            continue
+        state = entry.get("state")
+        pages = int(entry.get("pages_owned", 0) or 0)
+        # Only consider generations actually holding pages and not done.
+        if state == "done" or pages <= 0:
+            continue
+        # ELIGIBILITY: no active wire consumer = sheddable. A watched
+        # generation's working set is protected (never shed live-watched
+        # pages; over-subscription of watched work is the engine's
+        # admission-cap problem, not ours to kill).
+        if sid in _active_consumer_token:
+            continue
+        # VALUE: prefer an engine-reported decayed-citation score if the
+        # engine surfaces one; lower = shed first. Fall back to recency
+        # (least-recently-active bridge rate sample), then to a 0 floor.
+        val = entry.get("decayed_citation",
+                        entry.get("value"))
+        if val is not None:
+            try:
+                value_key = float(val)
+            except (TypeError, ValueError):
+                value_key = _last_activity_age(sid, now)
+        else:
+            value_key = _last_activity_age(sid, now)
+        candidates.append((value_key, -pages, sid))
+    if not candidates:
+        return None
+    # MIN value (engine path) / for recency-age fallback the key is an
+    # AGE (older = larger), so the engine-value path picks min-citation
+    # while the recency fallback would want max-age. Normalize: if every
+    # candidate used the recency fallback (no engine value present), pick
+    # the OLDEST (max age). Detect by whether any engine value was seen.
+    any_engine_value = any(
+        (e.get("decayed_citation", e.get("value")) is not None)
+        for e in live
+        if str(e.get("stream_id")) and _safe_int(e.get("stream_id")) is not None
+    )
+    if any_engine_value:
+        # Lowest decayed-citation first; -pages tiebreak frees the most.
+        victim = min(candidates, key=lambda c: (c[0], c[1]))[2]
+    else:
+        # Recency fallback: oldest (largest age) first; -pages tiebreak.
+        victim = max(candidates, key=lambda c: (c[0], -c[1]))[2]
+    print(f"[bridge] admission-pressure-cancel: shedding lowest-value "
+          f"no-consumer generation sid={victim} "
+          f"(candidates={[(c[2], round(c[0], 3), -c[1]) for c in candidates]}); "
+          f"kill+free via action=2 (partial output remains in transport log)",
+          flush=True)
+    try:
+        g.submit([g.StreamSpec(stream_id=victim, action=2)])
+    except Exception as e:
+        print(f"[bridge] admission-pressure-cancel: action=2 submit for "
+              f"sid={victim} failed ({e})", flush=True)
+        return None
+    _release_stream_log(victim)
+    return victim
+
+
+def _safe_int(v) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _last_activity_age(sid: int, now: float) -> float:
+    """Age (seconds) since the bridge last observed an update for `sid`.
+    Larger = staler. Streams with no samples are treated as maximally
+    stale (float('inf')) so a never-progressing zombie sheds first."""
+    samples = _stream_rate_samples.get(sid)
+    if not samples:
+        return float("inf")
+    return now - samples[-1][0]
+
+
+# Bound on how many shed-and-retry rounds a single admission-pressure
+# spike triggers before the caller is told to back off (503). Each round
+# sheds exactly one no-active-consumer generation, so the worst case is
+# this many whole generations killed to admit one new request. Small by
+# design — if pressure persists past a few sheds the right answer is to
+# tell the caller to retry later, not to kill the whole pool.
+_ADMISSION_SHED_MAX_ROUNDS = int(
+    os.environ.get("BRIDGE_ADMISSION_SHED_MAX_ROUNDS", "3"))
+# How long to wait for the engine's first update on a freshly-submitted
+# stream when probing for an admission-backpressure terminal. The engine
+# emits the synthetic backpressure terminal on the very next poll tick,
+# so this only needs to cover one driver poll deadline plus slack. If no
+# update arrives in this window the request was admitted (the engine is
+# busy prefilling) and we hand off to the normal consumer untouched.
+_ADMISSION_PROBE_TIMEOUT_S = float(
+    os.environ.get("BRIDGE_ADMISSION_PROBE_TIMEOUT_S", "0.5"))
+
+
+def _head_is_admission_backpressure(stream_id: int) -> bool:
+    """True iff the FIRST logged update for `stream_id` is a terminal
+    admission-backpressure rejection. Peek-only — does NOT advance any
+    consumer cursor (the downstream consume loop still starts at offset 0
+    on the non-backpressure path)."""
+    log = _stream_logs.get(stream_id)
+    if not log:
+        return False
+    head = log[0]
+    return (head.state == 2 and head.done_reason == 3
+            and (head.err_msg or "").startswith("admission backpressure"))
+
+
+async def _resubmit_after_shed_if_backpressure(
+        stream_id: int, spec: "g.StreamSpec",
+        response_q: "asyncio.Queue") -> int:
+    """Probe a freshly-submitted stream for an admission-backpressure
+    terminal; if found, shed the lowest-value no-active-consumer
+    generation and re-submit, up to _ADMISSION_SHED_MAX_ROUNDS times.
+
+    Returns the stream_id the downstream consumer should iterate. On the
+    happy path (request admitted, or no shed needed) this is the original
+    stream_id, untouched, with its log still at offset 0 for the consumer.
+
+    Each retry round, on a confirmed backpressure terminal:
+      1. release the rejected stream's bridge log (it carries only the
+         synthetic terminal — nothing a client wants to replay),
+      2. shed one zombie generation (kill+free via action=2),
+      3. allocate a FRESH stream_id + log + queue and re-submit the same
+         spec, then probe again.
+
+    If shedding finds no eligible victim, or we exhaust the round budget,
+    the most-recent (still-backpressured) stream_id is returned so the
+    normal consumer surfaces the backpressure terminal as HTTP 503 / SSE
+    error — preserving the existing client-visible contract.
+    """
+    cur_sid = stream_id
+    cur_q = response_q
+    for _round in range(_ADMISSION_SHED_MAX_ROUNDS):
+        # Wait briefly for the first update (or none if admitted+busy).
+        try:
+            await asyncio.wait_for(cur_q.get(), timeout=_ADMISSION_PROBE_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            # No update yet → admitted; engine is prefilling. Hand off.
+            return cur_sid
+        if not _head_is_admission_backpressure(cur_sid):
+            # First update is real progress (or a non-backpressure
+            # terminal). Hand off to the normal consumer; its cursor
+            # starts at offset 0 and re-reads the log including this
+            # update (we only drained the notification sentinel, not the
+            # payload, which lives in _stream_logs).
+            return cur_sid
+        # Confirmed backpressure. Shed a zombie and re-submit.
+        victim = _shed_lowest_value_generation()
+        if victim is None:
+            print(f"[bridge] admission-pressure-cancel: no sheddable "
+                  f"no-consumer generation for backpressured sid={cur_sid}; "
+                  f"surfacing backpressure to caller", flush=True)
+            return cur_sid
+        # Drop the rejected stream's log (only the synthetic terminal).
+        _release_stream_log(cur_sid)
+        # Fresh stream for the retry.
+        cur_sid = await _next_stream_id_alloc()
+        _stream_logs[cur_sid] = []
+        cur_q = asyncio.Queue(maxsize=64)
+        _response_qs[cur_sid] = cur_q
+        retry_spec = g.StreamSpec(
+            stream_id=cur_sid, action=spec.action, flags=spec.flags,
+            segments=spec.segments, sampling=spec.sampling,
+            tokens=spec.tokens, control_vectors=spec.control_vectors)
+        print(f"[bridge] admission-pressure-cancel: re-submitting as fresh "
+              f"sid={cur_sid} after shedding sid={victim} "
+              f"(round {_round + 1}/{_ADMISSION_SHED_MAX_ROUNDS})", flush=True)
+        try:
+            rc = g.submit([retry_spec])
+        except Exception as e:
+            _release_stream_log(cur_sid)
+            print(f"[bridge] admission-pressure-cancel: retry submit failed "
+                  f"({e})", flush=True)
+            return cur_sid
+        if rc != 0:
+            print(f"[bridge] admission-pressure-cancel: retry submit rc={rc}",
+                  flush=True)
+            return cur_sid
+    # Round budget exhausted; return the last (backpressured) stream so the
+    # caller surfaces 503/SSE-error per the existing contract.
+    return cur_sid
 
 
 async def _drain_until_engine_done(stream_id: int) -> None:
@@ -1505,13 +1743,42 @@ def engine_state() -> JSONResponse:
 @app.get("/health")
 def health() -> JSONResponse:
     s = g.status()
+    # KV-cache page telemetry (2026-06, KV-retention/connection-decoupling
+    # acceptance). test_kv_no_connection_pinning + test_kv_eviction_guarantees
+    # read these directly off /health:
+    #   - total_pages : pool capacity (grows under G2 dynamic-pool demand);
+    #       the eviction tests derive pinned = total - free - cached.
+    #   - free_pages / cached_pages : pool occupancy split.
+    #   - resident_sessions : the residency gauge (sessions holding KV pages).
+    #       T2 of the pinning leak detector asserts this stays BOUNDED, not
+    #       climbing toward MAX_RESIDENT_SESSIONS with the connection count.
+    #       Aliased as resident_count for the test's field-name tolerance.
+    #   - cache_hits : engine-wide monotonic prefix-adoption tally
+    #       (cross-session; the per-request usage block carries the
+    #       per-completion figure the G1/G3/G4/G5 assertions key on).
     return JSONResponse({
         "status": "ready",
         "model": MODEL_NAME,
         "multimodal": g.vision_is_ready(),
         "active_streams": s.active_streams,
+        "total_pages": s.total_pages,
+        # G2 dynamic-pool growth observable (2026-06): total_pages is the
+        # CONSTANT budget cap (so the pinned derivation total-free-cached
+        # stays correct); committed_pages is the high-water of pages the pool
+        # has actually exposed, which RISES under demand. G2 asserts growth on
+        # committed_pages. pool_capacity_pages == total_pages, surfaced for
+        # explicitness.
+        "committed_pages": s.committed_pages,
+        "pool_capacity_pages": s.pool_capacity_pages,
         "cached_pages": s.cached_pages,
         "free_pages": s.free_pages,
+        # pinned = refcount>0 pages = total - free - cached. Surfaced
+        # pre-computed so the leak detector doesn't have to re-derive it
+        # (it still does, for field-name tolerance, but this is canonical).
+        "pinned_pages": max(0, s.total_pages - s.free_pages - s.cached_pages),
+        "resident_sessions": s.resident_sessions,
+        "resident_count": s.resident_sessions,
+        "cache_hits": s.cache_hits,
         "vision_cache_entries": s.vision_cache_entries,
         "vision_cache_hits": s.vision_cache_hits,
         "total_steps": s.total_steps,
@@ -1926,6 +2193,18 @@ async def chat_completions(req: Request) -> Any:
     # see if SSE consumers ever start iterating after submit.
     print(f"[bridge DEBUG] submitted stream_id={stream_id} rc={rc} stream={stream}",
           flush=True)
+
+    # ADMISSION-PRESSURE-CANCEL (2026-06): the engine refuses a new session
+    # under page pressure by emitting a synthetic terminal update
+    # (done_reason=3, errMsg "admission backpressure: ..."). When that
+    # happens AND there is a sheddable no-active-consumer generation
+    # squatting KV pages, the bridge kills+frees the lowest-value such
+    # generation (whole, via action=2 — never pause) and RE-SUBMITS this
+    # request once. This converts a transient pressure spike into a clean
+    # retry instead of a bounced 503 while a disconnected zombie holds
+    # pages. The number of relief rounds is bounded so we never spin.
+    stream_id = await _resubmit_after_shed_if_backpressure(
+        stream_id, spec, response_q)
 
     if not stream:
         # Aggregate (non-streaming) path. Iterates the shared consumer
@@ -2402,13 +2681,14 @@ async def chat_completions(req: Request) -> Any:
 async def stream_cancel(stream_id: int) -> JSONResponse:
     """Explicitly RELEASE an in-flight engine session.
 
-    The engine's default policy is "the session continues after the HTTP client
-    disconnects" (so a flaky/reconnecting client doesn't lose its generation —
-    see the disconnect path's BRIDGE_CANCEL_ON_DISCONNECT comment). The
-    corollary is that a client which is genuinely DONE — or a test harness that
-    wants the engine to stop NOW rather than run to max_tokens with no consumer
-    — must say so explicitly instead of relying on socket teardown. This is
-    that signal.
+    The bridge treats the TCP socket as pure transport (B5): a session
+    continues after the HTTP client disconnects so a flaky/reconnecting
+    client doesn't lose its generation — disconnect NEVER cancels engine
+    work. The corollary is that a client which is genuinely DONE — or a
+    test harness that wants the engine to stop NOW rather than run to
+    max_tokens with no consumer — must say so explicitly instead of
+    relying on socket teardown. This endpoint is that one explicit signal:
+    the ONLY bridge path that submits action=2/closeSession.
 
     Submits the engine cancel opcode (action=2 → closeSession → frees the slot
     + KV pages within one poll tick) and drops the bridge-side stream log. The

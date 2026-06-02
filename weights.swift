@@ -179,6 +179,19 @@ extension LmWeights {
         bufs.append(contentsOf: V_chunks_argbuf)
         return bufs
     }
+
+    /// G2 (2026-06): resident footprint of the static model weights in bytes
+    /// — the sum of every static weight buffer's length (embeddings, per-layer
+    /// projections/norms/router, argument buffers). EXCLUDES the lazy-committed
+    /// K/V chunk pool (that is the budget being sized) and the vision tower
+    /// (allocated separately, small relative to the LM). Used by LmEngine to
+    /// reserve the model's RAM before handing the rest of KV_MEM_BUDGET_FRAC ·
+    /// physicalMemory to the dynamic KV pool, so growth cannot OOM the box.
+    func staticResidentBytesEstimate() -> Int {
+        var total = 0
+        for b in allWeightBuffers { total += b.length }
+        return total
+    }
 }
 
 func installWeightResidencySet(_ w: LmWeights) {

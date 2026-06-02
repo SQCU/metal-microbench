@@ -186,7 +186,7 @@ class TokenLogprob:
 class StreamUpdate:
     stream_id: int
     state: int                         # 0=priming, 1=generating, 2=done, 3=error
-    done_reason: int                   # 0=n/a, 1=eos, 2=max_tokens, 3=cancelled, 4=error
+    done_reason: int                   # 0=n/a, 1=eos, 2=max_tokens, 3=cancelled/error, 4=admission-pressure shed
     new_tokens: list[int]
     err_msg: str
     prompt_tokens_seen: int
@@ -224,6 +224,26 @@ class ServerStats:
     total_tokens_emitted: int
     vision_cache_entries: int
     vision_cache_hits: int
+    # 2026-06 (KV-retention/connection-decoupling acceptance): the two
+    # formerly-reserved trailing u32 of the fixed 64-byte ServerStats ABI.
+    #   resident_sessions  — engine.residentSessions.count (the residency
+    #                        gauge the connection-pinning leak detector T2
+    #                        asserts stays bounded; distinct from
+    #                        active_streams = live bound streams).
+    #   cache_hits         — engine.totalCacheHitTokens low32, the
+    #                        monotonic cross-session prefix-adoption tally
+    #                        surfaced as /health aggregate cache_hits.
+    resident_sessions: int = 0
+    cache_hits: int = 0
+    # 2026-06 (G2 dynamic-pool growth observable): the ABI grew 64 -> 72 to
+    # add two more u32.
+    #   committed_pages    — high-water of pages ever EXPOSED by the dynamic
+    #                        pool (committedHighWater). RISES under demand;
+    #                        G2 asserts this grows (total_pages is the constant
+    #                        budget cap, so it can't be the growth observable).
+    #   pool_capacity_pages — budget-derived hard cap == total_pages.
+    committed_pages: int = 0
+    pool_capacity_pages: int = 0
 
 
 # ----------------------------------------------------------------------
@@ -720,16 +740,23 @@ def engine_state() -> dict:
 
 
 def status() -> ServerStats:
-    out = (C.c_uint8 * 64)()
-    n = _lib.gemma_status(out, 64)
-    if n != 64:
+    out = (C.c_uint8 * 72)()
+    n = _lib.gemma_status(out, 72)
+    if n != 72:
         raise RuntimeError(f"gemma_status returned {n}")
     raw = bytes(out[:n])
-    (tp, fp, cp, act, gen, prim, ts, tok, ve, _pad, vh) = struct.unpack_from(
-        "<IIIIIIQQIIQ", raw, 0)
+    # Trailing four u32 populate what was the 8-byte reserved tail PLUS the
+    # 2026-06 G2 growth observable: resident_sessions, cache_hits (low32),
+    # committed_pages (growth high-water), pool_capacity_pages (budget cap).
+    # ABI grew 64 -> 72 bytes; the bridge is the sole consumer.
+    (tp, fp, cp, act, gen, prim, ts, tok, ve, _pad, vh,
+     resident, chits, committed, poolcap) = struct.unpack_from(
+        "<IIIIIIQQIIQIIII", raw, 0)
     return ServerStats(
         total_pages=tp, free_pages=fp, cached_pages=cp,
         active_streams=act, generating_streams=gen, priming_streams=prim,
         total_steps=ts, total_tokens_emitted=tok,
         vision_cache_entries=ve, vision_cache_hits=vh,
+        resident_sessions=resident, cache_hits=chits,
+        committed_pages=committed, pool_capacity_pages=poolcap,
     )

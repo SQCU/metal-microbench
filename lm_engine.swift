@@ -1118,6 +1118,11 @@ final class Session {
             // instead and let prepareARStep run a 1-token recover tick.
             position = adoptedTokens
             cacheHitTokens &+= UInt32(adoptedTokens)
+            // Engine-wide monotonic adoption tally (survives closeSession,
+            // unlike per-session cacheHitTokens). Surfaced as /health
+            // aggregate cache_hits. Counted ONCE here at the distinct-
+            // adopter site — never per-AR-step — so it cannot inflate.
+            eng.recordCacheHitTokens(adoptedTokens)
         }
         // Track B: mark prompt-end at the *final* prompt position
         // (after all submits). We update this on every submit so it
@@ -1213,11 +1218,19 @@ final class Session {
             // new on this probe.
             return (0, 0)
         }
-        // Adopt the new full pairs.
+        // Adopt the new full pairs. KEEP the incref (the listing/refcount that
+        // closeSession's decref-all at teardown balances, and that keeps the
+        // page off the free list while this live generation references it).
+        // Each adopted member is a CITATION: this session is a distinct adopter
+        // of a shared prefix page, so its decayed-citation reuse-value goes up
+        // (rmapAdd(isCitation:true) -> pageManager.recordCitation). The reverse
+        // map records the (page -> this generation) ownership in lockstep.
         for i in beforeAdopted..<match.pages.count {
             let pair = match.pages[i]
             engine.pageManager.incref(physPage: pair.slidePlusFullHead)
             engine.pageManager.incref(physPage: pair.fullTail)
+            engine.rmapAdd(id, pair.slidePlusFullHead, isCitation: true)
+            engine.rmapAdd(id, pair.fullTail, isCitation: true)
             ownedPages.append(pair.slidePlusFullHead)
             ownedPages.append(pair.fullTail)
         }
@@ -1253,30 +1266,75 @@ final class Session {
         // off-manifold "multilingual token soup" absorbing-state collapse on the
         // shareable-prefix suggester path.
         //
-        // Fix: keep sharing the fully-safe half ownedPages[0..N-1]; copy-on-write
-        // the slide-divergent half ownedPages[N..2N-1] into private pages. The
-        // whole-page copy preserves the still-valid shared FULL K/V (positions
-        // [8N..16N-1]); the slide rows it also copies are this session's to
-        // overwrite during generation before it ever reads them. Refcount-gated:
-        // a no-op when the page is already this session's alone (refcount==1,
-        // e.g. the producer already released), since then there is no other
-        // reader to corrupt. allocFresh failure (pool pressure) degrades to the
-        // prior shared behavior rather than crashing.
+        // Fix (CoW BY CONSTRUCTION, 2026-06): keep sharing the fully-safe half
+        // ownedPages[0..N-1] read-only; ALWAYS copy-on-write the slide-divergent
+        // half ownedPages[N..2N-1] into private pages, UNCONDITIONALLY — the
+        // refcount>1 gate is RETIRED. Rationale: the old gate skipped the copy
+        // when pageRefcount==1, assuming "no other reader to corrupt." But under
+        // the decoupled eviction model the listing refcount is no longer a sound
+        // proxy for "no other reader": a producer may have decref'd (refcount
+        // dropping to 1 or 0) while its trie anchor STILL exposes the page for a
+        // future concurrent adopter, and two adopters racing both see refcount<=1
+        // and both skip CoW -> the audit #8 cross-session slide-K/V clobber /
+        // multilingual-token-soup collapse (kv_slide_full_geometry memory: a
+        // single clean run is untrustworthy; the gate was only ever
+        // probabilistically safe). Always-CoW makes divergent writes land in a
+        // page this session SOLELY owns by construction — soundness no longer
+        // depends on any count. The whole-page copy preserves the still-valid
+        // shared FULL K/V (positions [8N..16N-1]).
+        //
+        // ALLOC-FAIL HOLE CLOSED (the 16b5416 class): if allocFresh throws under
+        // pool pressure we must NOT fall back to sharing the page we are about to
+        // divergently write (the old `try?` degraded to that share-in-place). We
+        // ABANDON adoption of every not-yet-privatized slide-divergent page from
+        // k onward: decref + drop them from ownedPages, returning only the safe
+        // fully-shared aligned prefix [0..k-1] and the privatized pages already
+        // swapped. The session re-prefills the abandoned tail itself (its
+        // primingQueue still covers those positions). Never share a page about to
+        // be divergently written.
         let nAdopted = match.pages.count
         if nAdopted > 0 {
             var k = nAdopted
             while k < 2 * nAdopted && k < ownedPages.count {
                 let phys = ownedPages[k]
-                if engine.pageManager.pageRefcount(phys) > 1 {
-                    if let fresh = try? engine.pageManager.allocFresh() {
-                        engine.copyPhysPageKV(srcPhys: phys, dstPhys: fresh)
-                        engine.pageManager.decref(physPage: phys)
-                        ownedPages[k] = fresh
-                        if dbg {
-                            print("  [cache] session \(id) slide-CoW idx \(k): \(phys)→\(fresh) "
-                                  + "(slide-divergent half [N..2N-1], full-K/V preserved)")
-                        }
+                guard let fresh = try? engine.pageManager.allocFresh() else {
+                    // Alloc failed: abandon the un-privatized slide-divergent
+                    // tail [k..2N-1] rather than share-in-place. Decref +
+                    // remove from ownedPages and the reverse map so the
+                    // session owns nothing it would divergently clobber.
+                    let dropFrom = k
+                    let dropTo = min(2 * nAdopted, ownedPages.count)
+                    for j in (dropFrom..<dropTo).reversed() {
+                        let drop = ownedPages[j]
+                        engine.rmapRemove(id, drop)
+                        engine.pageManager.decref(physPage: drop)
+                        ownedPages.remove(at: j)
                     }
+                    // Aligned-adopted count shrinks to what BOTH layer types
+                    // still cover. Full layers read ownedPages[pos/PAGE_FULL]:
+                    // the kept first `dropFrom` entries cover full positions
+                    // [0, PAGE_FULL·dropFrom) — the binding constraint (≤ the
+                    // 16N slide-shared prefix since dropFrom ≤ 2N). Round DOWN
+                    // to a whole slide-page boundary (the caller advances
+                    // position by this and expects PAGE_SLIDE multiples):
+                    // floor(PAGE_FULL·dropFrom / PAGE_SLIDE) = dropFrom/2 pairs.
+                    let safePairs = dropFrom / 2
+                    myPromotedSlidePairCount = safePairs
+                    let safeAligned = safePairs * PAGE_SLIDE
+                    if dbg {
+                        print("  [cache] session \(id) slide-CoW alloc-fail at idx \(k): "
+                              + "abandoned divergent tail [\(dropFrom)..\(dropTo)) "
+                              + "(no share-in-place); safe aligned=\(safeAligned)")
+                    }
+                    return (safeAligned, safeAligned)
+                }
+                engine.copyPhysPageKV(srcPhys: phys, dstPhys: fresh)
+                engine.rmapSwap(id, from: phys, to: fresh)
+                engine.pageManager.decref(physPage: phys)
+                ownedPages[k] = fresh
+                if dbg {
+                    print("  [cache] session \(id) slide-CoW idx \(k): \(phys)->\(fresh) "
+                          + "(slide-divergent half [N..2N-1], full-K/V preserved, always-CoW)")
                 }
                 k += 1
             }
@@ -1328,11 +1386,15 @@ final class Session {
             }
             // Whole-page copy; rows past validUpTo are producer-written-but-
             // soon-overwritten or zero. Producer keeps its pages (still
-            // adoptable via the trie anchor); we do not decref them.
+            // adoptable via the trie anchor); we do not decref them. The fresh
+            // pages are this session's OWN private pages (CoW by construction),
+            // not citations — record listing-only in the reverse map.
             engine.copyPhysPageKV(srcPhys: pp.slidePlusFullHead, dstPhys: freshHead)
             if let ft = pp.fullTail {
                 engine.copyPhysPageKV(srcPhys: ft, dstPhys: freshTail)
             }
+            engine.rmapAdd(id, freshHead, isCitation: false)
+            engine.rmapAdd(id, freshTail, isCitation: false)
             ownedPages.append(freshHead)
             ownedPages.append(freshTail)
             newPartialAdopted = pp.validUpTo
@@ -1807,10 +1869,79 @@ final class LmEngine {
     // `byCvecAnchorTagPartial` maps replace it entirely).
     let prefixTrie: RadixTrie
 
+    // ── G2/G4 reverse map: phys page -> owning generations (2026-06) ──────
+    // The PageManager is anonymous (it knows only refcounts + content hashes),
+    // but the engine must answer "which generations list this page?" for three
+    // things the decoupling design requires: (1) CITATION accounting — a
+    // distinct adopter (a new generation adopting a page via findLongestPrefix)
+    // increments the page's decayed-citation reuse-value exactly once; (2)
+    // ADMISSION-PRESSURE-CANCEL — under page pressure with no free/evictable
+    // pages, shed the lowest-decayed-citation / no-consumer generation; (3) a
+    // page_lifecycle BALANCE CHECK — every ownedPages mutation (adopt-incref,
+    // allocFresh-append, partial/slide CoW swap, teardown decref) updates this
+    // map in lockstep, so a divergence flags a leak/double-free.
+    //
+    // This is NOT a retention pin — it imposes no eviction veto. Eviction
+    // eligibility is governed solely by the PageManager free list (a page a
+    // live wants-slot session lists has refcount>0 and is structurally absent
+    // from the free stacks). The reverse map is pure bookkeeping/telemetry on
+    // top of the refcount that already tracks the same listing.
+    private var pageOwners: [Int: Set<Int>] = [:]
+    // Per-session covered range high-water (logical pages listed), for the
+    // balance check + admission-cancel value ranking. Keyed by session id.
+    private var sessionListedPageCount: [Int: Int] = [:]
+
+    // Record that session `sid` now lists phys `phys`. `isCitation` is true
+    // only for shared-prefix adoption (a distinct adopter) — fresh allocations
+    // a session makes for its OWN divergent tail are not citations (the page
+    // had no prior content worth crediting). Idempotent per (sid,phys): a
+    // second add for the same pair does NOT re-cite.
+    fileprivate func rmapAdd(_ sid: Int, _ phys: Int, isCitation: Bool) {
+        let inserted = pageOwners[phys, default: []].insert(sid).inserted
+        if inserted {
+            sessionListedPageCount[sid, default: 0] += 1
+            if isCitation { pageManager.recordCitation(physPage: phys) }
+        }
+    }
+    // Record that session `sid` no longer lists phys `phys`.
+    fileprivate func rmapRemove(_ sid: Int, _ phys: Int) {
+        guard var owners = pageOwners[phys] else { return }
+        if owners.remove(sid) != nil {
+            if let c = sessionListedPageCount[sid], c > 0 {
+                sessionListedPageCount[sid] = c - 1
+            }
+        }
+        if owners.isEmpty { pageOwners.removeValue(forKey: phys) }
+        else { pageOwners[phys] = owners }
+    }
+    // Swap session `sid`'s listing of `oldPhys` to `newPhys` (CoW privatize):
+    // the session stops listing the shared source and starts listing its fresh
+    // private page. Not a citation (the fresh page is the session's own).
+    fileprivate func rmapSwap(_ sid: Int, from oldPhys: Int, to newPhys: Int) {
+        rmapRemove(sid, oldPhys)
+        rmapAdd(sid, newPhys, isCitation: false)
+    }
+    // Drop every listing for a finished session (teardown). Returns the phys
+    // pages it listed (for the balance check vs ownedPages.count).
+    fileprivate func rmapDropSession(_ sid: Int, ownedPages: [Int]) {
+        for phys in ownedPages { rmapRemove(sid, phys) }
+        sessionListedPageCount.removeValue(forKey: sid)
+    }
+
     // Instrumentation — helps the scheduler-behaviour tests measure how
     // well we're batching. One CB per step regardless of active count.
     private(set) var totalSteps: Int = 0
     private(set) var totalTokensGenerated: Int = 0
+    // Cumulative prefix-adoption tokens across ALL sessions (incl. closed
+    // ones). Per-session `cacheHitTokens` is reset/lost on closeSession;
+    // this monotonic engine-wide tally is what /health surfaces as the
+    // aggregate `cache_hits` counter so KV-eviction tests (G1/G3/G4/G5)
+    // and the connection-pinning leak detector can observe adoption
+    // activity engine-wide, not just on the most-recent request's usage
+    // block. Incremented at the single adoption site (adoptSharedPrefixPages
+    // result fold-in) so it never double-counts per-AR-step self-rereads.
+    private(set) var totalCacheHitTokens: UInt64 = 0
+    func recordCacheHitTokens(_ n: Int) { totalCacheHitTokens &+= UInt64(n) }
 
     // (lockYielder + waitYielded removed Phase 4 — see notes/engine_debloat.md.
     // The wait they used to wrap doesn't exist on the hot path anymore.
@@ -1844,8 +1975,38 @@ final class LmEngine {
         self.weights = weights
         self.tokenizer = GemmaBpe(weights: weights)
         // 2026-05-07 (M:K): slotAssignment removed. Picker assigns kpos per CB.
+        // ── G2 dynamic-pool budget cap (2026-06) ──────────────────────────
+        // Per-page resident KV bytes = Σ_layers pg · KV_H · HD · 2 (fp16) · 2
+        // (K and V), pg = PAGE_FULL(8) for full-attn layers, PAGE_SLIDE(16) for
+        // slide layers. Convert the memory budget into a page cap so the pool
+        // can grow on demand WITHOUT OOMing: even if every exposed page is
+        // eventually written (committed), resident KV stays under
+        // KV_MEM_BUDGET_FRAC · physicalMemory − model footprint. Clamp to
+        // SCRATCH_PAGE_BASE (the device buffers back no more than that).
+        var perPageBytes = 0
+        for L in 0..<NUM_LAYERS {
+            let lw = weights.layers[L]
+            let pg = lw.isFull ? PAGE_FULL : PAGE_SLIDE
+            perPageBytes += pg * lw.KV_H * lw.HD * 2 * 2   // ×2 fp16, ×2 K+V
+        }
+        let physMem = Double(ProcessInfo.processInfo.physicalMemory)
+        let modelBytes = Double(weights.staticResidentBytesEstimate())
+        let activationsReserve = 4.0 * 1024 * 1024 * 1024   // 4 GB headroom
+        let kvBudgetBytes = max(0.0,
+            kvMemBudgetFrac() * physMem - modelBytes - activationsReserve)
+        let budgetPages = perPageBytes > 0
+            ? Int(kvBudgetBytes / Double(perPageBytes))
+            : SCRATCH_PAGE_BASE
+        let poolCap = max(ADMISSION_FREE_PAGE_FLOOR,
+                          min(SCRATCH_PAGE_BASE, budgetPages))
+        print(String(format: "[engine] KV dynamic pool: perPage=%.2f MB, budgetFrac=%.2f, physMem=%.1f GB, model~%.1f GB -> cap=%d pages (geometry max %d, ~%.1f GB if fully committed)",
+                     Double(perPageBytes) / (1024*1024), kvMemBudgetFrac(),
+                     physMem / (1024*1024*1024), modelBytes / (1024*1024*1024),
+                     poolCap, SCRATCH_PAGE_BASE,
+                     Double(poolCap) * Double(perPageBytes) / (1024*1024*1024)))
         self.pageManager = PageManager(numPhysPages: SCRATCH_PAGE_BASE,
-                                        pageSize: PAGE_SLIDE)
+                                        pageSize: PAGE_SLIDE,
+                                        poolCapPages: poolCap)
         self.prefixTrie = RadixTrie(pageSlide: PAGE_SLIDE)
         self._savedBTScratchByteCount = B * MAX_PAGES_PER_SLOT * MemoryLayout<UInt32>.stride
         self._savedBTScratch = UnsafeMutablePointer<UInt32>.allocate(
@@ -1889,6 +2050,7 @@ final class LmEngine {
             do {
                 let p = try pageManager.allocFresh()
                 zeroPhysPageKV(p)
+                rmapAdd(s.id, p, isCitation: false)   // own divergent tail, not a citation
                 s.ownedPages.append(p)
             } catch {
                 s.state = .done
@@ -2040,6 +2202,7 @@ final class LmEngine {
             do {
                 let p = try pageManager.allocFresh()
                 zeroPhysPageKV(p)
+                rmapAdd(s.id, p, isCitation: false)   // own page, not a citation
                 s.ownedPages.append(p)
             } catch {
                 print("  prefix-kv install: alloc failed for session \(s.id)")
@@ -2100,7 +2263,13 @@ final class LmEngine {
         let base = slot * MAX_PAGES_PER_SLOT
         let scratchGuard = UInt32(SCRATCH_PAGE_BASE)
         for p in 0..<MAX_PAGES_PER_SLOT {
-            btP[base + p] = p < s.ownedPages.count ? UInt32(s.ownedPages[p]) : scratchGuard
+            if p < s.ownedPages.count {
+                let phys = s.ownedPages[p]
+                btP[base + p] = UInt32(phys)
+                pageManager.touchAccess(physPage: phys)  // B1: recency == forward-dependency
+            } else {
+                btP[base + p] = scratchGuard
+            }
         }
     }
 
@@ -2197,10 +2366,30 @@ final class LmEngine {
         // admission when fewer pages are available than the floor, so
         // the new request can at least PROBABLY make progress without
         // immediately starving its peers.
-        let poolStats = pageManager.stats()
+        var poolStats = pageManager.stats()
         if poolStats.freePages < ADMISSION_FREE_PAGE_FLOOR {
-            print("  submitRequest: admission backpressure (free=\(poolStats.freePages) < floor=\(ADMISSION_FREE_PAGE_FLOOR), live=\(poolStats.pagesInUse))")
-            return nil
+            // ADMISSION-PRESSURE-CANCEL (G2, 2026-06): under page pressure, before
+            // refusing the new request, try to SHED the lowest-reuse-value
+            // generation — kill+free, NOT pause (pause→re-prefill is NOT
+            // bit-exact). Whole-generation cancel is bit-exact-safe: its partial
+            // output already lives in the bridge transport log, and we never
+            // re-prefill a survivor. This is admission control, not eviction of a
+            // live working set — we only shed when the pool genuinely cannot
+            // admit. Bounded loop: shed at most a few before giving up so a
+            // pathological all-hot-equal-value pool still terminates.
+            var shed = 0
+            while poolStats.freePages < ADMISSION_FREE_PAGE_FLOOR && shed < 8 {
+                guard shedLowestValueGeneration(excluding: nil) else { break }
+                shed += 1
+                poolStats = pageManager.stats()
+            }
+            if poolStats.freePages < ADMISSION_FREE_PAGE_FLOOR {
+                print("  submitRequest: admission backpressure (free=\(poolStats.freePages) < floor=\(ADMISSION_FREE_PAGE_FLOOR), live=\(poolStats.pagesInUse), shed=\(shed) generations)")
+                return nil
+            }
+            if shed > 0 {
+                print("  submitRequest: admission-pressure-cancel shed \(shed) low-value generation(s); free now \(poolStats.freePages)")
+            }
         }
         guard let s = openSession(eosId: initParams.eosId,
                                   maxNewTokens: initParams.maxNewTokens) else {
@@ -2287,6 +2476,21 @@ final class LmEngine {
         // 2026-05-07 (anonymous-pool refactor): caller (this session) is
         // the canonical holder of its phys-page references; decref each
         // one. PageManager has no per-session ledger to release from.
+        //
+        // G4 page_lifecycle BALANCE CHECK (2026-06): the engine's reverse map
+        // tracks the same (session -> listed pages) the refcount counts. At
+        // teardown the count of pages this session lists in the reverse map
+        // MUST equal ownedPages.count, or some ownedPages mutation skipped a
+        // reverse-map update (a leak / double-listing). Log once on mismatch.
+        let listedByRmap = sessionListedPageCount[s.id] ?? 0
+        if listedByRmap != s.ownedPages.count && !LmEngine.warnedRmapImbalance {
+            LmEngine.warnedRmapImbalance = true
+            let warn = "[engine] WARN: reverse-map imbalance at closeSession sid=\(s.id): "
+                + "rmap lists \(listedByRmap) pages, ownedPages.count=\(s.ownedPages.count) "
+                + "— a page_lifecycle balance bug (an ownedPages mutation missed an rmap update)\n"
+            FileHandle.standardError.write(Data(warn.utf8))
+        }
+        rmapDropSession(s.id, ownedPages: s.ownedPages)
         for phys in s.ownedPages { pageManager.decref(physPage: phys) }
         s.ownedPages.removeAll()
         s.consumedTokens.removeAll()
@@ -2294,6 +2498,7 @@ final class LmEngine {
         residentSessions.removeValue(forKey: s.id)
         unbindStream(s)
     }
+    static var warnedRmapImbalance = false
 
     // After a prefill tile commits, walk any fully-written logical pages
     // that haven't been promoted yet and publish them to the radix
@@ -2361,6 +2566,54 @@ final class LmEngine {
     }
 
     func poolStats() -> PageManager.Stats { return pageManager.stats() }
+
+    // Aggregate decayed-citation reuse-value of a session's listed pages.
+    // Lower = a better shed candidate (its KV is cheapest to lose + recompute).
+    // Used by admission-pressure-cancel. A session whose pages are all freshly
+    // allocated private tail (never adopted by anyone) sums to ~0 — exactly the
+    // "no-consumer / low-value" generation the policy wants to shed first.
+    private func sessionReuseValue(_ s: Session) -> Double {
+        var v = 0.0
+        for phys in s.ownedPages { v += pageManager.pageReuseValue(phys) }
+        return v
+    }
+
+    // ADMISSION-PRESSURE-CANCEL (G2, 2026-06). Kill (NOT pause) the lowest-
+    // reuse-value wants-slot generation to free its pages for a new admit.
+    // Bit-exact-safe: a whole-generation cancel re-prefills NOTHING and its
+    // partial output is already in the bridge transport log. Sets doneReason=4
+    // (admission-pressure shed) + an errMsg so the transport surfaces a clean
+    // terminal signal, then closeSession (decref-all + reverse-map drop + trie
+    // promotion of the warm prefix). Returns true if a generation was shed.
+    // `excluding` lets the caller protect a just-created session.
+    @discardableResult
+    private func shedLowestValueGeneration(excluding: Int?) -> Bool {
+        var victim: Session? = nil
+        var victimValue = Double.greatestFiniteMagnitude
+        for s in residentSessions.values {
+            guard s.state.wantsSlot else { continue }     // never shed .done (already freeing)
+            if let ex = excluding, s.id == ex { continue }
+            if s.ownedPages.isEmpty { continue }          // nothing to free
+            let v = sessionReuseValue(s)
+            // Tie-break to the LEAST-progressed (fewest tokens generated) — a
+            // fast-runaway-no-consumer session burning AR has many pages but
+            // low citation value; prefer shedding it over a near-done one.
+            if v < victimValue || (v == victimValue
+                && (victim == nil || s.numGenerated < victim!.numGenerated)) {
+                victimValue = v; victim = s
+            }
+        }
+        guard let v = victim else { return false }
+        print("[engine] admission-pressure-cancel: shedding sid=\(v.streamId) "
+            + "(reuseValue=\(victimValue), pages=\(v.ownedPages.count), "
+            + "numGenerated=\(v.numGenerated)) to free pages for a new admit")
+        v.state = .done
+        v.doneReason = 4   // admission-pressure shed (distinct from EOS/maxtokens/stall)
+        v.errMsg = "shed under admission pressure (lowest KV reuse-value); "
+            + "partial output remains in the transport log for replay"
+        closeSession(v)
+        return true
+    }
 
     // 2026-05-07 (M:K): "active" sessions are now all residents in a
     // busy state (.priming or .generating). Length can be > B; the

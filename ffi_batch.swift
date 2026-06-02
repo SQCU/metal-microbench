@@ -1299,11 +1299,13 @@ public func gemma_poll(_ timeoutMs: Int32,
 // Admin entries.
 // ----------------------------------------------------------------------
 
-// gemma_status: write a serialized ServerStats blob (ABI: 64 bytes).
+// gemma_status: write a serialized ServerStats blob (ABI: 72 bytes —
+// 6×u32 + 2×u64 + u32 + pad + u64 + 4×u32; grew from 64B to add
+// committed_pages + pool_capacity_pages for the dynamic KV pool).
 @_cdecl("gemma_status")
 public func gemma_status(_ outBuf: UnsafeMutablePointer<UInt8>?,
                           _ outCap: Int32) -> Int32 {
-    guard let outBuf = outBuf, outCap >= 64 else { return -28 }
+    guard let outBuf = outBuf, outCap >= 72 else { return -28 }
     var w = BinWriter()
     if let engine = gEngine {
         let stats = engine.pageManager.stats()
@@ -1327,10 +1329,42 @@ public func gemma_status(_ outBuf: UnsafeMutablePointer<UInt8>?,
         w.u32(UInt32(gVisionCacheEntryCount))
         w.zeros(4) // padding to align u64
         w.u64(gVisionCacheHits)
-        w.zeros(8) // reserved
+        // 2026-06 (KV-retention/connection-decoupling acceptance): the
+        // final 8 reserved bytes of the fixed 64-byte ServerStats ABI now
+        // carry two u32 fields the /health endpoint needs so the
+        // KV-eviction + connection-pinning tests can assert engine-wide:
+        //   - residentCount: engine.residentSessions.count. This is the
+        //     "resident/pinned sessions" gauge — sessions that hold KV
+        //     pages. test_kv_no_connection_pinning T2 asserts this stays
+        //     bounded (does NOT climb toward MAX_RESIDENT_SESSIONS with the
+        //     connection count). requestForStream.count (already in slot 3,
+        //     active_streams) tracks LIVE bound streams; residentSessions is
+        //     the residency gauge the leak detector keys on.
+        //   - cacheHitTokens(low32): engine.totalCacheHitTokens, the
+        //     monotonic cross-session adoption tally. Surfaced as the
+        //     /health aggregate cache_hits. Low 32 bits is plenty for a
+        //     throwaway-bridge test horizon; the per-request usage block
+        //     remains the authoritative full-width counter.
+        w.u32(UInt32(engine.residentSessions.count))
+        w.u32(UInt32(truncatingIfNeeded: engine.totalCacheHitTokens))
+        // 2026-06 (G2 dynamic-pool growth observable): the ServerStats ABI
+        // grows 64 -> 72 bytes to carry two more u32 the /health endpoint
+        // needs so test_kv_eviction_guarantees G2 can OBSERVE pool growth:
+        //   - committedPages: stats.committedPages, the high-water of pages
+        //     ever EXPOSED by the dynamic pool (committedHighWater). This is
+        //     the value that RISES under demand — G2 asserts committed1 >
+        //     committed0. totalPages stays the budget CAP (so T1's pinned
+        //     derivation total-free-cached remains correct), which is a
+        //     CONSTANT and would never satisfy G2's growth assertion.
+        //   - poolCapacityPages: stats.poolCapacityPages, the budget-derived
+        //     hard cap == totalPages, surfaced explicitly for new consumers.
+        // ABI grew 64 -> 72: gemma_ffi.status() reads <IIIIIIQQIIQIIII (72)
+        // and requests a 72-byte buffer; the bridge is the only consumer.
+        w.u32(UInt32(stats.committedPages))
+        w.u32(UInt32(stats.poolCapacityPages))
     } else {
         // Engine not initialized — return all-zero stats but valid frame.
-        w.zeros(64)
+        w.zeros(72)
     }
     let bytes = w.data
     bytes.withUnsafeBytes { src in
@@ -1456,6 +1490,8 @@ public func gemma_engine_state(_ outBuf: UnsafeMutablePointer<UInt8>?,
 "free_pages":\(stats.freePages),\
 "cached_pages":\(stats.cachedHashes),\
 "pages_in_use":\(stats.pagesInUse),\
+"committed_pages":\(stats.committedPages),\
+"pool_capacity_pages":\(stats.poolCapacityPages),\
 "prefix_trie":\(prefixTrieSection),\
 "pages":[\(pageLines.joined(separator: ","))]}
 """

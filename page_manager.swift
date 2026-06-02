@@ -88,6 +88,32 @@ private struct PageInfo {
     var contentHash: UInt64?    // nil = page isn't content-indexed (fresh/dirty)
     var pairMate: Int?          // other FULL-attn page (ownedPages[2P]/[2P+1]) sharing this hash (see header)
     var lastAccessTick: UInt64
+    // 2026-06 KV-retention decoupling — BILINEAR reuse-value (citation × recency).
+    //
+    // The value function (kv_pages_are_not_connection_stateful memory + G3/G4/G5):
+    // a page's worth to keep is NOT pure recency (LRU evicts a hot shared
+    // tool-prefix before a marginally-newer one-off suffix) and NOT pure
+    // citation-count (LFU pins a dead-but-historically-popular prefix forever).
+    // It is a RECENCY-DECAYED CITATION score:
+    //
+    //   value(page) = Σ_citations decay(now − t_citation)
+    //
+    // maintained as an EWMA: on each new citation,
+    //   citationScore = citationScore · decay(Δticks) + 1
+    // where Δticks = clockTick − lastCitationTick and decay(Δ) = HALF_LIFE^Δ.
+    //
+    // A CITATION is a DISTINCT ADOPTER — a new generation adopting the page
+    // via findLongestPrefix (adoptSharedPrefixPages). It is NOT a per-AR-step
+    // re-read by the page's own generation; recency (lastAccessTick, bumped on
+    // the forward-pass KV READ in touchAccess) already covers self-rereads, and
+    // counting them would re-create the immortality LFU suffers from.
+    //
+    // Eviction picks the MIN decayed-citation score over the eligible set.
+    // lastCitationTick lets the eviction scan decay the stored score to "now"
+    // before comparing, so a once-popular-but-now-cold prefix ranks correctly
+    // low. lastCitationTick==0 (never cited) keeps citationScore==0 = coldest.
+    var citationScore: Double   // EWMA of decayed distinct-adopter citations
+    var lastCitationTick: UInt64 // clockTick at last citation (for decay-to-now)
 }
 
 // SlidePairContents — the pair of phys page IDs capturing the FULL-attention
@@ -162,8 +188,30 @@ final class PageManager {
     // pages are anonymous, identified only by content hash + refcount.
     private var clockTick: UInt64 = 0
 
+    // ── Dynamic pool growth (G2, 2026-06) ─────────────────────────────────
+    // The free list is no longer eagerly populated over the whole pool. The
+    // per-layer K/V device buffers are sized at the HARD CAP (basePage ..
+    // basePage+poolCapPages) but are storage-mode-shared / lazy-committed —
+    // physical RAM is only committed when a phys page is first WRITTEN
+    // (zeroPhysPageKV). So the pool "grows on demand": allocFresh exposes the
+    // next contiguous page (growFrontier) only when both free stacks are empty,
+    // up to poolCapPages (the budget-derived cap). committedHighWater records
+    // the highest watermark ever exposed so /health (stats().totalPages) shows
+    // real growth, while poolCapPages bounds it to the memory budget.
+    //
+    // BIT-EXACTNESS: pages are exposed lowest-index-first, one at a time, ONLY
+    // when the free stacks are empty — the identical order the old eager-init
+    // (reversed range, popped from the tail) handed them out. A decref'd page
+    // returns to the free stack and is reused before growFrontier advances
+    // (allocFresh checks the free stacks first), exactly as before. So the
+    // sequence of phys indices handed to logical pages is unchanged → no
+    // physical page backing any position moves → K/V bytes are identical.
+    private var growFrontier: Int        // next never-yet-exposed page index
+    private let poolCapPages: Int        // hard cap on exposed pages (budget)
+    private var committedHighWater: Int = 0  // pages ever exposed (telemetry)
+
     init(numPhysPages: Int, pageSize: Int, basePage: Int = 0,
-          numPoolPages: Int? = nil) {
+          numPoolPages: Int? = nil, poolCapPages: Int? = nil) {
         // 2026-05-06: split scratch-strip from cache-pool addressing
         // (codex RCA). PageManager allocates physical-page indices
         // from [basePage, basePage + numPoolPages); pages outside that
@@ -177,17 +225,34 @@ final class PageManager {
         self.basePage = basePage
         self.numPoolPages = poolCount
         self.pageSize = pageSize
+        // Budget-derived hard cap. Defaults to the full pool (poolCount) so a
+        // caller that doesn't pass a budget keeps the legacy capacity; the
+        // engine passes the KV_MEM_BUDGET_FRAC-derived value. Clamp to [0,
+        // poolCount] — the device buffers only back poolCount pages.
+        self.poolCapPages = max(0, min(poolCount, poolCapPages ?? poolCount))
         self.pages = (0..<numPhysPages).map { _ in
-            PageInfo(refcount: 0, contentHash: nil, pairMate: nil, lastAccessTick: 0)
+            PageInfo(refcount: 0, contentHash: nil, pairMate: nil,
+                     lastAccessTick: 0, citationScore: 0, lastCitationTick: 0)
         }
-        // Free list spans only the pool range. Push in reverse so the
-        // lowest-indexed pool page pops first (cache-warm-friendly).
-        self.freeUncached = Array((basePage..<(basePage + poolCount)).reversed())
-        self.freeUncachedPos.reserveCapacity(self.freeUncached.count)
-        self.freeCachedPos.reserveCapacity(poolCount)
-        for (i, phys) in self.freeUncached.enumerated() {
-            self.freeUncachedPos[phys] = i
-        }
+        // Lazy free list: nothing pre-pushed. growFrontier starts at the pool
+        // base and advances (lowest-first) as allocFresh exposes pages.
+        self.growFrontier = basePage
+        self.freeUncachedPos.reserveCapacity(self.poolCapPages)
+        self.freeCachedPos.reserveCapacity(self.poolCapPages)
+    }
+
+    // Expose the next never-yet-seen page if the budget allows. Returns the
+    // freshly-exposed phys index (already pushed onto freeUncached), or nil if
+    // the pool is at its budget cap. Lowest-index-first, one at a time.
+    private func growPool() -> Int? {
+        guard growFrontier < basePage + poolCapPages else { return nil }
+        let phys = growFrontier
+        growFrontier += 1
+        committedHighWater = max(committedHighWater, growFrontier - basePage)
+        // Newly-exposed page is uncached, refcount 0.
+        freeUncachedPos[phys] = freeUncached.count
+        freeUncached.append(phys)
+        return phys
     }
 
     // O(1) removal from a free stack at a known index. Uses the
@@ -289,46 +354,71 @@ final class PageManager {
     // refcount==0 pages; some carry valid content hashes (cache entries
     // from prior sessions), some don't (genuinely uncached). We pick in
     // this order:
-    //   1. The LRU-OLDEST uncached page (no hash to drop, free reuse).
-    //   2. Otherwise: the LRU-OLDEST cached page → evict its hash, reuse.
+    //   1. A free uncached page (no hash to drop, free reuse).
+    //   2. Otherwise grow the pool by one fresh page (budget permitting).
+    //   3. Otherwise: forced eviction — the MIN decayed-citation cached
+    //      page → evict its hash, reuse.
     //
-    // Critically we DO NOT drop a content hash unless step 1 found nothing
-    // and we're forced to overwrite. The previous "drop on every pop"
-    // logic shredded cache entries that the SAME request was about to
+    // Critically we DO NOT drop a content hash unless steps 1-2 found
+    // nothing and we're forced to overwrite. The previous "drop on every
+    // pop" logic shredded cache entries that the SAME request was about to
     // probe for: iter N's session pop-and-evicts iter N-1's pages off
     // the free list (because the entire free list was content-cached
     // immediately after iter N-1 closed), then iter N's later probes
-    // for those same hashes miss. With LRU-no-eager-eviction, iter N
+    // for those same hashes miss. With no-eager-eviction, iter N
     // shareExisting-adopts iter N-1's pages first (refcount++, removes
     // them from free list), and only then allocFresh runs for the
     // genuine tail — by which point the free list contains uncached
     // pages.
+    //
+    // 2026-06 KV-retention decoupling: forced eviction now picks the MIN of
+    // a recency-DECAYED CITATION score (value(page)=Σ_citations decay(now −
+    // t_citation)) instead of the pure LRU lastAccessTick min — see PageInfo.
+    // citationScore. Pure-LRU evicts a hot shared prefix before a marginally-
+    // newer one-off suffix; pure-LFU pins a dead-but-popular prefix forever.
+    // The decayed-citation min is the bilinear value that does neither. The
+    // eligible set is freeCached (refcount==0 pages) — a page listed by a
+    // live wants-slot generation has refcount>0 and is structurally absent
+    // from the free stacks, so it is never an eviction victim (eligibility
+    // = "not active-step AND not listed by any wants-slot session"; the
+    // engine decrefs a session's pages at .done so finished/idle work falls
+    // here and becomes evictable, while live working sets stay protected).
+    //
     // 2026-05-07: anonymous-pool refactor — callers track their own
     // page references; PageManager only knows refcounts and content
     // hashes. Returns a phys page with refcount=1; caller MUST call
     // decref(physPage:) when done with it.
     func allocFresh() throws -> Int {
-        guard !freeUncached.isEmpty || !freeCached.isEmpty else {
-            throw PageManagerError.outOfPages(needed: 1, available: 0)
-        }
         let phys: Int
         if !freeUncached.isEmpty {
             // Prefer uncached pages. No prefix-cache entry is dropped.
             phys = freeUncachedPop(at: freeUncached.count - 1)
-        } else {
-            // Forced eviction: every free page is cached. Drop the LRU
-            // (lowest lastAccessTick) cached page — NOT the stack top.
-            // The prior code popped most-recently-freed (MRU), evicting the
-            // hottest cache entries first and defeating the prefix cache
-            // under pressure (page_lifecycle_audit_2026-05-28 #7). O(n) scan
-            // is fine: forced eviction only fires when freeUncached is empty.
-            var lruIdx = 0
-            var lruTick = UInt64.max
+        } else if let grown = growPool() {
+            // Pool grows on demand (budget permitting) before we evict any
+            // cached page — an unexposed page has no hash to drop, exactly
+            // as the eager-init pool would have preferred it (step 1).
+            phys = freeUncachedPop(at: freeUncachedPos[grown]!)
+        } else if !freeCached.isEmpty {
+            // Forced eviction: pool at budget cap and every free page is
+            // cached. Drop the MIN decayed-citation cached page (the lowest
+            // bilinear reuse-value) — NOT the stack top, NOT pure LRU. Decay
+            // each candidate's stored citationScore to "now" before
+            // comparing, so a once-popular-but-now-cold prefix ranks low.
+            // Ties (e.g. all never-cited score==0) break to the lower
+            // lastAccessTick (recency) — preserving the audit-#7 LRU-not-MRU
+            // property for the uncited common case. O(n) scan is fine: forced
+            // eviction only fires when uncached pages and growth are exhausted.
+            var victimIdx = 0
+            var victimScore = Double.greatestFiniteMagnitude
+            var victimTick = UInt64.max
             for (i, ph) in freeCached.enumerated() {
-                let t = pages[ph].lastAccessTick
-                if t < lruTick { lruTick = t; lruIdx = i }
+                let sc = decayedCitationScore(ph, at: clockTick)
+                let tk = pages[ph].lastAccessTick
+                if sc < victimScore || (sc == victimScore && tk < victimTick) {
+                    victimScore = sc; victimTick = tk; victimIdx = i
+                }
             }
-            phys = freeCachedPop(at: lruIdx)
+            phys = freeCachedPop(at: victimIdx)
             // Drop the now-orphaned content hash + its pair.
             // Followup 3 (2026-05-23): contentIndex deleted; only the
             // PageInfo bookkeeping + eviction callback into the trie
@@ -353,6 +443,12 @@ final class PageManager {
                 p.pairMate = nil
             }
             pages[phys] = p
+        } else {
+            // No uncached page, pool at budget cap, and no evictable cached
+            // page either (every page is refcount>0 = listed by a live
+            // generation). Genuine exhaustion — caller (engine admission /
+            // ensurePages) must shed a session or backpressure the submit.
+            throw PageManagerError.outOfPages(needed: 1, available: 0)
         }
         clockTick += 1
         var p = pages[phys]
@@ -360,6 +456,63 @@ final class PageManager {
         p.lastAccessTick = clockTick
         pages[phys] = p
         return phys
+    }
+
+    // Recency-decayed citation value of a page, evaluated at `now` (ticks).
+    // score(now) = storedScore · HALF_LIFE^(now − lastCitationTick).
+    // A page never cited (lastCitationTick==0, storedScore==0) returns 0 —
+    // the coldest possible value, evicted first. Decay base is configurable
+    // via env KV_CITATION_HALF_LIFE_TICKS (default 4096 ticks); larger =
+    // citations matter longer. Pure function of PageInfo + now: read-only,
+    // no mutation, safe to call from the eviction scan.
+    private func decayedCitationScore(_ phys: Int, at now: UInt64) -> Double {
+        // BILINEAR reuse-value = recency × citation-magnitude. RECENCY is the
+        // decaying MULTIPLIER, anchored on lastAccessTick (last forward
+        // dependency): it drives the whole value toward 0 as a page goes
+        // stale, so a once-popular-but-now-cold prefix falls BELOW a freshly-
+        // touched uncited page (value ≈ 1) and is finally evicted. The prior
+        // form decayed the CITATION SUM alone — that asymptotes >0 and never
+        // crosses an uncited page's 0, so a stale heavily-cited prefix was
+        // IMMORTAL (the G5 failure / the "stuck-en-cache forever" class). The
+        // citation magnitude (1 + citationScore) is the breadth bonus that
+        // keeps a HOT shared prefix last-evicted (G3). value =
+        // HALF_LIFE^(now − lastAccessTick) · (1 + citationScore). Half-life
+        // via KV_CITATION_HALF_LIFE_TICKS. Pure read-only fn; citationScore /
+        // lastAccessTick are not in hashSessionKVAtPosition, so eviction
+        // ranking changes never perturb K/V bytes (bit-exact preserved).
+        let p = pages[phys]
+        let age = now >= p.lastAccessTick ? Double(now - p.lastAccessTick) : 0
+        let recency = pow(PageManager.citationDecayBase, age)
+        return recency * (1.0 + p.citationScore)
+    }
+
+    // decay(Δ=1) per-tick multiplier = HALF_LIFE^(1/halfLifeTicks) computed
+    // as 2^(-1/halfLifeTicks). Lazily read once from the environment.
+    static let citationDecayBase: Double = {
+        let env = ProcessInfo.processInfo.environment["KV_CITATION_HALF_LIFE_TICKS"]
+        let halfLife = (env.flatMap { Double($0) }) ?? 4096.0
+        let hl = halfLife > 0 ? halfLife : 4096.0
+        return pow(2.0, -1.0 / hl)
+    }()
+
+    // Record a CITATION (a distinct adopter took this page via the prefix
+    // cache). EWMA update: decay the stored score to now, then add 1. Bumps
+    // the citation timestamp; does NOT touch refcount, contentHash, pairMate,
+    // or lastAccessTick (recency is a separate signal, bumped on the forward-
+    // pass KV read via touchAccess). Out-of-range / scratch indices ignored.
+    // citationScore is NOT part of hashSessionKVAtPosition, so it cannot
+    // perturb numerics or LM_KV_OVERWRITE_CHECK.
+    func recordCitation(physPage: Int) {
+        guard physPage >= 0 && physPage < pages.count else { return }
+        clockTick += 1
+        var p = pages[physPage]
+        let decayed = (p.lastCitationTick == 0)
+            ? 0.0
+            : p.citationScore * pow(PageManager.citationDecayBase,
+                                    Double(clockTick - p.lastCitationTick))
+        p.citationScore = decayed + 1.0
+        p.lastCitationTick = clockTick
+        pages[physPage] = p
     }
 
     // Increment refcount on an existing page (used to be `shareExisting`).
@@ -456,9 +609,31 @@ final class PageManager {
     static var warnedDoubleFree = false
     static var warnedBadDecref = false
 
+    // Decayed-citation reuse-value of a page evaluated at the current tick.
+    // Public read accessor for the engine's admission-pressure-cancel ranking
+    // (shed the lowest-value generation). 0 = never cited / coldest.
+    func pageReuseValue(_ phys: Int) -> Double {
+        guard phys >= 0 && phys < pages.count else { return 0 }
+        return decayedCitationScore(phys, at: clockTick)
+    }
+
     func pageRefcount(_ phys: Int) -> Int {
         guard phys >= 0 && phys < pages.count else { return 0 }
         return pages[phys].refcount
+    }
+
+    // B1 (2026-06 KV-retention decoupling): forward-read recency stamp.
+    // Telemetry ONLY — bumps lastAccessTick so a page an in-flight forward
+    // pass DEPENDS ON looks hot to the LRU eviction picker in allocFresh
+    // (the freeCached min-scan). Unlike incref/allocFresh this does NOT touch
+    // refcount, the free list, contentHash, or pairMate, so it cannot perturb
+    // numerics, ownership, or the 16b5416 refcount-gated CoW. lastAccessTick
+    // is not part of hashSessionKVAtPosition, so LM_KV_OVERWRITE_CHECK is
+    // unaffected. Out-of-range / scratch indices are ignored.
+    func touchAccess(physPage: Int) {
+        guard physPage >= 0 && physPage < pages.count else { return }
+        clockTick += 1
+        pages[physPage].lastAccessTick = clockTick
     }
 
     // Diagnostic snapshot.
@@ -477,14 +652,30 @@ final class PageManager {
         // 2026-05-07: pages-in-use count replaces "active sessions".
         // Pages are anonymous; "in-use" means refcount > 0.
         let pagesInUse: Int
+        // G2 dynamic-pool telemetry (2026-06). totalPages reports the BUDGET
+        // CAP (how big the pool may grow). committedPages is the high-water of
+        // pages ever exposed — the "growth" /health should show. poolCapacity
+        // duplicates totalPages explicitly for new consumers; legacy consumers
+        // keep reading totalPages.
+        let committedPages: Int
+        let poolCapacityPages: Int
     }
     func stats() -> Stats {
         var cached = 0
         for p in pages { if p.contentHash != nil { cached += 1 } }
-        return Stats(totalPages: numPhysPages,
-                     freePages: freeUncached.count + freeCached.count,
+        // freePages = free stacks (exposed, refcount==0) PLUS the still-
+        // growable headroom (budget cap minus pages ever exposed). Admission
+        // backpressure compares freePages against a floor; on a fresh engine
+        // committedHighWater is 0, so free MUST include the growth headroom or
+        // every submit would be rejected for "0 free".
+        let growHeadroom = poolCapPages - committedHighWater
+        let freeNow = freeUncached.count + freeCached.count + growHeadroom
+        return Stats(totalPages: poolCapPages,
+                     freePages: freeNow,
                      cachedHashes: cached,
-                     pagesInUse: numPoolPages - freeUncached.count - freeCached.count)
+                     pagesInUse: committedHighWater - freeUncached.count - freeCached.count,
+                     committedPages: committedHighWater,
+                     poolCapacityPages: poolCapPages)
     }
 
     // Per-page diagnostic record (used by the engine-state endpoint that
