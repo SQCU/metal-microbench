@@ -1246,42 +1246,32 @@ final class Session {
                       + "\(match.pages.count * PAGE) tokens; trie matched \(match.trieMatchLength))")
             }
         }
-        // Partial-page adoption (Track B fold-in): if the trie returned
-        // a partial extension past the aligned match, allocate ONE FRESH
-        // page and CoW-copy the partial's K/V bytes onto it. The consumer's
-        // prefill then writes positions [validUpTo, ...) into a page it
-        // solely owns — no shared writes, race-safe for multi-consumer
-        // concurrent extends. This single-page CoW is the ONE legitimate
-        // privatization kept under ONE PAGE=16 (the slide-divergent CoW is
-        // deleted; a partially-shared-then-extended page still needs a
-        // private copy so the producer's read-only anchor isn't clobbered).
-        var newPartialAdopted = 0
-        if let pp = match.partialTail {
-            let fresh: Int
-            do {
-                fresh = try engine.pageManager.allocFresh()
-                engine.zeroPhysPageKV(fresh)
-            } catch {
-                // No fresh page; abandon the partial (aligned pages kept).
-                return (newAlignedAdopted, newAlignedAdopted)
-            }
-            // Whole-page copy; rows past validUpTo are producer-written-but-
-            // soon-overwritten or zero. Producer keeps its page (still
-            // adoptable via the trie anchor); we do not decref it. The fresh
-            // page is this session's OWN private page (CoW by construction),
-            // not a citation — record listing-only in the reverse map.
-            engine.copyPhysPageKV(srcPhys: pp.phys, dstPhys: fresh)
-            engine.rmapAdd(id, fresh, isCitation: false)
-            ownedPages.append(fresh)
-            newPartialAdopted = pp.validUpTo
-            if dbg {
-                print("  [cache] session \(id) partial-CoW: \(pp.phys)→\(fresh), "
-                      + "validUpTo=\(pp.validUpTo)")
-            }
-            // Don't bump myPromotedSlidePairCount — the partial isn't a full
-            // page yet from this session's perspective.
-        }
-        return (newAlignedAdopted, newAlignedAdopted + newPartialAdopted)
+        // Partial-tail adoption DELETED — root cause of the adopted-prefix
+        // SIGABRT + the near-recent decode drift. It CoW-copied the trie
+        // producer's partial page and advanced the adopted-token count by
+        // `pp.validUpTo`. But that validUpTo is the PRODUCER page's valid
+        // length, which can come from a LONGER prior chain than THIS session's
+        // input — so it adopted tokens BEYOND consumedTokens.count. The caller
+        // then set position = adoptedTokens > consumedTokens.count, which:
+        //   (a) made firstStepLogitOnly's logitPos = position-1 index past the
+        //       consumed tokens -> precondition(logitPos < consumedTokens.count)
+        //       fails -> SIGABRT. In an -O build Swift drops the precondition
+        //       MESSAGE, so the process dies with no log — the "silent hang then
+        //       death" (the GPU was never involved; the engine-driver thread
+        //       trapped). State-dependent: only fires when a producer partial
+        //       page sits exactly past the re-adopter's aligned length.
+        //   (b) made decode attend page-rounded uninitialized slots
+        //       [consumedTokens.count .. position) — the near-recent drift at
+        //       contexts past the window.
+        // FIX: adopt ALIGNED FULL PAGES ONLY. Every adopted token is real and
+        // within consumedTokens, so position == aligned <= consumedTokens.count
+        // BY CONSTRUCTION (the invariant firstStepLogitOnly + decode rely on).
+        // The sub-PAGE suffix stays in primingQueue and re-prefills into a fresh
+        // private page (ensurePages) — a <PAGE-token re-prefill, no CoW, no
+        // validUpTo bookkeeping. Collapses the last partial-page remnant the
+        // ONE-PAGE=16 refactor set out to remove (match.partialTail unused by
+        // adoption now; the producer's anchor is untouched).
+        return (newAlignedAdopted, newAlignedAdopted)
     }
 
     // Re-probe the cache after consumedTokens has grown (e.g. additional
