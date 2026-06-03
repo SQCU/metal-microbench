@@ -746,7 +746,7 @@ final class Session {
     fileprivate(set) var state: SessionState = .priming
     // Phys-page IDs owned by this session, in logical-page order:
     //   ownedPages[p] = phys page number for this session's page p
-    //   ownedPages.count * PAGE_SLIDE bounds the max k_len this session
+    //   ownedPages.count * PAGE bounds the max k_len this session
     //   can reach without growing. Pages are allocated on-demand as the
     //   session's position advances (see growPagesFor(kLen:)).
     fileprivate var ownedPages: [Int] = []
@@ -1081,7 +1081,7 @@ final class Session {
     // At the *first* submit (session still at position=0, no owned pages),
     // we probe the PageManager's content index for cache hits on the
     // leading pages. Any hit is adopted read-only — ownedPages gets the
-    // shared phys page, position advances by PAGE_SLIDE, and the queued
+    // shared phys page, position advances by PAGE, and the queued
     // chunk only covers the un-cached tail. This is what makes multiple
     // sessions with the same system prompt / same image prefix skip the
     // redundant prefill work.
@@ -1180,13 +1180,11 @@ final class Session {
     // deterministically. (Pre-Followup 3 the source of truth was
     // PageManager.contentIndex, since deleted.)
 
-    // Walk the PageManager's content index for leading pages of
-    // consumedTokens. Returns the number of SLIDE pages successfully
-    // adopted (each adopted slide page appends TWO phys pages to
-    // ownedPages — the slide primary and the full-sibling — because
-    // Gemma-4's full-attn uses half the page size of its slide-attn
-    // layers and a single 16-token slide page straddles two full pages
-    // in the full-K/V cache).
+    // Walk the radix trie for leading pages of consumedTokens. Returns the
+    // number of pages successfully adopted; under ONE PAGE=16 each adopted
+    // page appends EXACTLY ONE phys page to ownedPages (a 16-token logical
+    // page is a single physical page covering [16P..16P+15] in every layer's
+    // K/V buffer — no full/slide page-size split, so no pair).
     //
     // Hash key includes a per-page cvec-state digest (see
     // cvecDigestForPage). Sessions with identical tokens but different
@@ -1194,224 +1192,94 @@ final class Session {
     // other's pages — preventing steered K/V from polluting unsteered
     // sessions (and vice versa).
     // Returns (alignedTokensAdoptedThisCall, totalTokensAdoptedThisCall).
-    // Total may exceed aligned by [1, PAGE_SLIDE-1] when a partial pair
-    // is CoW-copied onto fresh pages (Track B fold-in).
+    // Total may exceed aligned by [1, PAGE-1] when a partial page is
+    // CoW-copied onto a fresh page (Track B fold-in).
     private func adoptSharedPrefixPages(engine: LmEngine) -> (Int, Int) {
-        // Idempotent: resume from how many slide pages we've already
-        // adopted (each contributes 2 entries to ownedPages — slide
-        // primary + full sibling).
-        let beforeAdopted = ownedPages.count / 2
+        // Idempotent: resume from how many pages we've already adopted (one
+        // entry per page now).
+        let beforeAdopted = ownedPages.count
         let dbg = ProcessInfo.processInfo.environment["LM_CACHE_DEBUG"] != nil
         // Build closure capturing self's cvecAnchorTagForPage.
         let match = engine.prefixTrie.findLongestPrefix(
             tokens: consumedTokens[0..<consumedTokens.count],
             cvecTagFor: { pageStart in
-                self.cvecAnchorTagForPage(pageStart: pageStart, pageSize: PAGE_SLIDE)
+                self.cvecAnchorTagForPage(pageStart: pageStart, pageSize: PAGE)
             })
         // We only want the *new* portion past what we've already adopted.
-        let alreadyAdoptedTokens = beforeAdopted * PAGE_SLIDE
+        let alreadyAdoptedTokens = beforeAdopted * PAGE
         let alignedMatch = match.alignedMatchLength
         guard alignedMatch >= alreadyAdoptedTokens,
               beforeAdopted <= match.pages.count else {
             // Nothing new, OR the trie was trimmed by eviction since the last
-            // probe so it now returns FEWER full pages than we've already
-            // adopted (beforeAdopted > match.pages.count). The original guard
-            // compared only aligned TOKENS (alignedMatchLength), which can
-            // exceed match.pages.count*PAGE_SLIDE when the cvec-tag filter drops
-            // matched pages — so `for i in beforeAdopted..<match.pages.count`
-            // below forms an invalid Range (lowerBound > upperBound) and traps
-            // (EXC_BREAKPOINT, observed crashing the server under sustained deep
-            // multimodal refinement at high cache-hit/eviction pressure,
-            // 2026-05-29). Don't regress already-adopted pages; adopt nothing
-            // new on this probe.
+            // probe so it now returns FEWER pages than we've already adopted
+            // (beforeAdopted > match.pages.count). The guard compares aligned
+            // TOKENS (alignedMatchLength), which can exceed match.pages.count·PAGE
+            // when the cvec-tag filter drops matched pages — without the second
+            // clause `for i in beforeAdopted..<match.pages.count` below would
+            // form an invalid Range and trap. Don't regress already-adopted
+            // pages; adopt nothing new on this probe.
             return (0, 0)
         }
-        // Adopt the new full pairs. KEEP the incref (the listing/refcount that
-        // closeSession's decref-all at teardown balances, and that keeps the
+        // Adopt the new pages READ-ONLY (one incref+append each). With ONE
+        // PAGE=16 there is NO divergent half to privatize — adoption is
+        // copy-on-write-free BY CONSTRUCTION: the adopted span [0..N·16) is
+        // exactly the shared prefix, and the first divergent write lands at
+        // position N·16 onto a fresh private page (ensurePages). The whole
+        // slide-divergent CoW + alloc-fail abandon-tail machinery is GONE.
+        //
+        // KEEP the incref (closeSession's decref-all balances it; it keeps the
         // page off the free list while this live generation references it).
-        // Each adopted member is a CITATION: this session is a distinct adopter
-        // of a shared prefix page, so its decayed-citation reuse-value goes up
-        // (rmapAdd(isCitation:true) -> pageManager.recordCitation). The reverse
-        // map records the (page -> this generation) ownership in lockstep.
+        // Each adopted member is a CITATION (distinct adopter of a shared
+        // prefix page) -> isCitation:true bumps decayed-citation reuse-value.
         for i in beforeAdopted..<match.pages.count {
-            let pair = match.pages[i]
-            engine.pageManager.incref(physPage: pair.slidePlusFullHead)
-            engine.pageManager.incref(physPage: pair.fullTail)
-            engine.rmapAdd(id, pair.slidePlusFullHead, isCitation: true)
-            engine.rmapAdd(id, pair.fullTail, isCitation: true)
-            ownedPages.append(pair.slidePlusFullHead)
-            ownedPages.append(pair.fullTail)
+            let phys = match.pages[i]
+            engine.pageManager.incref(physPage: phys)
+            engine.rmapAdd(id, phys, isCitation: true)
+            ownedPages.append(phys)
         }
-        let newAlignedAdopted = (match.pages.count - beforeAdopted) * PAGE_SLIDE
+        let newAlignedAdopted = (match.pages.count - beforeAdopted) * PAGE
         if alignedMatch > 0 && newAlignedAdopted > 0 {
             myPromotedSlidePairCount = match.pages.count
             if dbg {
                 print("  [cache] session \(id) adopted \(match.pages.count - beforeAdopted) "
                       + "additional shared prefix pages via trie (total \(match.pages.count) = "
-                      + "\(match.pages.count * PAGE_SLIDE) tokens; trie matched \(match.trieMatchLength))")
+                      + "\(match.pages.count * PAGE) tokens; trie matched \(match.trieMatchLength))")
             }
         }
-        // ── Slide/full geometry copy-on-write (absorbing-state-collapse fix, 2026-06-01) ──
-        //
-        // ONE block_table per slot serves BOTH the full-attention layers
-        // (PAGE_FULL=8) and the sliding-window layers (PAGE_SLIDE=16). For a
-        // position P, full layers address ownedPages[P/8] and slide layers
-        // address ownedPages[P/16] — so physical page index k is aliased onto
-        // TWO different absolute position ranges: full positions [8k..8k+7]
-        // and slide positions [16k..16k+15].
-        //
-        // Aligned adoption of N slide-pairs (match.pages.count == N) incref-
-        // shares ownedPages[0..2N-1] (= the producer's full-pages 0..2N-1).
-        // For the FULL layers every one of those covers [8k..8k+7] ⊆ the shared
-        // prefix [0..16N-1] (k ≤ 2N-1), so read-only sharing is sound. But the
-        // SLIDE layers read/write ownedPages[k] for slide-page k = positions
-        // [16k..16k+15], and for k ∈ [N..2N-1] that is [16N..32N-1] — PAST the
-        // shared prefix, i.e. THIS session's own (divergent) generation region.
-        // Once the session generates past 16N it writes its divergent slide K/V
-        // into ownedPages[N..2N-1] — pages the producer (and any sibling adopter)
-        // still references read-only. That cross-session slide-K/V clobber is
-        // audit defect #8 firing on the serving path, and it surfaces as the
-        // off-manifold "multilingual token soup" absorbing-state collapse on the
-        // shareable-prefix suggester path.
-        //
-        // Fix (CoW BY CONSTRUCTION, 2026-06): keep sharing the fully-safe half
-        // ownedPages[0..N-1] read-only; ALWAYS copy-on-write the slide-divergent
-        // half ownedPages[N..2N-1] into private pages, UNCONDITIONALLY — the
-        // refcount>1 gate is RETIRED. Rationale: the old gate skipped the copy
-        // when pageRefcount==1, assuming "no other reader to corrupt." But under
-        // the decoupled eviction model the listing refcount is no longer a sound
-        // proxy for "no other reader": a producer may have decref'd (refcount
-        // dropping to 1 or 0) while its trie anchor STILL exposes the page for a
-        // future concurrent adopter, and two adopters racing both see refcount<=1
-        // and both skip CoW -> the audit #8 cross-session slide-K/V clobber /
-        // multilingual-token-soup collapse (kv_slide_full_geometry memory: a
-        // single clean run is untrustworthy; the gate was only ever
-        // probabilistically safe). Always-CoW makes divergent writes land in a
-        // page this session SOLELY owns by construction — soundness no longer
-        // depends on any count. The whole-page copy preserves the still-valid
-        // shared FULL K/V (positions [8N..16N-1]).
-        //
-        // ALLOC-FAIL HOLE CLOSED (the 16b5416 class): if allocFresh throws under
-        // pool pressure we must NOT fall back to sharing the page we are about to
-        // divergently write (the old `try?` degraded to that share-in-place). We
-        // ABANDON adoption of every not-yet-privatized slide-divergent page from
-        // k onward: decref + drop them from ownedPages, returning only the safe
-        // fully-shared aligned prefix [0..k-1] and the privatized pages already
-        // swapped. The session re-prefills the abandoned tail itself (its
-        // primingQueue still covers those positions). Never share a page about to
-        // be divergently written.
-        let nAdopted = match.pages.count
-        if nAdopted > 0 {
-            var k = nAdopted
-            while k < 2 * nAdopted && k < ownedPages.count {
-                let phys = ownedPages[k]
-                guard let fresh = try? engine.pageManager.allocFresh() else {
-                    // Alloc failed: abandon the un-privatized slide-divergent
-                    // tail [k..2N-1] rather than share-in-place. Decref +
-                    // remove from ownedPages and the reverse map so the
-                    // session owns nothing it would divergently clobber.
-                    let dropFrom = k
-                    let dropTo = min(2 * nAdopted, ownedPages.count)
-                    for j in (dropFrom..<dropTo).reversed() {
-                        let drop = ownedPages[j]
-                        engine.rmapRemove(id, drop)
-                        engine.pageManager.decref(physPage: drop)
-                        ownedPages.remove(at: j)
-                    }
-                    // Aligned-adopted count shrinks to what BOTH layer types
-                    // still cover. Full layers read ownedPages[pos/PAGE_FULL]:
-                    // the kept first `dropFrom` entries cover full positions
-                    // [0, PAGE_FULL·dropFrom) — the binding constraint (≤ the
-                    // 16N slide-shared prefix since dropFrom ≤ 2N). Round DOWN
-                    // to a whole slide-page boundary (the caller advances
-                    // position by this and expects PAGE_SLIDE multiples):
-                    // floor(PAGE_FULL·dropFrom / PAGE_SLIDE) = dropFrom/2 pairs.
-                    let safePairs = dropFrom / 2
-                    myPromotedSlidePairCount = safePairs
-                    let safeAligned = safePairs * PAGE_SLIDE
-                    if dbg {
-                        print("  [cache] session \(id) slide-CoW alloc-fail at idx \(k): "
-                              + "abandoned divergent tail [\(dropFrom)..\(dropTo)) "
-                              + "(no share-in-place); safe aligned=\(safeAligned)")
-                    }
-                    return (safeAligned, safeAligned)
-                }
-                engine.copyPhysPageKV(srcPhys: phys, dstPhys: fresh)
-                engine.rmapSwap(id, from: phys, to: fresh)
-                engine.pageManager.decref(physPage: phys)
-                ownedPages[k] = fresh
-                if dbg {
-                    print("  [cache] session \(id) slide-CoW idx \(k): \(phys)->\(fresh) "
-                          + "(slide-divergent half [N..2N-1], full-K/V preserved, always-CoW)")
-                }
-                k += 1
-            }
-        }
-        // Partial-pair adoption (Track B fold-in): if the trie returned
-        // a partial extension past the aligned match, allocate FRESH
-        // pages and CoW-copy the partial's K/V bytes onto them. The
-        // consumer's prefill then writes positions [validUpTo, ...)
-        // into pages it solely owns — no shared writes, race-safe for
-        // multi-consumer concurrent extends.
-        //
-        // Followup 1 (Grand-slam 2026-05-23): replaces the previous
-        // direct-incref-and-share approach, which was race-safe only
-        // for serialized workloads. The producer continues to hold
-        // its partial-pair pages via PageManager's content-index /
-        // trie back-pointer, so the producer-side pages are not
-        // reclaimed by this consumer's adoption — they remain
-        // available for future adopters.
-        //
-        // Operator escape hatch: LM_PARTIAL_COW_DISABLE=1 reverts to
-        // the old direct-incref behavior for A/B comparison.
+        // Partial-page adoption (Track B fold-in): if the trie returned
+        // a partial extension past the aligned match, allocate ONE FRESH
+        // page and CoW-copy the partial's K/V bytes onto it. The consumer's
+        // prefill then writes positions [validUpTo, ...) into a page it
+        // solely owns — no shared writes, race-safe for multi-consumer
+        // concurrent extends. This single-page CoW is the ONE legitimate
+        // privatization kept under ONE PAGE=16 (the slide-divergent CoW is
+        // deleted; a partially-shared-then-extended page still needs a
+        // private copy so the producer's read-only anchor isn't clobbered).
         var newPartialAdopted = 0
         if let pp = match.partialTail {
-            // Always copy-on-write the partial tail: allocate a fresh pair and
-            // copy the partial's K/V bytes, so the consumer never writes into a
-            // page the producer's trie anchor still shares read-only. The old
-            // LM_PARTIAL_COW_DISABLE direct-incref hatch was a confirmed
-            // cross-session-corruption soundness hole — removed 2026-05-28
-            // (docs/page_lifecycle_audit_2026-05-28.md #3).
-            let freshHead: Int
+            let fresh: Int
             do {
-                freshHead = try engine.pageManager.allocFresh()
-                engine.zeroPhysPageKV(freshHead)
+                fresh = try engine.pageManager.allocFresh()
+                engine.zeroPhysPageKV(fresh)
             } catch {
-                // No fresh page; abandon the partial (full-aligned pages kept).
-                return (newAlignedAdopted, newAlignedAdopted)
-            }
-            let freshTail: Int
-            do {
-                freshTail = try engine.pageManager.allocFresh()
-                engine.zeroPhysPageKV(freshTail)
-            } catch {
-                // Leak fix (#1): freshHead is at refcount=1 but not yet in
-                // ownedPages; decref it before bailing or it leaks for the
-                // engine's lifetime — and this fires exactly under the pool
-                // pressure that threw the second alloc.
-                engine.pageManager.decref(physPage: freshHead)
+                // No fresh page; abandon the partial (aligned pages kept).
                 return (newAlignedAdopted, newAlignedAdopted)
             }
             // Whole-page copy; rows past validUpTo are producer-written-but-
-            // soon-overwritten or zero. Producer keeps its pages (still
-            // adoptable via the trie anchor); we do not decref them. The fresh
-            // pages are this session's OWN private pages (CoW by construction),
-            // not citations — record listing-only in the reverse map.
-            engine.copyPhysPageKV(srcPhys: pp.slidePlusFullHead, dstPhys: freshHead)
-            if let ft = pp.fullTail {
-                engine.copyPhysPageKV(srcPhys: ft, dstPhys: freshTail)
-            }
-            engine.rmapAdd(id, freshHead, isCitation: false)
-            engine.rmapAdd(id, freshTail, isCitation: false)
-            ownedPages.append(freshHead)
-            ownedPages.append(freshTail)
+            // soon-overwritten or zero. Producer keeps its page (still
+            // adoptable via the trie anchor); we do not decref it. The fresh
+            // page is this session's OWN private page (CoW by construction),
+            // not a citation — record listing-only in the reverse map.
+            engine.copyPhysPageKV(srcPhys: pp.phys, dstPhys: fresh)
+            engine.rmapAdd(id, fresh, isCitation: false)
+            ownedPages.append(fresh)
             newPartialAdopted = pp.validUpTo
             if dbg {
-                print("  [cache] session \(id) partial-CoW: head \(pp.slidePlusFullHead)→\(freshHead), "
-                      + "tail \(pp.fullTail.map(String.init) ?? "nil")→\(freshTail), validUpTo=\(pp.validUpTo)")
+                print("  [cache] session \(id) partial-CoW: \(pp.phys)→\(fresh), "
+                      + "validUpTo=\(pp.validUpTo)")
             }
-            // Don't bump myPromotedSlidePairCount — the partial isn't a full page
-            // yet from this session's perspective.
+            // Don't bump myPromotedSlidePairCount — the partial isn't a full
+            // page yet from this session's perspective.
         }
         return (newAlignedAdopted, newAlignedAdopted + newPartialAdopted)
     }
@@ -1963,8 +1831,8 @@ final class LmEngine {
         // 2026-05-07 (M:K): slotAssignment removed. Picker assigns kpos per CB.
         // ── G2 dynamic-pool budget cap (2026-06) ──────────────────────────
         // Per-page resident KV bytes = Σ_layers pg · KV_H · HD · 2 (fp16) · 2
-        // (K and V), pg = PAGE_FULL(8) for full-attn layers, PAGE_SLIDE(16) for
-        // slide layers. Convert the memory budget into a page cap so the pool
+        // (K and V), pg = PAGE(16) for EVERY layer (one page size now).
+        // Convert the memory budget into a page cap so the pool
         // can grow on demand WITHOUT OOMing: even if every exposed page is
         // eventually written (committed), resident KV stays under
         // KV_MEM_BUDGET_FRAC · physicalMemory − model footprint. Clamp to
@@ -1972,7 +1840,7 @@ final class LmEngine {
         var perPageBytes = 0
         for L in 0..<NUM_LAYERS {
             let lw = weights.layers[L]
-            let pg = lw.isFull ? PAGE_FULL : PAGE_SLIDE
+            let pg = PAGE
             perPageBytes += pg * lw.KV_H * lw.HD * 2 * 2   // ×2 fp16, ×2 K+V
         }
         let physMem = Double(ProcessInfo.processInfo.physicalMemory)
@@ -1991,9 +1859,9 @@ final class LmEngine {
                      poolCap, SCRATCH_PAGE_BASE,
                      Double(poolCap) * Double(perPageBytes) / (1024*1024*1024)))
         self.pageManager = PageManager(numPhysPages: SCRATCH_PAGE_BASE,
-                                        pageSize: PAGE_SLIDE,
+                                        pageSize: PAGE,
                                         poolCapPages: poolCap)
-        self.prefixTrie = RadixTrie(pageSlide: PAGE_SLIDE)
+        self.prefixTrie = RadixTrie(pageSlide: PAGE)
         self._savedBTScratchByteCount = B * MAX_PAGES_PER_SLOT * MemoryLayout<UInt32>.stride
         self._savedBTScratch = UnsafeMutablePointer<UInt32>.allocate(
             capacity: B * MAX_PAGES_PER_SLOT)
@@ -2015,17 +1883,16 @@ final class LmEngine {
     // Fails if the page pool is exhausted — caller must close a session or
     // evict another resident to make room.
     fileprivate func ensurePages(_ s: Session, forKLen kLen: Int) -> Bool {
-        // Allocate at PAGE_FULL granularity (the SMALLER of slide/full
-        // page sizes) so block_table has enough entries for the
-        // full-attention layers, which use PAGE_FULL=8 while slide uses
-        // PAGE_SLIDE=16.
-        let needed = (kLen + PAGE_FULL - 1) / PAGE_FULL
+        // ONE PAGE=16 for every layer: ownedPages has exactly one entry per
+        // 16-token logical page, and the SAME flat block_table feeds full and
+        // sliding-window layers (both index block_table[slot][pos/16]).
+        let needed = (kLen + PAGE - 1) / PAGE
         if needed > MAX_PAGES_PER_SLOT {
             s.state = .done
             s.doneReason = 3
             s.errMsg = "context length \(kLen) exceeds engine block-table capacity "
-                + "\(MAX_PAGES_PER_SLOT * PAGE_FULL) tokens "
-                + "(\(MAX_PAGES_PER_SLOT) pages at PAGE_FULL=\(PAGE_FULL)); "
+                + "\(MAX_PAGES_PER_SLOT * PAGE) tokens "
+                + "(\(MAX_PAGES_PER_SLOT) pages at PAGE=\(PAGE)); "
                 + "reduce prompt plus max_tokens"
             print("  ensurePages: context overflow for session \(s.id): "
                 + "kLen=\(kLen), neededPages=\(needed), "
@@ -2069,7 +1936,7 @@ final class LmEngine {
         let localPhys = phys - chunkIdx * weights.kvChunkPages
         for L in 0..<NUM_LAYERS {
             let lw = weights.layers[L]
-            let pg = lw.isFull ? PAGE_FULL : PAGE_SLIDE
+            let pg = PAGE
             let bytesPerPage = pg * lw.KV_H * lw.HD * 2
             let off = localPhys * bytesPerPage
             let kBuf = weights.K_chunks[L][chunkIdx]
@@ -2079,10 +1946,10 @@ final class LmEngine {
         }
     }
 
-    // Followup 1 (CoW-on-extend for partial pairs): copy K/V bytes from
-    // a source phys page to a destination phys page, across all layers.
-    // The whole per-layer page is copied (PAGE_SLIDE or PAGE_FULL rows
-    // worth of K + V halves) because (a) the cost is dominated by the
+    // CoW-on-extend for partial pages: copy K/V bytes from a source phys
+    // page to a destination phys page, across all layers. The whole
+    // per-layer page is copied (PAGE rows worth of K + V halves) because
+    // (a) the cost is dominated by the
     // ~tens-of-microseconds memcpy bandwidth, not the byte count, and
     // (b) trailing rows in the source past validUpTo are either zeros
     // (fresh-allocated source) or producer-written bytes that the
@@ -2099,7 +1966,7 @@ final class LmEngine {
         let dstLocal = dstPhys - dstChunkIdx * weights.kvChunkPages
         for L in 0..<NUM_LAYERS {
             let lw = weights.layers[L]
-            let pg = lw.isFull ? PAGE_FULL : PAGE_SLIDE
+            let pg = PAGE
             let bytesPerPage = pg * lw.KV_H * lw.HD * 2
             let srcOff = srcLocal * bytesPerPage
             let dstOff = dstLocal * bytesPerPage
@@ -2154,7 +2021,7 @@ final class LmEngine {
         let localPhys = phys - chunkIdx * weights.kvChunkPages
         for L in 0..<NUM_LAYERS {
             let lw = weights.layers[L]
-            let pg = lw.isFull ? PAGE_FULL : PAGE_SLIDE
+            let pg = PAGE
             let sliceHalves = lw.KV_H * lw.HD
             let byteOffset = localPhys * pg * sliceHalves * 2
             // K and V destinations at that offset.
@@ -2355,27 +2222,25 @@ final class LmEngine {
         // is per-CB scratch. Just nil out the per-CB field for cleanliness.
         s.slot = nil
         // Track B fold-in: partial-page promotion at teardown. We promote
-        // a partial-pair anchor at the PROMPT boundary (not s.position,
-        // which has been extended by generation — generation tokens
-        // diverge across sessions and aren't useful to share).
+        // a partial anchor at the PROMPT boundary (not s.position, which has
+        // been extended by generation — generation tokens diverge across
+        // sessions and aren't useful to share). Under ONE PAGE=16 a 16-token
+        // page is a SINGLE phys page (ownedPages[p]).
         let promptEnd = s.promptEndPosition
         // Partial covers everything EXCEPT the last token of the prompt
         // (which gets re-prefilled by the consumer to drive the post-
         // prefill sample naturally; see B1/B3 test expectations).
-        let mod = promptEnd % PAGE_SLIDE
+        let mod = promptEnd % PAGE
         if mod >= 2 && promptEnd > 0 {
             let partialValid = mod - 1
-            let p = promptEnd / PAGE_SLIDE      // index of trailing partial page
-            let slideIdx = 2 * p
-            let fullIdx = 2 * p + 1
-            // Only promote if we have the trailing page pair allocated.
-            if slideIdx < s.ownedPages.count &&
+            let p = promptEnd / PAGE      // index of trailing partial page
+            // Only promote if we have the trailing page allocated.
+            if p < s.ownedPages.count &&
                promptEnd <= s.consumedTokens.count {
-                let slidePrim = s.ownedPages[slideIdx]
-                let fullSib = (fullIdx < s.ownedPages.count) ? s.ownedPages[fullIdx] : nil
-                let pageStart = p * PAGE_SLIDE
+                let phys = s.ownedPages[p]
+                let pageStart = p * PAGE
                 let tag = s.cvecAnchorTagForPage(pageStart: pageStart,
-                                                  pageSize: PAGE_SLIDE)
+                                                  pageSize: PAGE)
                 // The trie key is the first (pageStart + partialValid) tokens,
                 // which is the prefix that B's lookup will match against
                 // (B submits its own prefix; trie finds anchor at that depth).
@@ -2384,17 +2249,12 @@ final class LmEngine {
                     s.consumedTokens[0..<trieDepth],
                     cvecDigest: s.cvecDigestForPage(pageStart: pageStart,
                                                      pageSize: partialValid))
-                let partial = PartialPagePair(
-                    slidePlusFullHead: slidePrim,
-                    fullTail: (partialValid > PAGE_FULL) ? fullSib : nil,
-                    validUpTo: partialValid)
+                let partial = PartialPage(phys: phys, validUpTo: partialValid)
                 let inserted = prefixTrie.insertPartialAnchor(
                     tokensCoveringFullPrefix: s.consumedTokens[0..<trieDepth],
-                    pair: partial, cvecTag: tag)
-                if inserted, let fs = fullSib {
-                    pageManager.markPairContentIndexed(slidePlusFullHead: slidePrim,
-                                                       fullTail: fs,
-                                                       contentHash: synthHash)
+                    partial: partial, cvecTag: tag)
+                if inserted {
+                    pageManager.markContentIndexed(phys: phys, contentHash: synthHash)
                 }
             }
         }
@@ -2431,55 +2291,40 @@ final class LmEngine {
     // stepPrefillForSession. (Pre-Followup 3 this also wrote into the
     // deleted PageManager.contentIndex dict.)
     fileprivate func promoteFinishedPages(_ s: Session) {
-        let fullyWritten = s.position / PAGE_SLIDE
+        let fullyWritten = s.position / PAGE
         while s.myPromotedSlidePairCount < fullyWritten {
             let p = s.myPromotedSlidePairCount
-            // We need the first (p+1)*PAGE_SLIDE tokens of this session's
+            // We need the first (p+1)*PAGE tokens of this session's
             // submitted history to form the page's prefix hash. If the
             // session's consumedTokens hasn't caught up (unusual — happens
             // only when a submit staged tokens in primingQueue that were
             // consumed without being added to consumedTokens), skip.
-            let end = (p + 1) * PAGE_SLIDE
-            // The SlidePairContents we promote for slide-page P is the
-            // FULL-attention page PAIR: ownedPages[2P] holds full-attn K/V for
-            // positions [P*16, P*16+7], ownedPages[2P+1] holds full-attn K/V
-            // for [P*16+8, P*16+15]. (Historical names `slideIdx`/
-            // `slidePlusFullHead` are misnomers — neither holds slide-layer
-            // K/V. The slide-layer K/V for slide-page P lives at the SEPARATE
-            // page ownedPages[P], which the slide kernel reads at pos/16; it is
-            // shared implicitly by in-order aligned adoption and CoW-privatized
-            // for the divergent half ownedPages[N..2N-1] in
-            // adoptSharedPrefixPages, commit 16b5416.) Skip promotion until
-            // both full-attn pages are allocated.
-            let slideIdx = 2 * p
-            let fullIdx  = 2 * p + 1
+            let end = (p + 1) * PAGE
+            // Under ONE PAGE=16, logical page P is the SINGLE phys page
+            // ownedPages[P] covering positions [16P..16P+15] in every layer's
+            // K/V buffer. Skip promotion until the page is allocated.
             guard end <= s.consumedTokens.count,
-                  fullIdx < s.ownedPages.count else {
+                  p < s.ownedPages.count else {
                 break
             }
-            let pageStart = p * PAGE_SLIDE
+            let phys = s.ownedPages[p]
+            let pageStart = p * PAGE
             let digest = s.cvecDigestForPage(pageStart: pageStart,
-                                              pageSize: PAGE_SLIDE)
+                                              pageSize: PAGE)
             let hash = PageManager.hashPage(s.consumedTokens[0..<end],
                                              cvecDigest: digest)
-            let pair = SlidePairContents(slidePlusFullHead: s.ownedPages[slideIdx],
-                                       fullTail: s.ownedPages[fullIdx])
             // Track D: insert into the radix trie. The trie is the
             // source-of-truth for adoption lookups.
             let tag = s.cvecAnchorTagForPage(pageStart: pageStart,
-                                              pageSize: PAGE_SLIDE)
+                                              pageSize: PAGE)
             let inserted = prefixTrie.insertAnchor(
                 tokensCoveringFullPrefix: s.consumedTokens[0..<end],
-                pair: pair, cvecTag: tag)
+                phys: phys, cvecTag: tag)
             if inserted {
-                // Followup 3 (2026-05-23): contentIndex deleted; only the
-                // PageInfo bookkeeping (so the eviction callback knows the
-                // pair partner) survives. Do not mark duplicate pages for
-                // an existing trie anchor; they are not reachable by lookup.
-                pageManager.markPairContentIndexed(
-                    slidePlusFullHead: pair.slidePlusFullHead,
-                    fullTail: pair.fullTail,
-                    contentHash: hash)
+                // PageInfo bookkeeping (content hash for the eviction
+                // callback). Do not mark duplicate pages for an existing trie
+                // anchor; they are not reachable by lookup.
+                pageManager.markContentIndexed(phys: phys, contentHash: hash)
             }
             if ProcessInfo.processInfo.environment["LM_CACHE_DEBUG"] != nil {
                 let head = s.consumedTokens[pageStart..<end].prefix(4).map(String.init).joined(separator: ",")
@@ -2915,8 +2760,8 @@ final class LmEngine {
                     posP[slot] = UInt32(logitPos)
                     let kLen = logitPos + 1
                     klsP[slot] = UInt32(kLen); klfP[slot] = UInt32(kLen)
-                    npsP[slot] = UInt32((kLen + PAGE_SLIDE - 1) / PAGE_SLIDE)
-                    npfP[slot] = UInt32((kLen + PAGE_FULL  - 1) / PAGE_FULL)
+                    npsP[slot] = UInt32((kLen + PAGE - 1) / PAGE)
+                    npfP[slot] = UInt32((kLen + PAGE - 1) / PAGE)
                     realSlot[slot] = true
                     kvSkipP[slot] = 1
                     continue
@@ -2936,8 +2781,8 @@ final class LmEngine {
                     posP[slot] = UInt32(s.position)
                     let kLen = s.position + 1
                     klsP[slot] = UInt32(kLen); klfP[slot] = UInt32(kLen)
-                    npsP[slot] = UInt32((kLen + PAGE_SLIDE - 1) / PAGE_SLIDE)
-                    npfP[slot] = UInt32((kLen + PAGE_FULL  - 1) / PAGE_FULL)
+                    npsP[slot] = UInt32((kLen + PAGE - 1) / PAGE)
+                    npfP[slot] = UInt32((kLen + PAGE - 1) / PAGE)
                     realSlot[slot] = true
                     continue
                 }
@@ -3292,12 +3137,12 @@ final class LmEngine {
                     s.state = .done
                     s.doneReason = 2   // length / max_tokens budget
                 }
-                // Promote ONLY at page boundaries (every PAGE_SLIDE tokens)
+                // Promote ONLY at page boundaries (every PAGE tokens)
                 // to avoid the per-step hash-compute cost dominating AR
                 // throughput. promoteFinishedPages is internally bounded
                 // by myPromotedSlidePairCount → fullyWritten anyway, but checking
                 // before calling skips the function-call overhead.
-                if s.position % PAGE_SLIDE == 0 || s.state == .done {
+                if s.position % PAGE == 0 || s.state == .done {
                     promoteFinishedPages(s)
                 }
             }

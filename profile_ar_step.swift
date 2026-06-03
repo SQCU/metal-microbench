@@ -108,8 +108,8 @@ func runLmARProfile(ggufPath: String) {
         posBuf[b] = UInt32(qLen)
         arklsP[b] = UInt32(qLen + 1)        // attention sees positions 0..qLen
         arklfP[b] = UInt32(qLen + 1)
-        npsBuf[b] = UInt32((qLen + PAGE_SLIDE - 1) / PAGE_SLIDE)
-        npfBuf[b] = UInt32((qLen + PAGE_FULL - 1) / PAGE_FULL)
+        npsBuf[b] = UInt32((qLen + PAGE - 1) / PAGE)
+        npfBuf[b] = UInt32((qLen + PAGE - 1) / PAGE)
         inputBuf[b] = 1
     }
 
@@ -238,7 +238,7 @@ func runLmARProfile(ggufPath: String) {
                 numPagesA: num_pages_slide, numPagesB: num_pages_full,
                 activeB: B, kvChunkPages: w.kvChunkPages)
             stages.append(runARStage("kv_attn", layer: L) { cb in
-                let pg = isFull ? PAGE_FULL : PAGE_SLIDE
+                let pg = PAGE
                 encKVWrite(cb, K: k_out, V: v_out,
                             kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                             kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,

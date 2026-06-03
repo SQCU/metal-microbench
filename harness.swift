@@ -1647,7 +1647,7 @@ func runLmLayerDump(ggufPath: String, refDir: String, tag: String, outDir: Strin
     }
 
     // Dump layer-0 K and V cache page 0 (slot 0) after the full AR sweep.
-    // Shape: K_cache[L=0] page 0 = [PAGE_SLIDE=16, H_KV=8, HD=256] halves.
+    // Shape: K_cache[L=0] page 0 = [PAGE=16, H_KV=8, HD=256] halves.
     // We snapshot it at the end; by then entries 0..S-1 should hold the
     // post-rope/post-k_norm K from each AR step.
     do {
@@ -1656,7 +1656,7 @@ func runLmLayerDump(ggufPath: String, refDir: String, tag: String, outDir: Strin
         let Kc = w.K_chunks[0][0]
         let Vc = w.V_chunks[0][0]
         // Layer 0 is sliding (PAGE=16, H_KV=8, HD=256).
-        let pageElems = PAGE_SLIDE * 8 * 256
+        let pageElems = PAGE * 8 * 256
         var kFp32 = [Float](repeating: 0, count: pageElems)
         var vFp32 = [Float](repeating: 0, count: pageElems)
         let kp = Kc.contents().assumingMemoryBound(to: Float16.self)
@@ -1667,11 +1667,11 @@ func runLmLayerDump(ggufPath: String, refDir: String, tag: String, outDir: Strin
         }
         kFp32.withUnsafeBufferPointer { bp in
             writeNpyFloat32("\(outDir)/lm_swift_l0_K_page0.npy",
-                             data: bp.baseAddress!, shape: [PAGE_SLIDE, 8, 256])
+                             data: bp.baseAddress!, shape: [PAGE, 8, 256])
         }
         vFp32.withUnsafeBufferPointer { bp in
             writeNpyFloat32("\(outDir)/lm_swift_l0_V_page0.npy",
-                             data: bp.baseAddress!, shape: [PAGE_SLIDE, 8, 256])
+                             data: bp.baseAddress!, shape: [PAGE, 8, 256])
         }
         print("  wrote lm_swift_l0_K_page0.npy, lm_swift_l0_V_page0.npy  (slot 0, phys page 0)")
     }
@@ -1979,8 +1979,8 @@ func runLmPrefillValidate(ggufPath: String, refDir: String, tag: String) {
     for b in 0..<B {
         arPosP[b] = UInt32(qLen - 1)
         arKlsP[b] = UInt32(qLen); arKlfP[b] = UInt32(qLen)
-        arNpsP[b] = UInt32((qLen + PAGE_SLIDE - 1) / PAGE_SLIDE)
-        arNpfP[b] = UInt32((qLen + PAGE_FULL  - 1) / PAGE_FULL)
+        arNpsP[b] = UInt32((qLen + PAGE - 1) / PAGE)
+        arNpfP[b] = UInt32((qLen + PAGE  - 1) / PAGE)
     }
 
     // Teacher-force each AR step with the token that actually follows in

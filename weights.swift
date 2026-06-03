@@ -685,7 +685,7 @@ func loadLmWeights(ggufPath: String) throws -> LmWeights {
     let argBufBytes = KV_NUM_CHUNKS * MemoryLayout<UInt64>.size
     for L in 0..<NUM_LAYERS {
         let lw = layers[L]
-        let pg = lw.isFull ? PAGE_FULL : PAGE_SLIDE
+        let pg = PAGE
         // Per-chunk page count. The last chunk may carry fewer pages
         // if TOTAL_PAGES doesn't divide evenly. Per-chunk allocation
         // uses kvChunkPages (rounded up) so all chunks are the same

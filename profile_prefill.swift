@@ -141,7 +141,7 @@ func runLmPrefillProfile(ggufPath: String) {
                 kLenSlide: pre_k_len_slide, kLenFull: pre_k_len_full,
                 activeB: B, kvChunkPages: w.kvChunkPages)
             stages.append(runStage("kv_attn", layer: L) { cb in
-                let pg = isFull ? PAGE_FULL : PAGE_SLIDE
+                let pg = PAGE
                 encKVWriteMulti(cb, K: k_out, V: v_out,
                                 kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                                 kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
@@ -516,7 +516,7 @@ func runLmPrefillBandwidthSweep(ggufPath: String) {
                 kLenSlide: pre_k_len_slide, kLenFull: pre_k_len_full,
                 activeB: B, kvChunkPages: w.kvChunkPages)
             add("kv_attn", runStage("kv_attn", layer: L) { cb in
-                let pg = isFull ? PAGE_FULL : PAGE_SLIDE
+                let pg = PAGE
                 encKVWriteMulti(cb, K: k_out, V: v_out,
                                 kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                                 kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,

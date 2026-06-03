@@ -51,31 +51,14 @@ enum PageManagerError: Error {
     // decref() is a refcount op; double-decref is silently ignored.
 }
 
-// A logical page: which session owns it, at which logical index, plus the
-// content hash used for prefix-cache lookups.
+// A logical page: its refcount + the content hash used for prefix-cache
+// lookups.
 //
-// Pair bookkeeping: Gemma-4 uses PAGE_SLIDE=16 for sliding-window layers
-// and PAGE_FULL=8 for full-attention layers, but shares ONE flat block_table
-// per slot, addressed at PAGE_FULL=8 granularity (ownedPages is sized
-// ceil(kLen/8)). Each layer's K/V lives in its own per-layer buffer, but
-// both layer types index the SAME flat ownedPages array by their per-layer
-// logical page ordinal: full layers read ownedPages[pos/8], slide layers
-// read ownedPages[pos/16].
-//
-// So one 16-token slide page P spans TWO full-attn pages in the
-// full-attention layers' K/V: ownedPages[2P] holds full K/V for positions
-// [16P..16P+7], ownedPages[2P+1] holds full K/V for [16P+8..16P+15].
-// (The slide-LAYER K/V for slide-page P is a DIFFERENT page, ownedPages[P];
-// it is NOT part of this pair — it is shared implicitly by aligned adoption,
-// and CoW-privatized for the slide-divergent half ownedPages[N..2N-1] in
-// adoptSharedPrefixPages, commit 16b5416. See promoteFinishedPages.)
-//
-// To share slide-page P's FULL-attn K/V correctly across sessions, the
-// content index must track BOTH full-attn pages as a pair — adopting one
-// without the other leaves the full-attn K/V at positions [16P+8, 16P+15]
-// as zeros (or stale data), producing KL~0.38 divergence vs. fresh compute.
-// `pairMate` is the phys index of the OTHER full-attn page of this
-// content-hash pair (nil when this page isn't part of a promoted pair).
+// ONE PAGE=16 for EVERY layer: a 16-token logical page P is a SINGLE physical
+// page (ownedPages[P]) covering positions [16P..16P+15] in every per-layer K/V
+// buffer. Full and sliding-window layers both index block_table[slot][pos/16];
+// there is no dual /8-vs-/16 granularity and no per-page partner — the prior
+// "full-attn page pair" bookkeeping (pairMate / SlidePairContents) is deleted.
 private struct PageInfo {
     // 2026-05-07 (anonymous-pool refactor): pages are no longer tagged
     // with the set of session IDs that own them. The pool is a uniform
@@ -86,7 +69,6 @@ private struct PageInfo {
     // owners.count) but no per-session bookkeeping inside PageManager.
     var refcount: Int           // number of live page references
     var contentHash: UInt64?    // nil = page isn't content-indexed (fresh/dirty)
-    var pairMate: Int?          // other FULL-attn page (ownedPages[2P]/[2P+1]) sharing this hash (see header)
     var lastAccessTick: UInt64
     // 2026-06 KV-retention decoupling — BILINEAR reuse-value (citation × recency).
     //
@@ -116,30 +98,6 @@ private struct PageInfo {
     var lastCitationTick: UInt64 // clockTick at last citation (for decay-to-now)
 }
 
-// SlidePairContents — the pair of phys page IDs capturing the FULL-attention
-// K/V backing for one 16-token slide page P. Both members come from the flat
-// ownedPages array (PAGE_FULL=8 granularity):
-//   `slidePlusFullHead` == ownedPages[2P]   — full-attn K/V for positions [16P..16P+7]
-//   `fullTail`          == ownedPages[2P+1]  — full-attn K/V for positions [16P+8..16P+15]
-//
-// NOTE on the field name: `slidePlusFullHead` is a historical misnomer. It
-// does NOT hold any slide-layer K/V. The SLIDE-layer K/V for slide-page P
-// lives at a SEPARATE page, ownedPages[P] (slide layers index ownedPages[pos/16]),
-// which is not stored in this struct — it is shared implicitly by aligned
-// adoption (consumers reconstruct ownedPages page-for-page in order), and the
-// slide-divergent half ownedPages[N..2N-1] is refcount-gated copy-on-write
-// privatized in adoptSharedPrefixPages (commit 16b5416). This struct exists
-// only to carry the full-attn pair, whose two members are non-adjacent in
-// slide-page space and so must be tracked together for correct adoption.
-//
-// Followup 3 (2026-05-23): PageManager.contentIndex was deleted; the
-// radix trie (radix_trie.swift) is the sole source of truth for
-// adoption lookups. This struct survives as the value type stored at
-// each trie anchor.
-struct SlidePairContents {
-    let slidePlusFullHead: Int   // ownedPages[2P]: full-attn K/V [16P..16P+7]  (name is historical; no slide K/V here)
-    let fullTail: Int            // ownedPages[2P+1]: full-attn K/V [16P+8..16P+15]
-}
 
 final class PageManager {
     // Total physical pages this manager describes (for `pages[]` array
@@ -173,12 +131,12 @@ final class PageManager {
     // Followup 3 (2026-05-23): contentIndex deleted. The radix trie
     // (radix_trie.swift, RadixTrie) is now the sole source of truth
     // for adoption lookups; PageManager only tracks refcounts +
-    // content-hash bookkeeping per phys page, plus the per-page
-    // pairMate so the eviction callback can notify the trie about
-    // both members of a pair.
+    // content-hash bookkeeping per phys page so the eviction callback
+    // can notify the trie. Under ONE PAGE=16 a 16-token page is a single
+    // phys page — no per-page partner bookkeeping.
     //
     // Eviction callback (Track D fold-in): invoked when allocFresh
-    // forcibly evicts a cached page-pair. LmEngine wires this up to
+    // forcibly evicts a cached page. LmEngine wires this up to
     // RadixTrie.invalidateAnchorFor so stale anchors get unlinked.
     // Receives (physPage, oldHash).
     var onPageEvicted: ((Int, UInt64) -> Void)?
@@ -231,7 +189,7 @@ final class PageManager {
         // poolCount] — the device buffers only back poolCount pages.
         self.poolCapPages = max(0, min(poolCount, poolCapPages ?? poolCount))
         self.pages = (0..<numPhysPages).map { _ in
-            PageInfo(refcount: 0, contentHash: nil, pairMate: nil,
+            PageInfo(refcount: 0, contentHash: nil,
                      lastAccessTick: 0, citationScore: 0, lastCitationTick: 0)
         }
         // Lazy free list: nothing pre-pushed. growFrontier starts at the pool
@@ -427,20 +385,10 @@ final class PageManager {
             if let h = p.contentHash {
                 // Track D: notify the radix trie BEFORE we mutate
                 // PageInfo so the callback can read accurate state if
-                // it wishes.
+                // it wishes. Under ONE PAGE=16 a 16-span is a SINGLE page,
+                // so there is no partner page to co-evict.
                 onPageEvicted?(phys, h)
-                if let partner = p.pairMate {
-                    onPageEvicted?(partner, h)
-                }
-                if let partner = p.pairMate,
-                   partner >= 0 && partner < pages.count,
-                   pages[partner].contentHash == h {
-                    pages[partner].contentHash = nil
-                    pages[partner].pairMate = nil
-                    moveFreePageToUncachedIfPresent(partner)
-                }
                 p.contentHash = nil
-                p.pairMate = nil
             }
             pages[phys] = p
         } else {
@@ -532,36 +480,21 @@ final class PageManager {
         pages[physPage] = p
     }
 
-    // Followup 3 (2026-05-23): the old promotePair(...) populated both
-    // PageInfo bookkeeping (contentHash + pairMate) AND inserted into
-    // contentIndex. With contentIndex deleted, this method survives as
-    // a small PageInfo-only writer: it stamps each phys page with the
-    // content hash + partner phys so the eviction callback in
-    // allocFresh can notify the trie about the pair as a unit.
-    //
-    // Both arguments are FULL-attention pages for slide-page P, drawn from
-    // the flat ownedPages array: `slidePlusFullHead` == ownedPages[2P]
-    // (full K/V for [16P..16P+7]); `fullTail` == ownedPages[2P+1] (full K/V
-    // for [16P+8..16P+15]). Neither holds slide-layer K/V (the slide page
-    // ownedPages[P] is never passed here — see SlidePairContents header).
+    // PageInfo-only writer: stamps a phys page with the content hash so the
+    // eviction callback in allocFresh can notify the trie. Under ONE PAGE=16
+    // a 16-token page is a SINGLE phys page (ownedPages[P] covering
+    // [16P..16P+15]) — no partner page bookkeeping.
     //
     // Idempotent: re-stamping with the same hash is a no-op modulo
     // lastAccessTick refresh; re-stamping with a DIFFERENT hash
     // overwrites (the trie's insertAnchor is similarly first-writer-
     // wins via its internal walk, so callers should follow trie
     // semantics).
-    func markPairContentIndexed(slidePlusFullHead: Int, fullTail: Int,
-                                  contentHash: UInt64) {
-        var p1 = pages[slidePlusFullHead]
-        var p2 = pages[fullTail]
-        p1.contentHash = contentHash
-        p2.contentHash = contentHash
-        p1.pairMate = fullTail
-        p2.pairMate = slidePlusFullHead
-        pages[slidePlusFullHead] = p1
-        pages[fullTail]  = p2
-        if p1.refcount == 0 { moveFreePageToCachedIfPresent(slidePlusFullHead) }
-        if p2.refcount == 0 { moveFreePageToCachedIfPresent(fullTail) }
+    func markContentIndexed(phys: Int, contentHash: UInt64) {
+        var p = pages[phys]
+        p.contentHash = contentHash
+        pages[phys] = p
+        if p.refcount == 0 { moveFreePageToCachedIfPresent(phys) }
     }
 
     // Decrement refcount. If it drops to 0, the page goes on the free
@@ -672,7 +605,6 @@ final class PageManager {
         let phys: Int                  // physical page index
         let refcount: Int              // > 0 = in-use; 0 = free-but-cached
         let contentHash: UInt64?       // FNV-1a digest of the tokens on this page
-        let pairMate: Int?             // companion phys page (slide + full sibling)
     }
 
     func livePageSnapshot() -> [PageRecord] {
@@ -686,8 +618,7 @@ final class PageManager {
             let p = pages[phys]
             if p.refcount == 0 && p.contentHash == nil { continue }
             out.append(PageRecord(phys: phys, refcount: p.refcount,
-                                   contentHash: p.contentHash,
-                                   pairMate: p.pairMate))
+                                   contentHash: p.contentHash))
             if out.count >= cap { break }
         }
         return out

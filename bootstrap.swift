@@ -365,7 +365,7 @@ let flexAttnSlideV0PSO: MTLComputePipelineState = psoFC("flex_attn_v0") { fcv in
     fcv.setConstantValue(&useSlide, type: .bool, index: 3)
 }
 let flexAttnFullV0PSO: MTLComputePipelineState = psoFC("flex_attn_v0") { fcv in
-    var d: Int32 = 512, page: Int32 = 8, qPerTg: Int32 = 8
+    var d: Int32 = 512, page: Int32 = 16, qPerTg: Int32 = 8
     var useSlide: Bool = false
     fcv.setConstantValue(&d,        type: .int,  index: 0)
     fcv.setConstantValue(&page,     type: .int,  index: 1)
@@ -526,7 +526,7 @@ let shrd_gate_up_fused = emptyHalf(B * 2 * SHARED_INT)
 let logits      = emptyHalf(B * VOCAB)
 
 // Paging. TOTAL_PAGES is per-layer (per-layer K/V caches allocated at GGUF
-// load time). 256 pages × PAGE_SLIDE=16 tokens = 4096 slide tokens of
+// load time). 256 pages × PAGE=16 tokens = 4096 slide tokens of
 // per-layer capacity; at B=4 disjoint sequences that's ~1024 tokens/seq.
 // The scratch strip at the end (SCRATCH_PAGE_BASE..) is not assigned to
 // any session; it absorbs KV writes from slots we deliberately silence
@@ -653,14 +653,19 @@ func kvMemBudgetFrac() -> Double {
 // Admission-backpressure floor. submitRequest refuses to admit a new
 // session when fewer than this many pages are free in the pool. The
 // floor is sized for one typical prefill cycle (~1K-4K tokens =
-// 64-256 pages at PAGE_FULL=8 granularity); below it a new submission
+// 64-256 pages at PAGE=8 granularity); below it a new submission
 // would almost certainly starve. 256 leaves 7.5% headroom on an
 // 8192-page pool — enough for one fresh prefill plus a small margin.
 let ADMISSION_FREE_PAGE_FLOOR = 256
 // Load-time assert: if this ever drops below B*MAX_PAGES_PER_SLOT, default
 // initLmState's `(b*MAX + p) % TOTAL_PAGES` routing will alias batches.
-let PAGE_SLIDE = 16
-let PAGE_FULL  = 8      // smaller PAGE at D=512 to fit tg-mem (K+V tile 16 KB at PAGE=8)
+// ONE page size for EVERY layer (full and sliding-window alike). The earlier
+// dual granularity (PAGE=8 for full-attn layers, PAGE=16 for slide)
+// shared ONE flat block_table indexed at /8 for full and /16 for slide — the
+// /8-vs-/16 aliasing that divorced the window-mask k_pos tag from the physical
+// bytes (the confirmed root cause). With a single PAGE=16, position p maps the
+// SAME way for all layers: logical_page = p/16, offset = p%16, k_pos = page*16+k.
+let PAGE = 16
 
 // Gemma-4 sliding-window for slide-attention layers (from config.json). The
 // slide kernel masks K positions with k_pos < k_len - SLIDING_WINDOW. Set to
@@ -697,7 +702,7 @@ let k_len_full      = device.makeBuffer(length: B * 4, options: .storageModeShar
 // vs 85 tok/s @ MQL=1024.
 //
 // MAX_Q_LEN is the prefill CHUNK size / per-kernel-dispatch work size.
-// It is NOT the KV cache size (that is MAX_PAGES_PER_SLOT × PAGE_FULL
+// It is NOT the KV cache size (that is MAX_PAGES_PER_SLOT × PAGE
 // ≈ 64k tokens). Long prompts are chunked through the engine's
 // multi-tile prefill path (lm_engine.swift:2099 `thisTile = min(qLen,
 // MAX_Q_LEN)`); the chunk size is the GPU work granularity, not a
@@ -3367,7 +3372,7 @@ func encKVWrite(_ cb: MTLCommandBuffer, K: MTLBuffer, V: MTLBuffer,
 // caller passes the right buffers (e.g. num_pages_{slide,full} for AR,
 // pre_num_pages_{slide,full} for prefill). We walk the MAX of slide and
 // full per slot since block_table indexing covers both attention types
-// at PAGE_FULL granularity (the smaller of the two — see lm_engine.swift
+// at PAGE granularity (the smaller of the two — see lm_engine.swift
 // ensurePages comment).
 func activeKVChunkIdxs(blockTable: MTLBuffer,
                        numPagesA: MTLBuffer, numPagesB: MTLBuffer,
@@ -3401,8 +3406,8 @@ func activeKVChunkIdxsFromKLen(blockTable: MTLBuffer,
     for b in 0..<activeB {
         let kls = Int(klsP[b])
         let klf = Int(klfP[b])
-        let nSlide = (kls + PAGE_SLIDE - 1) / PAGE_SLIDE
-        let nFull  = (klf + PAGE_FULL  - 1) / PAGE_FULL
+        let nSlide = (kls + PAGE - 1) / PAGE
+        let nFull  = (klf + PAGE  - 1) / PAGE
         let n = max(nSlide, nFull)
         for p in 0..<n {
             let phys = Int(btP[b * MAX_PAGES_PER_SLOT + p])
@@ -3434,7 +3439,7 @@ func useResourceForActiveChunks(_ enc: MTLComputeCommandEncoder,
 
 // Host-side block-mask precompute for the flex attention kernel. v0 supports
 // Q_BLOCK=1 (decode) with causal_sliding mask_mod. Populates four buffers in
-// CSR layout. Classification per k_block B of width PAGE_SLIDE, for query
+// CSR layout. Classification per k_block B of width PAGE, for query
 // position q_pos = k_len - 1 (the most recent token; the only Q row at decode):
 //   window_lo  = max(0, k_len - sliding_window)
 //   valid k range: [window_lo, q_pos]
@@ -3457,10 +3462,10 @@ func precomputeFlexBlockMaskSlide(slidingWindow: Int) {
         let q_pos = k_len - 1
         let window_lo = (slidingWindow > 0 && k_len > slidingWindow)
                         ? (k_len - slidingWindow) : 0
-        let kBlocks = (k_len + PAGE_SLIDE - 1) / PAGE_SLIDE
+        let kBlocks = (k_len + PAGE - 1) / PAGE
         for K in 0..<kBlocks {
-            let lo = K * PAGE_SLIDE
-            let hi = lo + PAGE_SLIDE - 1
+            let lo = K * PAGE
+            let hi = lo + PAGE - 1
             if hi < window_lo || lo > q_pos {
                 // EMPTY — don't emit.
             } else if lo >= window_lo && hi <= q_pos {
@@ -3536,7 +3541,7 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
     let qBlocks = (qLen + qBlock - 1) / qBlock
     let qPosP = pre_q_positions.contents().assumingMemoryBound(to: UInt32.self)
 
-    // ---- Slide (PAGE_SLIDE=16) ----
+    // ---- Slide (PAGE=16) ----
     do {
         let fullOff = pre_slide_full_offsets.contents().assumingMemoryBound(to: UInt32.self)
         let fullIdx = pre_slide_full_indices.contents().assumingMemoryBound(to: UInt32.self)
@@ -3552,7 +3557,7 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
             let slotPos = Int(qPosP[b * qLen])
             let slotFirst = (slotPos != 0 || positionStart == 0) ? slotPos : positionStart
             let ctx = MaskModContext(kLen: k_len, slidingWindow: SLIDING_WINDOW)
-            let kBlocks = (k_len + PAGE_SLIDE - 1) / PAGE_SLIDE
+            let kBlocks = (k_len + PAGE - 1) / PAGE
             for qb in 0..<qBlocks {
                 let q_first = slotFirst + qb * qBlock
                 // Last real q row in this block — capped at the slot's
@@ -3561,8 +3566,8 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
                 let q_last  = slotFirst + blockLastIdx
                 let csrIdx = b * qBlocks + qb
                 for K in 0..<kBlocks {
-                    let lo = K * PAGE_SLIDE
-                    let hi = lo + PAGE_SLIDE - 1
+                    let lo = K * PAGE
+                    let hi = lo + PAGE - 1
                     let topLeft     = slideMask.keep(q: q_first, k: lo, ctx: ctx)
                     let topRight    = slideMask.keep(q: q_first, k: hi, ctx: ctx)
                     let botLeft     = slideMask.keep(q: q_last,  k: lo, ctx: ctx)
@@ -3577,7 +3582,7 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
                             let q_abs = q_first + qrow
                             var row: UInt32 = 0
                             if q_abs <= q_last {
-                                for kcell in 0..<PAGE_SLIDE {
+                                for kcell in 0..<PAGE {
                                     let k_abs = lo + kcell
                                     if slideMask.keep(q: q_abs, k: k_abs, ctx: ctx) {
                                         row |= UInt32(1) << kcell
@@ -3595,7 +3600,7 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
         }
     }
 
-    // ---- Full (PAGE_FULL=8, no sliding window) ----
+    // ---- Full (PAGE=8, no sliding window) ----
     do {
         let fullOff = flex_full_full_offsets.contents().assumingMemoryBound(to: UInt32.self)
         let fullIdx = flex_full_full_indices.contents().assumingMemoryBound(to: UInt32.self)
@@ -3609,15 +3614,15 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
             let slotPos = Int(qPosP[b * qLen])
             let slotFirst = (slotPos != 0 || positionStart == 0) ? slotPos : positionStart
             let ctx = MaskModContext(kLen: k_len, slidingWindow: 0)
-            let kBlocks = (k_len + PAGE_FULL - 1) / PAGE_FULL
+            let kBlocks = (k_len + PAGE - 1) / PAGE
             for qb in 0..<qBlocks {
                 let q_first = slotFirst + qb * qBlock
                 let blockLastIdx = min((qb + 1) * qBlock, qLen) - 1
                 let q_last  = slotFirst + blockLastIdx
                 let csrIdx = b * qBlocks + qb
                 for K in 0..<kBlocks {
-                    let lo = K * PAGE_FULL
-                    let hi = lo + PAGE_FULL - 1
+                    let lo = K * PAGE
+                    let hi = lo + PAGE - 1
                     let topLeft  = fullMask.keep(q: q_first, k: lo, ctx: ctx)
                     let topRight = fullMask.keep(q: q_first, k: hi, ctx: ctx)
                     let botLeft  = fullMask.keep(q: q_last,  k: lo, ctx: ctx)
@@ -3632,7 +3637,7 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
                             let q_abs = q_first + qrow
                             var row: UInt32 = 0
                             if q_abs <= q_last {
-                                for kcell in 0..<PAGE_FULL {
+                                for kcell in 0..<PAGE {
                                     let k_abs = lo + kcell
                                     if fullMask.keep(q: q_abs, k: k_abs, ctx: ctx) {
                                         row |= UInt32(1) << kcell
@@ -3817,7 +3822,7 @@ func encRopeMulti(_ cb: MTLCommandBuffer, _ x: MTLBuffer, q_positions: MTLBuffer
 
 // Precompute for full-attention (pure causal, no sliding window).
 // Same CSR layout as slide but writes into the full-specific buffers and
-// uses PAGE_FULL and k_len_full.
+// uses PAGE and k_len_full.
 func precomputeFlexBlockMaskFull() {
     let klfP = k_len_full.contents().assumingMemoryBound(to: UInt32.self)
     let fullOffPtr = flex_full_full_offsets.contents().assumingMemoryBound(to: UInt32.self)
@@ -3831,10 +3836,10 @@ func precomputeFlexBlockMaskFull() {
     for b in 0..<B {
         let k_len = Int(klfP[b])
         let q_pos = k_len - 1
-        let kBlocks = (k_len + PAGE_FULL - 1) / PAGE_FULL
+        let kBlocks = (k_len + PAGE - 1) / PAGE
         for K in 0..<kBlocks {
-            let lo = K * PAGE_FULL
-            let hi = lo + PAGE_FULL - 1
+            let lo = K * PAGE
+            let hi = lo + PAGE - 1
             if lo > q_pos {
                 // EMPTY (past causal horizon).
             } else if hi <= q_pos {
@@ -4552,7 +4557,7 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
     // active slots actually reference; useResource will be called only
     // on these in the dispatchers below. Walk block_table for the
     // active slot range up to each slot's num_pages (max of slide and
-    // full, since block_table indexes both at PAGE_FULL granularity).
+    // full, since block_table indexes both at PAGE granularity).
     let activeChunkIdxs = activeKVChunkIdxs(
         blockTable: block_table,
         numPagesA: num_pages_slide, numPagesB: num_pages_full,
@@ -4626,7 +4631,7 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
             blit.endEncoding()
         }
 
-        let pg = isFull ? PAGE_FULL : PAGE_SLIDE
+        let pg = PAGE
         encKVWrite(cb, K: k_out, V: v_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                     kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                     activeChunkIdxs: activeChunkIdxs,
@@ -5073,7 +5078,7 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
         }
 
         // Multi-position KV write: qLen entries per batch.
-        let pg = isFull ? PAGE_FULL : PAGE_SLIDE
+        let pg = PAGE
         encKVWriteMulti(cb, K: k_out, V: v_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                         kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                         activeChunkIdxs: activeChunkIdxs,
@@ -5406,7 +5411,7 @@ func encodeOnePrefillLayerSplit(_ w: LmWeights, L: Int, qLen: Int, sslot: Int) {
     commitAndCheck("v_norm", buf: v_out, count: N * KV_H * HD) { cb in
         encRMSNormNoScale(cb, x: v_out, out: v_out, D: HD, numVecs: N * KV_H)
     }
-    let pg = isFull ? PAGE_FULL : PAGE_SLIDE
+    let pg = PAGE
     commitAndCheck("kv_write", buf: kChunks[0], count: min(N * KV_H * HD, 4096)) { cb in
         encKVWriteMulti(cb, K: k_out, V: v_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                         kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
@@ -5616,7 +5621,7 @@ func encodeOnePrefillLayer(_ cb: MTLCommandBuffer, _ w: LmWeights, L: Int, qLen:
     encRopeMulti(cb, k_out, q_positions: pre_q_positions, H: KV_H, D: HD,
                  rotary: rotary, theta: theta, qLen: qLen)
     encRMSNormNoScale(cb, x: v_out, out: v_out, D: HD, numVecs: N * KV_H)
-    let pg = isFull ? PAGE_FULL : PAGE_SLIDE
+    let pg = PAGE
     encKVWriteMulti(cb, K: k_out, V: v_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                     kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                     activeChunkIdxs: activeChunkIdxs,
@@ -5745,8 +5750,8 @@ func advanceLmState(nextTokens: [UInt32]) {
         let newKLF = Int(klfP[b]) + 1
         klsP[b] = UInt32(newKLS)
         klfP[b] = UInt32(newKLF)
-        npsP[b] = UInt32((newKLS + PAGE_SLIDE - 1) / PAGE_SLIDE)
-        npfP[b] = UInt32((newKLF + PAGE_FULL - 1) / PAGE_FULL)
+        npsP[b] = UInt32((newKLS + PAGE - 1) / PAGE)
+        npfP[b] = UInt32((newKLF + PAGE - 1) / PAGE)
     }
     precomputeFlexBlockMaskSlide(slidingWindow: SLIDING_WINDOW)
     precomputeFlexBlockMaskFull()
@@ -5813,7 +5818,7 @@ func buildPartialStepCB(_ w: LmWeights, stopAfterLayer: Int) -> MTLCommandBuffer
         encRMSNormG(cb, x: k_out, gammaBuf: lw.attnKNorm, out: k_out, D: HD, numVecs: B * KV_H)
         encRope(cb, k_out, H: KV_H, D: HD, rotary: rotary, theta: theta)
         encRMSNormNoScale(cb, x: v_out, out: v_out, D: HD, numVecs: B * KV_H)
-        let pg = isFull ? PAGE_FULL : PAGE_SLIDE
+        let pg = PAGE
         encKVWrite(cb, K: k_out, V: v_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                     kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                     activeChunkIdxs: activeChunkIdxs,

@@ -180,8 +180,8 @@ final class LmSession {
         for b in 0..<B {
             arPosP[b] = UInt32(qLen - 1)
             arKlsP[b] = UInt32(qLen); arKlfP[b] = UInt32(qLen)
-            arNpsP[b] = UInt32((qLen + PAGE_SLIDE - 1) / PAGE_SLIDE)
-            arNpfP[b] = UInt32((qLen + PAGE_FULL  - 1) / PAGE_FULL)
+            arNpsP[b] = UInt32((qLen + PAGE - 1) / PAGE)
+            arNpfP[b] = UInt32((qLen + PAGE  - 1) / PAGE)
         }
 
         // Copy slot-0's last-position logits (row b=0, q=qLen-1) from

@@ -1445,11 +1445,12 @@ public func gemma_engine_state(_ outBuf: UnsafeMutablePointer<UInt8>?,
             } else {
                 hashStr = "null"
             }
-            let mateStr = p.pairMate.map { String($0) } ?? "null"
             let promoted = (p.contentHash != nil) ? "true" : "false"
+            // pair_mate retained as null for snapshot back-compat: under ONE
+            // PAGE=16 a 16-token page is a single phys page with no partner.
             pageLines.append("""
             {"phys":\(p.phys),"refcount":\(p.refcount),\
-"promoted":\(promoted),"hash":\(hashStr),"pair_mate":\(mateStr)}
+"promoted":\(promoted),"hash":\(hashStr),"pair_mate":null}
 """)
         }
 

@@ -9947,7 +9947,7 @@ kernel void softcap(
 //
 // ONE kernel source. Specialized per-PSO via function constants:
 //   FC_D          — head dim (256 for slide layers, 512 for full)
-//   FC_PAGE       — KV-cache page size in tokens (16 for slide, 8 for full)
+//   FC_PAGE       — KV-cache page size in tokens (16 for EVERY layer now)
 //   FC_Q_PER_TG   — real Q rows per threadgroup (2 for slide, 8 for full)
 //   FC_USE_SLIDE  — 1 enables per-row sliding-window mask; 0 = causal only
 //
@@ -10432,13 +10432,15 @@ kernel void flex_attn_slide_v1_q8(
 // of the 32 lanes in the threadgroup owns D/32 = 16 disjoint d-slots
 // across all 8 query rows = 128 floats = 512 B per lane — well within
 // Apple GPU's register budget, and faster than threadgroup memory in the
-// inner accumulate loop. Threadgroup-memory budget at D=512:
+// inner accumulate loop. Threadgroup-memory budget at D=512, PAGE=16:
 //   Q_tile:      8 * 512 * 2 = 8192 B
-//   scores_tile: 8 * 8 * 2   = 128 B
+//   scores_tile: 8 * 16 * 2  = 256 B
 //   m/l/scale:   8 * 12       = 96 B
 //   q_pos_tg:    8 * 4         = 32 B
 //   ---------------------------------
-//   total:                     ~8.4 KB (was ~24.5 KB before O_acc → reg)
+//   total:                     ~8.6 KB (K/V never enter a tg tile; streamed
+//                              one 16-row page at a time, K direct-from-device,
+//                              V into per-lane registers V_reg[16])
 // Why it matters: simdgroup_matrix usage causes Metal's compiler to
 // double-buffer operand tiles, putting the effective threadgroup-mem
 // reservation near 2× the static accounting. At ~24.5 KB static the
@@ -10476,7 +10478,7 @@ kernel void flex_attn_full_prefill(
     uint3 lid3                              [[thread_position_in_threadgroup]])
 {
     constexpr uint D = 512;
-    constexpr uint PAGE = 8;
+    constexpr uint PAGE = 16;
     constexpr uint THREADS = 32;
     constexpr uint Q_BLOCK = 8;
     constexpr uint Q_ROWS = Q_BLOCK;           // one q_head per TG
@@ -10569,15 +10571,20 @@ kernel void flex_attn_full_prefill(
         device const half* Kbase = Kx + (local_phys * PAGE * H_KV + kv_head) * D;
         device const half* Vbase = Vx + (local_phys * PAGE * H_KV + kv_head) * D;
 
-        // One MMA pass (Q_ROWS=8 fits 8x8) × PAGE/8=1 K slab × D8=64 d-tiles.
-        simdgroup_half8x8 mqk = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
-        for (uint dt = 0; dt < D8; ++dt) {
-            simdgroup_half8x8 mq, mk;
-            simdgroup_load(mq, Q_tile + dt * 8, D);
-            simdgroup_load(mk, Kbase + dt * 8, kv_row_stride, ulong2(0, 0), true);
-            simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+        // QK: PAGE/8 passes of 8 K-columns each (2 passes at PAGE=16).
+        // Q_ROWS=8 fits one 8x8 MMA pass; D8=64 d-tiles each a single
+        // simdgroup_load of an 8-column K slab direct from device.
+        for (uint pb = 0; pb < PAGE / 8; ++pb) {
+            device const half* pk = Kbase + (pb * 8) * kv_row_stride;
+            simdgroup_half8x8 mqk = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+            for (uint dt = 0; dt < D8; ++dt) {
+                simdgroup_half8x8 mq, mk;
+                simdgroup_load(mq, Q_tile + dt * 8, D);
+                simdgroup_load(mk, pk + dt * 8, kv_row_stride, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+            }
+            simdgroup_store(mqk, scores_tile + pb * 8, PAGE);
         }
-        simdgroup_store(mqk, scores_tile, PAGE);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Per-row online softmax. FULL blocks keep every element (no mask

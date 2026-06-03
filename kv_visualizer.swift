@@ -38,7 +38,7 @@ private struct PageCell {
 // Visualizer for K page-aligned sessions sharing a global content cache.
 struct PrefixDisciplineViz {
     let sessions: [VizSession]
-    let pageSize: Int   // must match PAGE_SLIDE for the engine
+    let pageSize: Int   // must match PAGE for the engine
 
     // Render everything: a header, a per-session "submission timeline"
     // row showing cache vs reprefill per page, then a summary table.
@@ -288,6 +288,6 @@ func runKvVisualizer() {
             tokens: (0..<32).map { UInt32(5000 + $0) }))
     }
 
-    let viz = PrefixDisciplineViz(sessions: sessions, pageSize: PAGE_SLIDE)
+    let viz = PrefixDisciplineViz(sessions: sessions, pageSize: PAGE)
     print(viz.render())
 }
