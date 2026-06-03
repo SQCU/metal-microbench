@@ -883,14 +883,14 @@ func runGgufValidateHarness(ggufPath: String) {
 }
 
 // Phase 2a unit test: synthesize Q/K/V for a single slot and single Q tile,
-// dispatch flex_attn_slide_v1_q8, write inputs + output to npy files so a
-// Python reference can verify correctness. B_test=1, Q_LEN=8, H_Q=16, H_KV=8,
-// HD=256. Sliding window disabled. Causal mask via q_positions=[0..7],
-// k_len=8 (one page of K).
+// dispatch flex_attn_prefill (FC_D=256, slide PSO), write inputs + output to
+// npy files so a Python reference can verify correctness. B_test=1, Q_LEN=8,
+// H_Q=16, H_KV=8, HD=256. Sliding window disabled. Causal mask via
+// q_positions=[0..7], k_len=8 (one page of K).
 //
 // Env: FLEX_ATTN_TEST=<outdir>
 func runFlexAttnSlideV1Test(outDir: String) {
-    print("\n=== flex_attn_slide_v1_q8 unit test ===")
+    print("\n=== flex_attn_prefill (slide, FC_D=256) unit test ===")
     let H_Q = 16, H_KV = 8, D = 256, PAGE = 16, Q_LEN = 8
     let B_test = 1
     let qElems  = B_test * Q_LEN * H_Q * D
@@ -949,7 +949,7 @@ func runFlexAttnSlideV1Test(outDir: String) {
     // Dispatch.
     let cb = queue.makeCommandBuffer()!
     let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(flexAttnSlideV1Q8PSO)
+    enc.setComputePipelineState(flexAttnSlidePrefillPSO)
     enc.setBuffer(Q,   offset: 0, index: 0); enc.setBuffer(Kc, offset: 0, index: 1)
     enc.setBuffer(Vc,  offset: 0, index: 2); enc.setBuffer(bt, offset: 0, index: 3)
     enc.setBuffer(mP,  offset: 0, index: 4)
@@ -961,18 +961,26 @@ func runFlexAttnSlideV1Test(outDir: String) {
     enc.setBuffer(partIdx, offset: 0, index: 10)
     enc.setBuffer(qPos, offset: 0, index: 11)
     enc.setBuffer(kLen, offset: 0, index: 12)
+    // Per-partial-block keep-bitmap (all-ones = keep every cell of the lone
+    // partial block). flex_attn_prefill reads partial_block_masks[partial_idx
+    // * 8 + r] for partial blocks.
+    let partMaskBuf = device.makeBuffer(length: FLEX_Q_BLOCK * 4, options: .storageModeShared)!
+    let pmPtr = partMaskBuf.contents().assumingMemoryBound(to: UInt32.self)
+    for r in 0..<FLEX_Q_BLOCK { pmPtr[r] = 0xFFFF }   // low PAGE=16 bits set
+    enc.setBuffer(partMaskBuf, offset: 0, index: 19)
     var scale: Float = 1.0
     var mv = UInt32(MAX_PAGES_PER_SLOT), hq = UInt32(H_Q), hkv = UInt32(H_KV)
-    var ns = UInt32(testNSplits), sw = UInt32(0), ql = UInt32(Q_LEN)
+    var ns = UInt32(testNSplits), ql = UInt32(Q_LEN)
     enc.setBytes(&scale, length: 4, index: 13)
     enc.setBytes(&mv,    length: 4, index: 14)
     enc.setBytes(&hq,    length: 4, index: 15)
     enc.setBytes(&hkv,   length: 4, index: 16)
     enc.setBytes(&ns,    length: 4, index: 17)
-    enc.setBytes(&sw,    length: 4, index: 18)
-    enc.setBytes(&ql,    length: 4, index: 19)
-    // Grid: (B_test * H_KV, Q_blocks=1, N_SPLITS=1) TGs of 32 lanes each.
-    enc.dispatchThreadgroups(MTLSize(width: B_test * H_KV, height: 1, depth: testNSplits),
+    enc.setBytes(&ql,    length: 4, index: 18)
+    var cp = UInt32(1)
+    enc.setBytes(&cp,    length: 4, index: 27)
+    // Grid: one q_head per TG → (B_test * H_Q, q_blocks=1, N_SPLITS).
+    enc.dispatchThreadgroups(MTLSize(width: B_test * H_Q, height: 1, depth: testNSplits),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
 
@@ -1208,6 +1216,11 @@ private func dispatchAttnBench(cb: MTLCommandBuffer, v: AttnBenchVariant,
                                 B: Int, maxPages: Int,
                                 H_Q: Int, H_KV: Int, D: Int, qLen: Int,
                                 slidingWindow: Int) {
+    // All-ones per-partial-block keep-bitmap for the prefill PSO cases
+    // (flex_attn_prefill reads partial_block_masks[partial_idx*8 + r]).
+    let partMaskBuf = device.makeBuffer(length: FLEX_Q_BLOCK * 4, options: .storageModeShared)!
+    let pmPtr = partMaskBuf.contents().assumingMemoryBound(to: UInt32.self)
+    for r in 0..<FLEX_Q_BLOCK { pmPtr[r] = 0xFFFF }
     let enc = cb.makeComputeCommandEncoder()!
     switch v.name {
     case "slide_ar":
@@ -1226,7 +1239,7 @@ private func dispatchAttnBench(cb: MTLCommandBuffer, v: AttnBenchVariant,
         enc.dispatchThreadgroups(MTLSize(width: B * H_KV, height: ATTN_N_SPLITS, depth: 1),
                                   threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     case "slide_prefill":
-        enc.setComputePipelineState(flexAttnSlideV1Q8PSO)
+        enc.setComputePipelineState(flexAttnSlidePrefillPSO)
         enc.setBuffer(Q, offset: 0, index: 0); enc.setBuffer(Kc, offset: 0, index: 1)
         enc.setBuffer(Vc, offset: 0, index: 2); enc.setBuffer(bt, offset: 0, index: 3)
         enc.setBuffer(mP, offset: 0, index: 4); enc.setBuffer(lP, offset: 0, index: 5)
@@ -1234,13 +1247,14 @@ private func dispatchAttnBench(cb: MTLCommandBuffer, v: AttnBenchVariant,
         enc.setBuffer(fullOff, offset: 0, index: 7); enc.setBuffer(fullIdx, offset: 0, index: 8)
         enc.setBuffer(partOff, offset: 0, index: 9); enc.setBuffer(partIdx, offset: 0, index: 10)
         enc.setBuffer(qPosBuf, offset: 0, index: 11); enc.setBuffer(kLenBuf, offset: 0, index: 12)
+        enc.setBuffer(partMaskBuf, offset: 0, index: 19)
         var sc: Float = 1.0, mv = UInt32(maxPages), hq = UInt32(H_Q), hkv = UInt32(H_KV)
-        var ns = UInt32(ATTN_N_SPLITS), sw = UInt32(slidingWindow), ql = UInt32(qLen)
+        var ns = UInt32(ATTN_N_SPLITS), ql = UInt32(qLen), cp = UInt32(1)
         enc.setBytes(&sc, length: 4, index: 13); enc.setBytes(&mv, length: 4, index: 14)
         enc.setBytes(&hq, length: 4, index: 15); enc.setBytes(&hkv, length: 4, index: 16)
-        enc.setBytes(&ns, length: 4, index: 17); enc.setBytes(&sw, length: 4, index: 18)
-        enc.setBytes(&ql, length: 4, index: 19)
-        enc.dispatchThreadgroups(MTLSize(width: B * H_KV, height: 1, depth: ATTN_N_SPLITS),
+        enc.setBytes(&ns, length: 4, index: 17); enc.setBytes(&ql, length: 4, index: 18)
+        enc.setBytes(&cp, length: 4, index: 27)
+        enc.dispatchThreadgroups(MTLSize(width: B * H_Q, height: 1, depth: ATTN_N_SPLITS),
                                   threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     case "full_ar":
         enc.setComputePipelineState(flexAttnFullV0PSO)
@@ -1266,11 +1280,13 @@ private func dispatchAttnBench(cb: MTLCommandBuffer, v: AttnBenchVariant,
         enc.setBuffer(fullOff, offset: 0, index: 7); enc.setBuffer(fullIdx, offset: 0, index: 8)
         enc.setBuffer(partOff, offset: 0, index: 9); enc.setBuffer(partIdx, offset: 0, index: 10)
         enc.setBuffer(qPosBuf, offset: 0, index: 11); enc.setBuffer(kLenBuf, offset: 0, index: 12)
+        enc.setBuffer(partMaskBuf, offset: 0, index: 19)
         var sc: Float = 1.0, mv = UInt32(maxPages), hq = UInt32(H_Q), hkv = UInt32(H_KV)
-        var ns = UInt32(ATTN_N_SPLITS), ql = UInt32(qLen)
+        var ns = UInt32(ATTN_N_SPLITS), ql = UInt32(qLen), cp = UInt32(1)
         enc.setBytes(&sc, length: 4, index: 13); enc.setBytes(&mv, length: 4, index: 14)
         enc.setBytes(&hq, length: 4, index: 15); enc.setBytes(&hkv, length: 4, index: 16)
         enc.setBytes(&ns, length: 4, index: 17); enc.setBytes(&ql, length: 4, index: 18)
+        enc.setBytes(&cp, length: 4, index: 27)
         enc.dispatchThreadgroups(MTLSize(width: B * H_Q, height: 1, depth: ATTN_N_SPLITS),
                                   threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     default: break
@@ -1282,8 +1298,8 @@ private func dispatchAttnBench(cb: MTLCommandBuffer, v: AttnBenchVariant,
 // HD=512. Grid: (B*H_Q, 1, 1) = 16 TGs, each owns one q_head's 8 queries.
 // kv_head = (q_head * H_KV) / H_Q = q_head / 8.
 func runFlexAttnFullPrefillTest(outDir: String) {
-    print("\n=== flex_attn_full_prefill unit test ===")
-    let H_Q = 16, H_KV = 2, D = 512, PAGE = 8, Q_LEN = 8
+    print("\n=== flex_attn_prefill (full, FC_D=512) unit test ===")
+    let H_Q = 16, H_KV = 2, D = 512, PAGE = 16, Q_LEN = 8
     let B_test = 1
     let qElems  = B_test * Q_LEN * H_Q * D
     let kvElems = PAGE * H_KV * D
@@ -1345,15 +1361,21 @@ func runFlexAttnFullPrefillTest(outDir: String) {
     enc.setBuffer(partIdx, offset: 0, index: 10)
     enc.setBuffer(qPos, offset: 0, index: 11)
     enc.setBuffer(kLen, offset: 0, index: 12)
+    // All-ones keep-bitmap for the lone partial block.
+    let partMaskBuf = device.makeBuffer(length: FLEX_Q_BLOCK * 4, options: .storageModeShared)!
+    let pmPtr = partMaskBuf.contents().assumingMemoryBound(to: UInt32.self)
+    for r in 0..<FLEX_Q_BLOCK { pmPtr[r] = 0xFFFF }
+    enc.setBuffer(partMaskBuf, offset: 0, index: 19)
     var scale: Float = 1.0
     var mv = UInt32(MAX_PAGES_PER_SLOT), hq = UInt32(H_Q), hkv = UInt32(H_KV)
-    var ns = UInt32(testNSplits), ql = UInt32(Q_LEN)
+    var ns = UInt32(testNSplits), ql = UInt32(Q_LEN), cp = UInt32(1)
     enc.setBytes(&scale, length: 4, index: 13)
     enc.setBytes(&mv,    length: 4, index: 14)
     enc.setBytes(&hq,    length: 4, index: 15)
     enc.setBytes(&hkv,   length: 4, index: 16)
     enc.setBytes(&ns,    length: 4, index: 17)
     enc.setBytes(&ql,    length: 4, index: 18)
+    enc.setBytes(&cp,    length: 4, index: 27)
     // Grid: (B_test * H_Q, 1 q_block, 1 split)
     enc.dispatchThreadgroups(MTLSize(width: B_test * H_Q, height: 1, depth: testNSplits),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))

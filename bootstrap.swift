@@ -370,8 +370,19 @@ let flexAttnFullV0PSO: MTLComputePipelineState = psoFC("flex_attn_v0") { fcv in
     fcv.setConstantValue(&qPerTg,   type: .int,  index: 1)
     fcv.setConstantValue(&useSlide, type: .bool, index: 2)
 }
-let flexAttnSlideV1Q8PSO = pso("flex_attn_slide_v1_q8")
-let flexAttnFullPrefillPSO = pso("flex_attn_full_prefill")
+// Two specialized PSOs compiled from the ONE `flex_attn_prefill` kernel
+// source. FC_D (function_constant(0)) sets head-dim per class (256 slide,
+// 512 full). Masking is bitmap-driven and policy-agnostic, so the kernel
+// needs no mask function constant — the host bakes causal-vs-sliding into
+// partial_block_masks. PAGE=16 for both.
+let flexAttnSlidePrefillPSO: MTLComputePipelineState = psoFC("flex_attn_prefill") { fcv in
+    var d: Int32 = 256   // SLIDE_HD
+    fcv.setConstantValue(&d, type: .int, index: 0)
+}
+let flexAttnFullPrefillPSO: MTLComputePipelineState = psoFC("flex_attn_prefill") { fcv in
+    var d: Int32 = 512   // FULL_HD
+    fcv.setConstantValue(&d, type: .int, index: 0)
+}
 let kvWriteMultiPSO      = pso("kv_write_multi")
 let ropeHalfMultiPSO     = pso("rope_half_multi")
 let rmsNormAddPSO   = pso("rms_norm_add")
@@ -679,11 +690,12 @@ let k_len_full      = device.makeBuffer(length: B * 4, options: .storageModeShar
 // ========================================================================
 // Prefill pipeline — a COMPLETELY SEPARATE forward from autoregressive decode.
 // Prefill kernels and buffers are disjoint from AR's; the only shared state
-// is GGUF weights + KV cache + block_table. At 32 KB tg-mem/TG on M5 Max,
-// parallel-Q attention fits for slide (D=256, Q_BLOCK=8) but not full
-// (D=512, Q_BLOCK>1 overflows O_acc at 64 KB). Full prefill serializes Q
-// inside the prefill CB — still a single CB for all 30 layers, just not
-// fully parallel on the 5/30 full-attn layers.
+// is GGUF weights + KV cache + block_table. The ONE streaming-flash prefill
+// attention kernel (flex_attn_prefill) runs Q_BLOCK=8 parallel-Q for BOTH
+// classes at PAGE=16, including D=512 full-attn: K is streamed direct from
+// device, V/O held in per-lane registers, so the only D-sized tg allocation
+// is Q (~8.6 KB at D=512) — the old "full prefill can't parallel-Q at D=512
+// because O_acc[8*512] overflows the 32 KB tg tile" ceiling is gone.
 // ========================================================================
 // Settled at 256 (2026-05-01) after empirical bridge measurement showed
 // 256 is at-or-near the end-to-end pareto optimum for single-stream
@@ -712,11 +724,11 @@ let k_len_full      = device.makeBuffer(length: B * 4, options: .storageModeShar
 // Scratch budget: pre_logits (B × MAX_Q_LEN × VOCAB fp16) is the
 // binding constraint; at B=8 / VOCAB=262144 / MAX_Q_LEN=256 → 1 GB.
 let MAX_Q_LEN = 256
-// Max number of 8-row Q-blocks that can fit in one prefill step. The
-// kernels (`flex_attn_full_prefill`, `flex_attn_slide_v1_q8`) tile along
-// the q_block axis at runtime; the v2 mask precompute below emits one
-// CSR entry per (slot, q_block) tuple, making MAX_Q_LEN ≥ 8 actually
-// usable. Buffer sizing below scales with this.
+// Max number of 8-row Q-blocks that can fit in one prefill step. The ONE
+// prefill kernel (`flex_attn_prefill`) tiles along the q_block axis at
+// runtime; the v2 mask precompute below emits one CSR entry per (slot,
+// q_block) tuple, making MAX_Q_LEN ≥ 8 actually usable. Buffer sizing below
+// scales with this.
 let MAX_Q_BLOCKS = (MAX_Q_LEN + 7) / 8
 
 // Prefill scratch buffers sized for B * MAX_Q_LEN "virtual batches".
@@ -794,8 +806,9 @@ let pre_slide_part_indices = device.makeBuffer(length: B * MAX_Q_BLOCKS * MAX_PA
 // just reads "is bit k of row r set" to decide whether to include k in
 // softmax or send it to -infinity.
 //
-// Sized for the worst case: every page is partial. Slide uses PAGE=16 (fits
-// in low 16 bits); full uses PAGE=8 (fits in low 8 bits). Q_BLOCK=8 rows.
+// Sized for the worst case: every page is partial. PAGE=16 for every layer
+// (slide and full alike — one page size), so the low 16 bits hold the
+// per-row keep mask. Q_BLOCK=8 rows.
 let FLEX_Q_BLOCK = 8   // compile-time; must match kernel's Q_BLOCK constant
 // One uint32 mask per Q-row × per partial-block. Worst case: every k_block
 // is partial in every q_block of every slot.
@@ -817,7 +830,7 @@ let flex_full_offsets    = device.makeBuffer(length: (B + 1) * 4, options: .stor
 let flex_full_indices    = device.makeBuffer(length: B * MAX_PAGES_PER_SLOT * 4, options: .storageModeShared)!
 let flex_partial_offsets = device.makeBuffer(length: (B + 1) * 4, options: .storageModeShared)!
 let flex_partial_indices = device.makeBuffer(length: B * MAX_PAGES_PER_SLOT * 4, options: .storageModeShared)!
-// Separate buffers for full-attention layer block masks (PAGE=8, no window).
+// Separate buffers for full-attention layer block masks (PAGE=16, no window).
 // Same per-(slot, q_block) CSR layout as the slide buffers above.
 let flex_full_full_offsets = device.makeBuffer(length: (B * MAX_Q_BLOCKS + 1) * 4, options: .storageModeShared)!
 let flex_full_full_indices = device.makeBuffer(length: B * MAX_Q_BLOCKS * MAX_PAGES_PER_SLOT * 4, options: .storageModeShared)!
@@ -3528,8 +3541,8 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
                                  numActiveSlots: Int = B) {
     // v2: emit one CSR entry per (slot, q_block_idx) so qLen > 8 actually
     // works. Kernel-side csr_idx = slot * q_blocks_per_slot + q_block_idx
-    // is already in place (`flex_attn_full_prefill`, `flex_attn_slide_v1_q8`),
-    // it was just waiting for the host-side widened CSR.
+    // is already in place (`flex_attn_prefill`), it was just waiting for the
+    // host-side widened CSR.
     //
     // numActiveSlots <= B: only the first numActiveSlots' CSR entries are
     // built. The attention dispatchers downstream are sized to dispatch
@@ -3598,7 +3611,7 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
         }
     }
 
-    // ---- Full (PAGE=8, no sliding window) ----
+    // ---- Full (PAGE=16, no sliding window) ----
     do {
         let fullOff = flex_full_full_offsets.contents().assumingMemoryBound(to: UInt32.self)
         let fullIdx = flex_full_full_indices.contents().assumingMemoryBound(to: UInt32.self)
@@ -3655,10 +3668,12 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
 }
 
 // Prefill attention dispatchers (slide + full). Called from buildPrefillCB;
-// dispatch the flex v1 kernels with (B*H_KV or B*H_Q, q_blocks, N_SPLITS).
-// chunkPages + KcHi/VcHi: virtual-page-table split. See kernels.swift
-// flex_attn_slide_v1_q8 signature comments. Operand-driven (no globals);
-// callers thread weights.kvChunkPages and weights.K_caches_hi[L].
+// both dispatch the ONE `flex_attn_prefill` kernel with (B*H_Q, q_blocks,
+// N_SPLITS) — same grid, differing only in FC_D (256 slide PSO, 512 full
+// PSO) and which per-class CSR + mask-bitmap buffers they bind. chunkPages
+// + KcHi/VcHi: virtual-page-table split. See kernels.swift flex_attn_prefill
+// signature comments. Operand-driven (no globals); callers thread
+// weights.kvChunkPages and weights.K_caches_hi[L].
 func encFlexAttnSlidePrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
                               kArgBuf: MTLBuffer, vArgBuf: MTLBuffer,
                               kChunks: [MTLBuffer], vChunks: [MTLBuffer], chunkPages: Int,
@@ -3668,7 +3683,7 @@ func encFlexAttnSlidePrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
                               numActiveSlots: Int = B) {
     let qBlocks = (qLen + 8 - 1) / 8
     let enc1 = cb.makeComputeCommandEncoder()!
-    enc1.setComputePipelineState(flexAttnSlideV1Q8PSO)
+    enc1.setComputePipelineState(flexAttnSlidePrefillPSO)
     enc1.setBuffer(Q, offset: 0, index: 0); enc1.setBuffer(kArgBuf, offset: 0, index: 1)
     enc1.setBuffer(vArgBuf, offset: 0, index: 2); enc1.setBuffer(block_table, offset: 0, index: 3)
     enc1.setBuffer(pre_m_partials, offset: 0, index: 4)
@@ -3680,24 +3695,19 @@ func encFlexAttnSlidePrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
     enc1.setBuffer(pre_slide_part_indices, offset: 0, index: 10)
     enc1.setBuffer(qPositions, offset: 0, index: 11)
     enc1.setBuffer(kLenBuf, offset: 0, index: 12)
-    enc1.setBuffer(pre_slide_part_masks, offset: 0, index: 20)
+    enc1.setBuffer(pre_slide_part_masks, offset: 0, index: 19)
     var sc: Float = 1.0, mv = UInt32(MAX_PAGES_PER_SLOT), hq = UInt32(H_Q), hkv = UInt32(H_KV)
-    var ns = UInt32(ATTN_N_SPLITS), sw = UInt32(SLIDING_WINDOW), ql = UInt32(qLen)
+    var ns = UInt32(ATTN_N_SPLITS), ql = UInt32(qLen)
     var cp = UInt32(chunkPages)
     enc1.setBytes(&sc, length: 4, index: 13); enc1.setBytes(&mv, length: 4, index: 14)
     enc1.setBytes(&hq, length: 4, index: 15); enc1.setBytes(&hkv, length: 4, index: 16)
-    enc1.setBytes(&ns, length: 4, index: 17); enc1.setBytes(&sw, length: 4, index: 18)
-    enc1.setBytes(&ql, length: 4, index: 19)
+    enc1.setBytes(&ns, length: 4, index: 17); enc1.setBytes(&ql, length: 4, index: 18)
     enc1.setBytes(&cp, length: 4, index: 27)
     useResourceForActiveChunks(enc1, kChunks: kChunks, vChunks: vChunks,
                                  activeChunkIdxs: activeChunkIdxs, usage: .read)
-    // 2026-05-06: x-dim is now B*H_Q (was B*H_KV) after switching
-    // flex_attn_slide_v1_q8 to one-q-head-per-TG geometry. Each TG
-    // handles a single q_head; previously Q_PER_TG=2 q_heads shared
-    // a TG. See kernels.swift comment block on the kernel for the
-    // threadgroup-memory rationale (drops static usage from 25,312
-    // to 12,672 bytes — under the 32 KB Metal hardware limit even
-    // accounting for compiler-side simdgroup-matrix doubling).
+    // One q_head per TG (llama.cpp geometry); x-dim is numActiveSlots*H_Q,
+    // height is q_blocks (parallel-Q), depth is N_SPLITS. Identical grid to
+    // the full-class prefill — same kernel, FC_D=256.
     enc1.dispatchThreadgroups(MTLSize(width: numActiveSlots * H_Q, height: qBlocks, depth: ATTN_N_SPLITS),
                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc1.endEncoding()
@@ -3725,7 +3735,7 @@ func encFlexAttnFullPrefill(_ cb: MTLCommandBuffer, Q: MTLBuffer, O: MTLBuffer,
                              numActiveSlots: Int = B) {
     let qBlocks = (qLen + 8 - 1) / 8
     let enc1 = cb.makeComputeCommandEncoder()!
-    enc1.setComputePipelineState(flexAttnFullPrefillPSO)
+    enc1.setComputePipelineState(flexAttnFullPrefillPSO)   // flex_attn_prefill, FC_D=512
     enc1.setBuffer(Q, offset: 0, index: 0); enc1.setBuffer(kArgBuf, offset: 0, index: 1)
     enc1.setBuffer(vArgBuf, offset: 0, index: 2); enc1.setBuffer(block_table, offset: 0, index: 3)
     enc1.setBuffer(pre_m_partials, offset: 0, index: 4)

@@ -32,10 +32,7 @@ struct ProbeThreadgroupMem {
 
         // Plain PSOs (no function constants).
         let plainNames = [
-            // Refactored slide kernel (now Q_PER_TG=1).
-            "flex_attn_slide_v1_q8",
-            // Full prefill kernel (D=512, Q_BLOCK=8, single-q-head-per-TG).
-            "flex_attn_full_prefill",
+            // (flex_attn_prefill is FC-specialized — see fcSpecs below.)
             // Q8_0 fused-RMS QKV: claimed-suspect for h_norms[B*2816].
             "dense_gemv_q8_0_btile_qkv_b1",
             "dense_gemv_q8_0_btile_qkv_b2",
@@ -76,6 +73,11 @@ struct ProbeThreadgroupMem {
                    d: 256, qPerTG: 2, useSlide: true),
             FCSpec(name: "flex_attn_v0", label: "flex_attn_v0/FULL  [D=512,PAGE=16,Q_PER_TG=8]",
                    d: 512, qPerTG: 8, useSlide: false),
+            // ONE prefill kernel, FC_D only (qPerTG/useSlide unused by it).
+            FCSpec(name: "flex_attn_prefill", label: "flex_attn_prefill/SLIDE [D=256,PAGE=16,Q_BLOCK=8]",
+                   d: 256, qPerTG: 0, useSlide: false),
+            FCSpec(name: "flex_attn_prefill", label: "flex_attn_prefill/FULL  [D=512,PAGE=16,Q_BLOCK=8]",
+                   d: 512, qPerTG: 0, useSlide: false),
         ]
 
         let fmt: (Int) -> String = { v in

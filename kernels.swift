@@ -10193,28 +10193,50 @@ kernel void flex_attn_v0(
 }
 
 
-// Flex attention v1 — slide layer with Q_BLOCK=8 (prefill).
+// ========================================================================
+// flex_attn_prefill — ONE clean streaming-flash prefill attention kernel
+// for BOTH attention classes (full-causal and sliding-window). Replaces the
+// two near-identical kernels flex_attn_slide_v1_q8 + flex_attn_full_prefill.
 //
-// 2026-05-06 refactor: switched from Q_PER_TG=2 (16 Q rows per TG) to
-// Q_PER_TG=1 (8 Q rows per TG, ONE q_head per TG). Matches the
-// flex_attn_full_prefill geometry. Reason: the Q_PER_TG=2 layout
-// declared 25,312 bytes of static threadgroup memory which Metal
-// counts as ~50 KB after compiler-side simdgroup-matrix double-
-// buffering — over the 32 KB hardware limit. Apple Silicon tolerated
-// the overflow at small KV-cache sizes (production worked at
-// pool=8192) but the threadgroup-mem assertion is real and fires
-// under MTL_DEBUG_LAYER. Single-q-head-per-TG drops static usage
-// to ~12.6 KB, well under 32 KB even with compiler doubling.
+// qLen>1 (prefill is large-M, compute-bound — kept distinct from the M=B
+// memory-bound AR-decode kernel flex_attn_v0). The ONLY per-PSO difference
+// is head-dim, threaded through function constant FC_D (256 for slide,
+// 512 for full). MASKING IS POLICY-AGNOSTIC: the per-partial-block bitmap
+// (partial_block_masks) already encodes whichever mask-mod the host chose
+// (causal or causal+sliding), evaluated host-side against the ONE true
+// k_pos = page*PAGE + k at PAGE=16 — so the kernel itself never branches on
+// full-vs-slide. FULL blocks keep every cell; PARTIAL blocks consult the
+// bitmap; rows past the real sequence end stay -INF.
 //
-// Grid changes: x dim was B*H_KV (each TG handled Q_PER_TG q_heads
-// for one kv_head); now B*H_Q (each TG handles ONE q_head). H_KV is
-// derived inside the kernel via kv_head = (q_head * H_KV) / H_Q. The
-// dispatcher in encFlexAttnSlidePrefill must use the new grid.
+// STREAMING FLASH (same skeleton as flex_attn_v0, Q_BLOCK=8 instead of 1):
+// GRID dispatchThreadgroups(width = numActiveSlots*H_Q, height = q_blocks,
+// depth = N_SPLITS), 32 threads (one simdgroup) per TG. ONE TG per
+// (slot, q_head, q_block) — one q_head per TG (llama.cpp geometry);
+// kv_head = (q_head*H_KV)/H_Q. Walk this (slot,q_block)'s CSR page list one
+// PAGE=16 page per iteration: K is simdgroup_loaded DIRECT FROM DEVICE
+// (transpose=true) over D8 d-tiles — never staged into a threadgroup tile;
+// V is read into per-lane registers V_reg[PAGE]; O is the per-lane REGISTER
+// accumulator O_local[Q_ROWS][D_PER_LANE]. So K/V threadgroup cost is ZERO
+// and INDEPENDENT of both PAGE and D — the only D-sized tg allocation is Q.
 //
-// Each TG covers 8 consecutive Q positions × 1 Q-head → 8 real Q rows.
-// Per-Q-row softmax applies a per-row causal+sliding mask using
-// per-row q_positions. Partials laid out per (q_pos, q_head).
-kernel void flex_attn_slide_v1_q8(
+// D=512 IS HANDLED BY STREAMING, NOT TILING: D never enters a K or V tg
+// tile. QK iterates D8 = D/8 d-tiles (32 at D=256, 64 at D=512); AV gives
+// each of the 32 lanes D_PER_LANE = D/THREADS register slots (8 / 16). So
+// D=512 vs 256 changes only loop counts and per-lane register slots, NOT
+// any threadgroup allocation — the old "full prefill can't parallel-Q at
+// D=512 because O_acc[8*512]=16 KB overflows the 32 KB tg tile" ceiling
+// dissolves (O is in registers; the serialize-Q workaround is deleted).
+// tg-mem worst case (D=512): Q_tile 8*512*2=8192 B + scores_tile 8*16*2=256
+// + m/l/scale/q_pos ~160 B ≈ 8.6 KB static (~17 KB doubled), under 32 KB.
+//
+// The all-masked-block guard (row_max==-INF → scale 1, zero scores) is
+// correct online-softmax math (avoids exp(-INF - -INF)=NaN when a split's
+// first page is fully past-horizon), NOT a fallback.
+//
+// FC_D (function_constant(0)) is the same constant the AR-decode kernel
+// flex_attn_v0 uses for head-dim — one shared per-PSO knob.
+// ========================================================================
+kernel void flex_attn_prefill(
     device const half* Q                    [[buffer(0)]],   // [B, Q_LEN, H_Q, D]
     device const KVChunks& k_chunks         [[buffer(1)]],
     device const KVChunks& v_chunks         [[buffer(2)]],
@@ -10233,258 +10255,28 @@ kernel void flex_attn_slide_v1_q8(
     constant uint& H_Q                      [[buffer(15)]],
     constant uint& H_KV                     [[buffer(16)]],
     constant uint& N_SPLITS                 [[buffer(17)]],
-    constant uint& sliding_window           [[buffer(18)]],  // legacy: ignored when mask bitmap drives masking
-    constant uint& q_len                    [[buffer(19)]],
-    device const uint* partial_block_masks  [[buffer(20)]],  // [total_partials, Q_BLOCK] uint; bit k set = keep
-    constant uint& chunk_pages              [[buffer(27)]],
-    uint3 tg_pos                            [[threadgroup_position_in_grid]],
-    uint3 lid3                              [[thread_position_in_threadgroup]])
-{
-    constexpr uint D = 256;
-    constexpr uint PAGE = 16;
-    constexpr uint THREADS = 32;
-    constexpr uint Q_BLOCK = 8;
-    constexpr uint Q_ROWS = Q_BLOCK;          // 8 (was Q_PER_TG * Q_BLOCK = 16)
-    constexpr uint D8 = D / 8;
-
-    const uint vs = tg_pos.x;                 // ranges B * H_Q (was B * H_KV)
-    const uint q_block_idx = tg_pos.y;        // which Q tile
-    const uint split = tg_pos.z;
-    const uint slot = vs / H_Q;               // (was vs / H_KV)
-    const uint q_head = vs % H_Q;             // (was kv_head, q_head_base = kv_head * Q_PER_TG)
-    const uint kv_head = (q_head * H_KV) / H_Q;
-    const uint lid = lid3.x;
-
-    const uint q_blocks_per_slot = (q_len + Q_BLOCK - 1) / Q_BLOCK;
-    const uint csr_idx = slot * q_blocks_per_slot + q_block_idx;
-    const uint q_local_base = q_block_idx * Q_BLOCK;
-
-    threadgroup half  Q_tile[Q_ROWS * D];           // 8 * 256 * 2 =  4096 B
-    threadgroup half  scores_tile[Q_ROWS * PAGE];   // 8 *  16 * 2 =   256 B
-    threadgroup float O_acc[Q_ROWS * D];            // 8 * 256 * 4 = 8192 B
-    threadgroup float m_state[Q_ROWS];              // 8 *       4 =   32 B
-    threadgroup float l_state[Q_ROWS];              //                  32 B
-    threadgroup float scale_tile[Q_ROWS];           //                  32 B
-    threadgroup uint  q_pos_tg[Q_BLOCK];            // 8 *       4 =   32 B
-                                                     // total: ~12,672 B static
-
-    device const uint* bt_s = block_table + slot * max_pages;
-
-    // Load Q_tile with layout [row=q_local, dim=d]. Each row corresponds
-    // to one Q position for our single q_head. Padding rows zero out so
-    // their MMA contributes zero.
-    for (uint i = lid; i < Q_ROWS * D; i += THREADS) {
-        uint r = i / D;
-        uint q_pos_in_seq = q_local_base + r;
-        if (q_pos_in_seq >= q_len) {
-            Q_tile[i] = half(0);
-        } else {
-            uint q_flat = (slot * q_len + q_pos_in_seq) * H_Q + q_head;
-            Q_tile[i] = Q[q_flat * D + (i % D)];
-        }
-    }
-    for (uint i = lid; i < Q_ROWS * D; i += THREADS) O_acc[i] = 0.0f;
-    if (lid < Q_ROWS) { m_state[lid] = -INFINITY; l_state[lid] = 0.0f; }
-    if (lid < Q_BLOCK) {
-        uint q_pos_in_seq = q_local_base + lid;
-        q_pos_tg[lid] = (q_pos_in_seq < q_len)
-                        ? q_positions[slot * q_len + q_pos_in_seq] : 0u;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint k_len = k_len_per_slot[slot];
-    const uint kv_row_stride = H_KV * D;
-
-    uint full_lo  = full_kv_offsets[csr_idx];
-    uint full_hi  = full_kv_offsets[csr_idx + 1];
-    uint part_lo  = partial_kv_offsets[csr_idx];
-    uint part_hi  = partial_kv_offsets[csr_idx + 1];
-    uint n_full   = full_hi - full_lo;
-    uint n_part   = part_hi - part_lo;
-    uint n_total  = n_full + n_part;
-    uint per_split = (n_total + N_SPLITS - 1) / N_SPLITS;
-    uint ix_begin = split * per_split;
-    uint ix_end   = min(ix_begin + per_split, n_total);
-
-    for (uint ix = ix_begin; ix < ix_end; ++ix) {
-        uint p;
-        bool is_partial = (ix >= n_full);
-        uint partial_idx = 0;
-        if (!is_partial) {
-            p = full_kv_indices[full_lo + ix];
-        } else {
-            partial_idx = part_lo + (ix - n_full);
-            p = partial_kv_indices[partial_idx];
-        }
-
-        const uint phys = bt_s[p];
-        const uint chunk_idx = phys / chunk_pages;
-        const uint local_phys = phys - chunk_idx * chunk_pages;
-        device const half* Kx = k_chunks.chunks[chunk_idx];
-        device const half* Vx = v_chunks.chunks[chunk_idx];
-        device const half* Kbase = Kx + (local_phys * PAGE * H_KV + kv_head) * D;
-        device const half* Vbase = Vx + (local_phys * PAGE * H_KV + kv_head) * D;
-
-        // QK via simdgroup_matrix. Q_ROWS=8 rows → 1 MMA pass (was 2 at
-        // Q_ROWS=16). PAGE=16 → 2 K col slabs (pb=0, 1).
-        for (uint pb = 0; pb < PAGE / 8; ++pb) {
-            device const half* pk = Kbase + (pb * 8) * kv_row_stride;
-            // Q_ROWS / 8 = 1 — single qp pass.
-            simdgroup_half8x8 mqk = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
-            for (uint dt = 0; dt < D8; ++dt) {
-                simdgroup_half8x8 mq, mk;
-                simdgroup_load(mq, Q_tile + dt * 8, D);
-                simdgroup_load(mk, pk + dt * 8, kv_row_stride, ulong2(0, 0), true);
-                simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
-            }
-            simdgroup_store(mqk, scores_tile + pb * 8, PAGE);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Per-row online softmax. For FULL blocks every element is kept; for
-        // PARTIAL blocks we read a per-(q_local, block) bitmap produced by
-        // the CPU mask-mod policy. Bit k of the per-row uint = 1 ⇒ keep, 0
-        // ⇒ -∞. Rows past the real sequence end stay at -INF.
-        //
-        // With Q_PER_TG=1 (was =2), q_local = r directly. The mask layout
-        // is [total_partials, Q_BLOCK=8] which still indexes per (q_pos
-        // within tile = q_local), so partial_block_masks[partial_idx * 8 +
-        // q_local] is unchanged.
-        if (lid < Q_ROWS) {
-            const uint r = lid;
-            const uint q_local = r;
-            const uint q_pos_in_seq = q_local_base + q_local;
-            if (q_pos_in_seq < q_len) {
-                uint mask_word = 0u;
-                if (is_partial) {
-                    mask_word = partial_block_masks[partial_idx * 8u + q_local];
-                }
-                float row_max = -INFINITY;
-                float s_loc[PAGE];
-                for (uint k = 0; k < PAGE; ++k) {
-                    float sv = float(scores_tile[r * PAGE + k]) * qk_scale;
-                    bool keep = is_partial ? (((mask_word >> k) & 1u) != 0u) : true;
-                    if (!keep) sv = -INFINITY;
-                    s_loc[k] = sv;
-                    row_max = max(row_max, sv);
-                }
-                if (row_max == -INFINITY) {
-                    scale_tile[r] = 1.0f;
-                    for (uint k = 0; k < PAGE; ++k) scores_tile[r * PAGE + k] = half(0);
-                } else {
-                    float m_old = m_state[r];
-                    float m_new = max(m_old, row_max);
-                    float scale = exp(m_old - m_new);
-                    float sum = 0.0f;
-                    for (uint k = 0; k < PAGE; ++k) {
-                        float e = exp(s_loc[k] - m_new);
-                        scores_tile[r * PAGE + k] = half(e);
-                        sum += e;
-                    }
-                    m_state[r] = m_new;
-                    l_state[r] = l_state[r] * scale + sum;
-                    scale_tile[r] = scale;
-                }
-            } else {
-                scale_tile[r] = 1.0f;
-                for (uint k = 0; k < PAGE; ++k) scores_tile[r * PAGE + k] = half(0);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // AV: scalar cooperative. Each lane owns D/THREADS=8 dims.
-        for (uint d = lid; d < D; d += THREADS) {
-            half V_reg[PAGE];
-            for (uint k = 0; k < PAGE; ++k) V_reg[k] = Vbase[k * kv_row_stride + d];
-            for (uint r = 0; r < Q_ROWS; ++r) {
-                float acc = O_acc[r * D + d] * scale_tile[r];
-                for (uint k = 0; k < PAGE; ++k) {
-                    acc += float(scores_tile[r * PAGE + k]) * float(V_reg[k]);
-                }
-                O_acc[r * D + d] = acc;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // Write partials per real (q_pos, q_head=this TG's q_head). One Q row
-    // per Q position now (was Q_PER_TG rows per position).
-    const bool empty_split = (ix_begin >= ix_end);
-    for (uint r = 0; r < Q_ROWS; ++r) {
-        const uint q_pos_in_seq = q_local_base + r;
-        if (q_pos_in_seq >= q_len) continue;
-        const uint pidx = ((slot * q_len + q_pos_in_seq) * H_Q + q_head) * N_SPLITS + split;
-        if (lid == 0) {
-            m_partials[pidx] = empty_split ? -INFINITY : m_state[r];
-            l_partials[pidx] = empty_split ? 0.0f : l_state[r];
-        }
-        device float* O_part = O_partials + pidx * D;
-        for (uint d = lid; d < D; d += THREADS) O_part[d] = O_acc[r * D + d];
-    }
-}
-
-// Flex attention v1 full-attention for prefill.
-// llama.cpp-style geometry: ONE TG per (slot, q_head, q_block). Each TG owns
-// Q_BLOCK=8 queries of a SINGLE q_head (not Q_PER_TG grouped like v0).
-//
-// 2026-05-06 refactor: moved the 16 KB O_acc accumulator out of threadgroup
-// memory and into per-lane registers (`O_local[Q_ROWS][D_PER_LANE]`). Each
-// of the 32 lanes in the threadgroup owns D/32 = 16 disjoint d-slots
-// across all 8 query rows = 128 floats = 512 B per lane — well within
-// Apple GPU's register budget, and faster than threadgroup memory in the
-// inner accumulate loop. Threadgroup-memory budget at D=512, PAGE=16:
-//   Q_tile:      8 * 512 * 2 = 8192 B
-//   scores_tile: 8 * 16 * 2  = 256 B
-//   m/l/scale:   8 * 12       = 96 B
-//   q_pos_tg:    8 * 4         = 32 B
-//   ---------------------------------
-//   total:                     ~8.6 KB (K/V never enter a tg tile; streamed
-//                              one 16-row page at a time, K direct-from-device,
-//                              V into per-lane registers V_reg[16])
-// Why it matters: simdgroup_matrix usage causes Metal's compiler to
-// double-buffer operand tiles, putting the effective threadgroup-mem
-// reservation near 2× the static accounting. At ~24.5 KB static the
-// kernel was clearing 49 KB doubled — over the 32 KB hardware limit.
-// At ~8.4 KB static the doubled accounting (~17 KB) is comfortably
-// under, with substantial headroom.
-//
-// Grid: (B * H_Q, q_blocks, N_SPLITS). kv_head = (q_head * H_KV) / H_Q is
-// derived inside the kernel; multiple q_heads that share a KV head re-read
-// the same K — on Apple Silicon with unified memory this hits L1/L2 cache.
-// Mask: pure causal (full-attn layers have no sliding window).
-kernel void flex_attn_full_prefill(
-    device const half* Q                    [[buffer(0)]],
-    device const KVChunks& k_chunks         [[buffer(1)]],
-    device const KVChunks& v_chunks         [[buffer(2)]],
-    device const uint* block_table          [[buffer(3)]],
-    device float* m_partials                [[buffer(4)]],
-    device float* l_partials                [[buffer(5)]],
-    device float* O_partials                [[buffer(6)]],
-    device const uint* full_kv_offsets      [[buffer(7)]],
-    device const uint* full_kv_indices      [[buffer(8)]],
-    device const uint* partial_kv_offsets   [[buffer(9)]],
-    device const uint* partial_kv_indices   [[buffer(10)]],
-    device const uint* q_positions          [[buffer(11)]],
-    device const uint* k_len_per_slot       [[buffer(12)]],
-    constant float& qk_scale                [[buffer(13)]],
-    constant uint& max_pages                [[buffer(14)]],
-    constant uint& H_Q                      [[buffer(15)]],
-    constant uint& H_KV                     [[buffer(16)]],
-    constant uint& N_SPLITS                 [[buffer(17)]],
     constant uint& q_len                    [[buffer(18)]],
-    device const uint* partial_block_masks  [[buffer(19)]],  // [total_partials, Q_BLOCK] uint
+    device const uint* partial_block_masks  [[buffer(19)]],  // [total_partials, Q_BLOCK] uint; bit k set = keep
     constant uint& chunk_pages              [[buffer(27)]],
     uint3 tg_pos                            [[threadgroup_position_in_grid]],
     uint3 lid3                              [[thread_position_in_threadgroup]])
 {
-    constexpr uint D = 512;
-    constexpr uint PAGE = 16;
     constexpr uint THREADS = 32;
+    constexpr uint PAGE = 16;                // ONE page size for every layer
     constexpr uint Q_BLOCK = 8;
-    constexpr uint Q_ROWS = Q_BLOCK;           // one q_head per TG
-    constexpr uint D8 = D / 8;                 // 64
+    constexpr uint Q_ROWS = Q_BLOCK;         // one q_head per TG
 
-    const uint vs = tg_pos.x;                  // 0..B*H_Q
+    // tg/stack arrays are sized at MSL-compile time (before FC_D resolves)
+    // to the max over the two PSOs (D=512). The slide PSO (D=256) uses only
+    // a prefix; the unused tail is a few KB of tg memory, well within budget.
+    constexpr uint MAX_D = 512;
+
+    const uint D            = uint(FC_D);
+    const uint D8           = D / 8;
+    const uint D_PER_LANE   = D / THREADS;    // 8 (slide) or 16 (full)
+    constexpr uint MAX_D_PER_LANE = MAX_D / THREADS;   // 16
+
+    const uint vs = tg_pos.x;                 // 0..B*H_Q
     const uint q_block_idx = tg_pos.y;
     const uint split = tg_pos.z;
     const uint slot = vs / H_Q;
@@ -10496,24 +10288,24 @@ kernel void flex_attn_full_prefill(
     const uint csr_idx = slot * q_blocks_per_slot + q_block_idx;
     const uint q_local_base = q_block_idx * Q_BLOCK;
 
-    threadgroup half  Q_tile[Q_ROWS * D];
-    threadgroup half  scores_tile[Q_ROWS * PAGE];
+    threadgroup half  Q_tile[Q_ROWS * MAX_D];       // 8 * 512 * 2 = 8192 B (max)
+    threadgroup half  scores_tile[Q_ROWS * PAGE];   // 8 *  16 * 2 =  256 B
     threadgroup float m_state[Q_ROWS];
     threadgroup float l_state[Q_ROWS];
     threadgroup float scale_tile[Q_ROWS];
     threadgroup uint  q_pos_tg[Q_BLOCK];
 
-    // Per-lane register accumulator. Replaces the 16 KB threadgroup
-    // O_acc[Q_ROWS * D] tile. Each lane owns disjoint d-slots
-    // {lid, lid+THREADS, lid+2*THREADS, ...} across all Q_ROWS query
-    // rows. D/THREADS = 512/32 = 16 d-slots × 8 rows = 128 floats per
-    // lane = 512 B, fits comfortably in Apple GPU registers.
-    constexpr uint D_PER_LANE = D / THREADS;   // 16
-    float O_local[Q_ROWS][D_PER_LANE];
+    // Per-lane register O accumulator: each lane owns D/THREADS disjoint
+    // d-slots {lid, lid+THREADS, ...} across all Q_ROWS query rows. Max
+    // 16 d-slots × 8 rows = 128 floats = 512 B/lane. K/V never enter a tg
+    // tile (K direct-from-device, V into V_reg registers), so the tg budget
+    // is independent of PAGE and D.
+    float O_local[Q_ROWS][MAX_D_PER_LANE];
 
     device const uint* bt_s = block_table + slot * max_pages;
 
-    // Load Q for this (slot, q_head) × [q_local_base, q_local_base+Q_BLOCK) rows.
+    // Load Q for this (slot, q_head) × [q_local_base, q_local_base+Q_BLOCK)
+    // rows. Padding rows (past q_len) zero out so their MMA contributes 0.
     for (uint i = lid; i < Q_ROWS * D; i += THREADS) {
         uint r = i / D;
         uint q_pos_in_seq = q_local_base + r;
@@ -10524,9 +10316,8 @@ kernel void flex_attn_full_prefill(
             Q_tile[i] = Q[q_flat * D + (i % D)];
         }
     }
-    // Zero the per-lane accumulator (pure-register init, no threadgroup-
-    // memory traffic and no barrier needed because each lane only touches
-    // its own private slots).
+    // Zero the per-lane accumulator (pure-register init, no tg traffic and
+    // no barrier — each lane only touches its own private slots).
     for (uint r = 0; r < Q_ROWS; ++r) {
         for (uint i = 0; i < D_PER_LANE; ++i) O_local[r][i] = 0.0f;
     }
@@ -10541,6 +10332,8 @@ kernel void flex_attn_full_prefill(
     const uint k_len = k_len_per_slot[slot];
     const uint kv_row_stride = H_KV * D;
 
+    // Each split gets a contiguous slice of the per-(slot,q_block) list
+    // (FULL first, PARTIAL second, concatenated). Keeps work balanced.
     uint full_lo  = full_kv_offsets[csr_idx];
     uint full_hi  = full_kv_offsets[csr_idx + 1];
     uint part_lo  = partial_kv_offsets[csr_idx];
@@ -10571,9 +10364,9 @@ kernel void flex_attn_full_prefill(
         device const half* Kbase = Kx + (local_phys * PAGE * H_KV + kv_head) * D;
         device const half* Vbase = Vx + (local_phys * PAGE * H_KV + kv_head) * D;
 
-        // QK: PAGE/8 passes of 8 K-columns each (2 passes at PAGE=16).
-        // Q_ROWS=8 fits one 8x8 MMA pass; D8=64 d-tiles each a single
-        // simdgroup_load of an 8-column K slab direct from device.
+        // QK: stream the 16-row page in PAGE/8 = 2 simdgroup passes of 8
+        // K-rows each. K is simdgroup_loaded direct from device (no K tile);
+        // D is consumed as the D8 loop. Q_ROWS=8 fits one 8x8 MMA pass.
         for (uint pb = 0; pb < PAGE / 8; ++pb) {
             device const half* pk = Kbase + (pb * 8) * kv_row_stride;
             simdgroup_half8x8 mqk = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
@@ -10589,15 +10382,14 @@ kernel void flex_attn_full_prefill(
 
         // Per-row online softmax. FULL blocks keep every element (no mask
         // consulted); PARTIAL blocks read a Q_BLOCK-row bitmap produced by
-        // the CPU mask-mod policy and zero-mask via -INF per cell.
+        // the host mask-mod policy (bit k = 1 ⇒ keep, 0 ⇒ -∞). Rows past
+        // the real sequence end stay at -INF.
         if (lid < Q_ROWS) {
             const uint r = lid;
             const uint q_pos_in_seq = q_local_base + r;
             if (q_pos_in_seq < q_len) {
                 uint mask_word = 0u;
                 if (is_partial) {
-                    // Full-attention prefill: one q_head per TG ⇒ one row per
-                    // q_pos_in_seq, so mask row index = r directly.
                     mask_word = partial_block_masks[partial_idx * 8u + r];
                 }
                 float row_max = -INFINITY;
@@ -10609,9 +10401,10 @@ kernel void flex_attn_full_prefill(
                     s_loc[k] = sv;
                     row_max = max(row_max, sv);
                 }
-                // All-masked-this-block guard: skip online-softmax update so
-                // we don't hit `exp(-INF - -INF)` = NaN when m_state is still
-                // -INF from a split whose first page was fully past-horizon.
+                // All-masked-this-block guard: skip the online-softmax update
+                // so we don't hit `exp(-INF - -INF)` = NaN when m_state is
+                // still -INF from a split whose first page is fully
+                // past-horizon. (Correct flash math, not a fallback.)
                 if (row_max == -INFINITY) {
                     scale_tile[r] = 1.0f;
                     for (uint k = 0; k < PAGE; ++k) scores_tile[r * PAGE + k] = half(0);
@@ -10636,8 +10429,9 @@ kernel void flex_attn_full_prefill(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // AV scalar cooperative: each lane owns D/THREADS=16 dims, kept
-        // in per-lane registers (`O_local[r][i]`) across all ix iterations.
+        // AV: scalar cooperative. Each lane owns D/THREADS d-slots, held in
+        // per-lane registers (`O_local[r][i]`) across all ix iterations. V is
+        // read into per-lane registers V_reg[PAGE] — never a tg tile.
         for (uint i = 0; i < D_PER_LANE; ++i) {
             uint d = lid + i * THREADS;
             half V_reg[PAGE];
@@ -10653,8 +10447,8 @@ kernel void flex_attn_full_prefill(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Write partials per (q_pos, q_head). Partial layout identical to v0:
-    // pidx = ((slot * q_len + q_pos_in_seq) * H_Q + q_head) * N_SPLITS + split.
+    // Write partials per (q_pos, q_head=this TG's q_head). One Q row per Q
+    // position. paged_attn_split_reduce combines the N_SPLITS partials.
     const bool empty_split = (ix_begin >= ix_end);
     for (uint r = 0; r < Q_ROWS; ++r) {
         const uint q_pos_in_seq = q_local_base + r;
@@ -11094,7 +10888,7 @@ kernel void vision_gemm_fp32_mma_v3(
 // online softmax, simdgroup_matrix<half, 8, 8> MMA for QK accumulated into
 // fp32 (simdgroup_float8x8). AV remains scalar-cooperative (8 K positions
 // per tile is small enough that the MMA overhead doesn't pay off — same
-// tradeoff as flex_attn_slide_v1_q8 on the LM side).
+// tradeoff as flex_attn_prefill on the LM side).
 //
 // Inputs are fp32; the kernel converts each K/V tile to half in tg-mem
 // once per iteration, which is the cheap part. QK then runs as 9 MMA
