@@ -478,8 +478,8 @@ final class PageManager {
         // keeps a HOT shared prefix last-evicted (G3). value =
         // HALF_LIFE^(now − lastAccessTick) · (1 + citationScore). Half-life
         // via KV_CITATION_HALF_LIFE_TICKS. Pure read-only fn; citationScore /
-        // lastAccessTick are not in hashSessionKVAtPosition, so eviction
-        // ranking changes never perturb K/V bytes (bit-exact preserved).
+        // lastAccessTick never touch K/V bytes — eviction ranking is
+        // decoupled from cache contents.
         let p = pages[phys]
         let age = now >= p.lastAccessTick ? Double(now - p.lastAccessTick) : 0
         let recency = pow(PageManager.citationDecayBase, age)
@@ -500,8 +500,7 @@ final class PageManager {
     // the citation timestamp; does NOT touch refcount, contentHash, pairMate,
     // or lastAccessTick (recency is a separate signal, bumped on the forward-
     // pass KV read via touchAccess). Out-of-range / scratch indices ignored.
-    // citationScore is NOT part of hashSessionKVAtPosition, so it cannot
-    // perturb numerics or LM_KV_OVERWRITE_CHECK.
+    // citationScore never touches K/V bytes — it cannot perturb numerics.
     func recordCitation(physPage: Int) {
         guard physPage >= 0 && physPage < pages.count else { return }
         clockTick += 1
@@ -577,37 +576,23 @@ final class PageManager {
     // Caller is responsible for not double-decref'ing or decref'ing
     // pages they didn't incref.
     func decref(physPage: Int) {
-        guard physPage >= 0 && physPage < pages.count else {
-            if !PageManager.warnedBadDecref {
-                PageManager.warnedBadDecref = true
-                FileHandle.standardError.write(Data("[pagemgr] WARN: decref out-of-range phys=\(physPage) (pool=\(pages.count)) — balance bug; see page_lifecycle_audit #2\n".utf8))
-            }
-            return
-        }
+        // Out-of-range phys = programmer error (a caller decref'ing a page
+        // index that was never allocated). Hard precondition — crash loudly,
+        // never a warn-and-proceed balance-bug masker.
+        precondition(physPage >= 0 && physPage < pages.count,
+                     "decref out-of-range phys=\(physPage) (pool=\(pages.count))")
         var p = pages[physPage]
+        // decref() is idempotent by design (see field doc): double-decref of
+        // an already-free page is a benign no-op. Refcount==0 falls through.
         if p.refcount > 0 {
             p.refcount -= 1
+            pages[physPage] = p
             if p.refcount == 0 {
-                pages[physPage] = p
                 freePush(physPage)
                 // contentHash preserved for potential cache hit later.
-                return
-            }
-            pages[physPage] = p
-        } else {
-            // decref of an already-free page = a balance bug (double-free /
-            // duplicate ownedPages entry). The old code silently swallowed
-            // this, masking every page-leak/double-free in the engine. Log
-            // ONCE (not a hard precondition — a latent double-free should be
-            // surfaced, not crash production). page_lifecycle_audit #2.
-            if !PageManager.warnedDoubleFree {
-                PageManager.warnedDoubleFree = true
-                FileHandle.standardError.write(Data("[pagemgr] WARN: decref of free page \(physPage) (refcount already 0) — double-free / balance bug; see page_lifecycle_audit #2\n".utf8))
             }
         }
     }
-    static var warnedDoubleFree = false
-    static var warnedBadDecref = false
 
     // Decayed-citation reuse-value of a page evaluated at the current tick.
     // Public read accessor for the engine's admission-pressure-cancel ranking
@@ -627,9 +612,8 @@ final class PageManager {
     // pass DEPENDS ON looks hot to the LRU eviction picker in allocFresh
     // (the freeCached min-scan). Unlike incref/allocFresh this does NOT touch
     // refcount, the free list, contentHash, or pairMate, so it cannot perturb
-    // numerics, ownership, or the 16b5416 refcount-gated CoW. lastAccessTick
-    // is not part of hashSessionKVAtPosition, so LM_KV_OVERWRITE_CHECK is
-    // unaffected. Out-of-range / scratch indices are ignored.
+    // numerics or ownership — it only adjusts eviction recency.
+    // Out-of-range / scratch indices are ignored.
     func touchAccess(physPage: Int) {
         guard physPage >= 0 && physPage < pages.count else { return }
         clockTick += 1

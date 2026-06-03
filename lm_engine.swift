@@ -1835,27 +1835,6 @@ final class LmEngine {
         }
     }
 
-    /// Defense-in-depth: sweep `requestForStream` for any session that
-    /// is .done but still bound. Such stragglers happen when a session
-    /// transitions to .done outside the work-step path (e.g., a future
-    /// code path that mutates state from a callback) and no
-    /// corresponding state==2 StreamUpdate gets emitted for the FFI
-    /// pump's cleanup pass to catch. Called from gemma_poll AFTER the
-    /// update-driven cleanup so it never duplicates work but always
-    /// catches what the update-driven path misses.
-    func sweepDoneStragglers() -> Int {
-        var toClose: [Session] = []
-        for s in requestForStream.values where s.state == .done {
-            toClose.append(s)
-        }
-        for s in toClose {
-            print("[engine] sweepDoneStragglers: "
-                + "sid=\(s.streamId) doneReason=\(s.doneReason) "
-                + "→ closeSession")
-            closeSession(s)
-        }
-        return toClose.count
-    }
     // 2026-05-07 (M:K): slotAssignment removed. With the per-CB picker
     // model, kernel positions are assigned dynamically via Session.slot.
     // Keeping the field declarations as @unused stubs would be misleading;
@@ -2427,15 +2406,15 @@ final class LmEngine {
         // tracks the same (session -> listed pages) the refcount counts. At
         // teardown the count of pages this session lists in the reverse map
         // MUST equal ownedPages.count, or some ownedPages mutation skipped a
-        // reverse-map update (a leak / double-listing). Log once on mismatch.
-        let listedByRmap = sessionListedPageCount[s.id] ?? 0
-        if listedByRmap != s.ownedPages.count && !LmEngine.warnedRmapImbalance {
-            LmEngine.warnedRmapImbalance = true
-            let warn = "[engine] WARN: reverse-map imbalance at closeSession sid=\(s.id): "
-                + "rmap lists \(listedByRmap) pages, ownedPages.count=\(s.ownedPages.count) "
-                + "— a page_lifecycle balance bug (an ownedPages mutation missed an rmap update)\n"
-            FileHandle.standardError.write(Data(warn.utf8))
-        }
+        // reverse-map update (a leak / double-listing). Programmer error:
+        // assert (loud crash in dev, compiled out under -O) — NOT a
+        // warn-and-continue backstop on the hot path.
+        assert(
+            (sessionListedPageCount[s.id] ?? 0) == s.ownedPages.count,
+            "reverse-map imbalance at closeSession sid=\(s.id): "
+            + "rmap lists \(sessionListedPageCount[s.id] ?? 0) pages, "
+            + "ownedPages.count=\(s.ownedPages.count)"
+        )
         rmapDropSession(s.id, ownedPages: s.ownedPages)
         for phys in s.ownedPages { pageManager.decref(physPage: phys) }
         s.ownedPages.removeAll()
@@ -2444,7 +2423,6 @@ final class LmEngine {
         residentSessions.removeValue(forKey: s.id)
         unbindStream(s)
     }
-    static var warnedRmapImbalance = false
 
     // After a prefill tile commits, walk any fully-written logical pages
     // that haven't been promoted yet and publish them to the radix

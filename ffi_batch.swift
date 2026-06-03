@@ -1269,20 +1269,6 @@ public func gemma_poll(_ timeoutMs: Int32,
         }
     }
 
-    // Defense-in-depth straggler sweep. Catches any session that
-    // transitioned to .done outside the work-step path (e.g., from a
-    // future callback or off-thread mutation) and didn't produce a
-    // state==2 StreamUpdate in the current poll's `updates` array.
-    // O(active_streams) cost — negligible against the AR-tick budget.
-    // expireStalledSessions does its own immediate closeSession now,
-    // so this sweep usually does nothing on healthy runs; it's the
-    // backstop for paths we haven't anticipated. Counter exposed for
-    // observability (task #179 RCA).
-    let strag = engine.sweepDoneStragglers()
-    if strag > 0 {
-        print("[batch_ffi] cleanup: \(strag) .done stragglers swept")
-    }
-
     let resp = encodeBatchResponse(updates)
     if resp.count > Int(outCap) {
         return -28 // -ENOSPC
