@@ -72,9 +72,8 @@ func runLmPrefillProfile(ggufPath: String) {
             posP[b * qLen + i] = UInt32(i)
         }
     }
-    let klsP = pre_k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-    let klfP = pre_k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
-    for b in 0..<B { klsP[b] = UInt32(qLen); klfP[b] = UInt32(qLen) }
+    let klP = pre_k_len_buf.contents().bindMemory(to: UInt32.self, capacity: B)
+    for b in 0..<B { klP[b] = UInt32(qLen) }
     let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
     for b in 0..<B {
         for p in 0..<MAX_PAGES_PER_SLOT {
@@ -138,7 +137,7 @@ func runLmPrefillProfile(ggufPath: String) {
 
             let activeChunkIdxs = activeKVChunkIdxsFromKLen(
                 blockTable: block_table,
-                kLenSlide: pre_k_len_slide, kLenFull: pre_k_len_full,
+                kLen: pre_k_len_buf,
                 activeB: B, kvChunkPages: w.kvChunkPages)
             stages.append(runStage("kv_attn", layer: L) { cb in
                 let pg = PAGE
@@ -149,7 +148,7 @@ func runLmPrefillProfile(ggufPath: String) {
                                 q_positions: pre_q_positions,
                                 H: KV_H, D: HD, page: pg, qLen: qLen,
                                 numActiveSlots: activeSlots)
-                let klBuf = isFull ? pre_k_len_full : pre_k_len_slide
+                let klBuf = pre_k_len_buf
                 if isFull {
                     encFlexAttnFullPrefill(cb, Q: q_out, O: pre_attn_out,
                                             kArgBuf: kArgBuf, vArgBuf: vArgBuf,
@@ -448,9 +447,8 @@ func runLmPrefillBandwidthSweep(ggufPath: String) {
                 posP[b * qLen + i] = UInt32(i)
             }
         }
-        let klsP = pre_k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-        let klfP = pre_k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
-        for b in 0..<B { klsP[b] = UInt32(qLen); klfP[b] = UInt32(qLen) }
+        let klP = pre_k_len_buf.contents().bindMemory(to: UInt32.self, capacity: B)
+        for b in 0..<B { klP[b] = UInt32(qLen) }
         let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
         for b in 0..<B {
             for p in 0..<MAX_PAGES_PER_SLOT {
@@ -513,7 +511,7 @@ func runLmPrefillBandwidthSweep(ggufPath: String) {
 
             let activeChunkIdxs = activeKVChunkIdxsFromKLen(
                 blockTable: block_table,
-                kLenSlide: pre_k_len_slide, kLenFull: pre_k_len_full,
+                kLen: pre_k_len_buf,
                 activeB: B, kvChunkPages: w.kvChunkPages)
             add("kv_attn", runStage("kv_attn", layer: L) { cb in
                 let pg = PAGE
@@ -524,7 +522,7 @@ func runLmPrefillBandwidthSweep(ggufPath: String) {
                                 q_positions: pre_q_positions,
                                 H: KV_H, D: HD, page: pg, qLen: qLen,
                                 numActiveSlots: activeSlots)
-                let klBuf = isFull ? pre_k_len_full : pre_k_len_slide
+                let klBuf = pre_k_len_buf
                 if isFull {
                     encFlexAttnFullPrefill(cb, Q: q_out, O: pre_attn_out,
                                             kArgBuf: kArgBuf, vArgBuf: vArgBuf,

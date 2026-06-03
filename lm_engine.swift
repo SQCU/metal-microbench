@@ -2718,10 +2718,8 @@ final class LmEngine {
         // Per-slot inputs (AR path).
         let tokP = input_tokens.contents().bindMemory(to: UInt32.self, capacity: B)
         let posP = positions.contents().bindMemory(to: UInt32.self, capacity: B)
-        let klsP = k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-        let klfP = k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
-        let npsP = num_pages_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-        let npfP = num_pages_full.contents().bindMemory(to: UInt32.self, capacity: B)
+        let klP = k_len_buf.contents().bindMemory(to: UInt32.self, capacity: B)
+        let npP = num_pages_buf.contents().bindMemory(to: UInt32.self, capacity: B)
 
         // 2026-05-07 (M:K permutation): pick up to B sessions in
         // .generating state from residentSessions to occupy the kernel
@@ -2759,9 +2757,8 @@ final class LmEngine {
                     tokP[slot] = s.consumedTokens[logitPos]
                     posP[slot] = UInt32(logitPos)
                     let kLen = logitPos + 1
-                    klsP[slot] = UInt32(kLen); klfP[slot] = UInt32(kLen)
-                    npsP[slot] = UInt32((kLen + PAGE - 1) / PAGE)
-                    npfP[slot] = UInt32((kLen + PAGE - 1) / PAGE)
+                    klP[slot] = UInt32(kLen)
+                    npP[slot] = UInt32((kLen + PAGE - 1) / PAGE)
                     realSlot[slot] = true
                     kvSkipP[slot] = 1
                     continue
@@ -2780,9 +2777,8 @@ final class LmEngine {
                     tokP[slot] = tok
                     posP[slot] = UInt32(s.position)
                     let kLen = s.position + 1
-                    klsP[slot] = UInt32(kLen); klfP[slot] = UInt32(kLen)
-                    npsP[slot] = UInt32((kLen + PAGE - 1) / PAGE)
-                    npfP[slot] = UInt32((kLen + PAGE - 1) / PAGE)
+                    klP[slot] = UInt32(kLen)
+                    npP[slot] = UInt32((kLen + PAGE - 1) / PAGE)
                     realSlot[slot] = true
                     continue
                 }
@@ -2792,8 +2788,8 @@ final class LmEngine {
             // from this park step from corrupting other sessions' pages.
             tokP[slot] = weights.bosTokenId
             posP[slot] = 0
-            klsP[slot] = 1; klfP[slot] = 1
-            npsP[slot] = 1; npfP[slot] = 1
+            klP[slot] = 1
+            npP[slot] = 1
             if arMapping[slot] == nil {
                 let btP = block_table.contents().bindMemory(to: UInt32.self,
                             capacity: B * MAX_PAGES_PER_SLOT)
@@ -2801,8 +2797,7 @@ final class LmEngine {
             }
         }
 
-        precomputeFlexBlockMaskSlide(slidingWindow: SLIDING_WINDOW)
-        precomputeFlexBlockMaskFull()
+        precomputeFlexBlockMasksAR()
 
         // Sampling params for the GPU sample_token dispatch that
         // encodes at the end of buildStepCB. See populateSamplingParams.
@@ -3275,11 +3270,9 @@ final class LmEngine {
                 tokP[b * thisTile + i] = weights.bosTokenId  // silenced-slot filler
             }
         }
-        let klsP = pre_k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-        let klfP = pre_k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
+        let klP = pre_k_len_buf.contents().bindMemory(to: UInt32.self, capacity: B)
         for b in 0..<B {
-            klsP[b] = UInt32(positionStart + thisTile)
-            klfP[b] = UInt32(positionStart + thisTile)
+            klP[b] = UInt32(positionStart + thisTile)
         }
 
         // --- Chunk-specific setup ---
@@ -3867,8 +3860,7 @@ final class LmEngine {
         // Populate pre_input_tokens, pre_q_positions, pre_k_len_*.
         let tokP = pre_input_tokens.contents().bindMemory(to: UInt32.self, capacity: B * MAX_Q_LEN)
         let posP = pre_q_positions.contents().bindMemory(to: UInt32.self, capacity: B * MAX_Q_LEN)
-        let klsP = pre_k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-        let klfP = pre_k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
+        let klP = pre_k_len_buf.contents().bindMemory(to: UInt32.self, capacity: B)
         for b in 0..<B {
             if let s = slotSession[b] {
                 let ts = slotTokens[b]
@@ -3876,15 +3868,13 @@ final class LmEngine {
                     tokP[b * qLen + i] = ts[i]
                     posP[b * qLen + i] = UInt32(s.position + i)
                 }
-                klsP[b] = UInt32(s.position + qLen)
-                klfP[b] = UInt32(s.position + qLen)
+                klP[b] = UInt32(s.position + qLen)
             } else {
                 for i in 0..<qLen {
                     tokP[b * qLen + i] = weights.bosTokenId
                     posP[b * qLen + i] = 0
                 }
-                klsP[b] = 1
-                klfP[b] = 1
+                klP[b] = 1
             }
         }
 
@@ -4113,8 +4103,7 @@ final class LmEngine {
         // wait. Queue ordering on the LM queue ensures the prefill CB
         // (built below) sees the populated rows. CPU never blocks.
         let posP = pre_q_positions.contents().bindMemory(to: UInt32.self, capacity: B * MAX_Q_LEN)
-        let klsP = pre_k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-        let klfP = pre_k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
+        let klP = pre_k_len_buf.contents().bindMemory(to: UInt32.self, capacity: B)
         let pH = pre_hidden.contents().assumingMemoryBound(to: Float16.self)
         // Zero silenced-slot rows once on CPU — silenced slots never had
         // a pendingCB so no wait is needed for those rows; their
@@ -4169,12 +4158,10 @@ final class LmEngine {
                 for i in 0..<qLen {
                     posP[b * qLen + i] = UInt32(sr.session.position + i)
                 }
-                klsP[b] = UInt32(sr.session.position + qLen)
-                klfP[b] = UInt32(sr.session.position + qLen)
+                klP[b] = UInt32(sr.session.position + qLen)
             } else {
                 for i in 0..<qLen { posP[b * qLen + i] = 0 }
-                klsP[b] = 1
-                klfP[b] = 1
+                klP[b] = 1
             }
         }
 

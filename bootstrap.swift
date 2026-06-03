@@ -681,11 +681,14 @@ let PAGE = 16
 // 0 to disable the window (equivalent to global attention).
 let SLIDING_WINDOW = 1024
 
-// Per-slot attention metadata, written by CPU per step.
-let num_pages_slide = device.makeBuffer(length: B * 4, options: .storageModeShared)!
-let num_pages_full  = device.makeBuffer(length: B * 4, options: .storageModeShared)!
-let k_len_slide     = device.makeBuffer(length: B * 4, options: .storageModeShared)!
-let k_len_full      = device.makeBuffer(length: B * 4, options: .storageModeShared)!
+// Per-slot attention metadata, written by CPU per step. ONE PAGE=16 for
+// every layer means slide and full attention share the SAME per-slot
+// k_len and page count — the formerly-separate k_len_{slide,full} /
+// num_pages_{slide,full} buffers were always written identically, so they
+// are merged into one each. (The mask policy is what differs per class,
+// not the page geometry.)
+let num_pages_buf = device.makeBuffer(length: B * 4, options: .storageModeShared)!
+let k_len_buf     = device.makeBuffer(length: B * 4, options: .storageModeShared)!
 
 // ========================================================================
 // Prefill pipeline — a COMPLETELY SEPARATE forward from autoregressive decode.
@@ -817,10 +820,10 @@ let pre_slide_part_masks = device.makeBuffer(length: B * MAX_Q_BLOCKS * MAX_PAGE
 let flex_full_part_masks = device.makeBuffer(length: B * MAX_Q_BLOCKS * MAX_PAGES_PER_SLOT * FLEX_Q_BLOCK * 4,
                                                options: .storageModeShared)!
 
-let pre_k_len_slide = device.makeBuffer(length: B * 4, options: .storageModeShared)!
-let pre_k_len_full  = device.makeBuffer(length: B * 4, options: .storageModeShared)!
-let pre_num_pages_slide = device.makeBuffer(length: B * 4, options: .storageModeShared)!
-let pre_num_pages_full  = device.makeBuffer(length: B * 4, options: .storageModeShared)!
+// Prefill per-slot k_len (post-prefill values). One buffer for both classes
+// under ONE PAGE=16 (see k_len_buf). pre_num_pages_{slide,full} were dead
+// (allocated, never read) and are deleted.
+let pre_k_len_buf = device.makeBuffer(length: B * 4, options: .storageModeShared)!
 
 // Flex-attention block-mask buffers. Sized for the worst case (Q_BLOCK=1,
 // so Q_blocks=1 per slot). CSR offsets: [B+1] u32; indices: [B * MAX_PAGES_PER_SLOT] u32.
@@ -3379,21 +3382,16 @@ func encKVWrite(_ cb: MTLCommandBuffer, K: MTLBuffer, V: MTLBuffer,
 // slot's pages cluster in 1-2 chunks → ~2-4 unique chunks per CB instead
 // of N=4 unconditionally.
 //
-// blockTable, numPagesA, numPagesB are the per-CB metadata buffers — the
-// caller passes the right buffers (e.g. num_pages_{slide,full} for AR,
-// pre_num_pages_{slide,full} for prefill). We walk the MAX of slide and
-// full per slot since block_table indexing covers both attention types
-// at PAGE granularity (the smaller of the two — see lm_engine.swift
-// ensurePages comment).
-func activeKVChunkIdxs(blockTable: MTLBuffer,
-                       numPagesA: MTLBuffer, numPagesB: MTLBuffer,
+// blockTable + numPages are the per-CB metadata buffers — the caller
+// passes num_pages_buf (AR). One page count per slot covers both
+// attention classes at PAGE=16 granularity (slide and full share geometry).
+func activeKVChunkIdxs(blockTable: MTLBuffer, numPages: MTLBuffer,
                        activeB: Int, kvChunkPages: Int) -> [Int] {
     let btP = blockTable.contents().assumingMemoryBound(to: UInt32.self)
-    let nsP = numPagesA.contents().assumingMemoryBound(to: UInt32.self)
-    let nfP = numPagesB.contents().assumingMemoryBound(to: UInt32.self)
+    let nP = numPages.contents().assumingMemoryBound(to: UInt32.self)
     var idxs = Set<Int>()
     for b in 0..<activeB {
-        let n = max(Int(nsP[b]), Int(nfP[b]))
+        let n = Int(nP[b])
         for p in 0..<n {
             let phys = Int(btP[b * MAX_PAGES_PER_SLOT + p])
             idxs.insert(phys / kvChunkPages)
@@ -3402,24 +3400,16 @@ func activeKVChunkIdxs(blockTable: MTLBuffer,
     return Array(idxs).sorted()
 }
 
-// Prefill variant: the engine populates `pre_k_len_slide/full` (k_len in
-// tokens) rather than separate num_pages buffers — `pre_num_pages_*` is
-// allocated but unused (verified 2026-05-14: only THIS helper read them
-// before this commit). Derive num_pages from k_len using the same
-// ceiling math the engine uses (ceil(k_len / PAGE)).
-func activeKVChunkIdxsFromKLen(blockTable: MTLBuffer,
-                                kLenSlide: MTLBuffer, kLenFull: MTLBuffer,
+// Prefill variant: the engine populates `pre_k_len_buf` (k_len in tokens)
+// rather than a num_pages buffer. Derive num_pages from k_len using the
+// same ceiling math the engine uses (ceil(k_len / PAGE)).
+func activeKVChunkIdxsFromKLen(blockTable: MTLBuffer, kLen: MTLBuffer,
                                 activeB: Int, kvChunkPages: Int) -> [Int] {
     let btP = blockTable.contents().assumingMemoryBound(to: UInt32.self)
-    let klsP = kLenSlide.contents().assumingMemoryBound(to: UInt32.self)
-    let klfP = kLenFull.contents().assumingMemoryBound(to: UInt32.self)
+    let klP = kLen.contents().assumingMemoryBound(to: UInt32.self)
     var idxs = Set<Int>()
     for b in 0..<activeB {
-        let kls = Int(klsP[b])
-        let klf = Int(klfP[b])
-        let nSlide = (kls + PAGE - 1) / PAGE
-        let nFull  = (klf + PAGE  - 1) / PAGE
-        let n = max(nSlide, nFull)
+        let n = (Int(klP[b]) + PAGE - 1) / PAGE
         for p in 0..<n {
             let phys = Int(btP[b * MAX_PAGES_PER_SLOT + p])
             idxs.insert(phys / kvChunkPages)
@@ -3458,28 +3448,49 @@ func useResourceForActiveChunks(_ enc: MTLComputeCommandEncoder,
 //   block EMPTY    ⟺ (B+1)*PAGE - 1 < window_lo  OR  B*PAGE > q_pos
 //   block PARTIAL  otherwise
 // sliding_window == 0 disables the lower bound (pure causal).
-func precomputeFlexBlockMaskSlide(slidingWindow: Int) {
-    let klsP = k_len_slide.contents().assumingMemoryBound(to: UInt32.self)
-    let fullOffPtr = flex_full_offsets.contents().assumingMemoryBound(to: UInt32.self)
-    let fullIdxPtr = flex_full_indices.contents().assumingMemoryBound(to: UInt32.self)
-    let partOffPtr = flex_partial_offsets.contents().assumingMemoryBound(to: UInt32.self)
-    let partIdxPtr = flex_partial_indices.contents().assumingMemoryBound(to: UInt32.self)
+// AR (qLen=1) block-mask CSR builder. ONE builder driven by a MaskMod
+// policy: per slot, classify each PAGE=16 block over the slot's k_len as
+// EMPTY / FULL / PARTIAL against the policy's 4-corner keep() test, and
+// emit FULL block indices and PARTIAL block indices into the caller's
+// per-class CSR buffers. The decode kernel (flex_attn_v0) re-derives the
+// per-cell causal + (FC_USE_SLIDE) window mask against the ONE true
+// k_pos = block*PAGE + k for PARTIAL blocks — so this builder only needs
+// the FULL/PARTIAL classification, no per-cell bitmap. (q is the single
+// decode position k_len-1; the per-cell window test on the PARTIAL/AR
+// boundary now lives in the kernel for BOTH classes, closing the old
+// AR-partMask window hole.)
+func precomputeFlexBlockMaskAR(_ mask: MaskMod, kLenBuf: MTLBuffer,
+                               fullOff: MTLBuffer, fullIdx: MTLBuffer,
+                               partOff: MTLBuffer, partIdx: MTLBuffer) {
+    let klP = kLenBuf.contents().assumingMemoryBound(to: UInt32.self)
+    let fullOffPtr = fullOff.contents().assumingMemoryBound(to: UInt32.self)
+    let fullIdxPtr = fullIdx.contents().assumingMemoryBound(to: UInt32.self)
+    let partOffPtr = partOff.contents().assumingMemoryBound(to: UInt32.self)
+    let partIdxPtr = partIdx.contents().assumingMemoryBound(to: UInt32.self)
     var fullCursor = 0
     var partCursor = 0
     fullOffPtr[0] = 0
     partOffPtr[0] = 0
     for b in 0..<B {
-        let k_len = Int(klsP[b])
+        let k_len = Int(klP[b])
         let q_pos = k_len - 1
-        let window_lo = (slidingWindow > 0 && k_len > slidingWindow)
-                        ? (k_len - slidingWindow) : 0
+        let ctx = MaskModContext(kLen: k_len, slidingWindow: SLIDING_WINDOW)
         let kBlocks = (k_len + PAGE - 1) / PAGE
         for K in 0..<kBlocks {
             let lo = K * PAGE
-            let hi = lo + PAGE - 1
-            if hi < window_lo || lo > q_pos {
+            // Exact per-cell classification (qLen=1: q is fixed at q_pos).
+            // Count kept cells over the whole PAGE; all kept = FULL (kernel
+            // skips per-k masking), none kept = EMPTY (skip), mixed =
+            // PARTIAL (kernel re-derives the per-cell mask). PAGE=16 host
+            // loop — exact for any MaskMod, including a window that straddles
+            // both edges inside one page.
+            var kept = 0
+            for c in 0..<PAGE where mask.keep(q: q_pos, k: lo + c, ctx: ctx) {
+                kept += 1
+            }
+            if kept == 0 {
                 // EMPTY — don't emit.
-            } else if lo >= window_lo && hi <= q_pos {
+            } else if kept == PAGE {
                 fullIdxPtr[fullCursor] = UInt32(K)
                 fullCursor += 1
             } else {
@@ -3490,6 +3501,18 @@ func precomputeFlexBlockMaskSlide(slidingWindow: Int) {
         fullOffPtr[b + 1] = UInt32(fullCursor)
         partOffPtr[b + 1] = UInt32(partCursor)
     }
+}
+
+// Build BOTH AR mask classes (sliding + pure-causal) from the class-uniform
+// k_len_buf into their respective CSR buffers. Sole AR mask-precompute entry
+// point — the decode kernel re-derives per-cell masks for PARTIAL blocks.
+func precomputeFlexBlockMasksAR() {
+    precomputeFlexBlockMaskAR(.causalSliding(SLIDING_WINDOW), kLenBuf: k_len_buf,
+        fullOff: flex_full_offsets, fullIdx: flex_full_indices,
+        partOff: flex_partial_offsets, partIdx: flex_partial_indices)
+    precomputeFlexBlockMaskAR(.causal, kLenBuf: k_len_buf,
+        fullOff: flex_full_full_offsets, fullIdx: flex_full_full_indices,
+        partOff: flex_full_partial_offsets, partIdx: flex_full_partial_indices)
 }
 
 // Mask-mod policy. Given an absolute (q_pos, k_pos) and a per-slot context
@@ -3551,23 +3574,30 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
     let qBlock = 8
     let qBlocks = (qLen + qBlock - 1) / qBlock
     let qPosP = pre_q_positions.contents().assumingMemoryBound(to: UInt32.self)
+    let klP = pre_k_len_buf.contents().assumingMemoryBound(to: UInt32.self)
 
-    // ---- Slide (PAGE=16) ----
-    do {
-        let fullOff = pre_slide_full_offsets.contents().assumingMemoryBound(to: UInt32.self)
-        let fullIdx = pre_slide_full_indices.contents().assumingMemoryBound(to: UInt32.self)
-        let partOff = pre_slide_part_offsets.contents().assumingMemoryBound(to: UInt32.self)
-        let partIdx = pre_slide_part_indices.contents().assumingMemoryBound(to: UInt32.self)
-        let partMask = pre_slide_part_masks.contents().assumingMemoryBound(to: UInt32.self)
+    // ONE class builder, called per attention class with its policy + the
+    // class's CSR/bitmap buffers. The kLen + page geometry is class-uniform
+    // (ONE PAGE=16, pre_k_len_buf); only the MaskMod policy + sliding-window
+    // context differ. Block classification is the 4-corner keep() test;
+    // PARTIAL blocks get an exact per-(q_local) bitmap the kernel consumes.
+    func buildClass(_ mask: MaskMod, slidingWindow: Int,
+                    fullOff: MTLBuffer, fullIdx: MTLBuffer,
+                    partOff: MTLBuffer, partIdx: MTLBuffer, partMask: MTLBuffer) {
+        let fullOffP = fullOff.contents().assumingMemoryBound(to: UInt32.self)
+        let fullIdxP = fullIdx.contents().assumingMemoryBound(to: UInt32.self)
+        let partOffP = partOff.contents().assumingMemoryBound(to: UInt32.self)
+        let partIdxP = partIdx.contents().assumingMemoryBound(to: UInt32.self)
+        let partMaskP = partMask.contents().assumingMemoryBound(to: UInt32.self)
         var fc = 0, pc = 0
-        fullOff[0] = 0; partOff[0] = 0
+        fullOffP[0] = 0; partOffP[0] = 0
         for b in 0..<numActiveSlots {
-            let k_len = Int(pre_k_len_slide.contents().assumingMemoryBound(to: UInt32.self)[b])
+            let k_len = Int(klP[b])
             // Slot's first q position. Fallback to positionStart for the
             // single-slot path that doesn't populate silenced slots.
             let slotPos = Int(qPosP[b * qLen])
             let slotFirst = (slotPos != 0 || positionStart == 0) ? slotPos : positionStart
-            let ctx = MaskModContext(kLen: k_len, slidingWindow: SLIDING_WINDOW)
+            let ctx = MaskModContext(kLen: k_len, slidingWindow: slidingWindow)
             let kBlocks = (k_len + PAGE - 1) / PAGE
             for qb in 0..<qBlocks {
                 let q_first = slotFirst + qb * qBlock
@@ -3579,92 +3609,48 @@ func precomputeFlexPrefillMasks(qLen: Int, positionStart: Int,
                 for K in 0..<kBlocks {
                     let lo = K * PAGE
                     let hi = lo + PAGE - 1
-                    let topLeft     = slideMask.keep(q: q_first, k: lo, ctx: ctx)
-                    let topRight    = slideMask.keep(q: q_first, k: hi, ctx: ctx)
-                    let botLeft     = slideMask.keep(q: q_last,  k: lo, ctx: ctx)
-                    let botRight    = slideMask.keep(q: q_last,  k: hi, ctx: ctx)
+                    let topLeft  = mask.keep(q: q_first, k: lo, ctx: ctx)
+                    let topRight = mask.keep(q: q_first, k: hi, ctx: ctx)
+                    let botLeft  = mask.keep(q: q_last,  k: lo, ctx: ctx)
+                    let botRight = mask.keep(q: q_last,  k: hi, ctx: ctx)
                     if !(topLeft || topRight || botLeft || botRight) { continue }
                     let allKeep = topLeft && topRight && botLeft && botRight
                     if allKeep {
-                        fullIdx[fc] = UInt32(K); fc += 1
+                        fullIdxP[fc] = UInt32(K); fc += 1
                     } else {
-                        partIdx[pc] = UInt32(K)
+                        partIdxP[pc] = UInt32(K)
                         for qrow in 0..<qBlock {
                             let q_abs = q_first + qrow
                             var row: UInt32 = 0
                             if q_abs <= q_last {
                                 for kcell in 0..<PAGE {
                                     let k_abs = lo + kcell
-                                    if slideMask.keep(q: q_abs, k: k_abs, ctx: ctx) {
+                                    if mask.keep(q: q_abs, k: k_abs, ctx: ctx) {
                                         row |= UInt32(1) << kcell
                                     }
                                 }
                             }
-                            partMask[pc * FLEX_Q_BLOCK + qrow] = row
+                            partMaskP[pc * FLEX_Q_BLOCK + qrow] = row
                         }
                         pc += 1
                     }
                 }
-                fullOff[csrIdx + 1] = UInt32(fc)
-                partOff[csrIdx + 1] = UInt32(pc)
+                fullOffP[csrIdx + 1] = UInt32(fc)
+                partOffP[csrIdx + 1] = UInt32(pc)
             }
         }
     }
 
-    // ---- Full (PAGE=16, no sliding window) ----
-    do {
-        let fullOff = flex_full_full_offsets.contents().assumingMemoryBound(to: UInt32.self)
-        let fullIdx = flex_full_full_indices.contents().assumingMemoryBound(to: UInt32.self)
-        let partOff = flex_full_partial_offsets.contents().assumingMemoryBound(to: UInt32.self)
-        let partIdx = flex_full_partial_indices.contents().assumingMemoryBound(to: UInt32.self)
-        let partMask = flex_full_part_masks.contents().assumingMemoryBound(to: UInt32.self)
-        var fc = 0, pc = 0
-        fullOff[0] = 0; partOff[0] = 0
-        for b in 0..<numActiveSlots {
-            let k_len = Int(pre_k_len_full.contents().assumingMemoryBound(to: UInt32.self)[b])
-            let slotPos = Int(qPosP[b * qLen])
-            let slotFirst = (slotPos != 0 || positionStart == 0) ? slotPos : positionStart
-            let ctx = MaskModContext(kLen: k_len, slidingWindow: 0)
-            let kBlocks = (k_len + PAGE - 1) / PAGE
-            for qb in 0..<qBlocks {
-                let q_first = slotFirst + qb * qBlock
-                let blockLastIdx = min((qb + 1) * qBlock, qLen) - 1
-                let q_last  = slotFirst + blockLastIdx
-                let csrIdx = b * qBlocks + qb
-                for K in 0..<kBlocks {
-                    let lo = K * PAGE
-                    let hi = lo + PAGE - 1
-                    let topLeft  = fullMask.keep(q: q_first, k: lo, ctx: ctx)
-                    let topRight = fullMask.keep(q: q_first, k: hi, ctx: ctx)
-                    let botLeft  = fullMask.keep(q: q_last,  k: lo, ctx: ctx)
-                    let botRight = fullMask.keep(q: q_last,  k: hi, ctx: ctx)
-                    if !(topLeft || topRight || botLeft || botRight) { continue }
-                    let allKeep = topLeft && topRight && botLeft && botRight
-                    if allKeep {
-                        fullIdx[fc] = UInt32(K); fc += 1
-                    } else {
-                        partIdx[pc] = UInt32(K)
-                        for qrow in 0..<qBlock {
-                            let q_abs = q_first + qrow
-                            var row: UInt32 = 0
-                            if q_abs <= q_last {
-                                for kcell in 0..<PAGE {
-                                    let k_abs = lo + kcell
-                                    if fullMask.keep(q: q_abs, k: k_abs, ctx: ctx) {
-                                        row |= UInt32(1) << kcell
-                                    }
-                                }
-                            }
-                            partMask[pc * FLEX_Q_BLOCK + qrow] = row
-                        }
-                        pc += 1
-                    }
-                }
-                fullOff[csrIdx + 1] = UInt32(fc)
-                partOff[csrIdx + 1] = UInt32(pc)
-            }
-        }
-    }
+    // ---- Slide (PAGE=16, sliding window) ----
+    buildClass(slideMask, slidingWindow: SLIDING_WINDOW,
+               fullOff: pre_slide_full_offsets, fullIdx: pre_slide_full_indices,
+               partOff: pre_slide_part_offsets, partIdx: pre_slide_part_indices,
+               partMask: pre_slide_part_masks)
+    // ---- Full (PAGE=16, pure causal) ----
+    buildClass(fullMask, slidingWindow: 0,
+               fullOff: flex_full_full_offsets, fullIdx: flex_full_full_indices,
+               partOff: flex_full_partial_offsets, partIdx: flex_full_partial_indices,
+               partMask: flex_full_part_masks)
 }
 
 // Prefill attention dispatchers (slide + full). Called from buildPrefillCB;
@@ -3826,39 +3812,6 @@ func encRopeMulti(_ cb: MTLCommandBuffer, _ x: MTLBuffer, q_positions: MTLBuffer
     enc.dispatchThreadgroups(MTLSize(width: B, height: qLen, depth: H),
                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     enc.endEncoding()
-}
-
-// Precompute for full-attention (pure causal, no sliding window).
-// Same CSR layout as slide but writes into the full-specific buffers and
-// uses PAGE and k_len_full.
-func precomputeFlexBlockMaskFull() {
-    let klfP = k_len_full.contents().assumingMemoryBound(to: UInt32.self)
-    let fullOffPtr = flex_full_full_offsets.contents().assumingMemoryBound(to: UInt32.self)
-    let fullIdxPtr = flex_full_full_indices.contents().assumingMemoryBound(to: UInt32.self)
-    let partOffPtr = flex_full_partial_offsets.contents().assumingMemoryBound(to: UInt32.self)
-    let partIdxPtr = flex_full_partial_indices.contents().assumingMemoryBound(to: UInt32.self)
-    var fullCursor = 0
-    var partCursor = 0
-    fullOffPtr[0] = 0
-    partOffPtr[0] = 0
-    for b in 0..<B {
-        let k_len = Int(klfP[b])
-        let q_pos = k_len - 1
-        let kBlocks = (k_len + PAGE - 1) / PAGE
-        for K in 0..<kBlocks {
-            let lo = K * PAGE
-            let hi = lo + PAGE - 1
-            if lo > q_pos {
-                // EMPTY (past causal horizon).
-            } else if hi <= q_pos {
-                fullIdxPtr[fullCursor] = UInt32(K); fullCursor += 1
-            } else {
-                partIdxPtr[partCursor] = UInt32(K); partCursor += 1
-            }
-        }
-        fullOffPtr[b + 1] = UInt32(fullCursor)
-        partOffPtr[b + 1] = UInt32(partCursor)
-    }
 }
 
 // Per-slot AR attention dispatcher. The `isFull` flag selects the
@@ -4564,11 +4517,11 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
     // Per-CB chunk-set narrowing. Compute the set of KV chunks our
     // active slots actually reference; useResource will be called only
     // on these in the dispatchers below. Walk block_table for the
-    // active slot range up to each slot's num_pages (max of slide and
-    // full, since block_table indexes both at PAGE granularity).
+    // active slot range up to each slot's num_pages (class-uniform under
+    // PAGE=16; block_table indexes both classes at PAGE granularity).
     let activeChunkIdxs = activeKVChunkIdxs(
         blockTable: block_table,
-        numPagesA: num_pages_slide, numPagesB: num_pages_full,
+        numPages: num_pages_buf,
         activeB: aB, kvChunkPages: w.kvChunkPages)
 
     // Embed lookup + Gemma-4 sqrt(hidden) scale on token embeddings.
@@ -4645,12 +4598,10 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
                     activeChunkIdxs: activeChunkIdxs,
                     H: KV_H, D: HD, page: pg, activeB: aB)
 
-        let npBuf = isFull ? num_pages_full : num_pages_slide
-        let klBuf = isFull ? k_len_full : k_len_slide
         encAttn(cb, Q: q_out, O: attn_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                 kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                 activeChunkIdxs: activeChunkIdxs,
-                kLenBuf: klBuf, H_Q: H, H_KV: KV_H, D: HD,
+                kLenBuf: k_len_buf, H_Q: H, H_KV: KV_H, D: HD,
                 isFull: isFull, activeB: aB)
         if LM_SKIP_ATTN {
             let blit = cb.makeBlitCommandEncoder()!
@@ -4968,7 +4919,7 @@ func buildStepCB(_ w: LmWeights, activeB: Int = B) -> MTLCommandBuffer {
 //
 // Caller is responsible for:
 //   1) Writing pre_input_tokens[b * qLen + i] and pre_q_positions[b * qLen + i]
-//   2) Writing pre_k_len_slide[b] and pre_k_len_full[b] (post-prefill values)
+//   2) Writing pre_k_len_buf[b] (post-prefill k_len; class-uniform)
 //   3) Setting block_table for the target slots (call initLmState or manage manually)
 //   4) Calling precomputeFlexPrefillMasks(qLen:, positionStart:) before build
 //
@@ -5006,7 +4957,7 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
     // prefill drives k_len via pre_q_positions.
     let activeChunkIdxs = activeKVChunkIdxsFromKLen(
         blockTable: block_table,
-        kLenSlide: pre_k_len_slide, kLenFull: pre_k_len_full,
+        kLen: pre_k_len_buf,
         activeB: B, kvChunkPages: w.kvChunkPages)
 
     if !skipEmbed {
@@ -5095,7 +5046,7 @@ func encodePrefillTileInto(_ cb: MTLCommandBuffer, _ w: LmWeights,
                         numActiveSlots: activeSlots)
 
         // Attention — flex v1 (Q_BLOCK=8).
-        let klBuf = isFull ? pre_k_len_full : pre_k_len_slide
+        let klBuf = pre_k_len_buf
         if isFull {
             encFlexAttnFullPrefill(cb, Q: q_out, O: pre_attn_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                                     kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
@@ -5371,7 +5322,7 @@ func encodeOnePrefillLayerSplit(_ w: LmWeights, L: Int, qLen: Int, sslot: Int) {
     // the non-split version since both use pre_num_pages_*.
     let activeChunkIdxs = activeKVChunkIdxsFromKLen(
         blockTable: block_table,
-        kLenSlide: pre_k_len_slide, kLenFull: pre_k_len_full,
+        kLen: pre_k_len_buf,
         activeB: B, kvChunkPages: w.kvChunkPages)
     let lw = w.layers[L]
     let isFull = lw.isFull
@@ -5462,7 +5413,7 @@ func encodeOnePrefillLayerSplit(_ w: LmWeights, L: Int, qLen: Int, sslot: Int) {
         print(String(format: "    L\(L) K_cache[sslot=\(sslot), pos=0..\(kLen-1)] sampled=\(sampledPositions) firstNaN=\(firstNaNPos) firstInf=\(firstInfPos)"))
         print("       by-range: prefill-early=\(byRange[0]!), AR-written=\(byRange[1]!), new-prefill=\(byRange[2]!)")
     }
-    let klBuf = isFull ? pre_k_len_full : pre_k_len_slide
+    let klBuf = pre_k_len_buf
     commitAndCheck("attention", buf: pre_attn_out, count: N * H * HD) { cb in
         if isFull {
             encFlexAttnFullPrefill(cb, Q: q_out, O: pre_attn_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
@@ -5593,7 +5544,7 @@ func encodeOnePrefillLayer(_ cb: MTLCommandBuffer, _ w: LmWeights, L: Int, qLen:
     // Per-CB chunk narrowing for prefill. See buildStepCB for rationale.
     let activeChunkIdxs = activeKVChunkIdxsFromKLen(
         blockTable: block_table,
-        kLenSlide: pre_k_len_slide, kLenFull: pre_k_len_full,
+        kLen: pre_k_len_buf,
         activeB: B, kvChunkPages: w.kvChunkPages)
     let lw = w.layers[L]
     let isFull = lw.isFull
@@ -5635,7 +5586,7 @@ func encodeOnePrefillLayer(_ cb: MTLCommandBuffer, _ w: LmWeights, L: Int, qLen:
                     activeChunkIdxs: activeChunkIdxs,
                     q_positions: pre_q_positions,
                     H: KV_H, D: HD, page: pg, qLen: qLen)
-    let klBuf = isFull ? pre_k_len_full : pre_k_len_slide
+    let klBuf = pre_k_len_buf
     if isFull {
         encFlexAttnFullPrefill(cb, Q: q_out, O: pre_attn_out,
                                 kArgBuf: kArgBuf, vArgBuf: vArgBuf,
@@ -5720,14 +5671,12 @@ func encodeOnePrefillLayer(_ cb: MTLCommandBuffer, _ w: LmWeights, L: Int, qLen:
 func initLmState(bos: UInt32) {
     let posP = positions.contents().bindMemory(to: UInt32.self, capacity: B)
     let tokP = input_tokens.contents().bindMemory(to: UInt32.self, capacity: B)
-    let npsP = num_pages_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-    let npfP = num_pages_full.contents().bindMemory(to: UInt32.self, capacity: B)
-    let klsP = k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-    let klfP = k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
+    let npP = num_pages_buf.contents().bindMemory(to: UInt32.self, capacity: B)
+    let klP = k_len_buf.contents().bindMemory(to: UInt32.self, capacity: B)
     for b in 0..<B {
         posP[b] = 0; tokP[b] = bos
-        klsP[b] = 1; klfP[b] = 1
-        npsP[b] = 1; npfP[b] = 1
+        klP[b] = 1
+        npP[b] = 1
     }
     let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
     for b in 0..<B {
@@ -5735,8 +5684,7 @@ func initLmState(bos: UInt32) {
             btP[b * MAX_PAGES_PER_SLOT + p] = UInt32(b * MAX_PAGES_PER_SLOT + p) % UInt32(TOTAL_PAGES)
         }
     }
-    precomputeFlexBlockMaskSlide(slidingWindow: SLIDING_WINDOW)
-    precomputeFlexBlockMaskFull()
+    precomputeFlexBlockMasksAR()
 }
 
 // Advance AR state by one token: next input_tokens = nextTokens,
@@ -5744,25 +5692,19 @@ func initLmState(bos: UInt32) {
 func advanceLmState(nextTokens: [UInt32]) {
     let posP = positions.contents().bindMemory(to: UInt32.self, capacity: B)
     let tokP = input_tokens.contents().bindMemory(to: UInt32.self, capacity: B)
-    let npsP = num_pages_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-    let npfP = num_pages_full.contents().bindMemory(to: UInt32.self, capacity: B)
-    let klsP = k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-    let klfP = k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
+    let npP = num_pages_buf.contents().bindMemory(to: UInt32.self, capacity: B)
+    let klP = k_len_buf.contents().bindMemory(to: UInt32.self, capacity: B)
     for b in 0..<B {
         posP[b] &+= 1
         tokP[b] = nextTokens[b]
-        // Let k_len grow freely; the slide kernel applies the SW mask at
+        // Let k_len grow freely; the slide mask applies the SW window at
         // softmax time and skips entire pages that fall before the window.
         // num_pages still tracks total pages so the kernel can short-circuit.
-        let newKLS = Int(klsP[b]) + 1
-        let newKLF = Int(klfP[b]) + 1
-        klsP[b] = UInt32(newKLS)
-        klfP[b] = UInt32(newKLF)
-        npsP[b] = UInt32((newKLS + PAGE - 1) / PAGE)
-        npfP[b] = UInt32((newKLF + PAGE - 1) / PAGE)
+        let newKL = Int(klP[b]) + 1
+        klP[b] = UInt32(newKL)
+        npP[b] = UInt32((newKL + PAGE - 1) / PAGE)
     }
-    precomputeFlexBlockMaskSlide(slidingWindow: SLIDING_WINDOW)
-    precomputeFlexBlockMaskFull()
+    precomputeFlexBlockMasksAR()
 }
 
 // Diagnostic: count finite / NaN / Inf / min / max in an fp16 buffer region.
@@ -5792,7 +5734,7 @@ func buildPartialStepCB(_ w: LmWeights, stopAfterLayer: Int) -> MTLCommandBuffer
     let cb = queue.makeCommandBuffer()!
     let activeChunkIdxs = activeKVChunkIdxs(
         blockTable: block_table,
-        numPagesA: num_pages_slide, numPagesB: num_pages_full,
+        numPages: num_pages_buf,
         activeB: B, kvChunkPages: w.kvChunkPages)
     encEmbed(cb, embedTable: w.embedTable)
     encScaleByScalar(cb, x: hidden, scalar: w.embedScaleBuf, N: HIDDEN, numVecs: B)
@@ -5831,12 +5773,10 @@ func buildPartialStepCB(_ w: LmWeights, stopAfterLayer: Int) -> MTLCommandBuffer
                     kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                     activeChunkIdxs: activeChunkIdxs,
                     H: KV_H, D: HD, page: pg)
-        let npBuf = isFull ? num_pages_full : num_pages_slide
-        let klBuf = isFull ? k_len_full : k_len_slide
         encAttn(cb, Q: q_out, O: attn_out, kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                 kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                 activeChunkIdxs: activeChunkIdxs,
-                kLenBuf: klBuf, H_Q: H, H_KV: KV_H, D: HD, isFull: isFull)
+                kLenBuf: k_len_buf, H_Q: H, H_KV: KV_H, D: HD, isFull: isFull)
         encDenseGemvAR(cb, attn_out, lw.attnOut, format: lw.attnOutFormat, mlp_out,
                         Din: H * HD, Dout: HIDDEN, activeB: B)
         encRmsNormAdd(cb, x: mlp_out, gammaBuf: lw.postAttnNorm,

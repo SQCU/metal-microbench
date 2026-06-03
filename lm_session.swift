@@ -150,9 +150,8 @@ final class LmSession {
                 posP[b * qLen + i] = UInt32(i)
             }
         }
-        let klsP = pre_k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-        let klfP = pre_k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
-        for b in 0..<B { klsP[b] = UInt32(qLen); klfP[b] = UInt32(qLen) }
+        let klP = pre_k_len_buf.contents().bindMemory(to: UInt32.self, capacity: B)
+        for b in 0..<B { klP[b] = UInt32(qLen) }
 
         // Per-slot-disjoint block_table.
         let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
@@ -173,15 +172,12 @@ final class LmSession {
         // qLen. advanceLmState increments positions by 1, so pre-seed to
         // qLen-1 with k_len=qLen (num_pages match prefill's final state).
         let arPosP = positions.contents().bindMemory(to: UInt32.self, capacity: B)
-        let arNpsP = num_pages_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-        let arNpfP = num_pages_full.contents().bindMemory(to: UInt32.self, capacity: B)
-        let arKlsP = k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-        let arKlfP = k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
+        let arNpP = num_pages_buf.contents().bindMemory(to: UInt32.self, capacity: B)
+        let arKlP = k_len_buf.contents().bindMemory(to: UInt32.self, capacity: B)
         for b in 0..<B {
             arPosP[b] = UInt32(qLen - 1)
-            arKlsP[b] = UInt32(qLen); arKlfP[b] = UInt32(qLen)
-            arNpsP[b] = UInt32((qLen + PAGE - 1) / PAGE)
-            arNpfP[b] = UInt32((qLen + PAGE  - 1) / PAGE)
+            arKlP[b] = UInt32(qLen)
+            arNpP[b] = UInt32((qLen + PAGE - 1) / PAGE)
         }
 
         // Copy slot-0's last-position logits (row b=0, q=qLen-1) from

@@ -76,9 +76,8 @@ func runLmARProfile(ggufPath: String) {
             posP[b * qLen + i] = UInt32(i)
         }
     }
-    let pklsP = pre_k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-    let pklfP = pre_k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
-    for b in 0..<B { pklsP[b] = UInt32(qLen); pklfP[b] = UInt32(qLen) }
+    let pklP = pre_k_len_buf.contents().bindMemory(to: UInt32.self, capacity: B)
+    for b in 0..<B { pklP[b] = UInt32(qLen) }
     let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
     for b in 0..<B {
         for p in 0..<MAX_PAGES_PER_SLOT {
@@ -99,17 +98,13 @@ func runLmARProfile(ggufPath: String) {
     // k_len_* set so attention sees qLen positions, num_pages set to
     // ceil(qLen / PAGE).
     let posBuf = positions.contents().bindMemory(to: UInt32.self, capacity: B)
-    let arklsP = k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-    let arklfP = k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
-    let npsBuf = num_pages_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-    let npfBuf = num_pages_full.contents().bindMemory(to: UInt32.self, capacity: B)
+    let arklP = k_len_buf.contents().bindMemory(to: UInt32.self, capacity: B)
+    let npBuf = num_pages_buf.contents().bindMemory(to: UInt32.self, capacity: B)
     let inputBuf = input_tokens.contents().bindMemory(to: UInt32.self, capacity: B)
     for b in 0..<B {
         posBuf[b] = UInt32(qLen)
-        arklsP[b] = UInt32(qLen + 1)        // attention sees positions 0..qLen
-        arklfP[b] = UInt32(qLen + 1)
-        npsBuf[b] = UInt32((qLen + PAGE - 1) / PAGE)
-        npfBuf[b] = UInt32((qLen + PAGE - 1) / PAGE)
+        arklP[b] = UInt32(qLen + 1)         // attention sees positions 0..qLen
+        npBuf[b] = UInt32((qLen + PAGE - 1) / PAGE)
         inputBuf[b] = 1
     }
 
@@ -235,7 +230,7 @@ func runLmARProfile(ggufPath: String) {
 
             let activeChunkIdxs = activeKVChunkIdxs(
                 blockTable: block_table,
-                numPagesA: num_pages_slide, numPagesB: num_pages_full,
+                numPages: num_pages_buf,
                 activeB: B, kvChunkPages: w.kvChunkPages)
             stages.append(runARStage("kv_attn", layer: L) { cb in
                 let pg = PAGE
@@ -244,12 +239,11 @@ func runLmARProfile(ggufPath: String) {
                             kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                             activeChunkIdxs: activeChunkIdxs,
                             H: KV_H, D: HD, page: pg)
-                let klBuf = isFull ? k_len_full : k_len_slide
                 encAttn(cb, Q: q_out, O: attn_out,
                         kArgBuf: kArgBuf, vArgBuf: vArgBuf,
                         kChunks: kChunks, vChunks: vChunks, chunkPages: w.kvChunkPages,
                         activeChunkIdxs: activeChunkIdxs,
-                        kLenBuf: klBuf, H_Q: H, H_KV: KV_H, D: HD,
+                        kLenBuf: k_len_buf, H_Q: H, H_KV: KV_H, D: HD,
                         isFull: isFull)
             })
 

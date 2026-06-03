@@ -1838,9 +1838,8 @@ func runLmPrefillValidate(ggufPath: String, refDir: String, tag: String) {
             posP[b * qLen + i] = UInt32(i)
         }
     }
-    let klsP = pre_k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-    let klfP = pre_k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
-    for b in 0..<B { klsP[b] = UInt32(qLen); klfP[b] = UInt32(qLen) }
+    let klP = pre_k_len_buf.contents().bindMemory(to: UInt32.self, capacity: B)
+    for b in 0..<B { klP[b] = UInt32(qLen) }
 
     // Block table — reuse the AR per-slot-disjoint layout. Each slot's
     // pages are physically distinct so batches can't alias.
@@ -1994,15 +1993,12 @@ func runLmPrefillValidate(ggufPath: String, refDir: String, tag: String) {
     // The AR kernels use the same block_table, so the KV cache prefill
     // wrote through pre_* plumbing is already live for AR to consume.
     let arPosP = positions.contents().bindMemory(to: UInt32.self, capacity: B)
-    let arNpsP = num_pages_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-    let arNpfP = num_pages_full.contents().bindMemory(to: UInt32.self, capacity: B)
-    let arKlsP = k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-    let arKlfP = k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
+    let arNpP = num_pages_buf.contents().bindMemory(to: UInt32.self, capacity: B)
+    let arKlP = k_len_buf.contents().bindMemory(to: UInt32.self, capacity: B)
     for b in 0..<B {
         arPosP[b] = UInt32(qLen - 1)
-        arKlsP[b] = UInt32(qLen); arKlfP[b] = UInt32(qLen)
-        arNpsP[b] = UInt32((qLen + PAGE - 1) / PAGE)
-        arNpfP[b] = UInt32((qLen + PAGE  - 1) / PAGE)
+        arKlP[b] = UInt32(qLen)
+        arNpP[b] = UInt32((qLen + PAGE - 1) / PAGE)
     }
 
     // Teacher-force each AR step with the token that actually follows in
