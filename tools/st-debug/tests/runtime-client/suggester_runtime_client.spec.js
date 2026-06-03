@@ -54,6 +54,15 @@ const SUGGESTER_DIR = process.env.SUGGESTER_DIR
     || '/Users/mdot/sillytavern-fork/plugins/user-personas/static';
 const SUGGESTER_HTML = path.join(SUGGESTER_DIR, 'suggester.html');
 const CSRF_JS = path.join(SUGGESTER_DIR, 'csrf-fetch.js');
+// The ONE Suggester core (suggester_core.js). The iframe is now a
+// `<script type="module">` that `import './suggester_core.js'`s this exact
+// file; in production the plugin streams it at /static/suggester_core.js (it
+// physically lives in the FE extension dir, NOT the static dir). The harness
+// must fulfil that module request with the real bytes — otherwise the catch-all
+// returns an empty 200, the static import fails, and the WHOLE module never
+// boots (no /yapper-seed, no rows). Overridable for an alternate checkout.
+const SUGGESTER_CORE_JS = process.env.SUGGESTER_CORE_JS
+    || '/Users/mdot/sillytavern-fork/public/scripts/extensions/user-personas/suggester_core.js';
 
 // Fabricated origin. Nothing listens here -- every request is route-fulfilled
 // before the network layer, so no server is contacted.
@@ -91,13 +100,18 @@ function loadClientSource() {
     if (!fs.existsSync(SUGGESTER_HTML)) {
         throw new Error(`real client source not found: ${SUGGESTER_HTML} (set SUGGESTER_DIR)`);
     }
+    if (!fs.existsSync(SUGGESTER_CORE_JS)) {
+        throw new Error(`Suggester core not found: ${SUGGESTER_CORE_JS} (set SUGGESTER_CORE_JS). ` +
+            `The iframe imports it as an ES module; without the real bytes the static import fails and nothing boots.`);
+    }
     const html = fs.readFileSync(SUGGESTER_HTML, 'utf8');
     const csrf = fs.existsSync(CSRF_JS) ? fs.readFileSync(CSRF_JS, 'utf8') : '';
-    return { html, csrf };
+    const core = fs.readFileSync(SUGGESTER_CORE_JS, 'utf8');
+    return { html, csrf, core };
 }
 
 async function installHarness(page, { chat, calls }) {
-    const { html, csrf } = loadClientSource();
+    const { html, csrf, core } = loadClientSource();
 
     // Catch-all FIRST (lowest priority): keeps stray requests (favicon, etc.)
     // from erroring. Specific routes registered after this win.
@@ -109,6 +123,15 @@ async function installHarness(page, { chat, calls }) {
         route.fulfill({ status: 200, contentType: 'text/html', body: html }));
     await page.route('**/csrf-fetch.js', route =>
         route.fulfill({ status: 200, contentType: 'application/javascript', body: csrf }));
+    // Serve the REAL suggester_core.js to the iframe's `<script type="module">`
+    // static import. The catch-all above would otherwise return an empty 200,
+    // the import would resolve to a module with no exports, and the whole
+    // module body would throw on the first `INITIAL_K_TOP` reference. This
+    // route is what lets the iframe share the ONE core (no inline mirror).
+    // MUST carry a JS MIME type — browsers reject module imports served as
+    // text/plain (strict MIME checking for module scripts).
+    await page.route('**/suggester_core.js', route =>
+        route.fulfill({ status: 200, contentType: 'application/javascript', body: core }));
     // csrf-fetch.js does a GET /csrf-token before the first unsafe request.
     await page.route('**/csrf-token', route =>
         route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ token: 'disabled' }) }));

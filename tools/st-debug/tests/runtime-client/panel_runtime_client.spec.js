@@ -108,9 +108,16 @@ const POPULATED_CHAT = [
     { is_user: false, name: 'dicemother', mes: 'No one follows. Something inside the satchel shifts against the leather.' },
 ];
 
+// The ONE Suggester core, imported by the real index.js as `./suggester_core.js`.
+// Both surfaces share it; without serving the real bytes here the static import
+// would resolve to the catch-all's empty 200 and index.js would throw at boot.
+const SUGGESTER_CORE_JS = path.join(EXT_DIR, 'suggester_core.js');
+
 async function installHarness(page, { chat, calls, yapper = yapperBody }) {
     if (!fs.existsSync(INDEX_JS)) throw new Error(`real index.js not found: ${INDEX_JS} (set PANEL_EXT_DIR)`);
+    if (!fs.existsSync(SUGGESTER_CORE_JS)) throw new Error(`real suggester_core.js not found: ${SUGGESTER_CORE_JS} (set PANEL_EXT_DIR)`);
     const indexSrc = fs.readFileSync(INDEX_JS, 'utf8');
+    const coreSrc = fs.readFileSync(SUGGESTER_CORE_JS, 'utf8');
 
     // Catch-all FIRST (lowest priority). Playwright matches the most-recently-
     // registered handler first, so specific routes below win. (A trailing
@@ -121,6 +128,10 @@ async function installHarness(page, { chat, calls, yapper = yapperBody }) {
     await page.route('**/harness.html', route => route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML }));
     await page.route('**/extensions/user-personas/index.js', route =>
         route.fulfill({ status: 200, contentType: 'application/javascript', body: indexSrc }));
+    // index.js imports `./suggester_core.js` (the ONE core). Serve the real
+    // bytes with a JS MIME type so the module import resolves.
+    await page.route('**/extensions/user-personas/suggester_core.js', route =>
+        route.fulfill({ status: 200, contentType: 'application/javascript', body: coreSrc }));
     // The real index.js does `import ... from '../../../script.js'`, which from
     // /public/scripts/extensions/user-personas/index.js resolves to
     // /public/script.js. Serve the host stub there.
