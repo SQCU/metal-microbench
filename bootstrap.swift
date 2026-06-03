@@ -824,6 +824,12 @@ let flex_full_partial_indices = device.makeBuffer(length: B * MAX_Q_BLOCKS * MAX
 // Dynamic routing/control buffers (populated by the forward pass every step).
 let positions    = device.makeBuffer(length: B * 4, options: .storageModeShared)!
 let block_table  = device.makeBuffer(length: B * MAX_PAGES_PER_SLOT * 4, options: .storageModeShared)!
+// Per-slot K/V-write suppression flag for the AR kv_write kernel. [B] uint
+// 0/1. Non-zero for a slot means "compute this row's logit but do NOT
+// persist its K/V" — the cache-hit first-step row at position N-1 whose K/V
+// already lives in the read-only adopted cache. Initialized to all-zero
+// (write enabled) and reset to zero by every AR step that doesn't need it.
+let kv_write_skip = device.makeBuffer(length: B * 4, options: .storageModeShared)!
 
 let active_exp   = device.makeBuffer(length: E_EXP * 4, options: .storageModeShared)!
 let group_start  = device.makeBuffer(length: (E_EXP + 1) * 4, options: .storageModeShared)!
@@ -3338,6 +3344,8 @@ func encKVWrite(_ cb: MTLCommandBuffer, K: MTLBuffer, V: MTLBuffer,
     enc.setBytes(&pv, length: 4, index: 8); enc.setBytes(&mv, length: 4, index: 9)
     var cp = UInt32(chunkPages)
     enc.setBytes(&cp, length: 4, index: 27)
+    // Per-slot K/V-write suppression (cache-hit first-step logit-only rows).
+    enc.setBuffer(kv_write_skip, offset: 0, index: 28)
     // Mark argbuf-referenced chunks for residency — narrowed to the
     // chunks this CB's active slots actually touch.
     useResourceForActiveChunks(enc, kChunks: kChunks, vChunks: vChunks,

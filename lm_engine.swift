@@ -44,17 +44,13 @@ import Metal
 // there's no half-state where a Session exists with no work.
 enum SessionState: Equatable {
     case priming        // primingQueue non-empty (or just-finished prefill on transition to generating)
-    case primed         // Track A fold-in: all prefill done, K/V at pos N exists,
-                        // no first generated token sampled yet. Needs a 1-token
-                        // recover tick at position-1 to produce the first
-                        // sampled token; then transitions to .generating.
     case generating     // sampling; pushing to outputQueue
     case done           // EOS / maxTokens
 
     // Does this session want a slot on the next scheduler tick?
     var wantsSlot: Bool {
         switch self {
-        case .priming, .primed, .generating: return true
+        case .priming, .generating: return true
         case .done: return false
         }
     }
@@ -810,6 +806,18 @@ final class Session {
     fileprivate var position: Int = 0
     fileprivate var numGenerated: Int = 0
 
+    // Cache-hit first-step flag. Set true when a session is admitted via a
+    // full prefix-cache adoption that left primingQueue empty at position>0
+    // (the old .primed condition). On its FIRST AR step the session re-runs
+    // the last consumed prompt token at position N-1 as a plain decode row
+    // (qLen=1, k_len=N) purely to obtain the first generated token's logit;
+    // the K/V at N-1 already lives in the read-only adopted cache, so that
+    // row's K/V write is SUPPRESSED (no clobber of the shared page). Cleared
+    // in finalizeARStep after the step; the first NEW K/V write is position N
+    // on the next normal AR step. This single flag replaces the entire
+    // .primed/recover state-machine.
+    fileprivate var firstStepLogitOnly: Bool = false
+
     // Control-vector state (Phase B). activeControls is evaluated once
     // per tick inside step(); turnIndex is set at construction (always
     // 0 under stateless chat-completions — one turn per request).
@@ -1112,10 +1120,6 @@ final class Session {
         var adoptedFullTokens = 0       // tokens covered by full page-pairs only
         if firstSubmit {
             (adoptedFullTokens, adoptedTokens) = adoptSharedPrefixPages(engine: eng)
-            // Track A fold-in: the old backstop unadopted the trailing page
-            // whenever adoption would leave primingQueue empty. Under the
-            // .primed state machine that's gone — we set state=.primed
-            // instead and let prepareARStep run a 1-token recover tick.
             position = adoptedTokens
             cacheHitTokens &+= UInt32(adoptedTokens)
             // Engine-wide monotonic adoption tally (survives closeSession,
@@ -1137,11 +1141,15 @@ final class Session {
                 cacheMissTokens &+= UInt32(tail.count)
             }
         }
-        // State transition: .primed when fully cached at >0 position
-        // (Track A path). .priming otherwise.
+        // State transition: a fully-cached session (primingQueue empty at a
+        // non-zero adopted position) enters the normal batched-AR pool with
+        // firstStepLogitOnly set — its first AR step re-runs the last prompt
+        // token at N-1 to get the first logit (no .primed half-state). Any
+        // session with remaining prefill work is .priming.
         if state != .done {
             if primingQueue.isEmpty && position > 0 {
-                state = .primed
+                state = .generating
+                firstStepLogitOnly = true
             } else {
                 state = .priming
             }
@@ -1419,9 +1427,6 @@ final class Session {
         }
         let (newlyAlignedTokens, _) = adoptSharedPrefixPages(engine: engine)
         guard newlyAlignedTokens > 0 else { return }
-        // Track A fold-in: backstop is gone. Sessions whose primingQueue
-        // empties out get .primed state and the recover-tick path picks
-        // them up to produce the first sampled token.
         var advance = newlyAlignedTokens
         position += advance
         // Move billing from miss → hit. The tokens we just adopted were
@@ -1457,10 +1462,12 @@ final class Session {
                 advance = 0
             }
         }
-        // If we drained the queue and have a non-zero position, transition
-        // to .primed so prepareARStep runs a recover tick.
+        // If we drained the queue and have a non-zero position, enter the
+        // batched-AR pool with firstStepLogitOnly: the first AR step re-runs
+        // the last prompt token at N-1 to produce the first generated token.
         if state != .done && primingQueue.isEmpty && position > 0 {
-            state = .primed
+            state = .generating
+            firstStepLogitOnly = true
         }
     }
     func submit(softTokens: MTLBuffer, count: Int, isFp32: Bool,
@@ -2093,67 +2100,6 @@ final class LmEngine {
         }
     }
 
-    // Followup 2 (LM_KV_OVERWRITE_CHECK assertion): compute a content
-    // hash over the K/V row(s) at a single logical position across all
-    // layers, walking the session's ownedPages map to find the right
-    // phys page per layer. Both layer types index the SAME flat ownedPages
-    // array by their per-layer logical page ordinal: full layers use
-    // ownedPages[position/PAGE_FULL] (=pos/8), slide layers use
-    // ownedPages[position/PAGE_SLIDE] (=pos/16). (Corrected 2026-06-01: the
-    // old text claimed slide layers use ownedPages[2*P] — that was the
-    // detector-geometry bug that made this very check blind to the shared-
-    // slide-page overwrite. See the per-layer indexing below.)
-    //
-    // Used to verify the .primed recover-step's "benign overwrite"
-    // property: the K/V write at position lands in pages shared with
-    // the producer; per the Track A analysis the bytes produced are
-    // bit-identical (same input + same KV[0..k-2] + same cvecs).
-    //
-    // Cost: walks NUM_LAYERS * (K_row + V_row) bytes ≈ a few KB total.
-    // FNV-1a over fp16 halves. Off the hot path by default (env-var
-    // gated); on, runs only for .primed sessions.
-    //
-    // NOTE: we deliberately hash ONLY the recover-position row(s), not
-    // whole pages. The benign-overwrite analysis only claims byte
-    // identity at the single row being written.
-    fileprivate func hashSessionKVAtPosition(_ s: Session, position: Int) -> UInt64 {
-        var h: UInt64 = 0xcbf29ce484222325
-        let logSlide = position / PAGE_SLIDE       // logical slide page index
-        let logFull = position / PAGE_FULL          // logical full page index
-        // Slide-layer phys: ownedPages[logSlide] (flat; slide kernel reads
-        //   bt_s[pos/16] = ownedPages[pos/16]).
-        // Full-layer phys: ownedPages[logFull]  (flat; full kernel reads
-        //   block_table[pos/8] = ownedPages[pos/8]).
-        for L in 0..<NUM_LAYERS {
-            let lw = weights.layers[L]
-            let pg = lw.isFull ? PAGE_FULL : PAGE_SLIDE
-            // Geometry fix (2026-06-01): the slide kernel addresses slide-page
-            // P at block_table[P] = ownedPages[P] (flat, PAGE_SLIDE=16), NOT
-            // ownedPages[2P]. The prior `2 * logSlide` hashed the WRONG physical
-            // page, so this LM_KV_OVERWRITE_CHECK detector was blind to exactly
-            // the shared-slide-page write that drives the absorbing-state
-            // collapse. Both layer types index the same flat block_table by
-            // their per-layer logical page ordinal (full: pos/8, slide: pos/16).
-            let physOwnedIdx = lw.isFull ? logFull : logSlide
-            guard physOwnedIdx < s.ownedPages.count else { continue }
-            let phys = s.ownedPages[physOwnedIdx]
-            let chunkIdx = phys / weights.kvChunkPages
-            let localPhys = phys - chunkIdx * weights.kvChunkPages
-            let rowBytes = lw.KV_H * lw.HD * 2
-            let rowOff = (localPhys * pg + (position % pg)) * rowBytes
-            let kBase = weights.K_chunks[L][chunkIdx].contents().advanced(by: rowOff)
-            let vBase = weights.V_chunks[L][chunkIdx].contents().advanced(by: rowOff)
-            for buf in [kBase, vBase] {
-                let p = buf.bindMemory(to: UInt8.self, capacity: rowBytes)
-                for i in 0..<rowBytes {
-                    h ^= UInt64(p[i])
-                    h = h &* 0x100000001b3
-                }
-            }
-        }
-        return h
-    }
-
     // Followup 1 (CoW-on-extend for partial pairs): copy K/V bytes from
     // a source phys page to a destination phys page, across all layers.
     // The whole per-layer page is copied (PAGE_SLIDE or PAGE_FULL rows
@@ -2695,8 +2641,8 @@ final class LmEngine {
 
     private func pickKernelMappingForAR() -> [Session?] {
         // AR can serve both .generating sessions (real decode) AND
-        // .priming sessions with a 1-token tail (popArPrimingToken
-        // consumes them one token at a time). The pickChainPath
+        // .priming sessions with a 1-token tail (consumed inline in
+        // prepareARStep as a normal decode row). The pickChainPath
         // already routed multi-token-priming sessions to a prefill
         // path; whatever lands here is decoder-eligible.
         return pickKernelMappingForState { $0.state.isBusy }
@@ -2721,11 +2667,14 @@ final class LmEngine {
         return mapping
     }
 
-    // Take one token off the head chunk if it's a .tokens chunk. Returns
-    // nil if the head is .softTokens (that chunk needs fast prefill, not
-    // AR priming) or the queue is empty. Also removes emptied chunks and
-    // updates session state.
-    private func popArPrimingToken(_ s: Session) -> UInt32? {
+    // Take one token off a .priming session's head chunk if it's a .tokens
+    // chunk. Returns nil if the head is .softTokens (that chunk needs fast
+    // prefill, not AR priming) or the queue is empty. Removes emptied chunks.
+    // pickChainPath routes multi-token (count>=2) text chunks to the prefill
+    // path, so what reaches AR here is a 1-token tail that must still be
+    // prefilled as a normal decode row (real K/V write at position N).
+    @inline(__always)
+    private func popPrimingToken(_ s: Session) -> UInt32? {
         while let head = s.primingQueue.first {
             switch head {
             case .tokens(var ts):
@@ -2743,17 +2692,6 @@ final class LmEngine {
             }
         }
         return nil
-    }
-
-    // True if this session has a pending chunk that must go through fast
-    // prefill (soft-tokens OR a .tokens chunk of size ≥ 2 for efficiency).
-    // Used by the scheduler to decide when to run single-slot prefill.
-    private func hasPrefillChunk(_ s: Session, minTokensThreshold: Int = 2) -> Bool {
-        guard let head = s.primingQueue.first else { return false }
-        switch head {
-        case .tokens(let ts): return ts.count >= minTokensThreshold
-        case .softTokens:    return true
-        }
     }
 
     // Populate the 6 sampling buffers (temperature, min_p, seed, step,
@@ -2929,10 +2867,6 @@ final class LmEngine {
         let t0: Date
         let realSlot: [Bool]
         let slotSession: [Session?]
-        // Followup 2 (LM_KV_OVERWRITE_CHECK): pre-step K/V byte hash for
-        // each .primed slot's trailing-page phys (slidePlusFullHead). Only
-        // populated when env-var is set; finalize compares post-step.
-        let primedRecoverPagePreHash: [Int: (phys: Int, hash: UInt64, position: Int)]
     }
 
     // Run exactly one buildStepCB covering every slot, with per-slot state
@@ -2977,64 +2911,36 @@ final class LmEngine {
 
         // Track which slots run REAL work this step.
         var realSlot = [Bool](repeating: false, count: B)
-        // Followup 2 (LM_KV_OVERWRITE_CHECK): record pre-step K/V byte
-        // hash for each .primed recover-step slot. finalize compares
-        // post-step to catch any silent corruption of the producer's
-        // shared pages. Empty when env-var is not set.
-        let kvCheckEnabled = ProcessInfo.processInfo.environment["LM_KV_OVERWRITE_CHECK"] != nil
-        var primedRecoverPagePreHash: [Int: (phys: Int, hash: UInt64, position: Int)] = [:]
+        // Per-slot K/V-write suppression flag. Default all-zero (write
+        // enabled). Set 1 for a cache-hit first-step (firstStepLogitOnly)
+        // row, whose K/V at position N-1 already lives in the read-only
+        // adopted cache and must NOT be re-written.
+        let kvSkipP = kv_write_skip.contents().bindMemory(to: UInt32.self, capacity: B)
+        for slot in 0..<B { kvSkipP[slot] = 0 }
 
         for slot in 0..<B {
             if let s = arMapping[slot], s.state.isBusy {
-                // Track A fold-in: .primed sessions get a recover tick.
-                // Input is the LAST consumed prompt token; position is
-                // the LAST cached position.
-                //
-                // 2026-05-23 (kernel-pair fix): .primed sessions are now
-                // routed to prepareRecoverPrefill via pickChainPath's
-                // .recoverPrefill path, which dispatches the prefill
-                // kernel (same as producer) for bit-identical K/V. If
-                // a .primed session reaches HERE, the routing has
-                // regressed — log it loudly. The AR-kernel branch below
-                // is kept for defense-in-depth but should never fire.
-                if s.state == .primed {
-                    fputs("[recover-step] WARNING: .primed session sid=\(s.id) "
-                          + "reached prepareARStep — pickChainPath routing "
-                          + "regression. Falling back to AR-kernel recover "
-                          + "(will re-trigger KV-overwrite drift).\n", stderr)
-                    let recoverPos = s.position - 1
-                    guard recoverPos >= 0,
-                          recoverPos < s.consumedTokens.count else {
-                        // Defensive: invalid recover state; park.
-                        tokP[slot] = weights.bosTokenId
-                        posP[slot] = 0
-                        klsP[slot] = 1; klfP[slot] = 1
-                        npsP[slot] = 1; npfP[slot] = 1
-                        continue
-                    }
-                    // ensurePages for K/V at recoverPos (it should already
-                    // exist via adoption, but defensive).
-                    _ = ensurePages(s, forKLen: recoverPos + 2)
+                if s.firstStepLogitOnly {
+                    // Cache-hit first step: re-run the LAST consumed prompt
+                    // token at position N-1 as a plain decode row (qLen=1,
+                    // k_len=N) to obtain the first generated token's logit.
+                    // The CSR flex mask admits it alongside the other decode
+                    // rows. Its K/V at N-1 is already in the adopted cache,
+                    // so we SUPPRESS the K/V write for this row (kvSkipP=1).
+                    // Sampling stays ON — we need the logit.
+                    let logitPos = s.position - 1
+                    precondition(logitPos >= 0 && logitPos < s.consumedTokens.count,
+                                 "firstStepLogitOnly with no cached prompt token (sid=\(s.id) position=\(s.position))")
+                    _ = ensurePages(s, forKLen: logitPos + 2)
                     installBlockTable(s, slot: slot)
-                    let tok = s.consumedTokens[recoverPos]
-                    tokP[slot] = tok
-                    posP[slot] = UInt32(recoverPos)
-                    let kLen = recoverPos + 1
+                    tokP[slot] = s.consumedTokens[logitPos]
+                    posP[slot] = UInt32(logitPos)
+                    let kLen = logitPos + 1
                     klsP[slot] = UInt32(kLen); klfP[slot] = UInt32(kLen)
                     npsP[slot] = UInt32((kLen + PAGE_SLIDE - 1) / PAGE_SLIDE)
                     npfP[slot] = UInt32((kLen + PAGE_FULL  - 1) / PAGE_FULL)
                     realSlot[slot] = true
-                    // KV-overwrite check: hash the K/V row at the
-                    // recover position (across all layers) pre-step.
-                    // finalize verifies it's unchanged post-step.
-                    if kvCheckEnabled {
-                        let h = hashSessionKVAtPosition(s, position: recoverPos)
-                        // We don't track a single phys page anymore;
-                        // hashSessionKVAtPosition walks ownedPages.
-                        // Store the session ref via slotSession in the
-                        // PreparedAR; here we just store the hash + pos.
-                        primedRecoverPagePreHash[slot] = (phys: -1, hash: h, position: recoverPos)
-                    }
+                    kvSkipP[slot] = 1
                     continue
                 }
                 // Grow pages if needed for the step that's about to run.
@@ -3043,7 +2949,7 @@ final class LmEngine {
 
                 let inputTok: UInt32?
                 if s.state == .priming {
-                    inputTok = popArPrimingToken(s)
+                    inputTok = popPrimingToken(s)
                 } else {
                     inputTok = s.nextGeneratedInput
                 }
@@ -3183,8 +3089,7 @@ final class LmEngine {
 
         let t0 = Date()
         let cb = buildStepCB(weights, activeB: activeB)
-        return PreparedAR(cb: cb, t0: t0, realSlot: realSlot, slotSession: arSlotSession,
-                          primedRecoverPagePreHash: primedRecoverPagePreHash)
+        return PreparedAR(cb: cb, t0: t0, realSlot: realSlot, slotSession: arSlotSession)
     }
 
     // Post-CB readback. Runs once the GPU has finished the AR step CB —
@@ -3197,51 +3102,6 @@ final class LmEngine {
         lastStepMs = Date().timeIntervalSince(p.t0) * 1000
         totalSteps += 1
         if let err = p.cb.error { print("  GPU step error: \(err)"); return 0 }
-        // Followup 2 (LM_KV_OVERWRITE_CHECK): verify the .primed
-        // recover-step's K/V write at position-1 produced bit-identical
-        // bytes (the "benign overwrite" property from Track A's design).
-        // On mismatch, abort the affected session and print a loud
-        // warning — this is a correctness failure that would silently
-        // corrupt downstream sampling.
-        if !p.primedRecoverPagePreHash.isEmpty {
-            // Followup 2: warn-only mode. The Track A design predicted
-            // "benign overwrite" — i.e., bit-identical K/V bytes at the
-            // recover position — based on (same input + same KV[0..k-2]
-            // + same cvecs) → same K/V output. In practice prefill and
-            // AR kernels use different reduction orders (q_len=16 vs
-            // q_len=1) and produce K/V bytes that differ at the fp16
-            // ULP level, even though the downstream sampling and KL-
-            // divergence guards are satisfied by these tiny differences.
-            //
-            // We keep the assertion as a debug/diagnostic signal: if
-            // the differences ever grow large enough to corrupt
-            // downstream behavior, the warning will be the first
-            // forensic breadcrumb. But we do NOT abort the session,
-            // because the differences are known-benign for the test
-            // harness's KL guard and the production hot path.
-            //
-            // Set LM_KV_OVERWRITE_CHECK=1 to enable; LM_KV_OVERWRITE_ABORT=1
-            // additionally upgrades the warning to session abort.
-            let abortOnMismatch = ProcessInfo.processInfo.environment["LM_KV_OVERWRITE_ABORT"] != nil
-            for (slot, pre) in p.primedRecoverPagePreHash {
-                guard let s = p.slotSession[slot] else { continue }
-                let postH = hashSessionKVAtPosition(s, position: pre.position)
-                if postH != pre.hash {
-                    let sid = s.id
-                    let preHex = String(pre.hash, radix: 16, uppercase: false)
-                    let postHex = String(postH, radix: 16, uppercase: false)
-                    fputs("[recover-step] KV BYTES CHANGED at position=\(pre.position) "
-                          + "slot=\(slot) sid=\(sid) "
-                          + "pre=\(preHex) post=\(postHex)"
-                          + (abortOnMismatch ? " — aborting session" : " (warn-only)") + "\n",
-                          stderr)
-                    if abortOnMismatch {
-                        s.state = .done
-                        s.doneReason = 3
-                    }
-                }
-            }
-        }
         // Periodic profiling dump every 100 AR steps. Gated by LM_PROF env.
         // Splits step time into: GPU compute, handler latency, finalize, prep.
         // GPU time is wall - cpu_overhead. Anything left is bandwidth-bound or
@@ -3393,11 +3253,13 @@ final class LmEngine {
             // written during the step CB. CPU `sampleTokenFromLogits`
             // is no longer called from the hot path.
             let sampled = gpuTokP[slot]
-            // Track A fold-in: .primed sessions don't bump position
-            // (the recover tick ran at position-1, not position).
-            // The sampled token is the first generated token.
-            if s.state == .primed {
-                s.state = .generating
+            // Cache-hit first step: the logit row ran at position-1 (no K/V
+            // write). The sampled token is the first generated token. Do NOT
+            // bump position — `position` is already N, the slot of the first
+            // NEW K/V write, which the next normal AR step performs. Clear
+            // the flag so this is a one-shot.
+            if s.firstStepLogitOnly {
+                s.firstStepLogitOnly = false
                 s.maybeAppendOutput(sampled)
                 s.consumedTokens.append(sampled)
                 s.nextGeneratedInput = sampled
@@ -3411,9 +3273,6 @@ final class LmEngine {
                     s.state = .done
                     s.doneReason = 2
                 }
-                // After the recover tick the cached K/V is intact
-                // (benign overwrite of bit-identical bytes). Continue.
-                s.position += 1
                 continue
             }
             s.position += 1
@@ -3825,261 +3684,6 @@ final class LmEngine {
         return true
     }
 
-    // Snapshot for the .primed → .generating recover-step prefill. Mirrors
-    // PreparedSinglePrefill but carries the fact that this is a recover
-    // dispatch (thisTile=1, no chunk to pop, position must NOT advance,
-    // sampled token is the first generated token).
-    struct PreparedRecoverPrefill {
-        let cb: MTLCommandBuffer
-        let t0: Date
-        let session: Session
-        let sslot: Int
-        // KV byte-hash captured pre-step at the recover position. Used by
-        // LM_KV_OVERWRITE_CHECK to verify the prefill kernel re-writes
-        // bit-identical K/V bytes (same-kernel-as-producer invariant).
-        let preKvHash: UInt64?
-        let recoverPos: Int
-    }
-
-    // 2026-05-23 (.primed recover-step kernel-pair fix):
-    //
-    // The .primed → .generating transition needs ONE GPU dispatch to
-    // produce the first generated token's logit. Previously this ran via
-    // prepareARStep's special-case branch which dispatched the
-    // dense_gemv_q8_0_btile_qkv_otf_b1 AR kernel (fused QKV+RMSNorm,
-    // serial accumulation) and re-wrote K/V at the prompt's last
-    // position. But the cached prefix's producer had written that same
-    // position via the prefill_mm_q8_0_swiz kernel (simdgroup matmul,
-    // separate RMSNorm dispatch). Same input bits, different fp16 bytes
-    // by reduction order alone — LM_KV_OVERWRITE_CHECK reported
-    // [recover-step] KV BYTES CHANGED across all 30 layers.
-    //
-    // Fix: dispatch the prefill kernel at qLen=1 for the recover step.
-    // Same kernel as producer → bit-identical K/V → no overwrite.
-    //
-    // This mirrors prepareSinglePrefill but:
-    //   - no primingQueue head requirement (synthesizes the 1-token
-    //     "chunk" from consumedTokens[position-1])
-    //   - thisTile = 1 (single-position prefill)
-    //   - positionStart = s.position - 1 (the recover position, already
-    //     covered by adopted K/V from the producer)
-    //   - kls/klf set to recoverPos + 1 (the inclusive cached length)
-    //   - DOES NOT pop primingQueue (it's empty by .primed contract)
-    //   - DOES NOT advance s.position (the recover overwrite is at an
-    //     existing position; the sampled token IS the first generated
-    //     token that subsequent AR steps consume)
-    //
-    // Cost: one prefill CB at qLen=1 has B-dim utilization ~3%
-    // (NR1=32 tile × 1 row), roughly 2-3× an AR step wall-time. Happens
-    // ONCE per adopted-prefix session at admission; trivially amortized.
-    func prepareRecoverPrefill(_ s: Session) -> PreparedRecoverPrefill? {
-        guard s.state == .primed else { return nil }
-        let recoverPos = s.position - 1
-        guard recoverPos >= 0,
-              recoverPos < s.consumedTokens.count else { return nil }
-        // 2026-05-07 (M:K): single-slot prefill puts THIS session at
-        // kpos 0, silences the rest. Mirror prepareSinglePrefill.
-        runAdmissionPass()    // ensure pages allocated
-        for other in residentSessions.values where other.id != s.id { other.slot = nil }
-        s.slot = 0
-        let sslot = 0
-        let thisTile = 1
-        // recoverPos is already covered by adopted K/V. Defensive: ensure
-        // pages exist for [0..recoverPos] (no growth needed in practice).
-        if !ensurePages(s, forKLen: recoverPos + 2) { return nil }
-        let positionStart = recoverPos
-        installBlockTable(s, slot: sslot)
-
-        // Save block_table; redirect non-target slots to scratch strip.
-        // Restoration runs in finalize after the GPU CB completes.
-        let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
-        memcpy(_savedBTScratch, btP, _savedBTScratchByteCount)
-        for slot in 0..<B where slot != sslot {
-            for p in 0..<MAX_PAGES_PER_SLOT {
-                btP[slot * MAX_PAGES_PER_SLOT + p] =
-                    UInt32(SCRATCH_PAGE_BASE + (p % SCRATCH_STRIP))
-            }
-        }
-
-        // Populate prefill scratch. Only sslot carries real data.
-        let tokP = pre_input_tokens.contents().bindMemory(to: UInt32.self, capacity: B * MAX_Q_LEN)
-        let posP = pre_q_positions.contents().bindMemory(to: UInt32.self, capacity: B * MAX_Q_LEN)
-        for b in 0..<B {
-            for i in 0..<thisTile {
-                posP[b * thisTile + i] = UInt32(positionStart + i)
-                tokP[b * thisTile + i] = weights.bosTokenId  // silenced-slot filler
-            }
-        }
-        // Real token in sslot's row: the LAST consumed prompt token.
-        // This is the same token the producer's prefill wrote at this
-        // position; re-dispatching with the same upstream K/V (cached)
-        // and same cvecs (adoption invariant) produces bit-identical
-        // K/V bytes at recoverPos.
-        tokP[sslot * thisTile + 0] = s.consumedTokens[recoverPos]
-
-        let klsP = pre_k_len_slide.contents().bindMemory(to: UInt32.self, capacity: B)
-        let klfP = pre_k_len_full.contents().bindMemory(to: UInt32.self, capacity: B)
-        // kLen = positionStart + thisTile = recoverPos + 1 (the inclusive
-        // cached length INCLUDING the recover position itself, which is
-        // what the prefill kernel expects — same shape as a single-tile
-        // prefill that filled positions [0..recoverPos]).
-        for b in 0..<B {
-            klsP[b] = UInt32(positionStart + thisTile)
-            klfP[b] = UInt32(positionStart + thisTile)
-        }
-
-        precomputeFlexPrefillMasks(qLen: thisTile, positionStart: positionStart)
-
-        // Cvec staging. By the adoption invariant a .primed session's
-        // active controls produce the SAME magnitudes at recoverPos as
-        // the producer used (otherwise the adoption would have missed),
-        // so the recover prefill sees the same cvec inputs as the
-        // producer did. Stage them identically to prepareSinglePrefill
-        // (one-row case).
-        gPrefillControls.removeAll(keepingCapacity: true)
-        let prefillRows = B * thisTile
-        for (pcIdx, c) in s.activeControls.enumerated() {
-            let magsBuf = acquirePrefillMagBuf(pcIdx * 5 + 0)
-            let targetsBuf = acquirePrefillMagBuf(pcIdx * 5 + 1)
-            let measuresBuf = acquirePrefillMagBuf(pcIdx * 5 + 2)
-            let scalesBuf = acquirePrefillMagBuf(pcIdx * 5 + 3)
-            let offsetsBuf = acquirePrefillMagBuf(pcIdx * 5 + 4)
-            let magsP = magsBuf.contents().bindMemory(to: Float.self, capacity: prefillRows)
-            let targP = targetsBuf.contents().bindMemory(to: Float.self, capacity: prefillRows)
-            let scaleP = scalesBuf.contents().bindMemory(to: Float.self, capacity: prefillRows)
-            let offP = offsetsBuf.contents().bindMemory(to: Float.self, capacity: prefillRows)
-            for r in 0..<prefillRows {
-                magsP[r] = 0
-                targP[r] = Float.nan
-                scaleP[r] = Float.nan
-                offP[r] = 0
-            }
-            let pos = positionStart
-            let m = c.magnitudeAt(position: pos, turn: s.turnIndex)
-            switch c.mode {
-            case .additive:
-                magsP[sslot * thisTile + 0] = m
-            case .project:
-                if let t = c.target {
-                    targP[sslot * thisTile + 0] = (m != 0) ? t : Float.nan
-                } else {
-                    targP[sslot * thisTile + 0] = m
-                }
-            case .transport:
-                if m != 0 {
-                    scaleP[sslot * thisTile + 0] = c.transportScale
-                    offP[sslot * thisTile + 0] = c.transportOffset
-                }
-            }
-            gPrefillControls.append(PrefillControl(
-                buffer: c.buffer, layer: c.layer, mode: c.mode,
-                magsBuf: magsBuf, targetsBuf: targetsBuf,
-                projectMeasuresBuf: measuresBuf,
-                transportScalesBuf: scalesBuf,
-                transportOffsetsBuf: offsetsBuf))
-        }
-        defer { gPrefillControls.removeAll(keepingCapacity: true) }
-
-        // Sampling params — only sslot is active; this IS the last
-        // prefill tick for the .primed session, so we want the unembed
-        // + sample_token dispatch to run and write gpu_sampled_tokens[sslot].
-        var prefillSlotSession: [Session?] = Array(repeating: nil, count: B)
-        prefillSlotSession[sslot] = s
-        populateSamplingParams(prefillSlotSession)
-
-        // LM_KV_OVERWRITE_CHECK: pre-step K/V hash so finalize can
-        // verify bit-identicality (the whole point of this fix).
-        let kvCheckEnabled = ProcessInfo.processInfo.environment["LM_KV_OVERWRITE_CHECK"] != nil
-        let preH: UInt64? = kvCheckEnabled
-            ? hashSessionKVAtPosition(s, position: recoverPos)
-            : nil
-
-        let t0 = Date()
-        // Always unembed: the recover step's sampled token IS the first
-        // generated token for the .primed session.
-        // numActiveRows=thisTile (i.e. 1) — recover-prefill is single-slot
-        // single-token; activeB-aware dispatch collapses every matmul stage
-        // to 1 row instead of B*qLen=2048. (Per the activeB refactor; see
-        // bootstrap.swift::encodePrefillTileInto numActiveRows threading.)
-        let cb = buildPrefillCB(weights, qLen: thisTile, skipEmbed: false,
-                                 skipUnembed: false, numActiveRows: thisTile)
-        return PreparedRecoverPrefill(cb: cb, t0: t0, session: s, sslot: sslot,
-                                       preKvHash: preH, recoverPos: recoverPos)
-    }
-
-    @discardableResult
-    func finalizeRecoverPrefill(_ p: PreparedRecoverPrefill) -> Bool {
-        lastStepMs = Date().timeIntervalSince(p.t0) * 1000
-        totalSteps += 1
-        if let err = p.cb.error { print("  GPU recover-prefill error: \(err)"); return false }
-
-        // Restore block_table.
-        let btP = block_table.contents().bindMemory(to: UInt32.self, capacity: B * MAX_PAGES_PER_SLOT)
-        memcpy(btP, _savedBTScratch, _savedBTScratchByteCount)
-
-        let s = p.session
-
-        // LM_KV_OVERWRITE_CHECK: post-step K/V hash. With the fix
-        // (same kernel as producer), these MUST match.
-        if let preH = p.preKvHash {
-            let postH = hashSessionKVAtPosition(s, position: p.recoverPos)
-            if postH != preH {
-                let abortOnMismatch = ProcessInfo.processInfo.environment["LM_KV_OVERWRITE_ABORT"] != nil
-                let preHex = String(preH, radix: 16, uppercase: false)
-                let postHex = String(postH, radix: 16, uppercase: false)
-                fputs("[recover-prefill] KV BYTES CHANGED at position=\(p.recoverPos) "
-                      + "slot=\(p.sslot) sid=\(s.id) "
-                      + "pre=\(preHex) post=\(postHex)"
-                      + (abortOnMismatch ? " — aborting session" : " (warn-only)") + "\n",
-                      stderr)
-                if abortOnMismatch {
-                    s.state = .done
-                    s.doneReason = 3
-                    return true
-                }
-            }
-        }
-
-        // .primed contract: position does NOT advance (the recover write
-        // is at an EXISTING position). promoteFinishedPages still safe
-        // (no new pages crossed any boundary).
-        promoteFinishedPages(s)
-
-        // Read GPU-sampled first generated token and transition to
-        // .generating. Mirrors finalizeSinglePrefill's drained-queue path
-        // exactly — no consumedTokens append for the recover position
-        // (that token is already there from the prompt); only append the
-        // newly sampled token.
-        let gpuTokP = gpu_sampled_tokens.contents()
-            .bindMemory(to: UInt32.self, capacity: B)
-        let sampled = gpuTokP[p.sslot]
-        s.state = .generating
-        s.maybeAppendOutput(sampled)
-        s.consumedTokens.append(sampled)
-        s.nextGeneratedInput = sampled
-        s.numGenerated += 1; totalTokensGenerated += 1
-        // s.position += 1 — the prompt-end was at s.position; the first
-        // generated token now lives at s.position, and subsequent AR
-        // steps will write at s.position + 1, s.position + 2, ... Mirror
-        // the .primed → .generating advance from prepareARStep's old path.
-        s.position += 1
-        if sampled == s.eosId {
-            s.state = .done
-            s.doneReason = 1
-        } else if s.numGenerated >= s.maxNewTokens {
-            s.state = .done
-            s.doneReason = 2
-        }
-        return true
-    }
-
-    @discardableResult
-    func stepRecoverPrefillForSession(_ s: Session) -> Bool {
-        guard let p = prepareRecoverPrefill(s) else { return false }
-        p.cb.commit(); p.cb.waitUntilCompleted()
-        return finalizeRecoverPrefill(p)
-    }
-
     // Unified scheduler tick. Picks between fast prefill and AR batch each
     // call. Path priority (rewritten 2026-05-07 — the prior "max wins"
     // rule was sched_sim_token-falsified, see pickChainPath body):
@@ -4104,14 +3708,6 @@ final class LmEngine {
         case softSinglePrefill(Session)
         case textMultiPrefill([Session])
         case textSinglePrefill(Session)
-        // 2026-05-23 (.primed kernel-pair fix): single-slot prefill at
-        // qLen=1 that re-runs the producer's prefill kernel on the
-        // recover position, producing bit-identical K/V bytes and the
-        // first generated token's logit. Routed BEFORE arStep so .primed
-        // sessions don't fall into prepareARStep's AR-kernel branch
-        // (whose different reduction order causes the KV-overwrite
-        // mismatch that this fix exists to eliminate).
-        case recoverPrefill(Session)
         case arStep
     }
 
@@ -4138,27 +3734,17 @@ final class LmEngine {
     // ticket -> first DispatchTime we saw it not-yet-signaled, for a NON-blocking
     // wall-clock deadline (preserves the old 30s safety without freezing the lock).
     var visionWaitSince: [UInt64: DispatchTime] = [:]
-    // 2026-05-23 (.primed kernel-pair fix): count of recover-prefill
-    // dispatches scheduled. Should equal the number of adopted-prefix
-    // sessions admitted; trivially small.
-    var sched_recoverPrefillCount: Int = 0
     private func pickChainPath() -> ChainPath {
         let busy = activeSessions.filter { $0.state.isBusy }
         if busy.isEmpty { return .idle }
 
         var softBusy: [Session] = []
         var textPrefillBusy: [Session] = []
-        var primedBusy: [Session] = []
         var nAR = 0
         for s in busy {
-            // 2026-05-23 fix: .primed sessions need a 1-token prefill-
-            // kernel dispatch (NOT the AR kernel) to recover the first
-            // generated token's logit while leaving K/V bit-identical.
-            // Peel them off here so they bypass arStep's AR-kernel path.
-            if s.state == .primed {
-                primedBusy.append(s)
-                continue
-            }
+            // Cache-hit first-step (firstStepLogitOnly) sessions are already
+            // .generating and route to AR like any other decode row — their
+            // K/V-write suppression is handled per-row in prepareARStep.
             switch s.primingQueue.first {
             case .some(.softTokens(_, _, _, _, let ticket)):
                 // NON-BLOCKING vision-readiness gate (root-cause fix for the
@@ -4192,9 +3778,10 @@ final class LmEngine {
             case .some(.tokens(let ts)) where ts.count >= 2:
                 textPrefillBusy.append(s)
             default:
-                // Either .generating (no chunks consumed by AR step) or
-                // .priming with a 1-token tail (popArPrimingToken handles
-                // it inside step's per-slot input population).
+                // Either .generating (no chunks consumed by AR step;
+                // includes firstStepLogitOnly cache-hit first steps) or
+                // .priming with a 1-token tail (popPrimingToken consumes
+                // it inside prepareARStep's per-slot input population).
                 nAR += 1
             }
         }
@@ -4206,10 +3793,10 @@ final class LmEngine {
         // "max wins" — pick whichever category (soft/text/AR) has more
         // slots. With nAR=7 and nText=1, that picked AR, which then
         // silenced the 1 priming session's slot for prompt_len AR
-        // ticks via popArPrimingToken (slot runs kernel with the
-        // prompt token loaded; sampled output discarded). For a
-        // 76-token prompt, that's 76 silenced AR ticks for that slot
-        // — a ~10% throughput loss per fresh-session admission.
+        // ticks (slot runs kernel with the prompt token loaded; sampled
+        // output discarded). For a 76-token prompt, that's 76 silenced
+        // AR ticks for that slot — a ~10% throughput loss per fresh-
+        // session admission.
         //
         // Single-slot prefill IS more expensive in the moment (1 CB
         // of all-8-slots silenced for prefill vs 1 CB of 7 AR + 1
@@ -4221,19 +3808,6 @@ final class LmEngine {
         // Order: soft > text > AR. Within soft/text, multi if ≥ 2
         // priming, else single.
 
-        // .primed recover-prefill: single-slot, qLen=1, prefill kernel.
-        // Highest priority because (a) it's at-most-one-per-tick (a
-        // .primed session transitions to .generating on its first tick),
-        // (b) it unblocks the session for AR participation on the next
-        // tick, and (c) running it before any other prefill avoids ever
-        // dispatching the AR kernel on a .primed slot (the whole point
-        // of the kernel-pair fix). Sort by sid for determinism if more
-        // than one is primed concurrently.
-        if !primedBusy.isEmpty {
-            let pick = primedBusy.min(by: { $0.id < $1.id })!
-            sched_recoverPrefillCount += 1
-            return .recoverPrefill(pick)
-        }
         // Soft (image) prefill takes priority — image tokens can't
         // be AR-primed, so any soft chunk MUST go through prefill.
         if nSoft >= 2 { sched_softMultiCount += 1; return .softMultiPrefill(softBusy) }
@@ -4296,10 +3870,6 @@ final class LmEngine {
             let beforeCounts = sessions.map { $0.outputQueue.count }
             _ = stepMultiSlotPrefill(sessions)
             return zip(sessions, beforeCounts).reduce(0) { $0 + ($1.0.outputQueue.count - $1.1) }
-        case .recoverPrefill(let s):
-            let before = s.outputQueue.count
-            _ = stepRecoverPrefillForSession(s)
-            return s.outputQueue.count - before
         case .arStep:
             return step()
         }
@@ -4350,11 +3920,6 @@ final class LmEngine {
             p.cb.commit()
             p.cb.waitUntilCompleted()
             _ = finalizeMultiSlotPrefill(p)
-        case .recoverPrefill(let s):
-            guard let p = prepareRecoverPrefill(s) else { return }
-            p.cb.commit()
-            p.cb.waitUntilCompleted()
-            _ = finalizeRecoverPrefill(p)
         case .arStep:
             // Bridge-vs-engine 10ms/step gap investigation (2026-04-29).
             // Attribute prep (mask precompute, block_table install,

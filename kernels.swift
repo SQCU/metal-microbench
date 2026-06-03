@@ -715,9 +715,14 @@ kernel void kv_write(
     constant uint& H [[buffer(6)]], constant uint& D [[buffer(7)]],
     constant uint& PAGE [[buffer(8)]], constant uint& max_pages [[buffer(9)]],
     constant uint& chunk_pages [[buffer(27)]],
+    device const uint* kv_write_skip [[buffer(28)]],   // [B] 0/1 per-slot
     uint3 tg [[threadgroup_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]])
 {
     uint b = tg.x; uint h = tg.y; uint t = lid.x;
+    // Cache-hit first-step logit-only row: position N-1 already lives in the
+    // read-only adopted cache; suppress this row's write so the shared page
+    // is never clobbered. The attention READ still uses the real block_table.
+    if (kv_write_skip[b] != 0) return;
     uint pos = positions[b]; uint lp = pos / PAGE; uint off = pos % PAGE;
     uint phys = block_table[b * max_pages + lp];
     uint chunk_idx = phys / chunk_pages;

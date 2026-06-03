@@ -936,7 +936,6 @@ private func drainSession(_ s: Session) -> [UInt32] {
 private func sessionStateByte(_ state: SessionState) -> UInt8 {
     switch state {
     case .priming:    return 0
-    case .primed:     return 0   // Track A: pre-first-sample; report as 'priming' on wire
     case .generating: return 1
     case .done:       return 2
     // .paused retired 2026-05-07; .idle retired 2026-05-07 (atomic
@@ -1424,7 +1423,6 @@ public func gemma_engine_state(_ outBuf: UnsafeMutablePointer<UInt8>?,
             let stateStr: String
             switch s.state {
             case .priming:    stateStr = "priming"
-            case .primed:     stateStr = "primed"
             case .generating: stateStr = "generating"
             case .done:       stateStr = "done"
             }
