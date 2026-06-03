@@ -9938,28 +9938,33 @@ kernel void softcap(
 }
 
 // ========================================================================
-// Flex Attention — tile-streaming, block-sparse, parameterized mask_mod.
+// Batched AR-decode attention — streaming flash online-softmax.
 //
-// Replaces the hard-coded k-page loop with two precomputed lists of k_block
-// indices: FULL (mask is True throughout the tile → skip per-k predicate)
-// and PARTIAL (intra-tile predicate required). EMPTY tiles are never in a
-// list, so they never dispatch.
+// ONE kernel, batched over B sessions (weight reads amortized via L2).
+// Each TG owns one (slot, kv_head, split) and produces the GQA group's
+// Q_PER_TG query rows for that kv_head in one shot. qLen=1 (decode).
 //
-// ONE kernel source. Specialized per-PSO via function constants:
+// Per slot: CSR gather over the ONE PAGE=16 block table. The slot's page
+// list (FULL pages first, PARTIAL second) is carved out of the shared
+// monotonic-cursor index pool by per-slot offsets. K/V are STREAMED one
+// 16-row page at a time and online-merged into running (m, l, O); the
+// threadgroup tile is bounded INDEPENDENT of context length and head-dim.
+// K is simdgroup_loaded direct from device (never staged into a tile);
+// V is read into per-lane registers; O accumulates in per-lane registers.
+//
+// The full-vs-sliding-window distinction is ONLY a mask term over the one
+// true k_pos = page*PAGE + k, selected by the FC_USE_SLIDE function
+// constant (constant-folded per PSO). There is no per-layer page size:
+// PAGE is 16 for every layer.
+//
+// Specialized per-PSO via function constants:
 //   FC_D          — head dim (256 for slide layers, 512 for full)
-//   FC_PAGE       — KV-cache page size in tokens (16 for EVERY layer now)
 //   FC_Q_PER_TG   — real Q rows per threadgroup (2 for slide, 8 for full)
-//   FC_USE_SLIDE  — 1 enables per-row sliding-window mask; 0 = causal only
-//
-// Metal function constants are resolved at PSO compile time; the compiler
-// constant-folds the `if (FC_USE_SLIDE)` branches and fixes array sizes
-// (threadgroup allocations, Q_tile/scores_tile) so each PSO lowers to
-// the same asm the old per-variant kernels did.
+//   FC_USE_SLIDE  — true enables the per-row sliding-window mask term
 // ========================================================================
 constant int  FC_D         [[function_constant(0)]];
-constant int  FC_PAGE      [[function_constant(1)]];
-constant int  FC_Q_PER_TG  [[function_constant(2)]];
-constant bool FC_USE_SLIDE [[function_constant(3)]];
+constant int  FC_Q_PER_TG  [[function_constant(1)]];
+constant bool FC_USE_SLIDE [[function_constant(2)]];
 
 kernel void flex_attn_v0(
     device const half* Q                    [[buffer(0)]],
@@ -9988,20 +9993,19 @@ kernel void flex_attn_v0(
     uint3 lid3                              [[thread_position_in_threadgroup]])
 {
     constexpr uint THREADS = 32;
-    constexpr uint MMA = 8;                 // simdgroup_half8x8 is fixed 8×8
+    constexpr uint MMA  = 8;                // simdgroup_half8x8 is fixed 8×8
+    constexpr uint PAGE = 16;               // ONE page size for every layer
 
-    // MSL library compile happens before function constants resolve, so
-    // threadgroup/stack array sizes can't use FC_* directly. We size to
-    // the max over the two specialized PSOs (D=512, PAGE=16, Q_PER_TG=8)
-    // and only use the FC_*-sized prefix at runtime. The slide PSO leaves
-    // the tail of each array unused — a few KB of wasted threadgroup
-    // memory, well within the 32 KB/TG Apple GPU budget.
+    // Threadgroup/stack array sizes are fixed at MSL-compile time, before
+    // function constants resolve, so they're sized to the max over the two
+    // PSOs (D=512, Q_PER_TG=8). The slide PSO (D=256, Q_PER_TG=2) uses only
+    // a prefix of each; the unused tail costs a few KB of threadgroup
+    // memory, well within the 32 KB/TG Apple GPU budget. PAGE is a true
+    // constant (16), so the page-sized arrays need no max-vs-runtime split.
     constexpr uint MAX_D        = 512;
-    constexpr uint MAX_PAGE     = 16;
     constexpr uint MAX_Q_PER_TG = 8;
 
     const     uint D        = uint(FC_D);
-    const     uint PAGE     = uint(FC_PAGE);
     const     uint Q_PER_TG = uint(FC_Q_PER_TG);
     const     uint D8       = D / 8;
 
@@ -10012,31 +10016,25 @@ kernel void flex_attn_v0(
     const uint q_head_base = kv_head * Q_PER_TG;
     const uint lid = lid3.x;
 
-    // Q_BLOCK=1, q_blocks=1 → CSR index is just the slot.
+    // qLen=1 (decode) → the CSR index is just the slot.
     const uint csr_idx = slot;
 
-    // Q_tile always holds MMA rows of up-to-MAX_D columns. When Q_PER_TG <
-    // MMA the trailing rows are zero-padded so they contribute 0 to the
-    // 8×8 MMA output and are ignored by the softmax/AV loops (which
-    // iterate q < Q_PER_TG only).
+    // Q_tile holds MMA rows of up-to-MAX_D columns. When Q_PER_TG < MMA the
+    // trailing rows are zero-padded so they contribute 0 to the 8×8 MMA and
+    // are ignored by the softmax/AV loops (q < Q_PER_TG only).
     //
-    // 2026-05-06 refactor: O_acc moved to per-lane registers
-    // (`O_local[MAX_Q_PER_TG][MAX_D_PER_LANE]`). Each lane owns
-    // MAX_D/THREADS = 16 disjoint d-slots × MAX_Q_PER_TG = 8 rows
-    // = 128 floats = 512 B per lane. Drops static threadgroup-memory
-    // budget by 16 KB (was 24.9 KB → 8.5 KB), keeping the doubled
-    // accounting (simdgroup_matrix operand-tile double-buffering)
-    // safely under the 32 KB hardware limit.
+    // The streaming working unit is ONE 16-row page: K is simdgroup_loaded
+    // direct from device (no K tile), V into per-lane registers, O into
+    // per-lane registers. So the only D-sized threadgroup allocation is Q,
+    // and the tile is bounded independent of PAGE and D.
     threadgroup half  Q_tile[MMA * MAX_D];
-    threadgroup half  scores_tile[MMA * MAX_PAGE];
+    threadgroup half  scores_tile[MMA * PAGE];
     threadgroup float m_state[MAX_Q_PER_TG];
     threadgroup float l_state[MAX_Q_PER_TG];
     threadgroup float scale_tile[MAX_Q_PER_TG];
 
-    // Per-lane register accumulator for O. Sized to the max specialization
-    // (Q_PER_TG=8, D_PER_LANE=MAX_D/THREADS=16). Slide PSO uses only the
-    // first FC_Q_PER_TG rows × FC_D/THREADS d-slots; remaining slots are
-    // unused but cost only register pressure, no memory traffic.
+    // Per-lane register O accumulator: each lane owns D/THREADS disjoint
+    // d-slots × Q_PER_TG rows (max 16 × 8 = 128 floats = 512 B/lane).
     constexpr uint MAX_D_PER_LANE = MAX_D / THREADS;   // 16
     const     uint D_PER_LANE     = D / THREADS;       // 8 (slide) or 16 (full)
     float O_local[MAX_Q_PER_TG][MAX_D_PER_LANE];
@@ -10097,7 +10095,9 @@ kernel void flex_attn_v0(
         device const half* Kbase = Kx + (local_phys * PAGE * H_KV + kv_head) * D;
         device const half* Vbase = Vx + (local_phys * PAGE * H_KV + kv_head) * D;
 
-        // QK: PAGE/8 passes of 8 K-columns each (1 pass at PAGE=8, 2 at PAGE=16).
+        // QK: stream the 16-row page in PAGE/8 = 2 simdgroup passes of 8
+        // K-rows each. K is simdgroup_loaded direct from device, never
+        // staged into a threadgroup tile — D is consumed as the D8 loop.
         for (uint pb = 0; pb < PAGE / 8; ++pb) {
             simdgroup_half8x8 mqk = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
             device const half* pk = Kbase + (pb * 8) * kv_row_stride;
@@ -10115,7 +10115,7 @@ kernel void flex_attn_v0(
         if (lid < Q_PER_TG) {
             const uint q = lid;
             float row_max = -INFINITY;
-            float s_loc[MAX_PAGE];
+            float s_loc[PAGE];
             if (is_partial) {
                 for (uint k = 0; k < PAGE; ++k) {
                     float sv = float(scores_tile[q * PAGE + k]) * qk_scale;
@@ -10155,7 +10155,7 @@ kernel void flex_attn_v0(
         // per-lane registers (`O_local[q][i]`) across all ix iterations.
         for (uint i = 0; i < D_PER_LANE; ++i) {
             uint d = lid + i * THREADS;
-            half V_reg[MAX_PAGE];
+            half V_reg[PAGE];
             for (uint k = 0; k < PAGE; ++k) {
                 V_reg[k] = Vbase[k * kv_row_stride + d];
             }

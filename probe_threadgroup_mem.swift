@@ -66,15 +66,16 @@ struct ProbeThreadgroupMem {
             "dense_gemv_q8_0_btile_qkv_tiled_b8",
         ]
 
-        // Function-constant variants. flex_attn_v0 has 4 FCs:
-        //   0=FC_D, 1=FC_PAGE, 2=FC_Q_PER_TG, 3=FC_USE_SLIDE
+        // Function-constant variants. flex_attn_v0 has 3 FCs (PAGE is a
+        // true constant 16 in the kernel now):
+        //   0=FC_D, 1=FC_Q_PER_TG, 2=FC_USE_SLIDE
         struct FCSpec { let name: String; let label: String;
-                         let d: Int32; let page: Int32; let qPerTG: Int32; let useSlide: Bool }
+                         let d: Int32; let qPerTG: Int32; let useSlide: Bool }
         let fcSpecs: [FCSpec] = [
             FCSpec(name: "flex_attn_v0", label: "flex_attn_v0/SLIDE [D=256,PAGE=16,Q_PER_TG=2]",
-                   d: 256, page: 16, qPerTG: 2, useSlide: true),
-            FCSpec(name: "flex_attn_v0", label: "flex_attn_v0/FULL  [D=512,PAGE=8, Q_PER_TG=8]",
-                   d: 512, page: 8,  qPerTG: 8, useSlide: false),
+                   d: 256, qPerTG: 2, useSlide: true),
+            FCSpec(name: "flex_attn_v0", label: "flex_attn_v0/FULL  [D=512,PAGE=16,Q_PER_TG=8]",
+                   d: 512, qPerTG: 8, useSlide: false),
         ]
 
         let fmt: (Int) -> String = { v in
@@ -100,11 +101,10 @@ struct ProbeThreadgroupMem {
         print("=== function-constant PSOs ===")
         for s in fcSpecs {
             let fcv = MTLFunctionConstantValues()
-            var d = s.d, p = s.page, q = s.qPerTG, u = s.useSlide
+            var d = s.d, q = s.qPerTG, u = s.useSlide
             fcv.setConstantValue(&d, type: .int, index: 0)
-            fcv.setConstantValue(&p, type: .int, index: 1)
-            fcv.setConstantValue(&q, type: .int, index: 2)
-            fcv.setConstantValue(&u, type: .bool, index: 3)
+            fcv.setConstantValue(&q, type: .int, index: 1)
+            fcv.setConstantValue(&u, type: .bool, index: 2)
             do {
                 let f = try lib.makeFunction(name: s.name, constantValues: fcv)
                 let pso = try device.makeComputePipelineState(function: f)

@@ -353,24 +353,22 @@ let moeGeluMulFusedPSO = pso("moe_gelu_mul_fused")
 let pagedSplitReducePSO = pso("paged_attn_split_reduce")
 let sampleTokenPSO      = pso("sample_token")
 let extractLogprobsPSO  = pso("extract_logprobs")
-// Two specialized PSOs compiled from the one unified `flex_attn_v0` kernel
-// source. Function constants set head-dim / page / Q-per-TG / mask style;
-// the MSL compiler produces the same asm as the old per-variant kernels.
+// Two specialized PSOs compiled from the one `flex_attn_v0` AR-decode
+// kernel source. Function constants set head-dim / Q-per-TG / mask style.
+// PAGE is a true constant (16) in the kernel — no per-PSO page size.
 let flexAttnSlideV0PSO: MTLComputePipelineState = psoFC("flex_attn_v0") { fcv in
-    var d: Int32 = 256, page: Int32 = 16, qPerTg: Int32 = 2
+    var d: Int32 = 256, qPerTg: Int32 = 2
     var useSlide: Bool = true
     fcv.setConstantValue(&d,        type: .int,  index: 0)
-    fcv.setConstantValue(&page,     type: .int,  index: 1)
-    fcv.setConstantValue(&qPerTg,   type: .int,  index: 2)
-    fcv.setConstantValue(&useSlide, type: .bool, index: 3)
+    fcv.setConstantValue(&qPerTg,   type: .int,  index: 1)
+    fcv.setConstantValue(&useSlide, type: .bool, index: 2)
 }
 let flexAttnFullV0PSO: MTLComputePipelineState = psoFC("flex_attn_v0") { fcv in
-    var d: Int32 = 512, page: Int32 = 16, qPerTg: Int32 = 8
+    var d: Int32 = 512, qPerTg: Int32 = 8
     var useSlide: Bool = false
     fcv.setConstantValue(&d,        type: .int,  index: 0)
-    fcv.setConstantValue(&page,     type: .int,  index: 1)
-    fcv.setConstantValue(&qPerTg,   type: .int,  index: 2)
-    fcv.setConstantValue(&useSlide, type: .bool, index: 3)
+    fcv.setConstantValue(&qPerTg,   type: .int,  index: 1)
+    fcv.setConstantValue(&useSlide, type: .bool, index: 2)
 }
 let flexAttnSlideV1Q8PSO = pso("flex_attn_slide_v1_q8")
 let flexAttnFullPrefillPSO = pso("flex_attn_full_prefill")
@@ -4020,10 +4018,10 @@ func encExtractLogprobs(_ cb: MTLCommandBuffer,
 
 // Unified flex-attention dispatcher — one Swift path, one MSL source.
 // Picks the specialized PSO (flexAttn{Slide,Full}V0PSO) and the matching
-// CSR buffer set (flex_full_* at PAGE=16 vs flex_full_full_* at PAGE=8)
-// by the per-layer `isFull` flag. Both PSOs are compiled from the same
-// `flex_attn_v0` kernel source; function constants select head-dim,
-// page size, Q-per-TG, and sliding-window enablement.
+// CSR buffer set by the per-layer `isFull` flag. Both PSOs are compiled
+// from the same `flex_attn_v0` AR-decode kernel source; function constants
+// select head-dim, Q-per-TG, and sliding-window enablement. PAGE is a true
+// constant (16) in the kernel — there is no per-layer page size.
 //
 // This is called from encAttn when the scheduler determines a layer
 // should NOT take the shared-prefix broadcast path.
