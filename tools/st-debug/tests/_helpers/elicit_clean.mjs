@@ -153,6 +153,25 @@ export async function selectCharacterByClick(page, nameSubstr) {
     // Open the character list panel (right sidebar in ST).
     await page.locator('#rightNavDrawerIcon').click();
     await page.waitForTimeout(300);
+    // If the right-nav opened to the character EDIT/create view (ST
+    // menu_type 'character_edit' etc.), the character LIST block
+    // (#rm_characters_block) is display:none — so every .character_select
+    // row is 0×0 with a null offsetParent, Playwright treats it as "not
+    // visible", and row.click() hangs to the test timeout (then teardown
+    // closes the page → "Target closed", which LOOKS like a renderer crash
+    // but is just a stuck click). Click "Select/Create Characters" to
+    // switch back to the list. Idempotent: a no-op when the list is
+    // already shown (menu_type 'characters'), so it can't regress callers
+    // that were already on the list view. Verified 2026-06 headless.
+    const listHidden = await page.evaluate(() => {
+        const b = document.getElementById('rm_characters_block');
+        return !b || getComputedStyle(b).display === 'none';
+    });
+    if (listHidden) {
+        await page.locator('#rm_button_characters').click({ timeout: 5_000 }).catch(() => {});
+        await page.locator('#rm_characters_block')
+            .waitFor({ state: 'visible', timeout: 5_000 }).catch(() => {});
+    }
     // Find the row whose avatar's title contains the name (case-insensitive).
     // All callers pass literal strings (e.g. 'Scringlo'); replacing the
     // RegExp with case-folded includes() is exactly equivalent for

@@ -1,215 +1,201 @@
 import { test, expect } from '@playwright/test';
+import { selectCharacterByClick, freshChatByClick } from './_helpers/elicit_clean.mjs';
+import { openPersonaSurface } from './_helpers/open_persona_surface.js';
 
-test.describe('Auto-poll K_1 regression', () => {
-    // K_1 rows should auto-fire /poll in parallel on first paint, no manual click needed.
-    // Thesis-positive: batched AR decoding is immediately visible.
-    // Note: These tests assume the corpus has at least some agents populated (R-3).
-    // If the corpus is empty, tests will gracefully skip.
+// Spec 66 — Auto-poll K_1 regression.
+//
+// Thesis-positive: on first paint with a non-empty chat, the top-K_1 ranked
+// rows auto-fire /poll IN PARALLEL (no operator click) — the canonical
+// visible batched-AR-decode demo. Side picks (K_2) stay inert.
+//
+// 2026-06 rewrite (operator directive): do NOT depend on auto_load_chat to
+// conjure chat context — NAVIGATE to a multi-turn chat via Playwright
+// (select dicemother → its saved welcome chat loads), then open the
+// suggester. The prior version frame-located a nonexistent
+// `iframe#user_personas_iframe` and skipped, phantom-passing. The suggester
+// wrapper mounts as #user-suggester-button (it has a buttonId), reached via
+// the canonical openPersonaSurface() helper.
+
+const PLUGIN_BASE = '/api/plugins/user-personas';
+const REAL_TOP = '.ranked-row:not(.side):not([data-bio-id^="__skeleton_"])';
+const POLL_TIMEOUT = 90_000;   // /yapper-seed (3 parallel judge calls) + /poll latency
+
+// Load ST WITHOUT connecting the chat API. The suggester's /yapper-seed +
+// /poll talk to the bridge directly (not ST's oai chat connection), so the
+// API-connect handshake is unnecessary here — and waiting for it to validate
+// headless hangs to the test timeout (the old loadAndConnect 12-min hang,
+// verified 2026-06 via interactive MCP-browser probe: the suggester ranks +
+// auto-fires with the API status showing "API Connections" / unconnected).
+async function loadSTNoConnect(page) {
+    await page.goto('/');
+    await page.waitForFunction(() => document.getElementById('preloader') === null, { timeout: 60_000 });
+    await page.waitForFunction(() => typeof window.SillyTavern?.getContext === 'function', { timeout: 30_000 });
+}
+
+test.describe('Auto-poll K_1 regression (spec 66)', () => {
+    test.setTimeout(12 * 60 * 1000);
+
+    test.beforeEach(async ({}, testInfo) => {
+        test.skip(testInfo.project.name !== 'desktop', 'desktop-only first-paint test');
+    });
+
+    // Honest corpus precondition: the suggester can only rank (bio × agent)
+    // compositions that exist. Skip-with-annotation (NOT silent) if the corpus
+    // lacks ≥2 signed agents — that is a seeding gap, not a wiring failure.
+    async function compositionCount(page) {
+        return await page.evaluate(async (base) => {
+            try {
+                const r = await fetch(`${base}/agents`);
+                if (!r.ok) return 0;
+                const j = await r.json();
+                return (j.agents || []).filter(
+                    a => a.signature && typeof a.signature === 'object'
+                        && Object.keys(a.signature).length > 0).length;
+            } catch { return 0; }
+        }, PLUGIN_BASE);
+    }
+
+    // Navigate via Playwright to a multi-turn chat, then open the suggester.
+    async function openSuggesterWithChat(page) {
+        await loadSTNoConnect(page);
+        try { await selectCharacterByClick(page, 'dicemother'); } catch { /* fall back to active char */ }
+        // Ensure ≥1 meaningful turn so the context judge has signal.
+        const chatLen = await page.evaluate(() =>
+            (window.SillyTavern?.getContext?.()?.chat || [])
+                .filter(m => (m?.mes || '').trim().length > 0).length);
+        if (chatLen < 1) {
+            await page.locator('#send_textarea').fill(
+                'I look around the room, searching for any clue about what happened here.');
+            await page.locator('#send_but').click();
+            await page.waitForFunction(
+                (prev) => (window.SillyTavern?.getContext?.()?.chat || []).length > prev,
+                chatLen, { timeout: 15_000 });
+        }
+        await openPersonaSurface(page, 'suggester');
+        const iframe = page.frameLocator('#user-suggester-button iframe');
+        await expect(iframe.locator('h1')).toBeVisible({ timeout: 20_000 });
+        return iframe;
+    }
 
     test('auto-fires top-K_1 rows in parallel on first paint', async ({ page }) => {
-        // Navigate to ST.
-        await page.goto('http://localhost:8002');
-        await page.waitForSelector('body', { timeout: 5000 });
+        const iframe = await openSuggesterWithChat(page);
 
-        // Access the suggester iframe.
-        const suggesterFrame = page.frameLocator('iframe#user_personas_iframe');
-
-        // The suggester can render in two states:
-        // 1. Empty state ("Awaiting active chat") if no chat has content.
-        // 2. Ranked list if a chat with content exists AND the corpus has agents.
-        //
-        // We wait for either the empty state OR the ranked list to appear.
-        // If ranked list appears with rows, we test auto-fire. If empty state appears,
-        // we skip (corpus is empty or no chat with content).
-
-        const emptyState = suggesterFrame.locator('.empty-state');
-        const topHeading = suggesterFrame.locator('h3:has-text("Top picks")');
-
-        // Wait for one of these to appear (5s for slow rank, or immediate empty state).
-        const emptyPromise = emptyState.isVisible({ timeout: 8000 }).catch(() => false);
-        const rankedPromise = topHeading.isVisible({ timeout: 8000 }).catch(() => false);
-
-        const [hasEmpty, hasRanked] = await Promise.all([emptyPromise, rankedPromise]);
-
-        if (hasEmpty || !hasRanked) {
-            // Either the empty state appeared, or no ranked list appeared.
-            // Skip gracefully.
-            test.skip();
-            return;
+        const n = await compositionCount(page);
+        if (n < 2) {
+            test.skip(true, `corpus has ${n} signed compositions; need ≥2 to render ranked rows ` +
+                '(seeding gap — populate via Fixed-Point lock_in_tetrad; NOT a wiring failure)');
         }
 
-        // Ranked list is visible; corpus has agents.
-        const topRows = suggesterFrame.locator('.ranked-row:not(.side)');
-        const rowCount = await topRows.count();
+        // (1) Real (non-skeleton) top rows appear from /yapper-seed WITHOUT a click.
+        const realTop = iframe.locator(REAL_TOP);
+        await expect.poll(async () => await realTop.count(),
+            { timeout: POLL_TIMEOUT, intervals: [1000, 2000, 3000] }).toBeGreaterThanOrEqual(1);
 
-        if (rowCount === 0) {
-            test.skip();
-            return;
-        }
+        const rowCount = await realTop.count();
+        const k1 = Math.min(3, rowCount);
 
-        // Assert at least one row is visible.
-        expect(rowCount).toBeGreaterThanOrEqual(1);
-
-        // Check the first min(3, rowCount) rows for non-empty .row-completion.
-        // The thesis is that K_1 rows auto-fire; so we assert streaming text exists
-        // WITHOUT operator clicks. Timeout is generous to account for /poll latency.
-        const k1Count = Math.min(3, rowCount);
-
-        for (let i = 0; i < k1Count; i++) {
-            const row = topRows.nth(i);
-            const slot = row.locator('.row-completion');
-
-            // 1. Slot is visible (display: block from .visible class).
-            // The slot becomes .visible when suggest() paints a result into it.
-            // Auto-fire should have triggered on first paint, so this should be fast.
-            await expect(slot).toHaveClass(/visible/, { timeout: 10000 });
-
-            // 2. Slot contains non-empty text (not a spinner or loading message).
-            const textDiv = slot.locator('.row-completion-text');
-            const text = await textDiv.textContent();
-            expect(text).not.toBeNull();
-            expect(text.trim().length).toBeGreaterThan(10);  // non-trivial prose
-        }
-
-        // 3. Verify side picks (K_2) stay DISABLED (no .row-completion populated).
-        const sideRows = suggesterFrame.locator('.ranked-row.side');
-        if (await sideRows.count() > 0) {
-            const sideSlot = sideRows.first().locator('.row-completion');
-            // Side rows should NOT have .visible class (inert by default).
-            await expect(sideSlot).not.toHaveClass(/visible/);
-        }
-
-        // 4. Click a top-K_1 row's Suggest button again; verify cache hit.
-        // On a 2nd suggest(same row), the cache hits and no /poll is fired.
-        // We assert this by checking that a cache-badge appears.
-        const firstBtn = topRows.first().locator('.suggest-btn');
-        const firstSlot = topRows.first().locator('.row-completion');
-
-        // Get the current text (populated by auto-fire).
-        const originalText = await firstSlot.locator('.row-completion-text').textContent();
-
-        // Click the button again.
-        await firstBtn.click();
-
-        // Wait briefly for the button to be re-enabled (suggest() completes).
-        await page.waitForTimeout(800);
-
-        // The text should remain the same (cache hit, no re-poll).
-        const cachedText = await firstSlot.locator('.row-completion-text').textContent();
-        expect(cachedText).toBe(originalText);
-
-        // A cache-badge should appear on cache hit (fromCache=true in paintCompletionSlot).
-        const cacheBadge = firstSlot.locator('.cache-badge');
-        await expect(cacheBadge).toBeVisible();
-    });
-
-    test('does not auto-poll when chat is empty', async ({ page }) => {
-        // Load ST.
-        await page.goto('http://localhost:8002');
-        await page.waitForSelector('body', { timeout: 5000 });
-
-        const suggesterFrame = page.frameLocator('iframe#user_personas_iframe');
-
-        // The suggester should show "Awaiting active chat" when the active
-        // chat has no content. Check for the empty state.
-        const emptyState = suggesterFrame.locator('.empty-state');
-
-        // Wait for the empty state or a ranked list to appear.
-        const emptyPromise = emptyState.isVisible({ timeout: 8000 }).catch(() => false);
-        const rankedPromise = suggesterFrame.locator('h3:has-text("Top picks")').isVisible({ timeout: 8000 }).catch(() => false);
-
-        const [hasEmpty, hasRanked] = await Promise.all([emptyPromise, rankedPromise]);
-
-        // If we see ranked rows, the chat isn't empty; skip this test.
-        if (hasRanked && !hasEmpty) {
-            test.skip();
-            return;
-        }
-
-        // If we don't see empty state either, the UI state is unexpected; skip.
-        if (!hasEmpty) {
-            test.skip();
-            return;
-        }
-
-        // Verify the empty state text matches the no-chat pattern.
-        const emptyText = await emptyState.textContent();
-        expect(emptyText).toContain('Awaiting');
-
-        // Verify no /poll requests were issued (implicit by empty state).
-        // The absence of populated .row-completion slots is evidence.
-        const anySlot = suggesterFrame.locator('.row-completion.visible');
-        const visibleCount = await anySlot.count();
-        expect(visibleCount).toBe(0);
-    });
-
-    test('K_1 cache hit survives page reload', async ({ page }) => {
-        // Load ST.
-        await page.goto('http://localhost:8002');
-        await page.waitForSelector('body', { timeout: 5000 });
-
-        const suggesterFrame = page.frameLocator('iframe#user_personas_iframe');
-
-        // Wait for ranked-list to appear (either empty or with rows).
-        const emptyState = suggesterFrame.locator('.empty-state');
-        const topHeading = suggesterFrame.locator('h3:has-text("Top picks")');
-
-        const [hasEmpty, hasRanked] = await Promise.all([
-            emptyState.isVisible({ timeout: 8000 }).catch(() => false),
-            topHeading.isVisible({ timeout: 8000 }).catch(() => false),
-        ]);
-
-        if (hasEmpty || !hasRanked) {
-            // Corpus is empty; skip.
-            test.skip();
-            return;
-        }
-
-        const topRows = suggesterFrame.locator('.ranked-row:not(.side)');
-        const rowCount = await topRows.count();
-
-        if (rowCount === 0) {
-            test.skip();
-            return;
-        }
-
-        // Verify all K_1 rows have .row-completion prose (auto-fired).
-        const k1Count = Math.min(3, rowCount);
-        for (let i = 0; i < k1Count; i++) {
-            const row = topRows.nth(i);
-            const slot = row.locator('.row-completion');
-            await expect(slot).toHaveClass(/visible/, { timeout: 10000 });
+        // (2) Each top-K_1 row AUTO-FIRED /poll: .row-completion goes .visible
+        //     with non-trivial prose, no operator click. (Parallel: all K_1
+        //     fire on first paint, so each resolves within the poll window.)
+        for (let i = 0; i < k1; i++) {
+            const slot = realTop.nth(i).locator('.row-completion');
+            await expect(slot, `K1 row ${i} auto-fired (.visible)`)
+                .toHaveClass(/visible/, { timeout: POLL_TIMEOUT });
             const text = await slot.locator('.row-completion-text').textContent();
-            expect(text).not.toBeNull();
-            expect(text.trim().length).toBeGreaterThan(10);
+            expect((text || '').trim().length, `K1 row ${i} has non-trivial prose`)
+                .toBeGreaterThan(10);
         }
 
-        // Reload the page. The in-memory _previewCache is cleared, but the
-        // ranking should hit the _rankCache (per-chat rank cache is preserved
-        // across reloads at the browser level if the same chat is active).
-        // After reload, auto-fire fires again.
+        // (3) Side picks (K_2) stay INERT (not auto-fired).
+        const side = iframe.locator('.ranked-row.side');
+        if (await side.count() > 0) {
+            await expect(side.first().locator('.row-completion')).not.toHaveClass(/visible/);
+        }
+
+        // (4) Re-suggest the first row → CACHE HIT: text unchanged + cache-badge,
+        //     no fresh /poll.
+        const slot0 = realTop.first().locator('.row-completion');
+        const orig = await slot0.locator('.row-completion-text').textContent();
+        await realTop.first().locator('.suggest-btn').click();
+        await page.waitForTimeout(800);
+        expect(await slot0.locator('.row-completion-text').textContent()).toBe(orig);
+        await expect(slot0.locator('.cache-badge')).toBeVisible();
+    });
+
+    // FIXME (2026-06): deferred — this thesis-NEGATIVE control needs a harness it
+    // doesn't have yet. Diagnosed in depth:
+    //  (1) A "fresh chat" is NOT empty to the suggester — dicemother's non-empty
+    //      first_mes makes activeChatHasContent() true (suggester.html:671), so it
+    //      ranks (skeletons → a real but INERT ranked row that never auto-streams).
+    //      A valid control needs a genuinely content-free chat (activeChatHasContent
+    //      == false → clearRankView "Awaiting active chat"), which the current UI
+    //      helpers can't produce (freshChatByClick keeps first_mes).
+    //  (2) Cross-test contamination — the positive tests prime the SHARED server-
+    //      side /poll cache for dicemother's compositions, so a CACHED completion can
+    //      render here (the .cache-badge filter below mitigates it but is fragile).
+    //  (3) The freshChatByClick → openPersonaSurface path is flaky: an #sheld overlay
+    //      intermittently intercepts the tools-menu item click (12-min stall).
+    // The thesis-POSITIVE (auto-fire on first paint, and again after reload) is
+    // covered by the two PASSING tests bracketing this one. Re-enable once a
+    // content-free-chat, cache-isolated harness exists. The body below is the
+    // best current approximation, kept for that future work.
+    test.fixme('does not auto-poll when chat is empty', async ({ page }) => {
+        await loadSTNoConnect(page);
+        try { await selectCharacterByClick(page, 'dicemother'); } catch { /* ignore */ }
+        // Drop to a fresh chat (first_mes only) so there is no behavioral context.
+        try { await freshChatByClick(page); } catch { /* ignore */ }
+        await openPersonaSurface(page, 'suggester');
+        const iframe = page.frameLocator('#user-suggester-button iframe');
+        await expect(iframe.locator('h1')).toBeVisible({ timeout: 20_000 });
+
+        // Thesis-negative: with no behavioral context (fresh chat = first_mes only),
+        // no FRESH /poll auto-fires. Empirically (2026-06):
+        //   - the suggester DOES rank a fresh chat (first_mes counts as content per
+        //     activeChatHasContent), painting SKELETON rows (.row-completion.visible
+        //     .loading) and eventually a real ranked row (~10-15s) — but that row is
+        //     INERT: it never auto-streams a fresh completion (18s watch).
+        //   - HOWEVER a CACHED completion from a prior test (the positive test primes
+        //     the shared server-side /poll cache for the same compositions) may be
+        //     DISPLAYED — it carries a .cache-badge. That is a cache replay, NOT an
+        //     auto-fire, so it must not fail this control.
+        // So assert: no visible, non-loading completion WITHOUT a .cache-badge (no
+        // fresh auto-fire). This is order-independent — robust whether or not the
+        // positive test ran first.
+        await page.waitForTimeout(8000);
+        const freshFires = await iframe.locator('body').evaluate((b) =>
+            [...b.querySelectorAll('.row-completion.visible:not(.loading)')].filter((rc) => {
+                const row = rc.closest('.ranked-row') || rc;
+                return !rc.querySelector('.cache-badge') && !row.querySelector('.cache-badge');
+            }).length);
+        expect(freshFires,
+            'no FRESH /poll auto-fires on a context-free chat (loading skeletons + cache-badged replays are OK)').toBe(0);
+    });
+
+    test('K_1 auto-fire repeats after reload (per-chat recommendation persists)', async ({ page }) => {
+        const iframe = await openSuggesterWithChat(page);
+        const n = await compositionCount(page);
+        if (n < 2) test.skip(true, `corpus has ${n} signed compositions; need ≥2`);
+
+        const realTop = iframe.locator(REAL_TOP);
+        await expect.poll(async () => await realTop.count(),
+            { timeout: POLL_TIMEOUT, intervals: [1000, 2000, 3000] }).toBeGreaterThanOrEqual(1);
+        await expect(realTop.first().locator('.row-completion'))
+            .toHaveClass(/visible/, { timeout: POLL_TIMEOUT });
+
+        // Reload: the active character + chat persist across reload, so auto-fire
+        // happens again. But reload resets the top-bar UI — the suggester drawer
+        // closes and its iframe unmounts — so we must RE-OPEN the suggester (the
+        // hamburger popover) before its iframe exists again.
         await page.reload();
-        await page.waitForSelector('body', { timeout: 5000 });
-
-        // Wait for the suggester to re-render.
-        const reloadedFrame = page.frameLocator('iframe#user_personas_iframe');
-        const reloadedHeading = reloadedFrame.locator('h3:has-text("Top picks")');
-        await expect(reloadedHeading).toBeVisible({ timeout: 10000 });
-
-        const reloadedRows = reloadedFrame.locator('.ranked-row:not(.side)');
-        const reloadedCount = await reloadedRows.count();
-
-        if (reloadedCount === 0) {
-            test.skip();
-            return;
-        }
-
-        // Verify that auto-fire happened again (all K_1 rows have text).
-        const reloadedK1 = Math.min(3, reloadedCount);
-        for (let i = 0; i < reloadedK1; i++) {
-            const row = reloadedRows.nth(i);
-            const slot = row.locator('.row-completion');
-            await expect(slot).toHaveClass(/visible/, { timeout: 10000 });
-        }
+        await page.waitForFunction(() => document.getElementById('preloader') === null, { timeout: 60_000 });
+        await page.waitForFunction(() => typeof window.SillyTavern?.getContext === 'function', { timeout: 30_000 });
+        await openPersonaSurface(page, 'suggester');
+        const iframe2 = page.frameLocator('#user-suggester-button iframe');
+        await expect(iframe2.locator('h1')).toBeVisible({ timeout: 20_000 });
+        const realTop2 = iframe2.locator(REAL_TOP);
+        await expect.poll(async () => await realTop2.count(),
+            { timeout: POLL_TIMEOUT, intervals: [1000, 2000, 3000] }).toBeGreaterThanOrEqual(1);
+        await expect(realTop2.first().locator('.row-completion'),
+            'auto-fire repeats on reload').toHaveClass(/visible/, { timeout: POLL_TIMEOUT });
     });
 });
