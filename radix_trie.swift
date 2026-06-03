@@ -398,8 +398,25 @@ final class RadixTrie {
                     if let phys = anchor.byCvecAnchorTag[tag] {
                         collectedPages.append(phys)
                         lastAdoptedDepth = anchor.depth
+                    } else {
+                        // GAP: this page boundary is NOT adoptable (the anchor
+                        // was unlinked by a MID-CHAIN eviction — pruneAnchorChain
+                        // can't prune it while it has deeper children — or the
+                        // cvec tag doesn't match this session). Adoption is
+                        // contiguous-from-root by definition: ownedPages[p] must
+                        // back token positions [p·PAGE .. p·PAGE+PAGE-1], so we
+                        // CANNOT skip this page and graft deeper pages onto its
+                        // slot. Stop the adoptable run here. This is the source
+                        // that GUARANTEES the PrefixMatch contract
+                        //   alignedMatchLength == pages.count * pageSlide
+                        // (consumed by adoptSharedPrefixPages: position is set to
+                        // pages.count·PAGE, and ownedPages[i]=pages[i]). Walking
+                        // past the gap divorced the position tag from the
+                        // physical bytes — the exact full/slide-aliasing class of
+                        // corruption the ONE-PAGE=16 refactor set out to kill,
+                        // here re-entering through the trie collector.
+                        break outer
                     }
-                    // else: not adoptable; keep walking (deeper anchors might match).
                 }
                 // For partial pages the anchor sits at end-of-prefix
                 // (any depth). Check for a partial that extends past
@@ -562,6 +579,31 @@ func runRadixTrieTests() {
         let m = t.findLongestPrefix(tokens: tokens[0..<32]) { _ in .unsteered }
         check("eviction unlinks deeper anchor; first still adopts",
               m.alignedMatchLength == 16 && m.pages.count == 1)
+    }
+    // (6b) MID-CHAIN eviction: evict an interior page whose anchor still has
+    // deeper children (so pruneAnchorChain cannot remove it). The walk MUST
+    // stop the adoptable run at the gap — it must NOT skip the evicted page
+    // and graft the surviving deeper page onto the gap's logical-page slot.
+    // (Regression guard for the state-dependent adopted-prefix corruption:
+    //  without the gap-stop, this returned alignedMatchLength=48/pages=[s1,s2]
+    //  — the deeper pages mismapped one logical page early, divorcing the
+    //  position tag from the physical bytes.)
+    do {
+        let t = RadixTrie(pageSlide: 16)
+        let tokens: [UInt32] = (0..<48).map { UInt32($0) }
+        for p in 0..<3 {
+            let end = (p + 1) * 16
+            t.insertAnchor(tokensCoveringFullPrefix: tokens[0..<end],
+                           phys: 800 + p, cvecTag: .unsteered)
+        }
+        // Evict the MIDDLE page (logical page 1, depth 32). Its anchor keeps
+        // its depth-48 child, so the anchor node survives (loses only its phys).
+        t.invalidateAnchorFor(physPage: 801)
+        let m = t.findLongestPrefix(tokens: tokens[0..<48]) { _ in .unsteered }
+        check("mid-chain eviction stops adoption at the gap (contiguous-from-root)",
+              m.alignedMatchLength == 16 && m.pages.count == 1 && m.pages[0] == 800)
+        check("mid-chain eviction preserves the contract alignedMatchLength == pages.count*PAGE",
+              m.alignedMatchLength == m.pages.count * 16)
     }
     // (7) Edge split: insert AB...P then ABQ... — second insert forces split.
     do {
