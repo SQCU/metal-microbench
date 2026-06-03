@@ -40,6 +40,13 @@ export default defineConfig({
     // Bump for parallel-distribution tests later.
     workers: 1,
     fullyParallel: false,
+    // One retry: a handful of these integration specs (e.g. spec 66's
+    // post-reload auto-fire) are timing-sensitive against a SHARED real-model
+    // bridge — they pass in isolation but can lose a 20–60s iframe/poll wait
+    // when cumulative in-suite load pushes the bridge into a slow window. That
+    // is a transient resource race, not a defect; a single retry absorbs it
+    // without masking a genuine regression (a real break fails both attempts).
+    retries: 1,
     timeout: 120_000,
     expect: {
         timeout: 30_000,

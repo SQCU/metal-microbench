@@ -1,44 +1,57 @@
-// Spec R-6 — COORDINATE-PICKER: synthesize a bio from operator-picked
-// axis coordinates via the Corpus tab.
+// Spec R-6 — COORDINATE-PICKER → DESIGNER HANDOFF.
+//
+// STEP F3 (salvage-phase1-2): the Designer (designer.html) is the SINGLE
+// bio creator. The Corpus tab's coordinate picker (corpus.html) is now a
+// pure ACTUATOR: it lets the operator dial axis coordinates with sliders,
+// then hands them to the Designer's Bio tab via ?coords=<json> ("Design in
+// Designer →"). The picker's OWN /synthesize-bio-from-coordinates dispatch
+// + preview/result/save UI was REMOVED — there is one synth path, owned by
+// the Designer.
 //
 // Surface chain under audit:
 //   browser → Corpus tab (corpus.html) → axis multi-select
-//   → operator selects 2 axes → per-axis sliders render
-//   → operator dials values → design_brief textarea auto-fills
-//   → Synthesize → POST /synthesize-bio-from-coordinates
-//   → plugin builds K=1 experiment card with k_max_outer=1, spawns
-//     lock_in_iterative.mjs → harness writes bio via saveBio
-//     (POST /personas/<candidate_key>)
-//   → server stamps target_bio on persona card at child exit
-//   → result strip renders with name + provenance=experiment_output
+//   → operator selects axes → per-axis sliders render
+//   → operator dials values
+//   → "Design in Designer →" → designer.html?coords=<json>
+//   → Designer.boot() parses ?coords=, switches to Bio tab,
+//     prefills #axis-sliders from the coordinate signature
+//   → operator clicks "Synthesize candidate bio"
+//   → Designer POSTs /synthesize-bio-from-coordinates {target_signature}
+//   → plugin builds K=1 experiment card, spawns lock_in_iterative.mjs
+//   → harness writes bio via saveBio; result lands in #bio-candidate-panel
 //
 // What this spec validates:
-//   (a) Multi-select visible with bio-kind axes as options.
+//   (a) Picker multi-select visible with bio-kind axes as options.
 //   (b) money_orientation (kind=agent) NOT in the multi-select options.
-//   (c) Pre-selected axes (astrology_sagittarian + intellectual_application)
-//       have sliders rendered on first paint without operator action.
+//   (c) Pre-selected axes have sliders on first paint (no operator action).
 //   (d) Slider labels + captions visible for pre-selected axes.
 //   (e) Slider default values are scale midpoints.
 //   (f) Dragging a slider updates the displayed value.
-//   (g) Selecting a different axis in the multi-select rebuilds sliders.
-//   (h) design_brief textarea pre-fills from selection + values.
-//   (i) Synthesize POSTs {target_signature:{...}} (selected axes only).
-//       Preview pane appears. Status shows run_id.
-//   (j) result strip renders with provenance badge after synthesis.
-//       [fixme — requires live harness completion]
+//   (g) Selecting a different axis rebuilds sliders.
+//   (h) The picker has NO local synth/preview/save UI (collapse check) and
+//       exposes only "Design in Designer →" as its action.
+//   (i) "Design in Designer →" (standalone nav) lands on designer.html with
+//       a ?coords= signature carrying ONLY the selected axes (no
+//       money_orientation), the Designer opens on the Bio tab, and prefills
+//       its axis sliders from those coordinates.
+//   (j) The Designer (the ONE creator) POSTs /synthesize-bio-from-coordinates
+//       with the handed-off target_signature when "Synthesize candidate bio"
+//       is clicked. [fixme tail: requires live harness completion]
 //
-// Tests (a)-(i) fail against pre-multi-select corpus.html (no multi-select
-// element exists). Tests (a)-(d) catch the regression where all bio axes
-// were shown as sliders regardless of selection (no multi-select).
+// Tests (a)-(g) drive the picker actuator. (h)/(i)/(j) assert the collapse:
+// the picker no longer synthesizes; it only hands coordinates to the single
+// Designer creator.
 
 import { test, expect } from '@playwright/test';
 import { execSync } from 'node:child_process';
 
 const ST_URL = 'http://127.0.0.1:8002';
-const CORPUS_URL = `${ST_URL}/api/plugins/user-personas/static/corpus.html`;
+const STATIC_BASE = `${ST_URL}/api/plugins/user-personas/static`;
+const CORPUS_URL = `${STATIC_BASE}/corpus.html`;
+const DESIGNER_URL = `${STATIC_BASE}/designer.html`;
 const PLUGIN_BASE = '/api/plugins/user-personas';
 
-test.describe('R-6: Coordinate Picker', () => {
+test.describe('R-6: Coordinate Picker → Designer handoff', () => {
     test.setTimeout(2 * 60 * 1000);
 
     test.afterAll(async () => {
@@ -51,8 +64,8 @@ test.describe('R-6: Coordinate Picker', () => {
     // ── (a) Multi-select is visible and has bio-kind axes as options ─────
     test('(a) axis multi-select is visible with bio axes', async ({ page }) => {
         await page.goto(CORPUS_URL);
-        // Picker heading is present.
-        await expect(page.locator('h2:has-text("Synthesize bio from coordinates")')).toBeVisible();
+        // Picker heading is present (the picker now hands off to the Designer).
+        await expect(page.locator('h2:has-text("Design a bio")')).toBeVisible();
         // The multi-select element is visible.
         const sel = page.locator('#picker-axis-multiselect');
         await expect(sel).toBeVisible({ timeout: 8_000 });
@@ -195,47 +208,47 @@ test.describe('R-6: Coordinate Picker', () => {
         await expect(sagSlider).not.toBeVisible();
     });
 
-    // ── (h) design_brief textarea pre-fills from selection + values ───────
-    test('(h) design_brief textarea pre-fills from axis selection', async ({ page }) => {
+    // ── (h) Collapse check: the picker has NO local synth/preview/save UI ──
+    // STEP F3: the picker is a pure actuator. Its only action is "Design in
+    // Designer →"; the old #picker-synthesize-btn / #picker-preview-pane /
+    // #picker-save-btn / #picker-result-strip elements must be GONE.
+    test('(h) picker exposes only the Designer handoff; no local synth UI', async ({ page }) => {
         await page.goto(CORPUS_URL);
         await expect(page.locator('#picker-axis-multiselect')).toBeVisible({ timeout: 8_000 });
-        await expect(page.locator('#picker-sliders-host input[type="range"]').first()).toBeVisible({ timeout: 5_000 });
 
-        // The textarea must be visible and non-empty on first paint.
-        const ta = page.locator('#picker-design-brief');
-        await expect(ta).toBeVisible();
-        const taValue = await ta.inputValue();
-        expect(taValue.trim().length).toBeGreaterThan(5);
-        // It mentions one of the pre-selected axes.
-        const lc = taValue.toLowerCase();
-        expect(
-            lc.includes('astrology_sagittarian') || lc.includes('intellectual_application'),
-            `design_brief should mention a pre-selected axis; got: ${taValue}`,
-        ).toBe(true);
+        // The single action: hand off to the Designer.
+        await expect(page.locator('#picker-design-in-designer-btn')).toBeVisible();
 
-        // Change selection to rpg_class only; brief should update.
-        await page.locator('#picker-axis-multiselect').evaluate(sel => {
-            for (const opt of sel.options) opt.selected = opt.value === 'rpg_class';
-            sel.dispatchEvent(new Event('change', { bubbles: true }));
-        });
-        await expect(page.locator('input[data-axis-id="rpg_class"]')).toBeVisible({ timeout: 3_000 });
-        const updatedVal = await ta.inputValue();
-        expect(updatedVal.toLowerCase()).toContain('rpg_class');
+        // The removed picker-local synth lifecycle must NOT exist.
+        for (const removedId of [
+            '#picker-synthesize-btn',
+            '#picker-preview-pane',
+            '#picker-preview-text',
+            '#picker-save-btn',
+            '#picker-result-strip',
+            '#picker-design-brief',
+        ]) {
+            await expect(page.locator(removedId),
+                `${removedId} must be removed (picker no longer synthesizes)`,
+            ).toHaveCount(0);
+        }
     });
 
-    // ── (i) Synthesize POSTs target_signature (selected axes only) ────────
-    test('(i) Synthesize POSTs selected axis coordinates and opens preview pane', async ({ page }) => {
+    // ── (i) Picker → Designer ?coords= handoff carries the selected axes ──
+    // Standalone nav path (no parent ST shell). Picking sag+intel and
+    // clicking "Design in Designer →" must navigate to designer.html with a
+    // ?coords= signature of ONLY those axes, land on the Bio tab, and
+    // prefill the Designer's axis sliders from the coordinates.
+    test('(i) "Design in Designer →" hands selected coords to the Designer Bio tab', async ({ page }) => {
         await page.goto(CORPUS_URL);
         await expect(page.locator('#picker-axis-multiselect')).toBeVisible({ timeout: 8_000 });
 
-        // Select astrology_sagittarian + intellectual_application (the demo axes).
+        // Select astrology_sagittarian + intellectual_application (demo axes).
         await page.locator('#picker-axis-multiselect').evaluate(sel => {
             const demoAxes = new Set(['astrology_sagittarian', 'intellectual_application']);
             for (const opt of sel.options) opt.selected = demoAxes.has(opt.value);
             sel.dispatchEvent(new Event('change', { bubbles: true }));
         });
-
-        // Wait for both sliders to render.
         await expect(page.locator('input[data-axis-id="astrology_sagittarian"]')).toBeVisible({ timeout: 4_000 });
         await expect(page.locator('input[data-axis-id="intellectual_application"]')).toBeVisible({ timeout: 4_000 });
 
@@ -243,16 +256,63 @@ test.describe('R-6: Coordinate Picker', () => {
         await page.locator('input[data-axis-id="astrology_sagittarian"]').fill('3');
         await page.locator('input[data-axis-id="intellectual_application"]').fill('4');
 
-        // Capture the POST body.
+        // Click the handoff and follow the top-level navigation to the Designer.
+        await Promise.all([
+            page.waitForURL(/designer\.html\?coords=/, { timeout: 10_000 }),
+            page.locator('#picker-design-in-designer-btn').click(),
+        ]);
+
+        // The ?coords= signature must carry ONLY the selected axes.
+        const coordsRaw = new URL(page.url()).searchParams.get('coords');
+        expect(coordsRaw, 'designer URL must carry a ?coords= signature').toBeTruthy();
+        const coords = JSON.parse(coordsRaw);
+        expect(coords).toMatchObject({
+            astrology_sagittarian: 3,
+            intellectual_application: 4,
+        });
+        // money_orientation (kind=agent) must NOT be in the handoff.
+        expect(Object.keys(coords)).not.toContain('money_orientation');
+
+        // The Designer opens on the Bio designer tab (coords handoff).
+        await expect(page.locator('#pane-bio')).toHaveClass(/active/, { timeout: 8_000 });
+        await expect(page.locator('.tab[data-tab="bio"]')).toHaveClass(/active/);
+
+        // The Designer's axis sliders are prefilled from the coordinates.
+        const sagRow = page.locator('#axis-sliders .axis-slider-row[data-axis="astrology_sagittarian"]');
+        await expect(sagRow.locator('input[type="range"]')).toHaveValue('3', { timeout: 8_000 });
+        const intRow = page.locator('#axis-sliders .axis-slider-row[data-axis="intellectual_application"]');
+        await expect(intRow.locator('input[type="range"]')).toHaveValue('4');
+
+        // The Designer's bio-synth affordance (the ONE creator) is present.
+        await expect(page.locator('#bio-synth-btn')).toBeVisible();
+    });
+
+    // ── (j) The Designer is the SINGLE creator: it POSTs the handoff coords ─
+    // Drive the full collapse end-to-end up to the synthesis dispatch: the
+    // POST must originate from the DESIGNER (not the picker), and carry the
+    // handed-off target_signature. The fixme tail (harness completion) is
+    // out of scope for a fast spec; the dispatch + body is the contract.
+    test('(j) Designer POSTs /synthesize-bio-from-coordinates with handed-off coords', async ({ page }) => {
+        // Arrive at the Designer directly via the handoff URL the picker emits.
+        const coords = { astrology_sagittarian: 3, intellectual_application: 4 };
+        const url = `${DESIGNER_URL}?coords=${encodeURIComponent(JSON.stringify(coords))}`;
+        await page.goto(url);
+
+        // Lands on the Bio tab, sliders prefilled from coords.
+        await expect(page.locator('#pane-bio')).toHaveClass(/active/, { timeout: 8_000 });
+        const sagInput = page.locator('#axis-sliders .axis-slider-row[data-axis="astrology_sagittarian"] input[type="range"]');
+        await expect(sagInput).toHaveValue('3', { timeout: 8_000 });
+
+        // Capture the synthesis POST body from the Designer.
         const postBodyPromise = page.waitForRequest(req =>
             req.url().includes('/synthesize-bio-from-coordinates') && req.method() === 'POST',
         ).then(r => r.postDataJSON());
 
-        await page.locator('#picker-synthesize-btn').click();
+        await page.locator('#bio-synth-btn').click();
 
         const postBody = await postBodyPromise;
         expect(postBody).toBeTruthy();
-        // target_signature must contain ONLY the selected axes.
+        // target_signature must contain the handed-off coordinates.
         expect(postBody.target_signature).toMatchObject({
             astrology_sagittarian: 3,
             intellectual_application: 4,
@@ -260,127 +320,39 @@ test.describe('R-6: Coordinate Picker', () => {
         // money_orientation must NOT be in target_signature.
         expect(Object.keys(postBody.target_signature)).not.toContain('money_orientation');
 
-        // Preview pane appears.
-        await expect(page.locator('#picker-preview-pane')).toBeVisible({ timeout: 10_000 });
-        // Status shows run_id.
-        await expect(page.locator('#picker-status')).toContainText(/Synthesis running|run_id/i, { timeout: 10_000 });
+        // The Designer's bio-status surfaces the dispatch (run_id / polling).
+        await expect(page.locator('#bio-status')).toContainText(/run_id|Polling|Dispatch/i, { timeout: 10_000 });
     });
 
-    // ── (j) Result strip renders after synthesis with provenance ──────────
-    // Marked fixme: requires the harness to run to completion (~30-90s)
-    // and stamp provenance on the persona card. The network + result strip
-    // assertions would only be observable after that full round-trip.
-    test.fixme('(j) result strip shows name + provenance=experiment_output after synthesis', async ({ page }) => {
-        await page.goto(CORPUS_URL);
-        await expect(page.locator('#picker-axis-multiselect')).toBeVisible({ timeout: 8_000 });
+    // ── (k) Result lands in the Designer after synthesis ──────────────────
+    // Marked fixme: requires the harness to run to completion (~30-90s) and
+    // write the candidate bio. The Designer's #bio-candidate-panel + Save
+    // CTA only become observable after that full round-trip.
+    test.fixme('(k) Designer renders candidate bio after synthesis completes', async ({ page }) => {
+        const coords = { astrology_sagittarian: 3, intellectual_application: 4 };
+        const url = `${DESIGNER_URL}?coords=${encodeURIComponent(JSON.stringify(coords))}`;
+        await page.goto(url);
+        await expect(page.locator('#pane-bio')).toHaveClass(/active/, { timeout: 8_000 });
 
-        // Select demo axes.
-        await page.locator('#picker-axis-multiselect').evaluate(sel => {
-            const demoAxes = new Set(['astrology_sagittarian', 'intellectual_application']);
-            for (const opt of sel.options) opt.selected = demoAxes.has(opt.value);
-            sel.dispatchEvent(new Event('change', { bubbles: true }));
-        });
-        await expect(page.locator('input[data-axis-id="astrology_sagittarian"]')).toBeVisible();
-
-        await page.locator('input[data-axis-id="astrology_sagittarian"]').fill('3');
-        await page.locator('input[data-axis-id="intellectual_application"]').fill('4');
-
-        // Capture candidate_id from the response.
+        // Capture candidate_id from the synthesis response.
         const respPromise = page.waitForResponse(r =>
             r.url().includes('/synthesize-bio-from-coordinates') && r.status() === 200,
         );
-        await page.locator('#picker-synthesize-btn').click();
+        await page.locator('#bio-synth-btn').click();
         const resp = await respPromise;
         const body = await resp.json();
         const candidateId = body.candidate_id;
         expect(candidateId).toBeTruthy();
 
-        // Wait for Save CTA — means synthesis finished.
-        await expect(page.locator('#picker-save-btn')).toBeVisible({ timeout: 5 * 60 * 1000 });
+        // The candidate bio panel becomes visible once the harness writes it.
+        await expect(page.locator('#bio-candidate-panel')).toBeVisible({ timeout: 8 * 60 * 1000 });
+        await expect(page.locator('#bio-candidate-key')).toContainText(candidateId);
+        await expect(page.locator('#bio-save-btn')).toBeEnabled();
 
-        // Result strip must be visible with provenance=experiment_output.
-        const strip = page.locator('#picker-result-strip');
-        await expect(strip).toBeVisible({ timeout: 5_000 });
-        await expect(strip.locator('[data-provenance-kind]')).toHaveAttribute(
-            'data-provenance-kind', 'experiment_output',
-        );
-        await expect(strip.locator('[data-provenance-kind]')).toContainText('experiment_output');
-
-        // curl /personas confirms target_bio is present.
+        // curl /personas confirms the candidate landed.
         const personasResp = await page.request.get(`${ST_URL}${PLUGIN_BASE}/personas`);
         const personasBody = await personasResp.json();
         const candidate = (personasBody.personas || []).find(p => p.id === candidateId);
         expect(candidate, `candidate ${candidateId} in /personas`).toBeTruthy();
-        expect(candidate.provenance?.kind,
-            'provenance.kind must be experiment_output',
-        ).toBe('experiment_output');
-        expect(candidate.target_bio,
-            'target_bio must be present and non-null',
-        ).toBeTruthy();
-        expect(candidate.target_bio.astrology_sagittarian).toBe(3);
-        expect(candidate.target_bio.intellectual_application).toBe(4);
-    });
-
-    // Retained from original spec: after Save, persona has ≥2 agents.
-    test.fixme('(k) after Save, candidate persona has ≥2 agents', async ({ page }) => {
-        await page.goto(CORPUS_URL);
-        await expect(page.locator('#picker-axis-multiselect')).toBeVisible({ timeout: 8_000 });
-
-        await page.locator('#picker-axis-multiselect').evaluate(sel => {
-            const demoAxes = new Set(['astrology_sagittarian', 'intellectual_application']);
-            for (const opt of sel.options) opt.selected = demoAxes.has(opt.value);
-            sel.dispatchEvent(new Event('change', { bubbles: true }));
-        });
-        await expect(page.locator('input[data-axis-id="astrology_sagittarian"]')).toBeVisible();
-        await page.locator('input[data-axis-id="astrology_sagittarian"]').fill('1');
-        await page.locator('input[data-axis-id="intellectual_application"]').fill('5');
-
-        const respPromise = page.waitForResponse(r =>
-            r.url().includes('/synthesize-bio-from-coordinates') && r.status() === 200,
-        );
-        await page.locator('#picker-synthesize-btn').click();
-        const resp = await respPromise;
-        const body = await resp.json();
-        const candidateId = body.candidate_id;
-        expect(candidateId).toBeTruthy();
-
-        const saveBtn = page.locator('#picker-save-btn');
-        await expect(saveBtn).toBeVisible({ timeout: 5 * 60 * 1000 });
-        await saveBtn.click();
-
-        // Poll /personas until candidate appears.
-        const personasDeadline = Date.now() + 60_000;
-        let foundPersona = false;
-        while (Date.now() < personasDeadline) {
-            const r = await page.request.get(`${ST_URL}${PLUGIN_BASE}/personas`);
-            if (r.ok()) {
-                const pb = await r.json();
-                if ((pb.personas || []).some(p => p.id === candidateId)) {
-                    foundPersona = true;
-                    break;
-                }
-            }
-            await new Promise(rs => setTimeout(rs, 2000));
-        }
-        expect(foundPersona, `candidate persona ${candidateId} in /personas`).toBe(true);
-
-        // Poll /agents for >= 2 agents.
-        const agentsDeadline = Date.now() + 5 * 60 * 1000;
-        let agentCount = 0;
-        while (Date.now() < agentsDeadline) {
-            const r = await page.request.get(`${ST_URL}${PLUGIN_BASE}/agents`);
-            if (r.ok()) {
-                const ab = await r.json();
-                const agentsForCandidate = (ab.agents || []).filter(
-                    a => a.designed_for_bio_id === candidateId,
-                );
-                agentCount = agentsForCandidate.length;
-                if (agentCount >= 2) break;
-            }
-            await new Promise(rs => setTimeout(rs, 5000));
-        }
-        expect(agentCount,
-            `expected >=2 agents derived from candidate ${candidateId}; got ${agentCount}`,
-        ).toBeGreaterThanOrEqual(2);
     });
 });

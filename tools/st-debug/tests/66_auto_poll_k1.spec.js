@@ -32,6 +32,21 @@ async function loadSTNoConnect(page) {
     await page.waitForFunction(() => typeof window.SillyTavern?.getContext === 'function', { timeout: 30_000 });
 }
 
+// Robustly wait for the freshly-(re)opened suggester iframe to be ready.
+// The flake (spec 66, in-suite, post-reload) was a single 20s `h1` visibility
+// wait racing the iframe MOUNT + first paint under cumulative real-model load:
+// the frameLocator can resolve before the iframe element is attached, and the
+// iframe's own document load is slow when the bridge is busy. So we (1) wait
+// for the <iframe> ELEMENT to attach in the parent doc, then (2) wait for its
+// contentFrame h1 with a generous timeout. Two-stage + longer budget removes
+// the race without touching the fork surface.
+async function waitSuggesterIframeReady(page) {
+    await expect(page.locator('#user-suggester-button iframe')).toBeAttached({ timeout: 30_000 });
+    const iframe = page.frameLocator('#user-suggester-button iframe');
+    await expect(iframe.locator('h1')).toBeVisible({ timeout: 60_000 });
+    return iframe;
+}
+
 test.describe('Auto-poll K_1 regression (spec 66)', () => {
     test.setTimeout(12 * 60 * 1000);
 
@@ -72,9 +87,7 @@ test.describe('Auto-poll K_1 regression (spec 66)', () => {
                 chatLen, { timeout: 15_000 });
         }
         await openPersonaSurface(page, 'suggester');
-        const iframe = page.frameLocator('#user-suggester-button iframe');
-        await expect(iframe.locator('h1')).toBeVisible({ timeout: 20_000 });
-        return iframe;
+        return await waitSuggesterIframeReady(page);
     }
 
     test('auto-fires top-K_1 rows in parallel on first paint', async ({ page }) => {
@@ -190,8 +203,7 @@ test.describe('Auto-poll K_1 regression (spec 66)', () => {
         await page.waitForFunction(() => document.getElementById('preloader') === null, { timeout: 60_000 });
         await page.waitForFunction(() => typeof window.SillyTavern?.getContext === 'function', { timeout: 30_000 });
         await openPersonaSurface(page, 'suggester');
-        const iframe2 = page.frameLocator('#user-suggester-button iframe');
-        await expect(iframe2.locator('h1')).toBeVisible({ timeout: 20_000 });
+        const iframe2 = await waitSuggesterIframeReady(page);
         const realTop2 = iframe2.locator(REAL_TOP);
         await expect.poll(async () => await realTop2.count(),
             { timeout: POLL_TIMEOUT, intervals: [1000, 2000, 3000] }).toBeGreaterThanOrEqual(1);
