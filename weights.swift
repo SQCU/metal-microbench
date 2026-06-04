@@ -328,6 +328,13 @@ func loadLmWeights(ggufPath: String) throws -> LmWeights {
             return (try loadDenseSwizzled(name, dtype: .q5_K, blkBytes: 176, blkElems: 256), .q5_K)
         case .q6_K:
             return (try loadDenseSwizzled(name, dtype: .q6_K, blkBytes: 210, blkElems: 256), .q6_K)
+        case .q4_K:
+            // Q4_K dense path (super-block 256, 144 B). Routes to the Q4_K
+            // dense btile zoo via encDenseGemvAR .q4_K. Added 2026-06 alongside
+            // dense_gemv_q4k_btile_b{1,2,4,8} so a mixed GGUF with a Q4_K dense
+            // tensor loads + decodes through the btile fast path (the UD-Q4_K_M
+            // goal model keeps dense at Q8_0, so this is for non-uniform mixes).
+            return (try loadDenseSwizzled(name, dtype: .q4_K, blkBytes: 144, blkElems: 256), .q4_K)
         case .q5_1:
             return (try loadDenseSwizzled(name, dtype: .q5_1, blkBytes: 24, blkElems: 32), .q5_1)
         case .q4_0:

@@ -1263,60 +1263,153 @@ kernel void moe_gemv_q5_1_v4(
     }
 }
 
-// Dense GEMV with Q4_K weights, v4 pattern (multi-batch-per-TG amortizes W).
-// Each thread owns one output column n, loops k-blocks over all B batch rows.
-kernel void dense_gemv_q4k_v4(
-    device const half* hidden           [[buffer(0)]],
-    device const uchar* W_q4k           [[buffer(1)]],
-    device half* output                 [[buffer(2)]],
-    constant uint& B                    [[buffer(3)]],
-    constant uint& D_in                 [[buffer(4)]],
-    constant uint& D_out                [[buffer(5)]],
-    uint2 tg                            [[threadgroup_position_in_grid]],
-    uint2 lid                           [[thread_position_in_threadgroup]])
+// =============================================================================
+// Q4_K btile GEMV — structural mirror of dense_gemv_q8_0_btile_impl /
+// dense_gemv_q5_K_btile_impl, swapping only the per-element dequant for the
+// Q4_K super-block layout (256 elts × 144 B). Same N_SPLITS=4 strided split-K
+// (kb = sg_id; kb += N_SPLITS, identical to the Q5_K btile because Q4_K's
+// 256-elt block count nbc need not divide N_SPLITS cleanly), same swizzled W
+// layout [n_super, kb, 32 cols, BLK] as loadDenseSwizzled produces, same
+// B_TILE register accumulator array, same per-batch threadgroup reduction
+// (one barrier publish + sg0 reduce + one barrier per b). Brings the Q4_K
+// dense path to full Q8_0-grade parity (replaces the old single-template
+// dense_gemv_q4k_v4 which had no B_TILE, no split-K, no register-accumulator
+// tiling). Per-pair dequant matches moe_gemv_q4k_v11_impl's paired-sub-block
+// layout (byte = qs[pair*32 + p]; lo nibble → sub-block 2*pair, hi nibble →
+// sub-block 2*pair+1) so output is bit-consistent with the MoE path's dequant.
+// =============================================================================
+
+template<uint B_TILE>
+inline void dense_gemv_q4k_btile_impl(
+    device const half* hidden,
+    device const uchar* W_sw,
+    device half* output,
+    constant uint& D_in,
+    constant uint& D_out,
+    threadgroup float (&partials)[4][32],
+    uint2 tg, uint2 lid, uint sg_id)
 {
-    constexpr uint MAX_B = 8;
-    uint n_block = tg.x; uint t = lid.x;
-    uint n = n_block * 32 + t;
+    constexpr uint N_SPLITS = 4;
+    constexpr uint BLK = 144;
+    constexpr uint K_PER_BLK = 256;
+
+    uint n_block = tg.x;
+    uint lid_sg = lid.x % 32;
+    uint n = n_block * 32 + lid_sg;
     if (n >= D_out) return;
 
-    constexpr uint BLK = 144;
-    uint n_blocks_per_col = D_in / 256;
-    uint col_bytes = n_blocks_per_col * BLK;
-    device const uchar* W_col = W_q4k + n * col_bytes;
+    uint nbc = D_in / K_PER_BLK;
+    uint super_bytes = nbc * 32 * BLK;
+    device const uchar* W_super = W_sw + n_block * super_bytes;
 
-    float accs[MAX_B];
-    for (uint b = 0; b < MAX_B; ++b) accs[b] = 0.0f;
+    float accs[B_TILE];
+    for (uint b = 0; b < B_TILE; ++b) accs[b] = 0.0f;
 
-    for (uint kb = 0; kb < n_blocks_per_col; ++kb) {
-        device const uchar* blk = W_col + kb * BLK;
-        device const half*  blk_d    = (device const half*)(blk + 0);
-        device const half*  blk_dmin = (device const half*)(blk + 2);
-        device const uchar* scales   = blk + 4;
-        device const uchar* qs       = blk + 16;
-        float d = float(*blk_d); float dmin = float(*blk_dmin);
+    for (uint kb = sg_id; kb < nbc; kb += N_SPLITS) {
+        device const uchar* blk = W_super + kb * 32 * BLK + lid_sg * BLK;
+        float d    = float(*(device const half*)(blk + 0));
+        float dmin = float(*(device const half*)(blk + 2));
+        device const uchar* scales = blk + 4;
+        device const uchar* qs     = blk + 16;
 
-        // Precompute 8 (dl, ml) pairs once per block (shared across batch)
-        float dl[8], ml[8];
+        // Hoist the 8 (dl, ml) sub-block scale pairs once per kb (V11 Approach 2).
+        float dl_arr[8], ml_arr[8];
         for (uint sb = 0; sb < 8; ++sb) {
-            uchar sc, mn; unpack_q4k_scales(scales, sc, mn, sb);
-            dl[sb] = d * float(sc); ml[sb] = dmin * float(mn);
+            uchar sc, mn;
+            unpack_q4k_scales(scales, sc, mn, sb);
+            dl_arr[sb] = d * float(sc);
+            ml_arr[sb] = dmin * float(mn);
         }
 
-        for (uint sb = 0; sb < 8; ++sb) {
-            for (uint p = 0; p < 16; ++p) {
-                uchar byte = qs[sb * 16 + p];
-                float w_lo = dl[sb] * float(byte & 0xF) - ml[sb];
-                float w_hi = dl[sb] * float((byte >> 4) & 0xF) - ml[sb];
-                uint base_k = kb * 256 + sb * 32;
-                for (uint b = 0; b < B; ++b) {
-                    accs[b] += float(hidden[b * D_in + base_k + p])      * w_lo
-                             + float(hidden[b * D_in + base_k + p + 16]) * w_hi;
+        for (uint pair = 0; pair < 4; ++pair) {
+            uint sb_lo = pair * 2;
+            uint sb_hi = pair * 2 + 1;
+            float dl_lo = dl_arr[sb_lo], ml_lo = ml_arr[sb_lo];
+            float dl_hi = dl_arr[sb_hi], ml_hi = ml_arr[sb_hi];
+            uint base_lo = kb * K_PER_BLK + sb_lo * 32;
+            uint base_hi = kb * K_PER_BLK + sb_hi * 32;
+            for (uint p = 0; p < 32; ++p) {
+                uchar byte = qs[pair * 32 + p];
+                float w_lo = dl_lo * float(byte & 0xF)        - ml_lo;
+                float w_hi = dl_hi * float((byte >> 4) & 0xF) - ml_hi;
+                for (uint b = 0; b < B_TILE; ++b) {
+                    accs[b] += float(hidden[b * D_in + base_lo + p]) * w_lo
+                             + float(hidden[b * D_in + base_hi + p]) * w_hi;
                 }
             }
         }
     }
-    for (uint b = 0; b < B; ++b) output[b * D_out + n] = half(accs[b]);
+
+    for (uint b = 0; b < B_TILE; ++b) {
+        partials[sg_id][lid_sg] = accs[b];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0) {
+            float total = partials[0][lid_sg] + partials[1][lid_sg]
+                        + partials[2][lid_sg] + partials[3][lid_sg];
+            output[b * D_out + n] = half(total);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+[[host_name("dense_gemv_q4k_btile_b1")]]
+kernel void dense_gemv_q4k_btile_b1(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q4k_btile_impl<1>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q4k_btile_b2")]]
+kernel void dense_gemv_q4k_btile_b2(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q4k_btile_impl<2>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q4k_btile_b4")]]
+kernel void dense_gemv_q4k_btile_b4(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q4k_btile_impl<4>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
+}
+
+[[host_name("dense_gemv_q4k_btile_b8")]]
+kernel void dense_gemv_q4k_btile_b8(
+    device const half* hidden  [[buffer(0)]],
+    device const uchar* W_sw   [[buffer(1)]],
+    device half* output        [[buffer(2)]],
+    constant uint& D_in        [[buffer(3)]],
+    constant uint& D_out       [[buffer(4)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint sg_id                 [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float partials[4][32];
+    dense_gemv_q4k_btile_impl<8>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
 }
 
 // -------- Q5_K dequant helpers + AR GEMV --------
@@ -9192,223 +9285,15 @@ kernel void moe_gemv_q6_K_v11_b8_kern(
     uint2 tg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
 { moe_gemv_q6_K_v11_impl<8>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, tg, lid); }
 
-// MoE Q4_K v12 — V11 + per-kb tg-mem nibble lookup table (compute-bound
-// dequant rewrite). Targets the 32% gap between V11's measured MoE wall
-// (~26 ms/step at B=8) and the bandwidth ceiling (~18 ms). The gap is
-// instruction-dispatch latency on the Q4_K dequant chain (nibble extract
-// + scale-mul + bias-sub per byte), not bandwidth.
-//
-// Structural change vs V11:
-//
-//   For each kb iteration, before the FMA loop:
-//     - V11 computes dl_arr[8] / ml_arr[8] in registers (kept here).
-//     - V12 ADDITIONALLY pre-computes the FULL 8×16 nibble lookup table
-//       in tg-mem: nibble_table[sb][v] = dl_arr[sb] * v - ml_arr[sb].
-//       128 entries built cooperatively across the SG's 32 threads,
-//       4 entries per thread. simdgroup_barrier seals the build.
-//
-//   Inner FMA loop replaces V11's per-byte mul-sub with a tg-mem load:
-//     V11: w_lo = dl_lo * float(byte & 0xF) - ml_lo;     // 2 ALU ops
-//     V12: w_lo = nibble_table[sb_lo][byte & 0xF];        // 1 tg-mem read
-//
-// Per-byte cycle count (estimated for Apple M-series GPU):
-//   V11: 2 nibble extracts + 2 fp32 mul-sub + 2 cvt-to-half ≈ 6 ALU cycles
-//        + 16 FMAs at MAX_SLOTS=8 = ~22 cycles per byte
-//   V12: 2 tg-mem reads (1-2 cycles each) + 16 FMAs ≈ 18-20 cycles per byte
-//   Saving: 3-4 cycles per byte × 32 bytes/pair × 4 pairs × 11 kbs × 64
-//   experts × 30 layers ≈ 5-6 ms per step at B=8 (estimate).
-//
-// Register pressure DROPS vs V11: V11 held W_lo[32] / W_hi[32] half scratch
-// (32 32-bit slots/thread); V12 doesn't need it. Lower register pressure
-// → potentially higher SM occupancy.
-//
-// tg-mem footprint per TG: 8 × 16 × 2 bytes = 256 B. Negligible.
-//
-// Dispatch shape, buffer layout, output write convention, slot_token
-// indexing — all match V6/V11.
-template<uint MAX_SLOTS>
-inline void moe_gemv_q4k_v12_impl(
-    device const half* hidden,
-    device const uint* slot_token,
-    device const uchar* W_sw,
-    device const uint* active_experts,
-    device const uint* group_start,
-    device half* output,
-    constant uint& D_in,
-    constant uint& D_out,
-    threadgroup half (&nibble_table)[8][16],
-    uint2 tg,
-    uint2 lid)
-{
-    uint n_block = tg.x; uint ai = tg.y; uint expert = active_experts[ai]; uint t = lid.x;
-    if (expert >= 128u) return;
-    uint n = n_block * 32 + t;
-    if (n >= D_out) return;
-    uint gb = group_start[expert]; uint ge = group_start[expert + 1];
-    if (ge == gb) return;
-
-    constexpr uint BLK = 144;
-    uint nbc = D_in / 256;
-    uint super_bytes = nbc * 32 * BLK;
-    uint expert_bytes = (D_out / 32) * super_bytes;
-    device const uchar* W_super = W_sw + expert * expert_bytes + n_block * super_bytes;
-
-    uint slot_base = gb;
-    while (slot_base < ge) {
-        uint chunk = (ge - slot_base < MAX_SLOTS) ? (ge - slot_base) : MAX_SLOTS;
-        device const half* hid_slots[MAX_SLOTS];
-        for (uint s = 0; s < MAX_SLOTS; ++s) {
-            uint idx = (s < chunk) ? (slot_base + s) : slot_base;
-            hid_slots[s] = hidden + slot_token[idx] * D_in;
-        }
-        float accs[MAX_SLOTS];
-        for (uint s = 0; s < MAX_SLOTS; ++s) accs[s] = 0.0f;
-
-        for (uint kb = 0; kb < nbc; ++kb) {
-            device const uchar* blk = W_super + kb * 32 * BLK + t * BLK;
-            float d    = float(*(device const half*)(blk + 0));
-            float dmin = float(*(device const half*)(blk + 2));
-            device const uchar* scales = blk + 4;
-            device const uchar* qs     = blk + 16;
-
-            // Hoist scales (V11 Approach 2, kept).
-            float dl_arr[8], ml_arr[8];
-            for (uint sb = 0; sb < 8; ++sb) {
-                uchar sc, mn;
-                unpack_q4k_scales(scales, sc, mn, sb);
-                dl_arr[sb] = d * float(sc);
-                ml_arr[sb] = dmin * float(mn);
-            }
-
-            // V12: build per-kb nibble lookup table cooperatively across
-            // the SG's 32 threads. 128 entries / 32 threads = 4 entries
-            // per thread. Layout: nibble_table[sb][v] = dl[sb]*v - ml[sb].
-            // Each thread builds entries [t*4 .. t*4+3] of the flattened
-            // table.
-            //
-            // CAVEAT: each thread t computes its OWN dl_arr/ml_arr from
-            // its OWN column's d/dmin. So the table THIS THREAD writes is
-            // specific to its column. Other threads write tables for
-            // their columns. The result: 32 different per-thread "table
-            // entries" living in the shared tg-mem region. This is wrong
-            // for shared-table semantics — each thread's entries clobber
-            // its neighbors.
-            //
-            // FIX: each thread builds its OWN private 8x16 table. Simplest
-            // way: keep it in registers. 128 halves = 64 32-bit per thread
-            // — too high. Better: build only the needed pair's entries
-            // per-pair iteration. 32 entries per pair = 16 32-bit. Doable.
-            //
-            // (Switching the kernel to per-pair private register table.)
-            for (uint pair = 0; pair < 4; ++pair) {
-                uint sb_lo = pair * 2;
-                uint sb_hi = pair * 2 + 1;
-                float dl_lo = dl_arr[sb_lo], ml_lo = ml_arr[sb_lo];
-                float dl_hi = dl_arr[sb_hi], ml_hi = ml_arr[sb_hi];
-
-                // Per-thread private nibble table for this pair.
-                // 16 lo entries + 16 hi entries = 32 halves in registers.
-                half tbl_lo[16], tbl_hi[16];
-                for (uint v = 0; v < 16; ++v) {
-                    tbl_lo[v] = half(dl_lo * float(v) - ml_lo);
-                    tbl_hi[v] = half(dl_hi * float(v) - ml_hi);
-                }
-                uint base_lo = kb * 256 + sb_lo * 32;
-                uint base_hi = kb * 256 + sb_hi * 32;
-
-                for (uint p = 0; p < 32; ++p) {
-                    uchar byte = qs[pair * 32 + p];
-                    half w_lo = tbl_lo[byte & 0xF];
-                    half w_hi = tbl_hi[(byte >> 4) & 0xF];
-                    for (uint s = 0; s < MAX_SLOTS; ++s) {
-                        if (s < chunk) {
-                            device const half* hid = hid_slots[s];
-                            accs[s] += float(hid[base_lo + p]) * float(w_lo)
-                                     + float(hid[base_hi + p]) * float(w_hi);
-                        }
-                    }
-                }
-            }
-        }
-
-        for (uint s = 0; s < MAX_SLOTS; ++s) {
-            if (s < chunk) {
-                output[(slot_base + s) * D_out + n] = half(accs[s]);
-            }
-        }
-        slot_base += chunk;
-    }
-    (void)nibble_table;  // unused — kept in signature for ABI parity if we
-                        // later want to switch to a tg-mem table layout.
-}
-
-[[host_name("moe_gemv_q4k_v12_b1")]]
-kernel void moe_gemv_q4k_v12_b1_kern(
-    device const half* hidden           [[buffer(0)]],
-    device const uint* slot_token       [[buffer(1)]],
-    device const uchar* W_sw            [[buffer(2)]],
-    device const uint* active_experts   [[buffer(3)]],
-    device const uint* group_start      [[buffer(4)]],
-    device half* output                 [[buffer(5)]],
-    constant uint& D_in                 [[buffer(6)]],
-    constant uint& D_out                [[buffer(7)]],
-    uint2 tg                            [[threadgroup_position_in_grid]],
-    uint2 lid                           [[thread_position_in_threadgroup]])
-{
-    threadgroup half nibble_table[8][16];
-    moe_gemv_q4k_v12_impl<1>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, nibble_table, tg, lid);
-}
-
-[[host_name("moe_gemv_q4k_v12_b2")]]
-kernel void moe_gemv_q4k_v12_b2_kern(
-    device const half* hidden           [[buffer(0)]],
-    device const uint* slot_token       [[buffer(1)]],
-    device const uchar* W_sw            [[buffer(2)]],
-    device const uint* active_experts   [[buffer(3)]],
-    device const uint* group_start      [[buffer(4)]],
-    device half* output                 [[buffer(5)]],
-    constant uint& D_in                 [[buffer(6)]],
-    constant uint& D_out                [[buffer(7)]],
-    uint2 tg                            [[threadgroup_position_in_grid]],
-    uint2 lid                           [[thread_position_in_threadgroup]])
-{
-    threadgroup half nibble_table[8][16];
-    moe_gemv_q4k_v12_impl<2>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, nibble_table, tg, lid);
-}
-
-[[host_name("moe_gemv_q4k_v12_b4")]]
-kernel void moe_gemv_q4k_v12_b4_kern(
-    device const half* hidden           [[buffer(0)]],
-    device const uint* slot_token       [[buffer(1)]],
-    device const uchar* W_sw            [[buffer(2)]],
-    device const uint* active_experts   [[buffer(3)]],
-    device const uint* group_start      [[buffer(4)]],
-    device half* output                 [[buffer(5)]],
-    constant uint& D_in                 [[buffer(6)]],
-    constant uint& D_out                [[buffer(7)]],
-    uint2 tg                            [[threadgroup_position_in_grid]],
-    uint2 lid                           [[thread_position_in_threadgroup]])
-{
-    threadgroup half nibble_table[8][16];
-    moe_gemv_q4k_v12_impl<4>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, nibble_table, tg, lid);
-}
-
-[[host_name("moe_gemv_q4k_v12_b8")]]
-kernel void moe_gemv_q4k_v12_b8_kern(
-    device const half* hidden           [[buffer(0)]],
-    device const uint* slot_token       [[buffer(1)]],
-    device const uchar* W_sw            [[buffer(2)]],
-    device const uint* active_experts   [[buffer(3)]],
-    device const uint* group_start      [[buffer(4)]],
-    device half* output                 [[buffer(5)]],
-    constant uint& D_in                 [[buffer(6)]],
-    constant uint& D_out                [[buffer(7)]],
-    uint2 tg                            [[threadgroup_position_in_grid]],
-    uint2 lid                           [[thread_position_in_threadgroup]])
-{
-    threadgroup half nibble_table[8][16];
-    moe_gemv_q4k_v12_impl<8>(hidden, slot_token, W_sw, active_experts, group_start, output, D_in, D_out, nibble_table, tg, lid);
-}
+// MoE Q4_K v12 — DELETED 2026-06 (audit: deceptive dead stub). It carried
+// a v12 suffix > the Q8_0 v11 reference and a header advertising a tg-mem
+// nibble-lookup-table 32%-gap optimization, but its own body admitted the
+// table was wrong for shared-table semantics and silently fell back to a
+// per-pair private register table functionally equal to v11 (nibble_table
+// param was (void)-cast unused). It had ZERO engine call sites — the live
+// AR forward routes Q4_K MoE-up through moe_gemv_q4k_v11_impl. Removed to
+// eliminate the mis-wire trap (a future flip of the up-dispatcher to v12
+// would have been a no-op-at-best). The wired v11 path is at full parity.
 
 // -------- Fused gate+up activation --------
 // Reads a [slots, 2*N_half] tensor where first half is gate_proj and second

@@ -27,13 +27,13 @@
       "role": "Embedding lookup table. Dequantized once at load to fp16 (no per-step kernel).",
       "allowed": ["Q8_0", "Q6_K", "F16"]
     },
-    "attn_q":      { "kind": "dense", "role": "Attention query projection.",  "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_1", "Q4_0", "F16"] },
-    "attn_k":      { "kind": "dense", "role": "Attention key projection.",    "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_1", "Q4_0", "F16"] },
-    "attn_v":      { "kind": "dense", "role": "Attention value projection.",  "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_1", "Q4_0", "F16"] },
-    "attn_output": { "kind": "dense", "role": "Attention output projection.", "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_1", "Q4_0", "F16"] },
-    "ffn_gate":    { "kind": "dense", "role": "Shared FFN gate projection.",  "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_1", "Q4_0", "F16"] },
-    "ffn_up":      { "kind": "dense", "role": "Shared FFN up projection.",    "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_1", "Q4_0", "F16"] },
-    "ffn_down":    { "kind": "dense", "role": "Shared FFN down projection.",  "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_1", "Q4_0", "F16"] },
+    "attn_q":      { "kind": "dense", "role": "Attention query projection.",  "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_K", "Q4_1", "Q4_0", "F16"] },
+    "attn_k":      { "kind": "dense", "role": "Attention key projection.",    "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_K", "Q4_1", "Q4_0", "F16"] },
+    "attn_v":      { "kind": "dense", "role": "Attention value projection.",  "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_K", "Q4_1", "Q4_0", "F16"] },
+    "attn_output": { "kind": "dense", "role": "Attention output projection.", "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_K", "Q4_1", "Q4_0", "F16"] },
+    "ffn_gate":    { "kind": "dense", "role": "Shared FFN gate projection.",  "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_K", "Q4_1", "Q4_0", "F16"] },
+    "ffn_up":      { "kind": "dense", "role": "Shared FFN up projection.",    "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_K", "Q4_1", "Q4_0", "F16"] },
+    "ffn_down":    { "kind": "dense", "role": "Shared FFN down projection.",  "allowed": ["Q8_0", "Q6_K", "Q5_K", "Q5_1", "Q4_K", "Q4_1", "Q4_0", "F16"] },
 
     "ffn_gate_up_exps": {
       "kind": "moe_up",

@@ -97,14 +97,11 @@ let moeQ51V11B1PSO = pso("moe_gemv_q5_1_v11_b1")
 let moeQ51V11B2PSO = pso("moe_gemv_q5_1_v11_b2")
 let moeQ51V11B4PSO = pso("moe_gemv_q5_1_v11_b4")
 let moeQ51V11B8PSO = pso("moe_gemv_q5_1_v11_b8")
-// MoE Q4_K v12 — V11 + per-pair private register nibble lookup table.
-// Compute-bound dequant rewrite attempt (Item-A precomputed-table
-// sub-option from the original kernel-zoo plan).
-let moeQ4KV12B1PSO = pso("moe_gemv_q4k_v12_b1")
-let moeQ4KV12B2PSO = pso("moe_gemv_q4k_v12_b2")
-let moeQ4KV12B4PSO = pso("moe_gemv_q4k_v12_b4")
-let moeQ4KV12B8PSO = pso("moe_gemv_q4k_v12_b8")
-let denseQ4KV4PSO  = pso("dense_gemv_q4k_v4")
+// MoE Q4_K v12 PSOs DELETED 2026-06 (deceptive dead stub; see kernels.swift
+// tombstone + the removed encMoeGemvQ4KV12 dispatcher). The wired Q4_K MoE-up
+// decode uses the v11 zoo. dense_gemv_q4k_v4 PSO DELETED too — replaced by the
+// Q4_K btile zoo (denseGemvQ4KBtileB{1,2,4,8}PSO) declared with the other
+// btile zoos below.
 let moeQ40PSO      = pso("moe_gemv_q4_0_v3")
 let denseQ40V4PSO  = pso("dense_gemv_q4_0_v4")
 let denseQ80V5PSO  = pso("dense_gemv_q8_0_v5")
@@ -244,6 +241,14 @@ let denseGemvQ51BtileB1PSO = pso("dense_gemv_q5_1_btile_b1")
 let denseGemvQ51BtileB2PSO = pso("dense_gemv_q5_1_btile_b2")
 let denseGemvQ51BtileB4PSO = pso("dense_gemv_q5_1_btile_b4")
 let denseGemvQ51BtileB8PSO = pso("dense_gemv_q5_1_btile_b8")
+// Q4_K dense btile zoo — replaces the old single-template dense_gemv_q4k_v4.
+// Brings the Q4_K dense AR path to full Q8_0-grade btile parity (4-SG split-K,
+// B_TILE register accumulators, 2-barrier per-batch reduction). Wired into
+// encDenseGemvAR's .q4_K case so a Q4_K dense tensor no longer hits fail().
+let denseGemvQ4KBtileB1PSO = pso("dense_gemv_q4k_btile_b1")
+let denseGemvQ4KBtileB2PSO = pso("dense_gemv_q4k_btile_b2")
+let denseGemvQ4KBtileB4PSO = pso("dense_gemv_q4k_btile_b4")
+let denseGemvQ4KBtileB8PSO = pso("dense_gemv_q4k_btile_b8")
 
 // Q5_K fused-RMSNorm QKV variants — structural mirror of Q8_0's
 // dense_gemv_q8_0_btile_qkv_otf_b{1,2,4,8}. Same 4-phase shape (RMS reduction,
@@ -666,6 +671,15 @@ func kvMemBudgetFrac() -> Double {
 // would almost certainly starve. 256 leaves 7.5% headroom on an
 // 8192-page pool — enough for one fresh prefill plus a small margin.
 let ADMISSION_FREE_PAGE_FLOOR = 256
+// Exponential-backoff admission (no-fault compaction, 2026-06). When the pool
+// is genuinely over-capacity (no reclaimable refcount-0 page AND growth at the
+// live-safe ceiling) a new submit is REFUSED with a retry-after that grows per
+// consecutive rejection: base · 2^(n−1), capped at MAX. The newcomer simply
+// waits; we never evict an in-flight refcount>0 page to admit it. base=50ms
+// (one tick-ish), cap=10s (a long standoff but still bounded so a client that
+// keeps retrying eventually gets in once a live generation finishes + frees).
+let ADMISSION_BACKOFF_BASE_MS = 50
+let ADMISSION_BACKOFF_MAX_MS = 10_000
 // Load-time assert: if this ever drops below B*MAX_PAGES_PER_SLOT, default
 // initLmState's `(b*MAX + p) % TOTAL_PAGES` routing will alias batches.
 // ONE page size for EVERY layer (full and sliding-window alike). The earlier
@@ -1804,7 +1818,7 @@ func encMoeWriteDispatchArgs(_ cb: MTLCommandBuffer, groupStartBuf: MTLBuffer,
 // the right kernel via a per-format LUT (expressed as a switch).
 //
 // The LUT entries are:
-//   dense:    Q8_0 → btile zoo (kept as fast path),   Q5_K/Q6_K/Q5_1 → v4 single-template
+//   dense:    Q8_0 → btile zoo (kept as fast path),   Q5_K/Q6_K/Q5_1/Q4_K → btile zoo
 //   MoE-up:   Q4_K → V11 templated zoo,                Q5_K          → v6 single-template
 //   MoE-down: Q5_1 → V11 templated zoo,                Q6_K/Q8_0     → v6 single-template
 //
@@ -1835,6 +1849,9 @@ func encDenseGemvAR(_ cb: MTLCommandBuffer,
                            Din: Din, Dout: Dout, activeB: activeB)
     case .q5_1:
         encDenseGemvBtile(cb, xbuf, W, out, psoZoo: q51BtileZoo,
+                           Din: Din, Dout: Dout, activeB: activeB)
+    case .q4_K:
+        encDenseGemvBtile(cb, xbuf, W, out, psoZoo: q4kBtileZoo,
                            Din: Din, Dout: Dout, activeB: activeB)
     case .q4_0:
         encDenseGemvBtile(cb, xbuf, W, out, psoZoo: q40BtileZoo,
@@ -1891,6 +1908,10 @@ private let q6kBtileZoo: [MTLComputePipelineState] = [
 private let q51BtileZoo: [MTLComputePipelineState] = [
     denseGemvQ51BtileB1PSO, denseGemvQ51BtileB2PSO,
     denseGemvQ51BtileB4PSO, denseGemvQ51BtileB8PSO,
+]
+private let q4kBtileZoo: [MTLComputePipelineState] = [
+    denseGemvQ4KBtileB1PSO, denseGemvQ4KBtileB2PSO,
+    denseGemvQ4KBtileB4PSO, denseGemvQ4KBtileB8PSO,
 ]
 private let q40BtileZoo: [MTLComputePipelineState] = [
     denseGemvQ40BtileB1PSO, denseGemvQ40BtileB2PSO,
@@ -3129,29 +3150,12 @@ func encMoeGemvQ51(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ Wq51: MTLBuffer,
     enc.endEncoding()
 }
 
-// MoE Q4_K v12 dispatcher — picks MAX_SLOTS specialization from activeB.
-// Same mapping as V11. Intended for A/B against V11.
-func encMoeGemvQ4KV12(_ cb: MTLCommandBuffer, _ xbuf: MTLBuffer, _ Wq4k: MTLBuffer, _ out: MTLBuffer,
-                       Din: Int, Dout: Int, numActive: Int, activeB: Int,
-                       slotTokenBuf: MTLBuffer? = nil, groupStartBuf: MTLBuffer? = nil) {
-    let pso: MTLComputePipelineState
-    switch max(1, activeB) {
-    case 1:           pso = moeQ4KV12B1PSO
-    case 2:           pso = moeQ4KV12B2PSO
-    case 3, 4:        pso = moeQ4KV12B4PSO
-    default:          pso = moeQ4KV12B8PSO
-    }
-    let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(pso)
-    enc.setBuffer(xbuf, offset: 0, index: 0); enc.setBuffer(slotTokenBuf ?? slot_token, offset: 0, index: 1)
-    enc.setBuffer(Wq4k, offset: 0, index: 2); enc.setBuffer(active_exp, offset: 0, index: 3)
-    enc.setBuffer(groupStartBuf ?? group_start, offset: 0, index: 4); enc.setBuffer(out, offset: 0, index: 5)
-    var du = UInt32(Din), dou = UInt32(Dout)
-    enc.setBytes(&du, length: 4, index: 6); enc.setBytes(&dou, length: 4, index: 7)
-    enc.dispatchThreadgroups(MTLSize(width: Dout / 32, height: numActive, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-    enc.endEncoding()
-}
+// MoE Q4_K v12 dispatcher — DELETED 2026-06 (audit: deceptive dead stub).
+// encMoeGemvQ4KV12 selected the moe_gemv_q4k_v12 kernels which advertised a
+// tg-mem nibble-LUT speedup they never delivered (the kernel fell back to a
+// v11-equivalent register table). It had ZERO call sites; the live MoE-up
+// Q4_K route is encMoeUpGemvAR → encMoeGemvQ4KV11. Removed alongside the
+// kernel + PSOs to eliminate the mis-wire trap.
 
 // MoE Q5_1 v11 dispatcher — picks MAX_SLOTS specialization from activeB,
 // same mapping as encMoeGemvQ4KV11. Used for the down projection.
