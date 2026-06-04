@@ -1670,7 +1670,7 @@ inline void dense_gemv_q8_0_btile_impl(
     device half* output,
     constant uint& D_in,
     constant uint& D_out,
-    threadgroup float (&partials)[4][32],
+    threadgroup float (&partials)[4][32][B_TILE],
     uint2 tg, uint2 lid, uint sg_id)
 {
     constexpr uint N_SPLITS = 4;
@@ -1711,17 +1711,23 @@ inline void dense_gemv_q8_0_btile_impl(
         }
     }
 
-    // Per-batch reduction across N_SPLITS SGs, write each output.
+    // Split-K reduction across N_SPLITS SGs. Publish ALL B_TILE partials,
+    // then ONE barrier, then sg0 reduces + writes ALL B_TILE outputs, then ONE
+    // final barrier. Was 2*B_TILE barriers (16 at B_TILE=8); now 2. Same
+    // partials[0..3] operand order per column => bit-identical output; only the
+    // synchronization count changes.
     for (uint b = 0; b < B_TILE; ++b) {
-        partials[sg_id][lid_sg] = accs[b];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg_id == 0) {
-            float total = partials[0][lid_sg] + partials[1][lid_sg]
-                        + partials[2][lid_sg] + partials[3][lid_sg];
+        partials[sg_id][lid_sg][b] = accs[b];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_id == 0) {
+        for (uint b = 0; b < B_TILE; ++b) {
+            float total = partials[0][lid_sg][b] + partials[1][lid_sg][b]
+                        + partials[2][lid_sg][b] + partials[3][lid_sg][b];
             output[b * D_out + n] = half(total);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 [[host_name("dense_gemv_q8_0_btile_b1")]]
@@ -1735,7 +1741,7 @@ kernel void dense_gemv_q8_0_btile_b1(
     uint2 lid                  [[thread_position_in_threadgroup]],
     uint sg_id                 [[simdgroup_index_in_threadgroup]])
 {
-    threadgroup float partials[4][32];
+    threadgroup float partials[4][32][1];
     dense_gemv_q8_0_btile_impl<1>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
 }
 
@@ -1750,7 +1756,7 @@ kernel void dense_gemv_q8_0_btile_b2(
     uint2 lid                  [[thread_position_in_threadgroup]],
     uint sg_id                 [[simdgroup_index_in_threadgroup]])
 {
-    threadgroup float partials[4][32];
+    threadgroup float partials[4][32][2];
     dense_gemv_q8_0_btile_impl<2>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
 }
 
@@ -1765,7 +1771,7 @@ kernel void dense_gemv_q8_0_btile_b4(
     uint2 lid                  [[thread_position_in_threadgroup]],
     uint sg_id                 [[simdgroup_index_in_threadgroup]])
 {
-    threadgroup float partials[4][32];
+    threadgroup float partials[4][32][4];
     dense_gemv_q8_0_btile_impl<4>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
 }
 
@@ -1780,7 +1786,7 @@ kernel void dense_gemv_q8_0_btile_b8(
     uint2 lid                  [[thread_position_in_threadgroup]],
     uint sg_id                 [[simdgroup_index_in_threadgroup]])
 {
-    threadgroup float partials[4][32];
+    threadgroup float partials[4][32][8];
     dense_gemv_q8_0_btile_impl<8>(hidden, W_sw, output, D_in, D_out, partials, tg, lid, sg_id);
 }
 
