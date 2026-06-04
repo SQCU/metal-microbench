@@ -664,6 +664,22 @@ func kvMemBudgetFrac() -> Double {
     return KV_MEM_BUDGET_FRAC_DEFAULT
 }
 
+// Tier 0 pin-on-grow VALIDATION knob (2026-06). If LM_KV_POOL_PAGES is set to a
+// positive integer, the engine caps the KV pool's resident frontier to that
+// many pages (clamped <= SCRATCH_PAGE_BASE — the device buffers back no more).
+// Used to validate the pin-on-grow MECHANISM on a memory-loaded box with a
+// small pool (e.g. 2000 pages ~6.8GB) that fits free RAM: wired memory should
+// rise by ~chunk-slice as the working set grows into a new chunk, pageins stay
+// flat under thrash, requestResidency succeeds. Returns nil if unset/invalid
+// (production sizing then governs poolCap). Symmetric with kvMemBudgetFrac().
+func kvPoolPagesOverride() -> Int? {
+    if let s = ProcessInfo.processInfo.environment["LM_KV_POOL_PAGES"],
+       let v = Int(s), v > 0 {
+        return min(SCRATCH_PAGE_BASE, v)
+    }
+    return nil
+}
+
 // Admission-backpressure floor. submitRequest refuses to admit a new
 // session when fewer than this many pages are free in the pool. The
 // floor is sized for one typical prefill cycle (~1K-4K tokens =

@@ -1815,6 +1815,16 @@ final class LmEngine {
     private let _savedBTScratch: UnsafeMutablePointer<UInt32>
     private let _savedBTScratchByteCount: Int
 
+    // Tier 0 pin-on-grow (2026-06): which KV chunks are currently wired-resident.
+    // High-water-marks at CHUNK granularity (KV_NUM_CHUNKS=4 discrete steps) as
+    // the working set grows. Monotone-grow: a chunk is never un-pinned within
+    // process life (Tier 0 never shrinks the wired set; eviction stays WITHIN
+    // the pool, recency-of-forward-dependency). Single-threaded access: growPool
+    // (the sole trigger) runs under gEngineLock (the engine serializes CBs), so
+    // no locking is needed. Keyed ONLY on phys-page->chunk, never on any
+    // session/connection/stream id (kv_pages_are_not_connection_stateful).
+    private var residentKvChunks = Set<Int>()
+
     init(weights: LmWeights) {
         self.weights = weights
         self.tokenizer = GemmaBpe(weights: weights)
@@ -1841,13 +1851,29 @@ final class LmEngine {
         let budgetPages = perPageBytes > 0
             ? Int(kvBudgetBytes / Double(perPageBytes))
             : SCRATCH_PAGE_BASE
-        let poolCap = max(ADMISSION_FREE_PAGE_FLOOR,
+        var poolCap = max(ADMISSION_FREE_PAGE_FLOOR,
                           min(SCRATCH_PAGE_BASE, budgetPages))
         print(String(format: "[engine] KV dynamic pool: perPage=%.2f MB, budgetFrac=%.2f, physMem=%.1f GB, model~%.1f GB -> cap=%d pages (geometry max %d, ~%.1f GB if fully committed)",
                      Double(perPageBytes) / (1024*1024), kvMemBudgetFrac(),
                      physMem / (1024*1024*1024), modelBytes / (1024*1024*1024),
                      poolCap, SCRATCH_PAGE_BASE,
                      Double(poolCap) * Double(perPageBytes) / (1024*1024*1024)))
+        // Tier 0 pin-on-grow VALIDATION override (2026-06): LM_KV_POOL_PAGES
+        // caps the resident frontier (growFrontier bounded by poolCapPages) so
+        // the pin-on-grow mechanism can be validated on a memory-loaded box
+        // with a SMALL pool that fits free RAM (e.g. 2000 pages ~6.8GB; wired
+        // rises ~chunk-slice stepwise as the working set grows into a new chunk,
+        // pageins stay flat, requestResidency succeeds). Clamped strictly to
+        // [ADMISSION_FREE_PAGE_FLOOR, SCRATCH_PAGE_BASE] — the device buffers
+        // back no more than SCRATCH_PAGE_BASE pages; never let a test value
+        // exceed the geometry cap.
+        if let override = kvPoolPagesOverride() {
+            let clamped = max(ADMISSION_FREE_PAGE_FLOOR, min(SCRATCH_PAGE_BASE, override))
+            print(String(format: "[engine] LM_KV_POOL_PAGES override -> poolCap=%d pages (requested %d, clamped to [%d, %d]; ~%.1f GB if fully resident)",
+                         clamped, override, ADMISSION_FREE_PAGE_FLOOR, SCRATCH_PAGE_BASE,
+                         Double(clamped) * Double(perPageBytes) / (1024*1024*1024)))
+            poolCap = clamped
+        }
         self.pageManager = PageManager(numPhysPages: SCRATCH_PAGE_BASE,
                                         pageSize: PAGE,
                                         poolCapPages: poolCap)
@@ -1865,6 +1891,41 @@ final class LmEngine {
         self.pageManager.onPageEvicted = { phys, _ in
             trieRef.invalidateAnchorFor(physPage: phys)
         }
+        // Tier 0 pin-on-grow: wire the resident-frontier growth callback so a
+        // never-before-exposed page's KV chunk is wired BEFORE it is handed out.
+        // The engine OWNS the PageManager, so self outlives it — but use [weak
+        // self] (the closure is cleared only at process teardown; a nil self at
+        // that point means no work to do).
+        self.pageManager.onPageCommitted = { [weak self] phys in
+            self?.ensureChunkResidentForPage(phys)
+        }
+    }
+
+    // Tier 0 pin-on-grow trigger (2026-06). Called from PageManager.growPool the
+    // first (and only) time phys page `phys` is exposed at the resident frontier.
+    // Computes the page's KV chunk and pins it (all 30 layers' K+V = 60 buffers)
+    // if not already resident. The chunk arithmetic MUST match zeroPhysPageKV
+    // (lm_engine.swift) and the dispatcher chunk-set builders (bootstrap.swift
+    // activeKVChunkIdxs*) bit-for-bit: `phys / weights.kvChunkPages`. Any
+    // divergence would wire the wrong chunk and reintroduce a fault.
+    //
+    // Idempotent + monotone: the guard short-circuits a chunk already resident
+    // (re-exposed/decref'd pages whose chunk is pinned do no redundant work).
+    // Single-threaded under gEngineLock (growPool serializes via CB execution),
+    // so residentKvChunks needs no locking.
+    //
+    // pinKvChunk is the LOAD-BEARING grow-time precondition: it LOUD-fails at
+    // this grow point if the chunk cannot be wired (it does NOT fall through to
+    // an unpinned page).
+    private func ensureChunkResidentForPage(_ phys: Int) {
+        let chunkIdx = phys / weights.kvChunkPages
+        assert(chunkIdx >= 0 && chunkIdx < KV_NUM_CHUNKS,
+               "ensureChunkResidentForPage: chunkIdx \(chunkIdx) out of range for phys \(phys)")
+        guard !residentKvChunks.contains(chunkIdx) else { return }
+        pinKvChunk(weights, chunkIdx)   // LOUD-fails on wiring failure
+        residentKvChunks.insert(chunkIdx)
+        FileHandle.standardError.write(Data(
+            "[kv-residency] resident KV chunks now \(residentKvChunks.sorted()) (grew into chunk \(chunkIdx) at frontier page \(phys))\n".utf8))
     }
 
     // Grow a session's owned pages so its logical page count covers k_len.

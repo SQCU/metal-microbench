@@ -160,6 +160,22 @@ struct LmWeights {
 // fall back to the prior per-CB residency behavior.
 private var gWeightResidencySet: AnyObject?
 
+// ── Tier 0 KV pin-on-grow residency set (2026-06) ──────────────────────────
+// SEPARATE from the weight set (gWeightResidencySet) by design:
+//   (1) the weight set is committed ONCE at boot from a complete, immutable
+//       buffer list (installWeightResidencySet); a residency set is committed
+//       as a unit. Pin-on-grow ADDS allocations incrementally and re-commits/
+//       re-requests as KV chunks enter the hot working set, so it needs its
+//       own mutable lifecycle.
+//   (2) the weight-set comment above explicitly states KV must NOT ride the
+//       weight set's per-CB-skip path because its working set changes; a
+//       distinct set keeps that boundary legible.
+//   (3) keeps allWeightBuffers (argbuf POINTERS only) untouched, so
+//       staticResidentBytesEstimate (the poolCap math input) stays correct.
+// Both sets attach to the SAME LM queue (Metal allows multiple per queue).
+// Process-life retain.
+private var gKvResidencySet: AnyObject?
+
 extension LmWeights {
     /// Every static weight buffer — fully indexed each forward, immutable.
     /// EXCLUDES the KV chunk pool (K_chunks/V_chunks); includes the static
@@ -213,6 +229,87 @@ func installWeightResidencySet(_ w: LmWeights) {
     } else {
         FileHandle.standardError.write(Data(
             "[residency] macOS < 15: no MTLResidencySet; per-CB useResource path\n".utf8))
+    }
+    // Tier 0: create the (empty) KV residency set + attach it to the LM queue
+    // at boot. No KV chunk is addAllocation'd here — that is PIN-ON-GROW
+    // (pinKvChunk, fired from the page allocator's grow frontier).
+    makeKvResidencySetIfNeeded()
+}
+
+// Tier 0 pin-on-grow — create the persistent KV residency set ONCE at boot and
+// attach it to the LM queue. The set starts EMPTY; chunks enter it lazily via
+// pinKvChunk as the page allocator's resident frontier grows into them.
+//
+// Tier 0 REQUIRES pinning: on macOS < 15 (no MTLResidencySet) OR if the set
+// cannot be created, this is a LOUD boot-time refusal (fail()), NOT a silent
+// unpinned run — an unpinned KV pool is exactly the page-out fault surface this
+// design removes (doc §4). (The weight set degrades to per-CB useResource on
+// the same branch; for KV we must escalate because Tier 0 cannot fall back.)
+func makeKvResidencySetIfNeeded() {
+    if gKvResidencySet != nil { return }
+    if #available(macOS 15.0, *) {
+        do {
+            let set = try device.makeResidencySet(descriptor: MTLResidencySetDescriptor())
+            // Empty commit is well-defined; chunks are added incrementally.
+            set.commit()
+            queue.addResidencySet(set)
+            gKvResidencySet = set   // retain for process lifetime
+            FileHandle.standardError.write(Data(
+                "[kv-residency] created persistent KV MTLResidencySet (attached to LM queue, pin-on-grow; 0 chunks resident at boot)\n".utf8))
+        } catch {
+            fail("[kv-residency] FATAL: could not create KV MTLResidencySet (\(error)); "
+                + "Tier 0 REQUIRES a wired KV pool — refusing to run unpinned "
+                + "(would reintroduce the hot-KV page-out fault, doc §4)")
+        }
+    } else {
+        fail("[kv-residency] FATAL: macOS < 15 has no MTLResidencySet; "
+            + "Tier 0 REQUIRES a wired KV pool — refusing to run unpinned "
+            + "(would reintroduce the hot-KV page-out fault, doc §4)")
+    }
+}
+
+// Tier 0 pin-on-grow — wire ALL 30 layers' K and V buffers for chunk `chunkIdx`
+// (= 60 MTLBuffers) into the KV residency set, then requestResidency.
+//
+// GEOMETRY: one phys page covers [16P..16P+15] in EVERY layer's K/V buffer
+// (page_manager.swift:58-59), so committing one pool page touches that page's
+// slice in all 30 layers' K AND V — all 60 buffers for the chunk must be wired
+// together or the first forward READ of a slide/full layer faults.
+//
+// requestResidency is LOAD-BEARING (requirement 3): this is a GROW-TIME
+// PRECONDITION. If the set is unavailable or wiring fails, this LOUD-fails at
+// the grow point — it does NOT fall through to handing back an unpinned page.
+// (macOS requestResidency() returns Void and does not signal a wired-limit
+// failure on the success path; the LM_KV_POOL_PAGES test — vm_stat wired delta
+// per chunk, pageins flat — is the validation that the call is load-bearing.)
+func pinKvChunk(_ w: LmWeights, _ chunkIdx: Int) {
+    precondition(chunkIdx >= 0 && chunkIdx < KV_NUM_CHUNKS,
+                 "pinKvChunk: chunkIdx \(chunkIdx) out of range [0, \(KV_NUM_CHUNKS))")
+    // Per-chunk byte size (telemetry + the LOUD-fail message).
+    var chunkBytes = 0
+    for L in 0..<NUM_LAYERS {
+        chunkBytes += w.K_chunks[L][chunkIdx].length + w.V_chunks[L][chunkIdx].length
+    }
+    if #available(macOS 15.0, *) {
+        guard let set = gKvResidencySet as? MTLResidencySet else {
+            fail("[kv-residency] FATAL: failed to wire KV chunk \(chunkIdx) "
+                + "(60 buffers, ~\(chunkBytes / (1024*1024)) MiB) at grow frontier: "
+                + "KV residency set was never created — Tier 0 cannot serve an "
+                + "unpinned page (doc §4)")
+        }
+        for L in 0..<NUM_LAYERS {
+            set.addAllocation(w.K_chunks[L][chunkIdx])
+            set.addAllocation(w.V_chunks[L][chunkIdx])
+        }
+        set.commit()
+        set.requestResidency()
+        FileHandle.standardError.write(Data(
+            "[kv-residency] pinned KV chunk \(chunkIdx) (60 buffers, ~\(chunkBytes / (1024*1024)) MiB) into the KV residency set + requestResidency\n".utf8))
+    } else {
+        fail("[kv-residency] FATAL: failed to wire KV chunk \(chunkIdx) "
+            + "(60 buffers, ~\(chunkBytes / (1024*1024)) MiB) at grow frontier: "
+            + "macOS < 15 has no MTLResidencySet — Tier 0 cannot serve an "
+            + "unpinned page (doc §4)")
     }
 }
 

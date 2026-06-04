@@ -140,6 +140,15 @@ final class PageManager {
     // RadixTrie.invalidateAnchorFor so stale anchors get unlinked.
     // Receives (physPage, oldHash).
     var onPageEvicted: ((Int, UInt64) -> Void)?
+    // Tier 0 pin-on-grow (2026-06): fired EXACTLY ONCE per never-before-exposed
+    // phys page (resident-frontier growth in growPool), for chunk-granular KV
+    // wiring. The engine wires this to ensureChunkResidentForPage, which pins
+    // the page's KV chunk (all 30 layers' K+V) into the KV residency set before
+    // the page is handed out / first-touched. PageManager stays Metal-free (no
+    // MTLBuffer / weights dependency) — same decoupling as onPageEvicted. The
+    // reuse/decref paths (free-stack pop, freeUncached.append on decref) do NOT
+    // call this — only the growFrontier advance does.
+    var onPageCommitted: ((Int) -> Void)?
     // 2026-05-07: deleted `sessionPages: [Int: [Int]]`. Callers now hold
     // their own list of phys pages they reference and call decref()
     // when done. No per-session ledger lives in the page manager —
@@ -210,6 +219,12 @@ final class PageManager {
         // Newly-exposed page is uncached, refcount 0.
         freeUncachedPos[phys] = freeUncached.count
         freeUncached.append(phys)
+        // Tier 0 pin-on-grow: this is the SOLE resident-frontier growth point.
+        // Fire BEFORE returning so the page's KV chunk is wired-resident before
+        // allocFresh hands the page to a session and zeroPhysPageKV first-touches
+        // it (same call stack — completes synchronously). Idempotent on the
+        // engine side: a page whose chunk is already resident short-circuits.
+        onPageCommitted?(phys)
         return phys
     }
 
