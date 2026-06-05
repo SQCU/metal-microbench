@@ -123,6 +123,7 @@ if ProcessInfo.processInfo.environment["KV_VIZ"] != nil {
 }
 if ProcessInfo.processInfo.environment["LM_TEST_RADIX_TRIE"] != nil {
     runRadixTrieTests()
+    runKvSsdStoreRecencyTests()
 }
 // LM_SHARED_PREFIX_DEMO / LM_BRANCH_DEMO / LM_PAUSE_DEMO were inline-
 // template harnesses replicating what /v1/chat/completions does. Removed.

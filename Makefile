@@ -4,7 +4,7 @@
 # bootstrap.swift contains the former main.swift's declarations + helpers +
 # runEnvDrivenDemos() function. main.swift is a tiny top-level entry that only
 # the executable target builds; the dylib target omits it.
-FORWARD_GRAPH_LIB_SRCS = bootstrap.swift weights.swift runtime.swift common.swift kernels.swift vision_tower.swift vision_residency.swift harness.swift tokenizer.swift lm_session.swift lm_engine.swift page_manager.swift radix_trie.swift kv_visualizer.swift profile_prefill.swift profile_ar_step.swift
+FORWARD_GRAPH_LIB_SRCS = bootstrap.swift weights.swift runtime.swift common.swift kernels.swift vision_tower.swift vision_residency.swift harness.swift tokenizer.swift lm_session.swift lm_engine.swift page_manager.swift radix_trie.swift kv_ssd_store.swift kv_visualizer.swift profile_prefill.swift profile_ar_step.swift
 # lm_engine.swift references isVisionTicketFailed/clearVisionTicket defined in
 # ffi.swift; include ffi.swift in the executable build too (it only adds
 # @_cdecl shims that are no-ops when called from Swift).

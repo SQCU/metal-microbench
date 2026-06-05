@@ -1231,19 +1231,76 @@ final class Session {
         // page off the free list while this live generation references it).
         // Each adopted member is a CITATION (distinct adopter of a shared
         // prefix page) -> isCitation:true bumps decayed-citation reuse-value.
-        for i in beforeAdopted..<match.pages.count {
-            let phys = match.pages[i]
-            engine.pageManager.incref(physPage: phys)
+        //
+        // Tier 1: a matched page may be .ssd (demoted). RELOAD it FIRST into a
+        // fresh RAM page (Tier-0 onPageCommitted pins its chunk on grow), then
+        // treat the reloaded page like a RAM adoption. allocFresh hands a
+        // refcount==1 page, so the .ssd branch SKIPS the incref (the alloc's
+        // refcount is the adoption reference); the .ram branch increfs a
+        // refcount==0 cached page back alive. Adoption stays ALIGNED FULL PAGES
+        // ONLY (position == aligned <= consumedTokens.count invariant intact).
+        var adoptStop = match.pages.count
+        adoptLoop: for i in beforeAdopted..<match.pages.count {
+            let phys: Int
+            switch match.pages[i] {
+            case .ram(let p):
+                phys = p
+                engine.pageManager.incref(physPage: phys)
+            case .ssd(let slot, let hash):
+                // Allocate a fresh RAM page; reload (pread + scatter, bit-exact).
+                guard let p = try? engine.pageManager.allocFresh() else {
+                    // Pool exhausted mid-reload: stop the adoptable run HERE.
+                    // Contiguous-from-root is preserved (we adopted [0..i)); the
+                    // rest re-prefills. allocFresh already failed so no page to
+                    // free.
+                    if ProcessInfo.processInfo.environment["LM_TRIE_DEBUG"] != nil {
+                        let st = engine.pageManager.stats()
+                        FileHandle.standardError.write(Data("[adopt] allocFresh THREW at .ssd page i=\(i) slot=\(slot) (committed=\(st.committedPages) free=\(st.freePages) cap=\(st.poolCapacityPages))\n".utf8))
+                    }
+                    adoptStop = i
+                    break adoptLoop
+                }
+                engine.zeroPhysPageKV(p)   // matches the RAM-path first-touch
+                if !engine.reloadKvPageFromSsd(slot: slot, intoPhys: p) {
+                    // pread failed: release the page, stop the run, re-prefill.
+                    engine.pageManager.decref(physPage: p)
+                    adoptStop = i
+                    break adoptLoop
+                }
+                // Anchor flips SSD->RAM(p); back-entry restored.
+                engine.prefixTrie.reloadAnchor(ssdSlot: slot, intoPhys: p)
+                // Re-establish the content index so a future eviction can
+                // re-demote/drop this page (the hash was preserved through demote).
+                engine.pageManager.markContentIndexed(phys: p, contentHash: hash)
+                engine.ssdStore?.freeSlot(slot)
+                // allocFresh's refcount==1 IS the adoption reference; do NOT
+                // incref (the .ram path increfs because it resurrects a
+                // refcount==0 page).
+                phys = p
+            }
             engine.rmapAdd(id, phys, isCitation: true)
             ownedPages.append(phys)
+        }
+        // If a reload aborted the run, treat alignedMatch as the truncated
+        // length so the downstream tallies use the actually-adopted count.
+        if adoptStop < match.pages.count {
+            // ownedPages now holds beforeAdopted + (adoptStop - beforeAdopted)
+            // entries; the rest stays in primingQueue to re-prefill. Sync the
+            // promote watermark to what we actually adopted so promoteFinished
+            // doesn't re-insert an already-resident anchor.
+            if adoptStop > 0 { myPromotedSlidePairCount = adoptStop }
+            let newlyAdopted = (adoptStop - beforeAdopted) * PAGE
+            if ProcessInfo.processInfo.environment["LM_CACHE_DEBUG"] != nil
+                || ProcessInfo.processInfo.environment["LM_TRIE_DEBUG"] != nil {
+                FileHandle.standardError.write(Data("  [cache] session \(id) reload aborted at page \(adoptStop)/\(match.pages.count) (beforeAdopted=\(beforeAdopted)); adopted \(newlyAdopted) tokens\n".utf8))
+            }
+            return (newlyAdopted, newlyAdopted)
         }
         let newAlignedAdopted = (match.pages.count - beforeAdopted) * PAGE
         if alignedMatch > 0 && newAlignedAdopted > 0 {
             myPromotedSlidePairCount = match.pages.count
-            if dbg {
-                print("  [cache] session \(id) adopted \(match.pages.count - beforeAdopted) "
-                      + "additional shared prefix pages via trie (total \(match.pages.count) = "
-                      + "\(match.pages.count * PAGE) tokens; trie matched \(match.trieMatchLength))")
+            if dbg || ProcessInfo.processInfo.environment["LM_TRIE_DEBUG"] != nil {
+                FileHandle.standardError.write(Data("  [cache] session \(id) ADOPTED \(match.pages.count - beforeAdopted) pages (total \(match.pages.count) = \(match.pages.count * PAGE) tokens; engine kvReloadCount=\(engine.kvReloadCount))\n".utf8))
             }
         }
         // Partial-tail adoption DELETED — root cause of the adopted-prefix
@@ -1713,6 +1770,19 @@ final class LmEngine {
     // `byCvecAnchorTagPartial` maps replace it entirely).
     let prefixTrie: RadixTrie
 
+    // Tier 1 cold-KV SSD store (2026-06). nil = Tier 1 DISABLED (KV_SSD_TIER_GB
+    // unset/0): the engine never sets pageManager.onPageDemoteCandidate, so the
+    // drop path is bit-identical to today. When enabled, a forced-eviction
+    // victim (refcount==0 cached page) is gathered + pwritten to a free slot and
+    // its trie anchor retagged RAM->SSD instead of dropped; a later re-adoption
+    // reloads it (pread + scatter) into a fresh RAM page (bit-exact). Owned by
+    // the engine, guarded by gEngineLock like all PageManager ops.
+    let ssdStore: KvSsdStore?
+    // Tier 1 bandwidth telemetry (requirement 5). Counted at the single reload
+    // site in adoptSharedPrefixPages; emitted under LM_CACHE_DEBUG.
+    private(set) var kvReloadCount: Int = 0
+    private(set) var kvReloadBytes: UInt64 = 0
+
     // ── G2/G4 reverse map: phys page -> owning generations (2026-06) ──────
     // The PageManager is anonymous (it knows only refcounts + content hashes),
     // but the engine must answer "which generations list this page?" for three
@@ -1878,6 +1948,11 @@ final class LmEngine {
                                         pageSize: PAGE,
                                         poolCapPages: poolCap)
         self.prefixTrie = RadixTrie(pageSlide: PAGE)
+        // Tier 1 cold-KV SSD store. nil unless KV_SSD_TIER_GB > 0. The slot size
+        // is the SAME perPageBytes computed above (the budget math's Sigma over
+        // all 30 layers of PAGE*KV_H*HD*2 for K and V) — never re-derived, so it
+        // cannot drift from the kernel layout (== doc §1's 3,604,480 B).
+        self.ssdStore = KvSsdStore.makeIfEnabled(perPageBytes: perPageBytes)
         self._savedBTScratchByteCount = B * MAX_PAGES_PER_SLOT * MemoryLayout<UInt32>.stride
         self._savedBTScratch = UnsafeMutablePointer<UInt32>.allocate(
             capacity: B * MAX_PAGES_PER_SLOT)
@@ -1898,6 +1973,27 @@ final class LmEngine {
         // that point means no work to do).
         self.pageManager.onPageCommitted = { [weak self] phys in
             self?.ensureChunkResidentForPage(phys)
+        }
+        // Tier 1 demote hook — wired ONLY when the SSD store exists (KV_SSD_TIER_GB
+        // > 0). When nil the closure is never set -> onPageDemoteCandidate stays
+        // nil -> allocFresh's `?? false` -> the existing DROP runs verbatim
+        // (disabled-no-op path). Returns true iff the page was gathered+pwritten
+        // and the trie anchor retagged RAM->SSD; false (SSD full) -> DROP.
+        if let store = self.ssdStore {
+            self.pageManager.onPageDemoteCandidate = { [weak self] phys, oldHash in
+                return self?.demoteKvPageToSsd(phys: phys, contentHash: oldHash) ?? false
+            }
+            // In-tier LRU belt-and-suspenders (2026-06): when a DEFENSIVE trie
+            // removal (invalidateAnchorFor's clearTagEntry) clears a tag entry
+            // that still held a .ssd(slot) value, reclaim the slab slot. Capture
+            // STORE (not self) and WEAKLY so the trie's lifetime never pins the
+            // store (trie holds the closure, closure holds store, engine holds
+            // both — weak breaks the trie->store strong edge). The explicit
+            // evict-retry path calls store.freeSlot directly and does NOT route
+            // through here, so no slot is ever double-freed.
+            trieRef.onSsdSlotOrphaned = { [weak store] slot in
+                store?.freeSlot(slot)
+            }
         }
     }
 
@@ -1981,20 +2077,50 @@ final class LmEngine {
     // Cost: ~32 KB per page across 25 layers ≈ 800 KB memset, ~3 μs on
     // M5's ~250 GB/s memcpy bandwidth. Negligible vs the ~30 ms step.
     fileprivate func zeroPhysPageKV(_ phys: Int) {
-        // Virtual-page-table-aware zero-fill. Map phys → (chunk_idx,
-        // local_phys) using the same arithmetic the kernels do.
+        // Virtual-page-table-aware zero-fill. Routed through the canonical
+        // kvSliceLayout helper so it cannot drift from copyPhysPageKV /
+        // installPrefixKV / the Tier 1 gather+scatter.
+        for s in kvSliceLayout(phys: phys) {
+            memset(s.k.contents().advanced(by: s.off), 0, s.len)
+            memset(s.v.contents().advanced(by: s.off), 0, s.len)
+        }
+    }
+
+    // CANONICAL per-layer K/V slice descriptor for a phys page (2026-06). THE
+    // single source of truth for the per-layer slice geometry that was
+    // previously duplicated inline in zeroPhysPageKV / copyPhysPageKV /
+    // installPrefixKV. Tier 1 gather/scatter ALSO go through this, so demote and
+    // reload copy the IDENTICAL bytes the kernels read/write — no parallel
+    // re-derived formula can drift. The slide(KV_H=8,HD=256) vs full(KV_H=2,
+    // HD=512) per-layer slice sizes fall out automatically from lw per layer
+    // (never hardcode 65536/32768). Maps phys -> (chunkIdx, localPhys) via the
+    // SAME `phys / weights.kvChunkPages` arithmetic the kernels / Tier 0 use.
+    private func kvSliceLayout(phys: Int)
+        -> [(k: MTLBuffer, v: MTLBuffer, off: Int, len: Int)] {
         let chunkIdx = phys / weights.kvChunkPages
         let localPhys = phys - chunkIdx * weights.kvChunkPages
+        var out: [(k: MTLBuffer, v: MTLBuffer, off: Int, len: Int)] = []
+        out.reserveCapacity(NUM_LAYERS)
         for L in 0..<NUM_LAYERS {
             let lw = weights.layers[L]
-            let pg = PAGE
-            let bytesPerPage = pg * lw.KV_H * lw.HD * 2
-            let off = localPhys * bytesPerPage
-            let kBuf = weights.K_chunks[L][chunkIdx]
-            let vBuf = weights.V_chunks[L][chunkIdx]
-            memset(kBuf.contents().advanced(by: off), 0, bytesPerPage)
-            memset(vBuf.contents().advanced(by: off), 0, bytesPerPage)
+            let len = PAGE * lw.KV_H * lw.HD * 2   // == bytesPerPage, halves x 2 bytes
+            let off = localPhys * len
+            out.append((weights.K_chunks[L][chunkIdx],
+                        weights.V_chunks[L][chunkIdx], off, len))
         }
+        return out
+    }
+
+    // Total bytes a gathered page occupies (Sigma over layers of K+V slice
+    // lengths) — the SSD slot size. Identical to the engine init perPageBytes
+    // and to copyPhysPageKV's per-call total. == doc §1's 3,604,480 B.
+    private var kvPagePerByteTotal: Int {
+        var total = 0
+        for L in 0..<NUM_LAYERS {
+            let lw = weights.layers[L]
+            total += PAGE * lw.KV_H * lw.HD * 2 * 2   // K and V
+        }
+        return total
     }
 
     // CoW-on-extend for partial pages: copy K/V bytes from a source phys
@@ -2011,26 +2137,195 @@ final class LmEngine {
     // (managed/host-visible) so the copy is visible to subsequent GPU
     // dispatches without an explicit synchronize.
     fileprivate func copyPhysPageKV(srcPhys: Int, dstPhys: Int) {
-        let srcChunkIdx = srcPhys / weights.kvChunkPages
-        let srcLocal = srcPhys - srcChunkIdx * weights.kvChunkPages
-        let dstChunkIdx = dstPhys / weights.kvChunkPages
-        let dstLocal = dstPhys - dstChunkIdx * weights.kvChunkPages
+        // Both sides routed through the canonical kvSliceLayout helper (same
+        // per-layer order + slice sizes), so it cannot drift from zeroPhysPageKV
+        // / installPrefixKV / Tier 1 gather+scatter.
+        let src = kvSliceLayout(phys: srcPhys)
+        let dst = kvSliceLayout(phys: dstPhys)
         for L in 0..<NUM_LAYERS {
-            let lw = weights.layers[L]
-            let pg = PAGE
-            let bytesPerPage = pg * lw.KV_H * lw.HD * 2
-            let srcOff = srcLocal * bytesPerPage
-            let dstOff = dstLocal * bytesPerPage
-            let srcK = weights.K_chunks[L][srcChunkIdx]
-            let srcV = weights.V_chunks[L][srcChunkIdx]
-            let dstK = weights.K_chunks[L][dstChunkIdx]
-            let dstV = weights.V_chunks[L][dstChunkIdx]
-            memcpy(dstK.contents().advanced(by: dstOff),
-                   srcK.contents().advanced(by: srcOff),
-                   bytesPerPage)
-            memcpy(dstV.contents().advanced(by: dstOff),
-                   srcV.contents().advanced(by: srcOff),
-                   bytesPerPage)
+            memcpy(dst[L].k.contents().advanced(by: dst[L].off),
+                   src[L].k.contents().advanced(by: src[L].off), src[L].len)
+            memcpy(dst[L].v.contents().advanced(by: dst[L].off),
+                   src[L].v.contents().advanced(by: src[L].off), src[L].len)
+        }
+    }
+
+    // ── Tier 1 gather (RAM -> SSD) / scatter (SSD -> RAM) (2026-06) ───────────
+    // gather: read phys's 60 K/V slices via kvSliceLayout into ONE contiguous
+    // buffer laid out [L0.K | L0.V | L1.K | L1.V | ... | L29.K | L29.V], total
+    // == kvPagePerByteTotal == the SSD slot size. scatter: the exact inverse,
+    // memcpy from the contiguous buffer back into each layer's K then V slice in
+    // the IDENTICAL order. Bit-exact: pure byte copies (no fp re-round), the
+    // per-layer slice len is computed per-layer (slide vs full get their correct
+    // distinct sizes), and the contiguous layout is symmetric between the two.
+    //
+    // DEMOTE: gather phys's bytes, pwrite to a free SSD slot, retag the trie
+    // anchor(s) RAM(phys)->SSD(slot). Returns true iff tiered. Called from the
+    // PageManager forced-eviction victim point (refcount==0 cached page only).
+    private func demoteKvPageToSsd(phys: Int, contentHash: UInt64) -> Bool {
+        guard let store = ssdStore else { return false }
+        // In-tier LRU evict-retry (2026-06): when the store is at its
+        // KV_SSD_TIER_GB cap, allocSlot returns nil. Instead of declining the
+        // demote (which leaked dead .ssd anchors forever — see MEMORY), evict
+        // the COLDEST in-use cold-page ONCE, then retry. The page we are
+        // demoting (`phys`) is a RAM page with NO ssd slot yet, so it can never
+        // be its own eviction victim. There is NO reload in flight in THIS call
+        // (reload runs only in the adopt path, a different CB; single-threaded
+        // under gEngineLock => no interleave), so no mid-reload slot can be
+        // evicted. ORDER: orphanSsdSlot(cold) BEFORE freeSlot(cold) so the trie
+        // entry is nilled before the slot can be re-handed-out; freeSlot then
+        // pushes `cold` onto the free stack so the retry's allocSlot popLast
+        // returns exactly `cold` (retry is guaranteed to succeed).
+        guard let slot: Int = {
+            if let s = store.allocSlot() { return s }
+            guard let cold = store.coldestInUseSlot() else { return nil }
+            prefixTrie.orphanSsdSlot(cold)   // trie bookkeeping only, NO byte I/O
+            store.freeSlot(cold)             // reclaim the slab slot
+            if ProcessInfo.processInfo.environment["LM_CACHE_DEBUG"] != nil {
+                FileHandle.standardError.write(Data(
+                    "[kv-ssd] store FULL, evicted coldest slot \(cold) to demote phys \(phys)\n".utf8))
+            }
+            return store.allocSlot()         // retry ONCE; popLast returns `cold`
+        }() else {
+            // Still nil (no in-use slot to evict, or retry failed) -> DROP.
+            if ProcessInfo.processInfo.environment["LM_CACHE_DEBUG"] != nil {
+                FileHandle.standardError.write(Data(
+                    "[kv-ssd] store FULL, no evictable slot, declining demote of phys \(phys) -> DROP\n".utf8))
+            }
+            return false
+        }
+        let layout = kvSliceLayout(phys: phys)
+        let total = store.perPageBytes
+        let scratch = UnsafeMutableRawPointer.allocate(
+            byteCount: total, alignment: 16)
+        defer { scratch.deallocate() }
+        var cursor = 0
+        for L in 0..<NUM_LAYERS {
+            let s = layout[L]
+            memcpy(scratch.advanced(by: cursor),
+                   s.k.contents().advanced(by: s.off), s.len); cursor += s.len
+            memcpy(scratch.advanced(by: cursor),
+                   s.v.contents().advanced(by: s.off), s.len); cursor += s.len
+        }
+        precondition(cursor == total,
+                     "demoteKvPageToSsd: gathered \(cursor) != slot \(total)")
+        guard store.write(slot: slot, bytes: scratch) else {
+            store.freeSlot(slot)          // pwrite failed: reclaim, then DROP
+            return false
+        }
+        // Retag the trie anchor(s): RAM(phys) -> SSD(slot, hash). The phys
+        // back-entry is removed (so a later eviction of the reused RAM page
+        // does NOT touch this anchor). The contentHash rides along so a reload
+        // can re-establish markContentIndexed without re-walking tokens.
+        let tiered = prefixTrie.demoteAnchor(physPage: phys, ssdSlot: slot,
+                                             contentHash: contentHash)
+        if !tiered {
+            // No full anchor referenced this phys (only partials, already
+            // dropped by demoteAnchor) -> nothing to reload from this slot;
+            // reclaim it and treat as a (non-)demote so the caller's DROP path
+            // semantics (anchor already gone) are preserved.
+            store.freeSlot(slot)
+            return false
+        }
+        if ProcessInfo.processInfo.environment["LM_CACHE_DEBUG"] != nil {
+            FileHandle.standardError.write(Data(
+                "[kv-ssd] DEMOTE phys \(phys) -> slot \(slot) (\(total) B)\n".utf8))
+        }
+        return true
+    }
+
+    // RELOAD (SSD -> RAM): pread slot into a contiguous buffer, scatter into the
+    // 60 slices of freshly-allocated RAM page `intoPhys` via kvSliceLayout. The
+    // scatter OVERWRITES every byte of every live slice, so the page's prior
+    // zero-fill (from allocFresh's zeroPhysPageKV in the caller) is irrelevant.
+    // Bit-exact with the original gather. Returns true on success.
+    fileprivate func reloadKvPageFromSsd(slot: Int, intoPhys: Int) -> Bool {
+        guard let store = ssdStore else { return false }
+        let total = store.perPageBytes
+        let scratch = UnsafeMutableRawPointer.allocate(
+            byteCount: total, alignment: 16)
+        defer { scratch.deallocate() }
+        guard store.read(slot: slot, into: scratch) else { return false }
+        let layout = kvSliceLayout(phys: intoPhys)
+        var cursor = 0
+        for L in 0..<NUM_LAYERS {
+            let s = layout[L]
+            memcpy(s.k.contents().advanced(by: s.off),
+                   scratch.advanced(by: cursor), s.len); cursor += s.len
+            memcpy(s.v.contents().advanced(by: s.off),
+                   scratch.advanced(by: cursor), s.len); cursor += s.len
+        }
+        precondition(cursor == total,
+                     "reloadKvPageFromSsd: scattered \(cursor) != slot \(total)")
+        kvReloadCount += 1
+        kvReloadBytes += UInt64(total)
+        return true
+    }
+
+    // Tier 1 BIT-EXACT round-trip self-test (gated on LM_KV_SSD_SELFTEST).
+    // Writes a deterministic per-byte pattern into a fresh RAM page's 60 K/V
+    // slices, gathers+pwrites to an SSD slot, allocates a SECOND fresh page,
+    // pread+scatters the slot into it, then memcmp's all 60 slices of the two
+    // pages. Proves the demote/reload cycle restores byte-identical K/V across
+    // BOTH the 25 slide layers (KV_H=8,HD=256) and the 5 full layers
+    // (KV_H=2,HD=512) — the per-layer slice len is computed per-layer, so the
+    // distinct sizes are exercised. Requires KV_SSD_TIER_GB enabled (ssdStore
+    // non-nil). No-op (logs skip) when Tier 1 is disabled.
+    func runKvSsdSelfTest() {
+        guard let store = ssdStore else {
+            FileHandle.standardError.write(Data("[kv-ssd-selftest] SKIP: Tier 1 disabled (KV_SSD_TIER_GB unset/0)\n".utf8))
+            return
+        }
+        guard let src = try? pageManager.allocFresh(),
+              let dst = try? pageManager.allocFresh(),
+              let slot = store.allocSlot() else {
+            FileHandle.standardError.write(Data("[kv-ssd-selftest] SKIP: could not allocate pages/slot\n".utf8))
+            return
+        }
+        // Fill src's slices with a deterministic pattern; zero dst.
+        let srcLayout = kvSliceLayout(phys: src)
+        let dstLayout = kvSliceLayout(phys: dst)
+        for L in 0..<NUM_LAYERS {
+            let s = srcLayout[L]
+            let kp = s.k.contents().advanced(by: s.off).assumingMemoryBound(to: UInt8.self)
+            let vp = s.v.contents().advanced(by: s.off).assumingMemoryBound(to: UInt8.self)
+            for b in 0..<s.len {
+                kp[b] = UInt8(truncatingIfNeeded: (L &* 131 &+ b &* 17 &+ 1))
+                vp[b] = UInt8(truncatingIfNeeded: (L &* 251 &+ b &* 13 &+ 7))
+            }
+            let d = dstLayout[L]
+            memset(d.k.contents().advanced(by: d.off), 0, d.len)
+            memset(d.v.contents().advanced(by: d.off), 0, d.len)
+        }
+        // Gather src -> slot, scatter slot -> dst, via the SAME helpers a demote
+        // / reload uses. (Direct gather/scatter to avoid touching the trie.)
+        let total = store.perPageBytes
+        let buf = UnsafeMutableRawPointer.allocate(byteCount: total, alignment: 16)
+        defer { buf.deallocate() }
+        var cur = 0
+        for L in 0..<NUM_LAYERS {
+            let s = srcLayout[L]
+            memcpy(buf.advanced(by: cur), s.k.contents().advanced(by: s.off), s.len); cur += s.len
+            memcpy(buf.advanced(by: cur), s.v.contents().advanced(by: s.off), s.len); cur += s.len
+        }
+        _ = store.write(slot: slot, bytes: buf)
+        _ = reloadKvPageFromSsd(slot: slot, intoPhys: dst)
+        // memcmp all 60 slices.
+        var mismatches = 0
+        for L in 0..<NUM_LAYERS {
+            let s = srcLayout[L]; let d = dstLayout[L]
+            if memcmp(s.k.contents().advanced(by: s.off),
+                      d.k.contents().advanced(by: d.off), s.len) != 0 { mismatches += 1 }
+            if memcmp(s.v.contents().advanced(by: s.off),
+                      d.v.contents().advanced(by: d.off), s.len) != 0 { mismatches += 1 }
+        }
+        store.freeSlot(slot)
+        pageManager.decref(physPage: src)
+        pageManager.decref(physPage: dst)
+        if mismatches == 0 {
+            FileHandle.standardError.write(Data("[kv-ssd-selftest] PASS: demote/reload round-trip bit-exact across all \(NUM_LAYERS) layers (\(total) B/page, slide+full)\n".utf8))
+        } else {
+            FileHandle.standardError.write(Data("[kv-ssd-selftest] FAIL: \(mismatches)/\(NUM_LAYERS * 2) slices differ after round-trip\n".utf8))
         }
     }
 
@@ -2067,15 +2362,13 @@ final class LmEngine {
     // many * 2 bytes.
     fileprivate func installPrefixKV(_ s: Session, k: [Data], v: [Data]) {
         let phys = s.ownedPages[0]
-        // Virtual-page-table-aware K/V write. Same routing as kernels.
-        let chunkIdx = phys / weights.kvChunkPages
-        let localPhys = phys - chunkIdx * weights.kvChunkPages
+        // Routed through the canonical kvSliceLayout helper. The write targets
+        // position 0 of each layer's slice — sliceHalves*2 bytes at the slice
+        // base s.off (== localPhys * PAGE * KV_H * HD * 2, the prior formula).
+        let layout = kvSliceLayout(phys: phys)
         for L in 0..<NUM_LAYERS {
             let lw = weights.layers[L]
-            let pg = PAGE
             let sliceHalves = lw.KV_H * lw.HD
-            let byteOffset = localPhys * pg * sliceHalves * 2
-            // K and V destinations at that offset.
             guard L < k.count, L < v.count else { continue }
             let kBlob = k[L]; let vBlob = v[L]
             guard kBlob.count == sliceHalves * 2,
@@ -2085,10 +2378,8 @@ final class LmEngine {
                       "expected \(sliceHalves * 2))")
                 continue
             }
-            let kBuf = weights.K_chunks[L][chunkIdx]
-            let vBuf = weights.V_chunks[L][chunkIdx]
-            let kDst = kBuf.contents().advanced(by: byteOffset)
-            let vDst = vBuf.contents().advanced(by: byteOffset)
+            let kDst = layout[L].k.contents().advanced(by: layout[L].off)
+            let vDst = layout[L].v.contents().advanced(by: layout[L].off)
             kBlob.withUnsafeBytes { memcpy(kDst, $0.baseAddress, sliceHalves * 2) }
             vBlob.withUnsafeBytes { memcpy(vDst, $0.baseAddress, sliceHalves * 2) }
         }

@@ -126,6 +126,12 @@ public func gemma_init(_ ggufPath: UnsafePointer<CChar>?) -> Int32 {
             for vc in w.V_chunks[L] { _ = vc.setPurgeableState(.nonVolatile) }
         }
         gEngine = LmEngine(weights: w)
+        // Tier 1 cold-KV SSD store BIT-EXACT round-trip self-test (gated on
+        // LM_KV_SSD_SELFTEST; requires KV_SSD_TIER_GB enabled). Validates the
+        // gather/scatter byte layout against the real weight buffers at boot.
+        if ProcessInfo.processInfo.environment["LM_KV_SSD_SELFTEST"] != nil {
+            gEngine?.runKvSsdSelfTest()
+        }
         // Subscribe to macOS memory-pressure events. .warn ⇒ just ask for
         // vision soft-cache flush; .critical ⇒ drop vision working weights
         // + image-softs cache entirely. Session KV stays pinned throughout.

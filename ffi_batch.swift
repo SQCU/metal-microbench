@@ -1485,9 +1485,23 @@ public func gemma_engine_state(_ outBuf: UnsafeMutablePointer<UInt8>?,
 "hits":\(gVisionCacheHits),\
 "misses":\(gVisionCacheMisses)}
 """
+        // Tier 1 cold-KV SSD store telemetry (additive; "enabled":false when
+        // KV_SSD_TIER_GB unset/0). used_slots <= max_slots is the in-tier-
+        // eviction bound invariant; reload/demote counts surface cache value.
+        let ssdSection: String
+        if let s = engine.ssdStore?.stats() {
+            ssdSection = """
+            {"enabled":true,"used_slots":\(s.usedSlots),"max_slots":\(s.maxSlots),\
+"demote_count":\(s.demoteCount),"demote_bytes":\(s.demoteBytes),\
+"reload_count":\(s.reloadCount),"reload_bytes":\(s.reloadBytes)}
+"""
+        } else {
+            ssdSection = #"{"enabled":false}"#
+        }
         return """
         {"kv_cache":\(kvSection),\
 "vision_cache":\(visionSection),\
+"kv_ssd_tier":\(ssdSection),\
 "active_streams":[\(streamLines.joined(separator: ","))],\
 "engine":\(engineSection)}
 """

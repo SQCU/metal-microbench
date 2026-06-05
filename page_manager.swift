@@ -140,6 +140,18 @@ final class PageManager {
     // RadixTrie.invalidateAnchorFor so stale anchors get unlinked.
     // Receives (physPage, oldHash).
     var onPageEvicted: ((Int, UInt64) -> Void)?
+    // Tier 1 cold-KV SSD demote (2026-06): fired at the SAME forced-eviction
+    // victim point as onPageEvicted, but INSTEAD OF it, when Tier 1 is enabled.
+    // (phys, oldHash) -> demoted? The engine's closure gathers the page's 60 K/V
+    // slices, pwrites them to a free SSD slot, retags the trie anchor(s)
+    // RAM(phys)->SSD(slot), and returns true. If it returns false (SSD full) OR
+    // the closure is nil (Tier 1 disabled) the existing onPageEvicted DROP runs
+    // verbatim. The victim is always a refcount==0 CACHED page (a refcount>0
+    // page is structurally absent from the free stacks), so "NEVER demote a
+    // refcount>0 page" holds BY CONSTRUCTION. PageManager stays Metal-free — the
+    // gather/pwrite/retag all live in the engine closure, same decoupling as
+    // onPageEvicted/onPageCommitted.
+    var onPageDemoteCandidate: ((Int, UInt64) -> Bool)?
     // Tier 0 pin-on-grow (2026-06): fired EXACTLY ONCE per never-before-exposed
     // phys page (resident-frontier growth in growPool), for chunk-granular KV
     // wiring. The engine wires this to ensureChunkResidentForPage, which pins
@@ -398,11 +410,20 @@ final class PageManager {
             // remain. The trie is responsible for unlinking the anchor.
             var p = pages[phys]
             if let h = p.contentHash {
-                // Track D: notify the radix trie BEFORE we mutate
-                // PageInfo so the callback can read accurate state if
-                // it wishes. Under ONE PAGE=16 a 16-span is a SINGLE page,
-                // so there is no partner page to co-evict.
-                onPageEvicted?(phys, h)
+                // Tier 1: try to DEMOTE the cold (refcount==0) cached page to
+                // the SSD store instead of DROPPING it. The closure gathers +
+                // pwrites + retags the trie anchor RAM->SSD and returns true. If
+                // Tier 1 is disabled (nil closure) or the SSD store is full
+                // (returns false), fall through to the existing DROP path
+                // (onPageEvicted -> invalidateAnchorFor), bit-identical to
+                // before. Gather READS the page bytes here BEFORE the caller
+                // (ensurePages) zeroes the reused page, so the demote captures
+                // valid K/V. Track D: notify the radix trie BEFORE we mutate
+                // PageInfo so the callback can read accurate state.
+                let demoted = onPageDemoteCandidate?(phys, h) ?? false
+                if !demoted {
+                    onPageEvicted?(phys, h)
+                }
                 p.contentHash = nil
             }
             pages[phys] = p
