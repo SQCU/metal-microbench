@@ -410,17 +410,48 @@ final class PageManager {
             // remain. The trie is responsible for unlinking the anchor.
             var p = pages[phys]
             if let h = p.contentHash {
+                // VALUE-GATED DEMOTE (2026-06): the demote-vs-drop decision now
+                // consults the victim's PROVEN re-adoption value, not just
+                // `contentHash != nil`. The min-scan above selected this page as
+                // the LOWEST-value cached page; here we ask whether it has ANY
+                // proven reuse worth a wasted SSD write. The signal is the
+                // citation MAGNITUDE (p.citationScore), bumped ONLY by
+                // recordCitation on a DISTINCT-ADOPTER adoption — never by a
+                // page's own AR re-reads. A page that was never adopted/cited (a
+                // one-off tail of a distinct prompt) has citationScore == 0 and
+                // therefore ~0 reload value: it would never be re-adopted, so
+                // demoting it is a pure wasted write (the 49,804-demote / 175 GB
+                // distinct-prompt storm). Such a page DROPs (onPageEvicted, no
+                // SSD write) exactly as if Tier 1 were disabled.
+                //
+                // We do NOT gate on decayedCitationScore (the eviction RANK):
+                // a fresh uncited page has recency≈1 so its decayed value ≈ 1.0
+                // (citationScore 0 ⇒ 1+0), which would NOT discriminate the
+                // never-adopted tail. The citation magnitude does: it is >0 iff
+                // some distinct generation adopted the page at least once.
+                //
+                // Threshold is in citation-magnitude units (EWMA of decayed
+                // distinct-adopter citations), env-tunable via
+                // KV_DEMOTE_VALUE_FLOOR; default 0.0 ⇒ predicate is
+                // `citationScore > 0` = "demote ONLY pages with ≥1 proven
+                // citation, drop the rest". No magic number — the floor lives in
+                // the same units as the existing value model, and the default
+                // maps to the principled "proven-adoption" rule.
+                let worthDemoting = p.citationScore > PageManager.demoteValueFloor
                 // Tier 1: try to DEMOTE the cold (refcount==0) cached page to
                 // the SSD store instead of DROPPING it. The closure gathers +
                 // pwrites + retags the trie anchor RAM->SSD and returns true. If
                 // Tier 1 is disabled (nil closure) or the SSD store is full
-                // (returns false), fall through to the existing DROP path
-                // (onPageEvicted -> invalidateAnchorFor), bit-identical to
-                // before. Gather READS the page bytes here BEFORE the caller
-                // (ensurePages) zeroes the reused page, so the demote captures
-                // valid K/V. Track D: notify the radix trie BEFORE we mutate
-                // PageInfo so the callback can read accurate state.
-                let demoted = onPageDemoteCandidate?(phys, h) ?? false
+                // (returns false) OR the page failed the value gate, fall
+                // through to the existing DROP path (onPageEvicted ->
+                // invalidateAnchorFor), bit-identical to before. Gather READS the
+                // page bytes here BEFORE the caller (ensurePages) zeroes the
+                // reused page, so the demote captures valid K/V. Track D: notify
+                // the radix trie BEFORE we mutate PageInfo so the callback can
+                // read accurate state.
+                let demoted = worthDemoting
+                    ? (onPageDemoteCandidate?(phys, h) ?? false)
+                    : false
                 if !demoted {
                     onPageEvicted?(phys, h)
                 }
@@ -469,6 +500,21 @@ final class PageManager {
         let recency = pow(PageManager.citationDecayBase, age)
         return recency * (1.0 + p.citationScore)
     }
+
+    // Value-gate floor for the demote-vs-drop decision (allocFresh forced
+    // eviction). A cached eviction victim is written to SSD (DEMOTED) only if
+    // its citation MAGNITUDE strictly exceeds this floor; otherwise it is
+    // DROPPED (no SSD write). Units = citation magnitude (EWMA of decayed
+    // distinct-adopter citations, same as PageInfo.citationScore). Default 0.0
+    // ⇒ predicate `citationScore > 0` = "demote ONLY pages adopted ≥1 time".
+    // Env KV_DEMOTE_VALUE_FLOOR raises the bar (e.g. require >1 distinct
+    // adopter). Negative values are clamped to 0 (a floor below 0 would admit
+    // never-cited pages, defeating the gate). Lazily read once from the env.
+    static let demoteValueFloor: Double = {
+        let env = ProcessInfo.processInfo.environment["KV_DEMOTE_VALUE_FLOOR"]
+        let floor = (env.flatMap { Double($0) }) ?? 0.0
+        return floor >= 0 ? floor : 0.0
+    }()
 
     // decay(Δ=1) per-tick multiplier = HALF_LIFE^(1/halfLifeTicks) computed
     // as 2^(-1/halfLifeTicks). Lazily read once from the environment.
