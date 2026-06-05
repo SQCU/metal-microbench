@@ -1547,5 +1547,9 @@ public func gemma_shutdown() -> Int32 {
         }
     }
     gEngine = nil
+    // Deterministically unwire the weight + KV residency sets (tens of GB of
+    // wired GPU memory). Without this, reclamation relies on OS process-image
+    // teardown — non-deterministic on graceful exit. See releaseResidencySets.
+    releaseResidencySets()
     return 0
 }

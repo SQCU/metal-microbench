@@ -268,6 +268,31 @@ func makeKvResidencySetIfNeeded() {
     }
 }
 
+// Deterministic teardown of the wired residency sets (2026-06). The weight +
+// KV residency sets pin tens of GB of wired GPU memory; without an explicit
+// release, reclamation relies on the OS tearing down the process image, which
+// (a) is non-deterministic on graceful shutdown and (b) can lag/leak under an
+// abrupt exit. gemma_shutdown calls this so a graceful stop (uvicorn SIGTERM ->
+// app shutdown -> gemma_shutdown) UNWIRES immediately. Idempotent: nils the
+// globals so a re-init recreates them via install/makeKvResidencySetIfNeeded.
+//
+// Supervisor contract: send SIGTERM (graceful drain) — NEVER SIGKILL — so this
+// path runs. (SIGKILL skips it; the OS still reclaims on process death, but not
+// deterministically.) Target the real serve.py PID, not the uv wrapper.
+func releaseResidencySets() {
+    if #available(macOS 15.0, *) {
+        for g in [gWeightResidencySet, gKvResidencySet] {
+            guard let set = g as? MTLResidencySet else { continue }
+            queue.removeResidencySet(set)
+            set.endResidency()
+        }
+        FileHandle.standardError.write(Data(
+            "[residency] released weight + KV residency sets (unwired on shutdown)\n".utf8))
+    }
+    gWeightResidencySet = nil
+    gKvResidencySet = nil
+}
+
 // Tier 0 pin-on-grow — wire ALL 30 layers' K and V buffers for chunk `chunkIdx`
 // (= 60 MTLBuffers) into the KV residency set, then requestResidency.
 //
