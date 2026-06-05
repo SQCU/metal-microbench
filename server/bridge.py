@@ -836,6 +836,23 @@ def _head_is_admission_backpressure(stream_id: int) -> bool:
             and (head.err_msg or "").startswith("admission backpressure"))
 
 
+def _head_is_context_too_large(stream_id: int) -> bool:
+    """True iff the FIRST logged update for `stream_id` is a terminal
+    context-too-large rejection (PERMANENT — the request can never be
+    served because its worst-case k_len exceeds the slot block-table
+    capacity or the KV pool capacity). Peek-only, mirrors
+    _head_is_admission_backpressure. These are NEVER retried — the
+    _resubmit_after_shed retry loop keys only off the backpressure prefix,
+    so a context-too-large terminal falls through to the normal consumer
+    and surfaces as HTTP 413."""
+    log = _stream_logs.get(stream_id)
+    if not log:
+        return False
+    head = log[0]
+    return (head.state == 2 and head.done_reason == 3
+            and (head.err_msg or "").startswith("context too large"))
+
+
 async def _resubmit_after_shed_if_backpressure(
         stream_id: int, spec: "g.StreamSpec",
         response_q: "asyncio.Queue") -> int:
@@ -2272,11 +2289,22 @@ async def chat_completions(req: Request) -> Any:
         # In both cases, errMsg carries the human-readable cause.
         if done_reason == 3:
             print(f"[bridge] stream errored: done_reason=3 err_msg={err_msg!r}")
+            # PERMANENT (-> 413): the request can never be served (slot
+            # block-table cap or KV pool capacity exceeded). NO retry, NO
+            # Retry-After — the client must shrink prompt + max_tokens.
+            # Checked before backpressure (prefixes are disjoint; order is
+            # only for clarity).
+            if err_msg.startswith("context too large"):
+                raise HTTPException(413, f"context too large: {err_msg}")
+            # TRANSIENT (-> 503): fits-but-not-now (pool floor / residency
+            # cap / fit-check / mid-prefill pool exhaustion). Retryable.
             if err_msg.startswith("admission backpressure"):
                 raise HTTPException(
                     503,
                     f"engine admission backpressure: {err_msg}",
                     headers={"Retry-After": "2"})
+            # Generic real engine error (vision 0 soft tokens, consumer
+            # abandonment, etc.) -> 500.
             raise HTTPException(500, f"upstream stream errored: {err_msg or 'unspecified engine failure'}")
         text = g.detokenize(all_tokens)
         # Strip Gemma-4 turn-delimiter surface strings (`<|turn>`,
@@ -2524,14 +2552,18 @@ async def chat_completions(req: Request) -> Any:
                 # finish_reason="error" with the message.
                 if u.done_reason == 3:
                     err_msg = u.err_msg or "unspecified engine failure"
-                    # Distinguish admission backpressure (transient,
-                    # client should retry) from genuine engine failure
-                    # (likely persistent). Both yield as SSE error
-                    # events but with different error types so clients
-                    # can react differently.
-                    is_backpressure = err_msg.startswith("admission backpressure")
-                    err_type = ("admission_backpressure"
-                                if is_backpressure else "engine_error")
+                    # Distinguish three terminal classes (SSE has already
+                    # sent 200 headers, so 413/503 semantics are surfaced
+                    # via the OpenAI error type rather than HTTP status):
+                    #   context_too_large  -> permanent (413), no retry
+                    #   admission_backpressure -> transient (503), retry
+                    #   engine_error -> generic (500)
+                    if err_msg.startswith("context too large"):
+                        err_type = "context_too_large"
+                    elif err_msg.startswith("admission backpressure"):
+                        err_type = "admission_backpressure"
+                    else:
+                        err_type = "engine_error"
                     print(f"[bridge] (SSE) stream errored: done_reason=3 type={err_type} err_msg={err_msg!r}")
                     yield _sse(current_offset, {
                         "id": completion_id,
@@ -2809,9 +2841,16 @@ async def stream_reconnect_sse(stream_id: int, req: Request,
                 if u.state == 2:
                     if u.done_reason == 3:
                         err_msg = u.err_msg or "unspecified engine failure"
-                        is_backpressure = err_msg.startswith("admission backpressure")
-                        err_type = ("admission_backpressure"
-                                    if is_backpressure else "engine_error")
+                        # Same three-class split as the main SSE path:
+                        # context_too_large (413), admission_backpressure
+                        # (503), engine_error (500) — surfaced via the
+                        # OpenAI error type since SSE headers are sent.
+                        if err_msg.startswith("context too large"):
+                            err_type = "context_too_large"
+                        elif err_msg.startswith("admission backpressure"):
+                            err_type = "admission_backpressure"
+                        else:
+                            err_type = "engine_error"
                         yield _sse(current_offset, {
                             "id": completion_id,
                             "object": "chat.completion.chunk",

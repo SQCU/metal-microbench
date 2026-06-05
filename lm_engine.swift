@@ -2035,8 +2035,13 @@ final class LmEngine {
         if needed > MAX_PAGES_PER_SLOT {
             s.state = .done
             s.doneReason = 3
-            s.errMsg = "context length \(kLen) exceeds engine block-table capacity "
-                + "\(MAX_PAGES_PER_SLOT * PAGE) tokens "
+            // PERMANENT (-> 413). Belt-and-suspenders for a request whose total
+            // k_len overshoots MAX_PAGES_PER_SLOT during prefill (admission's
+            // slotPages check should already catch this, but a continue-segment
+            // growth path or rounding could still hit it). "context too large"
+            // prefix routes to HTTP 413 (no retry).
+            s.errMsg = "context too large: context length \(kLen) exceeds engine "
+                + "block-table capacity \(MAX_PAGES_PER_SLOT * PAGE) tokens "
                 + "(\(MAX_PAGES_PER_SLOT) pages at PAGE=\(PAGE)); "
                 + "reduce prompt plus max_tokens"
             print("  ensurePages: context overflow for session \(s.id): "
@@ -2053,8 +2058,14 @@ final class LmEngine {
             } catch {
                 s.state = .done
                 s.doneReason = 3
-                s.errMsg = "KV page pool exhausted while growing context "
-                    + "for stream_id=\(s.streamId) at page "
+                // TRANSIENT (-> 503). A concurrent-admit race (two requests both
+                // passed admission, each saw freePages>=its newPagesNeeded, then
+                // one exhausts the pool mid-prefill) or a TOCTOU trie-trim
+                // between the admission probe and real adoption lands here. It is
+                // RETRYABLE, not a 500: the "admission backpressure" prefix
+                // routes to HTTP 503 ("retry with fewer concurrent").
+                s.errMsg = "admission backpressure: KV page pool exhausted while "
+                    + "growing context for stream_id=\(s.streamId) at page "
                     + "\(s.ownedPages.count)/\(needed); retry with fewer "
                     + "concurrent requests or a shorter prompt"
                 print("  ensurePages: pool exhausted for session \(s.id) "
@@ -2469,15 +2480,31 @@ final class LmEngine {
         case image(Data)   // raw image bytes; bridge resolves via vision tower
     }
 
+    // Admission outcome (2026-06): submitRequest now distinguishes THREE
+    // results so the boundary behaves like a well-behaved API server.
+    //   .admitted(Session)  — request accepted; live Session bound.
+    //   .backpressure       — fits-but-not-now (pool floor / residency cap /
+    //                         post-shed still insufficient). TRANSIENT -> 503.
+    //   .tooLarge(String)   — can NEVER be served (slot block-table cap or KV
+    //                         pool capacity exceeded). PERMANENT -> 413.
+    // The reason String on .tooLarge carries the human-readable cause; the
+    // ffi_batch drain forwards it verbatim and the bridge keys HTTP status off
+    // the err_msg prefix ("context too large" vs "admission backpressure").
+    enum AdmitResult {
+        case admitted(Session)
+        case backpressure
+        case tooLarge(String)
+    }
+
     @discardableResult
     func submitRequest(streamId sid: UInt64,
                        init initParams: RequestInit,
                        segments: [InitialSegment],
-                       imageSubmit: ((Session, Data) -> Void)? = nil) -> Session? {
+                       imageSubmit: ((Session, Data) -> Void)? = nil) -> AdmitResult {
         // Refuse re-binding a live stream — bridge mistake or leaked sid.
         if requestForStream[sid] != nil {
             print("  submitRequest: stream_id \(sid) already live; ignored")
-            return nil
+            return .backpressure
         }
         // Admission backpressure: refuse new submissions when the page
         // pool is below the absolute floor needed for one prefill cycle.
@@ -2495,8 +2522,87 @@ final class LmEngine {
         // admission when fewer pages are available than the floor, so
         // the new request can at least PROBABLY make progress without
         // immediately starving its peers.
+        // ────────────────────────────────────────────────────────────────
+        // ADMISSION FIT-CHECK (2026-06). Compute this request's page footprint
+        // at admission so we (a) PERMANENTLY reject (413) what can never be
+        // served and (b) TRANSIENTLY back-pressure (503) what fits-but-not-now,
+        // instead of admitting an oversized/over-budget request and 500-ing
+        // when ensurePages exhausts the pool mid-prefill.
+        //
+        // slotPages = ceil((promptTokens + maxNewTokens) / PAGE) — the WORST-
+        // CASE per-slot page reservation (a request that stops early never
+        // needs all gen pages, but admission reserves the max — well-behaved-
+        // server worst-case semantics). promptTokensTotal is summed from the
+        // text `.tokens` segments; image segments contribute soft tokens whose
+        // exact count is resolved later by the vision tower, so they're not
+        // counted here — the belt-and-suspenders ensurePages 413 reclassify
+        // (block-table overflow) backstops a vision request that overshoots.
+        var promptTokensTotal = 0
+        for seg in segments {
+            if case .tokens(let toks) = seg { promptTokensTotal += toks.count }
+        }
+        let slotPages = (promptTokensTotal + initParams.maxNewTokens + PAGE - 1) / PAGE
+
         var poolStats = pageManager.stats()
-        if poolStats.freePages < ADMISSION_FREE_PAGE_FLOOR {
+
+        // (1) PERMANENT — slot block-table capacity. A single slot's block
+        // table can address at most MAX_PAGES_PER_SLOT pages; a request whose
+        // worst-case k_len needs more can NEVER be served, regardless of pool
+        // pressure. -> 413.
+        if slotPages > MAX_PAGES_PER_SLOT {
+            let reason = "context too large: slot needs \(slotPages) pages "
+                + "(\(promptTokensTotal + initParams.maxNewTokens) tokens) > engine "
+                + "block-table capacity \(MAX_PAGES_PER_SLOT) pages "
+                + "(\(MAX_PAGES_PER_SLOT * PAGE) tokens at PAGE=\(PAGE)); "
+                + "reduce prompt plus max_tokens"
+            print("  submitRequest: tooLarge (block-table) stream_id=\(sid): \(reason)")
+            return .tooLarge(reason)
+        }
+
+        // POST-ADOPTION new-page count. Real adoption runs LATER inside
+        // s.submit() -> adoptSharedPrefixPages (after openSession). To estimate
+        // newPagesNeeded at admission WITHOUT a session, do a READ-ONLY trie
+        // probe with the SAME cvec tag adoptSharedPrefixPages will compute
+        // (built here from initParams.controls — the session doesn't exist yet
+        // but the controls are known). The probe does NOT adopt/mutate pages or
+        // the trie, so the real adoption inside s.submit() stays byte-identical.
+        // Adoption returns ALIGNED FULL PAGES only, so adoptedPages =
+        // match.pages.count is exact: newPagesNeeded = slotPages - adoptedPages.
+        var adoptedPages = 0
+        if promptTokensTotal > 0 {
+            let probeTokens = assembledProbeTokens(segments)
+            if probeTokens.count > 0 {
+                let match = prefixTrie.findLongestPrefix(
+                    tokens: probeTokens[0..<probeTokens.count],
+                    cvecTagFor: { pageStart in
+                        computeCvecAnchorTag(activeControls: initParams.controls,
+                                             pageStart: pageStart, pageSize: PAGE)
+                    })
+                adoptedPages = match.pages.count
+            }
+        }
+        let newPagesNeeded = max(0, slotPages - adoptedPages)
+
+        // (2) PERMANENT — KV pool capacity. Even after adopting every cache-
+        // resident page, the fresh pages this request needs exceed the entire
+        // pool budget; no amount of shedding can ever make room. -> 413.
+        let poolCap = poolStats.totalPages   // == poolCapacityPages (the budget cap)
+        if newPagesNeeded > poolCap {
+            let reason = "context too large: needs \(newPagesNeeded) new pages "
+                + "(slot \(slotPages) pages minus \(adoptedPages) cache-resident) "
+                + "> KV pool capacity \(poolCap) pages; reduce prompt plus max_tokens"
+            print("  submitRequest: tooLarge (pool-cap) stream_id=\(sid): \(reason)")
+            return .tooLarge(reason)
+        }
+
+        // (3) TRANSIENT FIT-CHECK. Admit only if freePages >= max(FLOOR,
+        // newPagesNeeded), so a request needing >FLOOR pages is NOT admitted
+        // with merely FLOOR free and then exhausted mid-prefill. The FLOOR term
+        // preserves the existing one-prefill-cycle headroom guarantee; the
+        // newPagesNeeded term is the per-request fit. If after shed the pool is
+        // still insufficient -> .backpressure (existing 503 path, unchanged).
+        let admitFloor = max(ADMISSION_FREE_PAGE_FLOOR, newPagesNeeded)
+        if poolStats.freePages < admitFloor {
             // ADMISSION-PRESSURE-CANCEL (G2, 2026-06): under page pressure, before
             // refusing the new request, try to SHED the lowest-reuse-value
             // generation — kill+free, NOT pause (pause→re-prefill is NOT
@@ -2507,14 +2613,14 @@ final class LmEngine {
             // admit. Bounded loop: shed at most a few before giving up so a
             // pathological all-hot-equal-value pool still terminates.
             var shed = 0
-            while poolStats.freePages < ADMISSION_FREE_PAGE_FLOOR && shed < 8 {
+            while poolStats.freePages < admitFloor && shed < 8 {
                 guard shedLowestValueGeneration(excluding: nil) else { break }
                 shed += 1
                 poolStats = pageManager.stats()
             }
-            if poolStats.freePages < ADMISSION_FREE_PAGE_FLOOR {
-                print("  submitRequest: admission backpressure (free=\(poolStats.freePages) < floor=\(ADMISSION_FREE_PAGE_FLOOR), live=\(poolStats.pagesInUse), shed=\(shed) generations)")
-                return nil
+            if poolStats.freePages < admitFloor {
+                print("  submitRequest: admission backpressure (free=\(poolStats.freePages) < admitFloor=\(admitFloor) [floor=\(ADMISSION_FREE_PAGE_FLOOR), newPagesNeeded=\(newPagesNeeded)], live=\(poolStats.pagesInUse), shed=\(shed) generations)")
+                return .backpressure
             }
             if shed > 0 {
                 print("  submitRequest: admission-pressure-cancel shed \(shed) low-value generation(s); free now \(poolStats.freePages)")
@@ -2522,7 +2628,7 @@ final class LmEngine {
         }
         guard let s = openSession(eosId: initParams.eosId,
                                   maxNewTokens: initParams.maxNewTokens) else {
-            return nil
+            return .backpressure
         }
         bindStream(s, streamId: sid)
         s.samplingTemperature = initParams.samplingTemperature
@@ -2549,7 +2655,27 @@ final class LmEngine {
                 imageSubmit?(s, bytes)
             }
         }
-        return s
+        return .admitted(s)
+    }
+
+    // Build the read-only admission probe token vector from the request's
+    // text segments (image segments contribute soft tokens resolved later by
+    // the vision tower and are skipped here — the probe only needs the
+    // contiguous-from-root text prefix that adoptSharedPrefixPages will walk).
+    // Used only by the admission fit-check; does NOT mutate any state.
+    private func assembledProbeTokens(_ segments: [InitialSegment]) -> [UInt32] {
+        var out: [UInt32] = []
+        for seg in segments {
+            switch seg {
+            case .tokens(let toks): out.append(contentsOf: toks)
+            case .image:
+                // An image segment breaks the contiguous text prefix the trie
+                // can match (its soft tokens aren't known here). Stop the probe
+                // at the first image so we never mis-match across the gap.
+                return out
+            }
+        }
+        return out
     }
 
     // Close: release slot (if any), return pages, drop from residency.

@@ -50,12 +50,16 @@ import Foundation
 private let gIntakeCond = NSCondition()    // protects gIntakeQueue + idle wait
 private var gIntakeQueue: [DecodedStream] = []
 
-// Admission-rejected stream IDs. Pushed when submitRequest returns nil
-// (engine refused admission due to pool pressure or residency cap);
-// drained at the top of each gemma_poll iteration into synthetic
-// StreamUpdateOut records carrying done_reason=3 + admission errMsg.
+// Admission-rejected stream IDs. Pushed when submitRequest returns a
+// non-.admitted AdmitResult: .backpressure (TRANSIENT — pool pressure /
+// residency cap / fit-check, "admission backpressure" prefix -> 503) or
+// .tooLarge (PERMANENT — block-table or pool capacity, "context too large"
+// prefix -> 413). Both drain at the top of each gemma_poll iteration into
+// synthetic StreamUpdateOut records carrying done_reason=3 + the reason
+// errMsg; the bridge keys HTTP status off the err_msg prefix.
 // Protected by gEngineLock (applyStreamAction runs under it; gemma_poll
 // also holds it). 2026-05-13: added with admission backpressure.
+// 2026-06: extended to carry the permanent "context too large" reason too.
 private var gRejectedAdmissions: [(streamId: UInt64, reason: String)] = []
 // RCA-1 note (no code change): the audit flagged a cancel-before-bind race
 // where a cancel (action=2) could orphan a not-yet-bound session. On review
@@ -476,20 +480,31 @@ private func applyStreamAction(_ stream: DecodedStream, engine: LmEngine) {
             default: return nil
             }
         }
-        let admitted = engine.submitRequest(streamId: sid, init: initParams,
-                                             segments: segs,
-                                             imageSubmit: { s, bytes in
-                                                 submitImageSegment(s, imageBytes: bytes)
-                                             })
-        if admitted == nil {
-            // Admission backpressure: engine refused the new session
-            // (page-pool floor or residency cap). Surface as a
-            // synthetic terminal update so the bridge gets a clean
-            // signal instead of waiting forever for a stream_id that
-            // never appears in poll results.
+        let admit = engine.submitRequest(streamId: sid, init: initParams,
+                                          segments: segs,
+                                          imageSubmit: { s, bytes in
+                                              submitImageSegment(s, imageBytes: bytes)
+                                          })
+        switch admit {
+        case .admitted:
+            // Live Session bound; the normal poll consumer takes over.
+            break
+        case .backpressure:
+            // TRANSIENT: engine refused the new session (page-pool floor /
+            // residency cap / post-shed-still-insufficient fit-check).
+            // Surface as a synthetic terminal update so the bridge gets a
+            // clean signal instead of waiting forever for a stream_id that
+            // never appears in poll results. The "admission backpressure"
+            // prefix routes to HTTP 503 (retryable) at the bridge.
             let stats = engine.pageManager.stats()
             let msg = "admission backpressure: free=\(stats.freePages) live=\(stats.pagesInUse) total=\(stats.totalPages); retry shortly"
             gRejectedAdmissions.append((streamId: sid, reason: msg))
+        case .tooLarge(let reason):
+            // PERMANENT: the request can never be served (slot block-table cap
+            // or KV pool capacity exceeded). Same synthetic-terminal drain
+            // (state=2/doneReason=3) but the "context too large" prefix routes
+            // to HTTP 413 (no retry) at the bridge.
+            gRejectedAdmissions.append((streamId: sid, reason: reason))
         }
     case 1: // continue — append more segments to a live request
         guard let s = engine.requestForStream[sid] else {
