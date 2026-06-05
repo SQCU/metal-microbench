@@ -34,8 +34,11 @@
 
 import Foundation
 
-// Tier 1 capacity config. KV_SSD_TIER_GB (Double): 0 / unset = DISABLED.
-// Symmetric with kvMemBudgetFrac() / kvPoolPagesOverride() in bootstrap.swift.
+// Tier 1 capacity config. KV_SSD_TIER_GB (Double): a POSITIVE value OVERRIDES
+// the size (tiny tiers force eviction in tests); unset/<=0 returns 0.0 so
+// make() falls back to kDefaultSsdTierGB. Tier 1 is ALWAYS ON (2026-06): the
+// env can resize but NEVER disable. Symmetric with kvMemBudgetFrac() /
+// kvPoolPagesOverride() in bootstrap.swift.
 func kvSsdTierGB() -> Double {
     if let s = ProcessInfo.processInfo.environment["KV_SSD_TIER_GB"],
        let v = Double(s), v > 0 {
@@ -43,6 +46,12 @@ func kvSsdTierGB() -> Double {
     }
     return 0.0
 }
+
+// Fixed default Tier-1 budget when KV_SSD_TIER_GB is unset/<=0. Generous by
+// design: the backing file is SPARSE (ftruncate grows lazily; only written
+// slots consume disk) and eviction is O(1), so a large cap is free until it is
+// actually used. At perPageBytes=3,604,480 B this is ~76,260 slots.
+let kDefaultSsdTierGB = 256.0
 
 final class KvSsdStore {
     // Bytes per logical page = the engine's perPageBytes (Sigma over 30
@@ -57,48 +66,53 @@ final class KvSsdStore {
     // Free-slot reuse stack + high-water of never-used slots.
     private var freeSlots: [Int] = []
     private var highWater: Int = 0
-    // Tier-1 in-tier LRU (2026-06): per-slot recency for coldestInUseSlot().
-    // A monotonic tick (matches PageManager.clockTick's style; no wall clock)
-    // is bumped on the two byte-I/O sites (write=demote, read=reload). slotTick
-    // is a SPARSE dict (not a [UInt64] array) because freeSlot()/allocSlot()
-    // reuse arbitrary indices: a reused slot gets a fresh stamp on its next
-    // write, and freeSlot drops the stale stamp so a freed slot is never a
-    // coldest candidate.
-    private var globalTick: UInt64 = 0
-    private var slotTick: [Int: UInt64] = [:]
+    // Tier-1 in-tier LRU (2026-06): an O(1) intrusive doubly-linked list over
+    // the IN-USE slots, ordered by recency. lruHead = MRU, lruTail = LRU (the
+    // coldest = the eviction victim). Replaces the prior O(highWater) tick-scan
+    // coldestInUseSlot(), which fired on EVERY demote once full — unacceptable
+    // at a 256 GB cap (~76,260 slots) in steady state. A slot is linked into the
+    // list by its FIRST write() (the demote site) and unlinked by freeSlot();
+    // every write()/read() (demote/reload byte-I/O) moves it to the head. Arrays
+    // are sized maxSlots; sentinel -1 means "no neighbour" / "not linked".
+    // (76,260 Ints × 2 ≈ 1.2 MB, negligible.)
+    private var lruPrev: [Int]   // lruPrev[s] = more-recent neighbour, -1 at head
+    private var lruNext: [Int]   // lruNext[s] = less-recent neighbour, -1 at tail
+    private var lruHead: Int = -1   // MRU
+    private var lruTail: Int = -1   // LRU (the coldest)
     // Telemetry.
     private(set) var demoteCount: Int = 0
     private(set) var demoteBytes: UInt64 = 0
     private(set) var reloadCount: Int = 0
     private(set) var reloadBytes: UInt64 = 0
 
-    // Returns nil if Tier 1 is disabled (gb<=0) OR the file cannot be opened.
-    // The caller (engine init) treats nil as "Tier 1 off" and leaves the drop
-    // path unchanged.
-    static func makeIfEnabled(perPageBytes: Int) -> KvSsdStore? {
-        let gb = kvSsdTierGB()
-        guard gb > 0, perPageBytes > 0 else { return nil }
+    // ALWAYS-ON Tier 1 (2026-06): NEVER returns nil. Budget = a positive
+    // KV_SSD_TIER_GB override if set, else kDefaultSsdTierGB (256 GB). The
+    // env can only RESIZE (tiny tiers force eviction in tests), never disable.
+    // createDirectory / open failure => fail() LOUD boot abort (NOT a silent
+    // return-nil that would secretly disable the tier).
+    static func make(perPageBytes: Int) -> KvSsdStore {
+        // A non-positive perPageBytes is a kernel-layout bug, not a disable.
+        precondition(perPageBytes > 0,
+                     "[kv-ssd] perPageBytes must be > 0, got \(perPageBytes)")
+        let gb: Double = { let v = kvSsdTierGB(); return v > 0 ? v : kDefaultSsdTierGB }()
         let bytesCap = gb * 1024.0 * 1024.0 * 1024.0
         let maxSlots = Int(bytesCap / Double(perPageBytes))
-        guard maxSlots > 0 else { return nil }
+        precondition(maxSlots > 0,
+                     "[kv-ssd] maxSlots must be > 0 (gb=\(gb), perPageBytes=\(perPageBytes))")
         // output_data is the canonical artifact dir (memory: outputs_never_to_tmp).
         let dir = "output_data/kv_ssd_tier"
         do {
             try FileManager.default.createDirectory(atPath: dir,
                 withIntermediateDirectories: true, attributes: nil)
         } catch {
-            FileHandle.standardError.write(Data(
-                "[kv-ssd] FAILED to create \(dir): \(error) -> Tier 1 disabled\n".utf8))
-            return nil
+            fail("[kv-ssd] cannot create \(dir): \(error)")
         }
         let path = "\(dir)/kv_tier1.bin"
         // O_TRUNC: the file is process-life only; never trust it across a
         // process restart (volatile content-addressed cache). 0600.
         let fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0o600)
         guard fd >= 0 else {
-            FileHandle.standardError.write(Data(
-                "[kv-ssd] FAILED to open \(path): errno=\(errno) -> Tier 1 disabled\n".utf8))
-            return nil
+            fail("[kv-ssd] cannot open \(path): errno=\(errno)")
         }
         let store = KvSsdStore(fd: fd, path: path,
                                perPageBytes: perPageBytes, maxSlots: maxSlots)
@@ -114,6 +128,37 @@ final class KvSsdStore {
         self.perPageBytes = perPageBytes
         self.maxSlots = maxSlots
         self.freeSlots.reserveCapacity(min(maxSlots, 4096))
+        // Intrusive-LRU neighbour arrays, sentinel -1 = unlinked.
+        self.lruPrev = [Int](repeating: -1, count: maxSlots)
+        self.lruNext = [Int](repeating: -1, count: maxSlots)
+    }
+
+    // ── O(1) intrusive-LRU helpers (2026-06) ─────────────────────────────────
+    // lruUnlink: splice s out of the list (fix neighbours + head/tail), clear
+    // its links. Safe to call on an already-unlinked slot (no-op).
+    private func lruUnlink(_ s: Int) {
+        // Not in the list (and not the lone head==tail) -> nothing to do.
+        if lruPrev[s] == -1 && lruNext[s] == -1 && lruHead != s { return }
+        let p = lruPrev[s], n = lruNext[s]
+        if p != -1 { lruNext[p] = n } else { lruHead = n }   // s was head
+        if n != -1 { lruPrev[n] = p } else { lruTail = p }   // s was tail
+        lruPrev[s] = -1; lruNext[s] = -1
+    }
+
+    // lruPushFront: make s the new head (MRU). Assumes s is currently unlinked.
+    private func lruPushFront(_ s: Int) {
+        lruPrev[s] = -1
+        lruNext[s] = lruHead
+        if lruHead != -1 { lruPrev[lruHead] = s }
+        lruHead = s
+        if lruTail == -1 { lruTail = s }   // first element: head == tail
+    }
+
+    // lruMoveToFront: bump s to MRU. Covers both first-link (unlink is a no-op)
+    // and re-touch (unlink-then-push). O(1).
+    private func lruMoveToFront(_ s: Int) {
+        lruUnlink(s)
+        lruPushFront(s)
     }
 
     deinit {
@@ -144,31 +189,27 @@ final class KvSsdStore {
     }
 
     // Return a slot to the free stack (after a reload reclaims it OR an
-    // in-tier LRU eviction orphans it). Drop the recency stamp so a freed
-    // (not-yet-reused) slot is never picked by coldestInUseSlot.
+    // in-tier LRU eviction orphans it). Unlink it from the recency list so a
+    // freed (not-yet-reused) slot is never picked by coldestInUseSlot.
     func freeSlot(_ slot: Int) {
+        lruUnlink(slot)
         freeSlots.append(slot)
-        slotTick[slot] = nil
     }
 
-    // In-tier LRU victim selection (2026-06). The in-use set is the
-    // [0, highWater) frontier MINUS freeSlots (exactly Stats.usedSlots). Return
-    // the lowest-lastTick in-use slot. Returns nil only when there are no
-    // in-use slots (cannot happen on the demote-evict-retry path, where
-    // allocSlot just returned nil => highWater==maxSlots with every slot in
-    // use, so coldest is non-nil). O(highWater) scan, fired only at cap.
+    // In-tier LRU victim selection (2026-06). The coldest in-use slot is the
+    // LRU tail — O(1). Returns nil only when there are no in-use slots (lruTail
+    // == -1; cannot happen on the demote-evict-retry path, where allocSlot just
+    // returned nil => highWater==maxSlots with every slot in use, so the tail is
+    // non-nil). For the test-only `excluding` set, walk tail->head skipping
+    // excluded slots (small sets, acceptable).
     func coldestInUseSlot(excluding: Set<Int> = []) -> Int? {
-        if highWater == 0 { return nil }
-        let free = Set(freeSlots)   // small; O(1) membership
-        var coldest: Int? = nil
-        var coldestTick = UInt64.max
-        for s in 0..<highWater where !free.contains(s) && !excluding.contains(s) {
-            // A written slot always has a stamp; default 0 ranks an
-            // (in-use but somehow unstamped) slot as coldest, which is safe.
-            let tk = slotTick[s] ?? 0
-            if tk < coldestTick { coldestTick = tk; coldest = s }
+        if excluding.isEmpty { return lruTail == -1 ? nil : lruTail }
+        var s = lruTail
+        while s != -1 {
+            if !excluding.contains(s) { return s }
+            s = lruPrev[s]
         }
-        return coldest
+        return nil
     }
 
     // Write a gathered page (exactly perPageBytes) to slot. Caller has already
@@ -187,7 +228,7 @@ final class KvSsdStore {
             }
             written += n
         }
-        globalTick += 1; slotTick[slot] = globalTick   // recency: demote
+        lruMoveToFront(slot)   // recency: demote (links on first write)
         demoteCount += 1
         demoteBytes += UInt64(perPageBytes)
         return true
@@ -208,7 +249,7 @@ final class KvSsdStore {
             }
             got += n
         }
-        globalTick += 1; slotTick[slot] = globalTick   // recency: reload
+        lruMoveToFront(slot)   // recency: reload
         reloadCount += 1
         reloadBytes += UInt64(perPageBytes)
         return true

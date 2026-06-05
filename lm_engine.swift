@@ -1272,7 +1272,7 @@ final class Session {
                 // Re-establish the content index so a future eviction can
                 // re-demote/drop this page (the hash was preserved through demote).
                 engine.pageManager.markContentIndexed(phys: p, contentHash: hash)
-                engine.ssdStore?.freeSlot(slot)
+                engine.ssdStore.freeSlot(slot)
                 // allocFresh's refcount==1 IS the adoption reference; do NOT
                 // incref (the .ram path increfs because it resurrects a
                 // refcount==0 page).
@@ -1770,14 +1770,14 @@ final class LmEngine {
     // `byCvecAnchorTagPartial` maps replace it entirely).
     let prefixTrie: RadixTrie
 
-    // Tier 1 cold-KV SSD store (2026-06). nil = Tier 1 DISABLED (KV_SSD_TIER_GB
-    // unset/0): the engine never sets pageManager.onPageDemoteCandidate, so the
-    // drop path is bit-identical to today. When enabled, a forced-eviction
-    // victim (refcount==0 cached page) is gathered + pwritten to a free slot and
-    // its trie anchor retagged RAM->SSD instead of dropped; a later re-adoption
-    // reloads it (pread + scatter) into a fresh RAM page (bit-exact). Owned by
-    // the engine, guarded by gEngineLock like all PageManager ops.
-    let ssdStore: KvSsdStore?
+    // Tier 1 cold-KV SSD store (2026-06). ALWAYS ON (non-optional): the engine
+    // always wires pageManager.onPageDemoteCandidate. A forced-eviction victim
+    // (refcount==0 cached page) is gathered + pwritten to a free slot and its
+    // trie anchor retagged RAM->SSD instead of dropped; a later re-adoption
+    // reloads it (pread + scatter) into a fresh RAM page (bit-exact). KV_SSD_TIER_GB
+    // can only RESIZE the budget (tiny tiers force eviction in tests), never
+    // disable. Owned by the engine, guarded by gEngineLock like all PageManager ops.
+    let ssdStore: KvSsdStore
     // Tier 1 bandwidth telemetry (requirement 5). Counted at the single reload
     // site in adoptSharedPrefixPages; emitted under LM_CACHE_DEBUG.
     private(set) var kvReloadCount: Int = 0
@@ -1948,11 +1948,12 @@ final class LmEngine {
                                         pageSize: PAGE,
                                         poolCapPages: poolCap)
         self.prefixTrie = RadixTrie(pageSlide: PAGE)
-        // Tier 1 cold-KV SSD store. nil unless KV_SSD_TIER_GB > 0. The slot size
-        // is the SAME perPageBytes computed above (the budget math's Sigma over
-        // all 30 layers of PAGE*KV_H*HD*2 for K and V) — never re-derived, so it
-        // cannot drift from the kernel layout (== doc §1's 3,604,480 B).
-        self.ssdStore = KvSsdStore.makeIfEnabled(perPageBytes: perPageBytes)
+        // Tier 1 cold-KV SSD store. ALWAYS ON (make never returns nil; a positive
+        // KV_SSD_TIER_GB resizes, unset/<=0 falls back to the 256 GB default). The
+        // slot size is the SAME perPageBytes computed above (the budget math's Sigma
+        // over all 30 layers of PAGE*KV_H*HD*2 for K and V) — never re-derived, so
+        // it cannot drift from the kernel layout (== doc §1's 3,604,480 B).
+        self.ssdStore = KvSsdStore.make(perPageBytes: perPageBytes)
         self._savedBTScratchByteCount = B * MAX_PAGES_PER_SLOT * MemoryLayout<UInt32>.stride
         self._savedBTScratch = UnsafeMutablePointer<UInt32>.allocate(
             capacity: B * MAX_PAGES_PER_SLOT)
@@ -1974,26 +1975,23 @@ final class LmEngine {
         self.pageManager.onPageCommitted = { [weak self] phys in
             self?.ensureChunkResidentForPage(phys)
         }
-        // Tier 1 demote hook — wired ONLY when the SSD store exists (KV_SSD_TIER_GB
-        // > 0). When nil the closure is never set -> onPageDemoteCandidate stays
-        // nil -> allocFresh's `?? false` -> the existing DROP runs verbatim
-        // (disabled-no-op path). Returns true iff the page was gathered+pwritten
-        // and the trie anchor retagged RAM->SSD; false (SSD full) -> DROP.
-        if let store = self.ssdStore {
-            self.pageManager.onPageDemoteCandidate = { [weak self] phys, oldHash in
-                return self?.demoteKvPageToSsd(phys: phys, contentHash: oldHash) ?? false
-            }
-            // In-tier LRU belt-and-suspenders (2026-06): when a DEFENSIVE trie
-            // removal (invalidateAnchorFor's clearTagEntry) clears a tag entry
-            // that still held a .ssd(slot) value, reclaim the slab slot. Capture
-            // STORE (not self) and WEAKLY so the trie's lifetime never pins the
-            // store (trie holds the closure, closure holds store, engine holds
-            // both — weak breaks the trie->store strong edge). The explicit
-            // evict-retry path calls store.freeSlot directly and does NOT route
-            // through here, so no slot is ever double-freed.
-            trieRef.onSsdSlotOrphaned = { [weak store] slot in
-                store?.freeSlot(slot)
-            }
+        // Tier 1 demote hook — ALWAYS wired (Tier 1 is always on). Returns true
+        // iff the page was gathered+pwritten and the trie anchor retagged
+        // RAM->SSD; false (SSD full AND no evictable slot) -> DROP.
+        self.pageManager.onPageDemoteCandidate = { [weak self] phys, oldHash in
+            return self?.demoteKvPageToSsd(phys: phys, contentHash: oldHash) ?? false
+        }
+        // In-tier LRU belt-and-suspenders (2026-06): when a DEFENSIVE trie
+        // removal (invalidateAnchorFor's clearTagEntry) clears a tag entry that
+        // still held a .ssd(slot) value, reclaim the slab slot. Capture STORE
+        // (not self) and WEAKLY so the trie's lifetime never pins the store (trie
+        // holds the closure, closure holds store, engine holds both — weak breaks
+        // the trie->store strong edge). The explicit evict-retry path calls
+        // store.freeSlot directly and does NOT route through here, so no slot is
+        // ever double-freed.
+        let storeRef = self.ssdStore
+        trieRef.onSsdSlotOrphaned = { [weak storeRef] slot in
+            storeRef?.freeSlot(slot)
         }
     }
 
@@ -2163,7 +2161,7 @@ final class LmEngine {
     // anchor(s) RAM(phys)->SSD(slot). Returns true iff tiered. Called from the
     // PageManager forced-eviction victim point (refcount==0 cached page only).
     private func demoteKvPageToSsd(phys: Int, contentHash: UInt64) -> Bool {
-        guard let store = ssdStore else { return false }
+        let store = ssdStore
         // In-tier LRU evict-retry (2026-06): when the store is at its
         // KV_SSD_TIER_GB cap, allocSlot returns nil. Instead of declining the
         // demote (which leaked dead .ssd anchors forever — see MEMORY), evict
@@ -2240,7 +2238,7 @@ final class LmEngine {
     // zero-fill (from allocFresh's zeroPhysPageKV in the caller) is irrelevant.
     // Bit-exact with the original gather. Returns true on success.
     fileprivate func reloadKvPageFromSsd(slot: Int, intoPhys: Int) -> Bool {
-        guard let store = ssdStore else { return false }
+        let store = ssdStore
         let total = store.perPageBytes
         let scratch = UnsafeMutableRawPointer.allocate(
             byteCount: total, alignment: 16)
@@ -2272,10 +2270,7 @@ final class LmEngine {
     // distinct sizes are exercised. Requires KV_SSD_TIER_GB enabled (ssdStore
     // non-nil). No-op (logs skip) when Tier 1 is disabled.
     func runKvSsdSelfTest() {
-        guard let store = ssdStore else {
-            FileHandle.standardError.write(Data("[kv-ssd-selftest] SKIP: Tier 1 disabled (KV_SSD_TIER_GB unset/0)\n".utf8))
-            return
-        }
+        let store = ssdStore
         guard let src = try? pageManager.allocFresh(),
               let dst = try? pageManager.allocFresh(),
               let slot = store.allocSlot() else {

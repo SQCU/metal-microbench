@@ -1284,13 +1284,14 @@ public func gemma_poll(_ timeoutMs: Int32,
 // Admin entries.
 // ----------------------------------------------------------------------
 
-// gemma_status: write a serialized ServerStats blob (ABI: 72 bytes —
-// 6×u32 + 2×u64 + u32 + pad + u64 + 4×u32; grew from 64B to add
-// committed_pages + pool_capacity_pages for the dynamic KV pool).
+// gemma_status: write a serialized ServerStats blob (ABI: 88 bytes —
+// 6×u32 + 2×u64 + u32 + pad + u64 + 4×u32 + 4×u32; grew from 72B to add the
+// Tier-1 SSD telemetry (ssd_used_slots, ssd_max_slots, ssd_demote_count low32,
+// ssd_reload_count low32) for the /health kv_ssd_tier section).
 @_cdecl("gemma_status")
 public func gemma_status(_ outBuf: UnsafeMutablePointer<UInt8>?,
                           _ outCap: Int32) -> Int32 {
-    guard let outBuf = outBuf, outCap >= 72 else { return -28 }
+    guard let outBuf = outBuf, outCap >= 88 else { return -28 }
     var w = BinWriter()
     if let engine = gEngine {
         let stats = engine.pageManager.stats()
@@ -1347,9 +1348,21 @@ public func gemma_status(_ outBuf: UnsafeMutablePointer<UInt8>?,
         // and requests a 72-byte buffer; the bridge is the only consumer.
         w.u32(UInt32(stats.committedPages))
         w.u32(UInt32(stats.poolCapacityPages))
+        // 2026-06 (Tier-1 SSD telemetry): the ABI grows 72 -> 88 to carry four
+        // more u32 the /health kv_ssd_tier section needs. ssdStore is ALWAYS
+        // present (Tier 1 always on), so direct access — no if-let.
+        //   - ssd_used_slots / ssd_max_slots : in-tier-eviction bound gauge
+        //     (used_slots <= max_slots; soak asserts used == max at cap).
+        //   - ssd_demote_count / ssd_reload_count : cache-value tallies, low32
+        //     (test horizons fit; matches the cache_hits low32 precedent above).
+        let ss = engine.ssdStore.stats()
+        w.u32(UInt32(ss.usedSlots))
+        w.u32(UInt32(ss.maxSlots))
+        w.u32(UInt32(truncatingIfNeeded: ss.demoteCount))
+        w.u32(UInt32(truncatingIfNeeded: ss.reloadCount))
     } else {
         // Engine not initialized — return all-zero stats but valid frame.
-        w.zeros(72)
+        w.zeros(88)
     }
     let bytes = w.data
     bytes.withUnsafeBytes { src in
@@ -1485,19 +1498,17 @@ public func gemma_engine_state(_ outBuf: UnsafeMutablePointer<UInt8>?,
 "hits":\(gVisionCacheHits),\
 "misses":\(gVisionCacheMisses)}
 """
-        // Tier 1 cold-KV SSD store telemetry (additive; "enabled":false when
-        // KV_SSD_TIER_GB unset/0). used_slots <= max_slots is the in-tier-
-        // eviction bound invariant; reload/demote counts surface cache value.
-        let ssdSection: String
-        if let s = engine.ssdStore?.stats() {
-            ssdSection = """
+        // Tier 1 cold-KV SSD store telemetry. ALWAYS enabled (Tier 1 is always
+        // on). used_slots <= max_slots is the in-tier-eviction bound invariant;
+        // reload/demote counts surface cache value.
+        let ssdSection: String = {
+            let s = engine.ssdStore.stats()
+            return """
             {"enabled":true,"used_slots":\(s.usedSlots),"max_slots":\(s.maxSlots),\
 "demote_count":\(s.demoteCount),"demote_bytes":\(s.demoteBytes),\
 "reload_count":\(s.reloadCount),"reload_bytes":\(s.reloadBytes)}
 """
-        } else {
-            ssdSection = #"{"enabled":false}"#
-        }
+        }()
         return """
         {"kv_cache":\(kvSection),\
 "vision_cache":\(visionSection),\

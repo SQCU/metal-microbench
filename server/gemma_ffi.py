@@ -244,6 +244,16 @@ class ServerStats:
     #   pool_capacity_pages — budget-derived hard cap == total_pages.
     committed_pages: int = 0
     pool_capacity_pages: int = 0
+    # 2026-06 (Tier-1 SSD cold-cache telemetry): the ABI grew 72 -> 88 to add
+    # four more u32 surfaced on /health as kv_ssd_tier.
+    #   ssd_used_slots / ssd_max_slots — in-tier-eviction bound gauge
+    #       (used <= max; soak asserts used == max at cap, demonstrating the
+    #       O(1)-LRU eviction bounds the store).
+    #   ssd_demote_count / ssd_reload_count — cache-value tallies (low32).
+    ssd_used_slots: int = 0
+    ssd_max_slots: int = 0
+    ssd_demote_count: int = 0
+    ssd_reload_count: int = 0
 
 
 # ----------------------------------------------------------------------
@@ -740,18 +750,21 @@ def engine_state() -> dict:
 
 
 def status() -> ServerStats:
-    out = (C.c_uint8 * 72)()
-    n = _lib.gemma_status(out, 72)
-    if n != 72:
+    out = (C.c_uint8 * 88)()
+    n = _lib.gemma_status(out, 88)
+    if n != 88:
         raise RuntimeError(f"gemma_status returned {n}")
     raw = bytes(out[:n])
     # Trailing four u32 populate what was the 8-byte reserved tail PLUS the
     # 2026-06 G2 growth observable: resident_sessions, cache_hits (low32),
     # committed_pages (growth high-water), pool_capacity_pages (budget cap).
-    # ABI grew 64 -> 72 bytes; the bridge is the sole consumer.
+    # ABI then grew 72 -> 88 to add the Tier-1 SSD telemetry: ssd_used_slots,
+    # ssd_max_slots, ssd_demote_count (low32), ssd_reload_count (low32).
+    # The bridge is the sole consumer.
     (tp, fp, cp, act, gen, prim, ts, tok, ve, _pad, vh,
-     resident, chits, committed, poolcap) = struct.unpack_from(
-        "<IIIIIIQQIIQIIII", raw, 0)
+     resident, chits, committed, poolcap,
+     ssd_used, ssd_max, ssd_demote, ssd_reload) = struct.unpack_from(
+        "<IIIIIIQQIIQIIIIIIII", raw, 0)
     return ServerStats(
         total_pages=tp, free_pages=fp, cached_pages=cp,
         active_streams=act, generating_streams=gen, priming_streams=prim,
@@ -759,4 +772,6 @@ def status() -> ServerStats:
         vision_cache_entries=ve, vision_cache_hits=vh,
         resident_sessions=resident, cache_hits=chits,
         committed_pages=committed, pool_capacity_pages=poolcap,
+        ssd_used_slots=ssd_used, ssd_max_slots=ssd_max,
+        ssd_demote_count=ssd_demote, ssd_reload_count=ssd_reload,
     )

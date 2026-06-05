@@ -1779,6 +1779,15 @@ def health() -> JSONResponse:
         "resident_sessions": s.resident_sessions,
         "resident_count": s.resident_sessions,
         "cache_hits": s.cache_hits,
+        # Tier-1 cold-KV SSD store telemetry (2026-06). used_slots <= max_slots
+        # is the in-tier-eviction bound invariant (soak: used == max at cap);
+        # demote/reload counts surface the cold-cache value (low32).
+        "kv_ssd_tier": {
+            "used_slots": s.ssd_used_slots,
+            "max_slots": s.ssd_max_slots,
+            "demote_count": s.ssd_demote_count,
+            "reload_count": s.ssd_reload_count,
+        },
         "vision_cache_entries": s.vision_cache_entries,
         "vision_cache_hits": s.vision_cache_hits,
         "total_steps": s.total_steps,
