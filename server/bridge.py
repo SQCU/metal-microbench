@@ -1251,19 +1251,33 @@ class _StreamTurnMarkerStripper:
 
     def feed(self, chunk: str) -> str:
         buf = self.tail + chunk
-        # Strip both markers from the buf as far as we can confidently.
-        # Hold back the last (marker_len - 1) chars in case a marker is
-        # being assembled across delta boundaries.
-        hold = max(len(_TURN_OPEN_TEXT), len(_TURN_CLOSE_TEXT)) - 1
-        safe_end = max(0, len(buf) - hold)
-        safe_part = buf[:safe_end].replace(_TURN_OPEN_TEXT, "").replace(_TURN_CLOSE_TEXT, "")
-        self.tail = buf[safe_end:]
-        return safe_part
+        # 1. Strip every COMPLETE marker anywhere in buf. (The old code stripped
+        #    only buf[:safe_end], so a whole 7-char marker straddling the 6-char
+        #    hold boundary had its first char emitted and the rest held — then
+        #    reassembled on the client, e.g. "<" + "turn|>". Strip the WHOLE buf.)
+        buf = buf.replace(_TURN_OPEN_TEXT, "").replace(_TURN_CLOSE_TEXT, "")
+        # 2. Hold back only the longest trailing substring that is a genuine
+        #    PREFIX of a marker (it may be completed by the next delta). Emit the
+        #    rest. A fixed-length hold over-holds and (per above) mis-splits.
+        markers = (_TURN_OPEN_TEXT, _TURN_CLOSE_TEXT)
+        maxp = min(max(len(m) for m in markers) - 1, len(buf))
+        hold_len = 0
+        for plen in range(maxp, 0, -1):
+            suffix = buf[-plen:]
+            if any(m.startswith(suffix) and m != suffix for m in markers):
+                hold_len = plen
+                break
+        if hold_len:
+            self.tail = buf[-hold_len:]
+            return buf[:-hold_len]
+        self.tail = ""
+        return buf
 
     def flush(self) -> str:
-        """Emit the held tail at end-of-stream, stripped of any whole
-        markers that happen to be entirely within it."""
-        t = self.tail.replace(_TURN_OPEN_TEXT, "").replace(_TURN_CLOSE_TEXT, "")
+        """Emit the held tail at end-of-stream. The tail is a marker PREFIX that
+        never completed — strip it the same way the non-streaming path does
+        (_strip_turn_markers drops whole markers + trailing prefixes len>=2)."""
+        t = _strip_turn_markers(self.tail)
         self.tail = ""
         return t
 
@@ -2273,8 +2287,24 @@ async def chat_completions(req: Request) -> Any:
         collected_logprobs: list[g.TokenLogprob] = []
         terminal: g.StreamUpdate | None = None
         # The aggregate branch ignores offsets — it just accumulates.
+        idle_s = 0.0
         async for _offset, u in _consume_engine_stream(
-                stream_id, req, retain_on_clean_close=False):
+                stream_id, req, retain_on_clean_close=False,
+                heartbeat_s=_SSE_HEARTBEAT_S):
+            if u is None:
+                # Non-streaming forward-progress contract: there's no wire to
+                # heartbeat, so a genuine stall (engine emitted NOTHING for the
+                # deadline) must surface as a fast clean 504 instead of hanging
+                # until the client gives up (the /poll 502 we saw). A queued-but-
+                # progressing request still completes — the deadline only counts
+                # consecutive ZERO-update intervals; any real update resets it.
+                idle_s += _SSE_HEARTBEAT_S
+                if idle_s >= _SSE_FORWARD_PROGRESS_DEADLINE_S:
+                    raise HTTPException(504, f"engine produced no output for "
+                                             f"{int(_SSE_FORWARD_PROGRESS_DEADLINE_S)}s "
+                                             f"(forward-progress timeout)")
+                continue
+            idle_s = 0.0
             all_tokens.extend(u.new_tokens)
             all_thinking_tokens.extend(u.new_thinking_tokens)
             if u.logprobs:
