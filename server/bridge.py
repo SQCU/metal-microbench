@@ -403,9 +403,23 @@ async def _wait_until_disconnected(request: Request) -> None:
         await asyncio.sleep(_DISCONNECT_POLL_INTERVAL_S)
 
 
+# SSE forward-progress contract (2026-06): a streaming response must NEVER be
+# silent. While the engine prefills (no tokens emitted yet), the SSE consumer
+# emits a keep-alive every _SSE_HEARTBEAT_S so the client knows the stream is
+# alive (not hung), announces the stream immediately (role delta + prefilling
+# comment), and surfaces a GENUINE engine hang as a fast clean error after
+# _SSE_FORWARD_PROGRESS_DEADLINE_S of zero engine updates — instead of leaving
+# the wire silent until an opaque client socket timeout (~30s) papered over by
+# downstream band-aids. Opt-in via heartbeat_s so the aggregate/reconnect
+# callers stay byte-identical.
+_SSE_HEARTBEAT_S = 2.0
+_SSE_FORWARD_PROGRESS_DEADLINE_S = 90.0
+
+
 async def _consume_engine_stream(stream_id: int, request: Request,
                                    from_offset: int = 0,
-                                   retain_on_clean_close: bool = True):
+                                   retain_on_clean_close: bool = True,
+                                   heartbeat_s=None):
     """Single shared coroutine that owns engine-stream lifecycle.
 
     Yields `(offset, StreamUpdate)` tuples in order, starting at
@@ -489,9 +503,25 @@ async def _consume_engine_stream(stream_id: int, request: Request,
             # Cursor caught up to log tail; wait for a notification.
             get_task = asyncio.create_task(response_q.get())
             try:
-                done, _pending = await asyncio.wait(
-                    {get_task, disc_task},
-                    return_when=asyncio.FIRST_COMPLETED)
+                if heartbeat_s is None:
+                    # Aggregate / reconnect callers: wait indefinitely; the
+                    # cursor re-reads the log on the next append. Unchanged.
+                    done, _pending = await asyncio.wait(
+                        {get_task, disc_task},
+                        return_when=asyncio.FIRST_COMPLETED)
+                else:
+                    # SSE forward-progress: bounded waits so the wire is NEVER
+                    # silent. Each interval with no engine update yields a
+                    # heartbeat sentinel (cursor, None) — the caller emits an SSE
+                    # keep-alive and owns the hang deadline. The pending get_task
+                    # survives across timeouts (asyncio.wait does not cancel it).
+                    while True:
+                        done, _pending = await asyncio.wait(
+                            {get_task, disc_task}, timeout=heartbeat_s,
+                            return_when=asyncio.FIRST_COMPLETED)
+                        if done:
+                            break
+                        yield (cursor, None)   # heartbeat; wire stays alive
             except asyncio.CancelledError:
                 get_task.cancel(); disc_task.cancel()
                 raise
@@ -2473,7 +2503,50 @@ async def chat_completions(req: Request) -> Any:
                 return f": offset={offset}\ndata: {data_obj}\n\n"
             return f": offset={offset}\ndata: {json.dumps(data_obj)}\n\n"
         current_offset = 0
-        async for current_offset, u in _consume_engine_stream(stream_id, req):
+        # Forward-progress contract: announce the stream IMMEDIATELY so it is
+        # never silent while the engine prefills. The role delta is the standard
+        # OpenAI "assistant is responding" first chunk (the admitted/prefilling
+        # signal); the prefilling comment is an SSE keep-alive. Heartbeats then
+        # flow every _SSE_HEARTBEAT_S until the first token; a genuine hang is
+        # surfaced as a clean error after _SSE_FORWARD_PROGRESS_DEADLINE_S.
+        _role_chunk = {
+            "id": completion_id, "object": "chat.completion.chunk",
+            "created": created, "model": MODEL_NAME,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        }
+        yield f"data: {json.dumps(_role_chunk)}\n\n"
+        yield ": prefilling\n\n"
+        _heartbeats = 0
+        async for current_offset, u in _consume_engine_stream(
+                stream_id, req, heartbeat_s=_SSE_HEARTBEAT_S):
+            if u is None:
+                # Heartbeat: engine produced nothing this interval (prefill /
+                # queue / hang). Keep the wire alive; surface a genuine hang fast.
+                _heartbeats += 1
+                if _heartbeats * _SSE_HEARTBEAT_S >= _SSE_FORWARD_PROGRESS_DEADLINE_S:
+                    print(f"[bridge] (SSE) forward-progress timeout: no engine "
+                          f"update for {_SSE_FORWARD_PROGRESS_DEADLINE_S}s on "
+                          f"stream {stream_id}; surfacing engine_stall")
+                    yield _sse(current_offset, {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": MODEL_NAME,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": ""},
+                            "finish_reason": "error",
+                        }],
+                        "error": {
+                            "message": f"engine produced no output for {int(_SSE_FORWARD_PROGRESS_DEADLINE_S)}s",
+                            "type": "engine_stall",
+                        },
+                    })
+                    yield _sse(current_offset, "[DONE]")
+                    return
+                yield ": heartbeat\n\n"
+                continue
+            _heartbeats = 0
             if u.new_thinking_tokens:
                 raw_delta = g.detokenize(u.new_thinking_tokens)
                 if not thinking_header_consumed:
