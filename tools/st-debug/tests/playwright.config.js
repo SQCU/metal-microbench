@@ -27,6 +27,10 @@ const CLEANUP_SCRIPT = resolve(__dirname, '..', 'scripts', 'cleanup_playwright.s
 export default defineConfig({
     testDir: '.',
     testMatch: '*.spec.js',
+    // Deep-and-narrow guard: fails INSTANTLY if the runner is invoked with no
+    // spec/grep selection (a full-suite run = breadth theater). Name specific
+    // specs or --grep; genuine release gate uses RUN_FULL_SUITE=1.
+    globalSetup: resolve(__dirname, 'deep_and_narrow_guard.js'),
     globalTeardown: resolve(__dirname, 'global_teardown.js'),
     use: {
         baseURL: 'http://127.0.0.1:8002',
