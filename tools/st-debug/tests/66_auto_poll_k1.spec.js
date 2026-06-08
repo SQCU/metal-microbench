@@ -70,8 +70,33 @@ test.describe('Auto-poll K_1 regression (spec 66)', () => {
         }, PLUGIN_BASE);
     }
 
+    // The suggester's DEFAULT provenance filter hides experiment_output +
+    // seed_demo personas ("harness probe noise"). The st-debug corpus is now
+    // dominated by experiment_output bios (outer_outer / lock_in synthesis
+    // output), and /yapper-seed ranks those AS the top picks — so with the
+    // default filter the suggester correctly shows "No top picks for this
+    // context" and REAL_TOP=0, which masks the auto-fire thesis under test.
+    // Enable ALL provenance kinds before any frame loads (addInitScript runs in
+    // every frame, incl. the iframe, pre-script) so the available corpus's top
+    // picks render and autoFireK1 is actually exercised. This is orthogonal
+    // test setup (like selecting a character), NOT masking: if auto-fire
+    // regressed, the rows would render but never go .visible and the test still
+    // fails. Verified 2026-06: with the filter open, top=3 rows render and all
+    // 3 auto-fire /poll → 200 on first paint.
+    async function enableAllProvenanceKinds(page) {
+        await page.addInitScript(() => {
+            try {
+                localStorage.setItem('user-personas/suggester-filter-state', JSON.stringify({
+                    canonical: true, manual: true, legacy: true,
+                    experiment_output: true, seed_demo: true,
+                }));
+            } catch (_) { /* private-mode / quota — non-fatal */ }
+        });
+    }
+
     // Navigate via Playwright to a multi-turn chat, then open the suggester.
     async function openSuggesterWithChat(page) {
+        await enableAllProvenanceKinds(page);
         await loadSTNoConnect(page);
         try { await selectCharacterByClick(page, 'dicemother'); } catch { /* fall back to active char */ }
         // Ensure ≥1 meaningful turn so the context judge has signal.
