@@ -70,19 +70,18 @@ test.describe('Auto-poll K_1 regression (spec 66)', () => {
         }, PLUGIN_BASE);
     }
 
-    // The suggester's DEFAULT provenance filter hides experiment_output +
-    // seed_demo personas ("harness probe noise"). The st-debug corpus is now
-    // dominated by experiment_output bios (outer_outer / lock_in synthesis
-    // output), and /yapper-seed ranks those AS the top picks — so with the
-    // default filter the suggester correctly shows "No top picks for this
-    // context" and REAL_TOP=0, which masks the auto-fire thesis under test.
-    // Enable ALL provenance kinds before any frame loads (addInitScript runs in
-    // every frame, incl. the iframe, pre-script) so the available corpus's top
-    // picks render and autoFireK1 is actually exercised. This is orthogonal
-    // test setup (like selecting a character), NOT masking: if auto-fire
-    // regressed, the rows would render but never go .visible and the test still
-    // fails. Verified 2026-06: with the filter open, top=3 rows render and all
-    // 3 auto-fire /poll → 200 on first paint.
+    // Defensive guard: pin ALL provenance kinds visible before any frame loads.
+    // Since efb5c432a the suggester's DEFAULT_FILTER_STATE shows every kind, so
+    // this is normally a no-op — BUT the filter persists to localStorage, and a
+    // prior interactive session in the same profile could leave a kind toggled
+    // OFF. The st-debug corpus is dominated by experiment_output bios
+    // (outer_outer / lock_in synthesis output) which /yapper-seed ranks AS the
+    // top picks; if any of those kinds were persisted-off, REAL_TOP would drop
+    // to 0 and mask the auto-fire thesis. Pinning all-on keeps the spec robust
+    // regardless of stored state. addInitScript runs in every frame (incl. the
+    // iframe) pre-script. NOT masking: a real auto-fire regression still fails
+    // (rows render but never go .visible). Verified 2026-06 in a FRESH context
+    // (no seeding): the new default alone renders top=3 with [0 hidden].
     async function enableAllProvenanceKinds(page) {
         await page.addInitScript(() => {
             try {
