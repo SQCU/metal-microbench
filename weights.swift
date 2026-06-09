@@ -230,6 +230,32 @@ func installWeightResidencySet(_ w: LmWeights) {
         FileHandle.standardError.write(Data(
             "[residency] macOS < 15: no MTLResidencySet; per-CB useResource path\n".utf8))
     }
+    // G9 (2026-06): WIRE the static weights against IDLE eviction. The
+    // MTLResidencySet above wires them for per-CB submission efficiency, NOT
+    // against the OS reclaiming memory while the engine sits idle: the weights
+    // are mmap'd (clean, file-backed, droppable) or copied (compressible), all
+    // storageModeShared. Under accumulated host memory pressure macOS evicted
+    // them and the next forward pass re-faulted ~25GB from the GGUF on SSD —
+    // an ~80s cold prefill (decode was always fine). mlock() pins them
+    // unconditionally (wired limit ~108GB >> ~25GB model); madvise(WILLNEED)
+    // prefetches/keeps them hot. ONLY the static weights — NOT the KV chunks,
+    // which are pin-on-grow + DESIGNED to be evictable under page pressure.
+    // Env-gated (LM_WIRE_WEIGHTS=0 disables) in case wired pressure ever bites;
+    // mlock failure is non-fatal (we degrade to the prior evict-and-refault).
+    if ProcessInfo.processInfo.environment["LM_WIRE_WEIGHTS"] != "0" {
+        var wiredBufs = 0, wiredBytes = 0, failed = 0
+        for b in w.allWeightBuffers {
+            let p = b.contents(); let n = b.length
+            if n == 0 { continue }
+            madvise(p, n, MADV_WILLNEED)
+            if mlock(p, n) == 0 { wiredBufs += 1; wiredBytes += n } else { failed += 1 }
+        }
+        FileHandle.standardError.write(Data(
+            "[residency] mlock+WILLNEED \(wiredBufs) static weight buffers (~\(wiredBytes / (1024*1024*1024)) GB wired against idle eviction; \(failed) mlock failures)\n".utf8))
+    } else {
+        FileHandle.standardError.write(Data(
+            "[residency] LM_WIRE_WEIGHTS=0 — weights NOT wired (will evict+refault under idle pressure)\n".utf8))
+    }
     // Tier 0: create the (empty) KV residency set + attach it to the LM queue
     // at boot. No KV chunk is addAllocation'd here — that is PIN-ON-GROW
     // (pinKvChunk, fired from the page allocator's grow frontier).
