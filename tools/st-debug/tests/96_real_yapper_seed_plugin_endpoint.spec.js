@@ -29,7 +29,10 @@ test.describe('real user-personas /yapper-seed endpoint', () => {
         expect(runtime.ok()).toBeTruthy();
         const runtimeBody = await runtime.json();
         expect(runtimeBody.plugin_dir).toContain(instance.cloneDir);
-        expect(runtimeBody.bridge_url).toBe(manifest.bridgeUrl);
+        // runtime-config exposes bridge_diagnostics_url (the bridge_url/bridgeUrl
+        // field pair was removed from both the handler and the matrix manifest).
+        expect(runtimeBody, 'runtime-config exposes bridge_diagnostics_url')
+            .toHaveProperty('bridge_diagnostics_url');
 
         const response = await request.post(`${instance.url}${PLUGIN_BASE}/yapper-seed`, {
             headers: {

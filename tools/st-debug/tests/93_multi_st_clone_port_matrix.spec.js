@@ -175,7 +175,10 @@ async function assertRuntimeConfig(request, instance, manifest) {
     const body = await response.json();
     expect(body.st_url).toBe(instance.url);
     expect(body.plugin_url).toBe(`${instance.url}${PLUGIN_PATH}`);
-    expect(body.bridge_url).toBe(manifest.bridgeUrl);
+    // runtime-config exposes bridge_diagnostics_url (the bridge_url/bridgeUrl
+    // field pair was removed from both the handler and the matrix manifest).
+    expect(body, `${instance.name} runtime-config exposes bridge_diagnostics_url`)
+        .toHaveProperty('bridge_diagnostics_url');
     expect(body.plugin_dir).toContain(instance.cloneDir);
     expect(body.disable_boot_autosynth).toBe(true);
 }
