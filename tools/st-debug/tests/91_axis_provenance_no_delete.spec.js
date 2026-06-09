@@ -327,28 +327,34 @@ test.describe('axis provenance no-delete invariants - desktop only', () => {
         await expect(filter.locator('input[data-kind="canonical"]')).toBeChecked();
         await expect(filter.locator('input[data-kind="manual"]')).toBeChecked();
         await expect(filter.locator('input[data-kind="legacy"]')).toBeChecked();
-        await expect(filter.locator('input[data-kind="experiment_output"]')).not.toBeChecked();
-        await expect(filter.locator('input[data-kind="seed_demo"]')).not.toBeChecked();
+        // efb5c432a: default-SHOW all kinds (no hidden-by-default) — the operator's
+        // "no fake/hidden outputs no composed interface can reach" tenet. The filter
+        // HIDES reversibly + client-side; it never hides a real output by default.
+        await expect(filter.locator('input[data-kind="experiment_output"]')).toBeChecked();
+        await expect(filter.locator('input[data-kind="seed_demo"]')).toBeChecked();
 
-        await expect(page.locator('#pf-hidden-badge')).toHaveText('[2 hidden]');
-        await expect(page.locator('.ranked-row')).toHaveCount(3);
+        await expect(page.locator('#pf-hidden-badge')).toHaveText('[0 hidden]');
+        await expect(page.locator('.ranked-row')).toHaveCount(5);
         await expect(page.locator('.ranked-row[data-bio-id="canonical-bio.png"]')).toBeVisible();
         await expect(page.locator('.ranked-row[data-bio-id="manual-bio.png"]')).toBeVisible();
         await expect(page.locator('.ranked-row[data-bio-id="legacy-bio.png"]')).toBeVisible();
-        await expect(page.locator('.ranked-row[data-bio-id="experiment-bio.png"]')).toHaveCount(0);
-        await expect(page.locator('.ranked-row[data-bio-id="seed-bio.png"]')).toHaveCount(0);
+        await expect(page.locator('.ranked-row[data-bio-id="experiment-bio.png"]')).toBeVisible();
+        await expect(page.locator('.ranked-row[data-bio-id="seed-bio.png"]')).toBeVisible();
 
+        // Unchecking a kind HIDES it (the reversible opt-in hide), client-side
+        // with NO API call.
         const routeCountsAfterRender = { ...requestCounts };
-        await filter.locator('input[data-kind="experiment_output"]').click();
+        await filter.locator('input[data-kind="experiment_output"]').click();  // uncheck -> hide
         await expect(page.locator('#pf-hidden-badge')).toHaveText('[1 hidden]');
         await expect(page.locator('.ranked-row')).toHaveCount(4);
-        await expect(page.locator('.ranked-row[data-bio-id="experiment-bio.png"]')).toBeVisible();
+        await expect(page.locator('.ranked-row[data-bio-id="experiment-bio.png"]')).toHaveCount(0);
         expect(requestCounts, 'provenance toggle re-filters client-side without API calls')
             .toEqual(routeCountsAfterRender);
 
-        await filter.locator('input[data-kind="seed_demo"]').click();
-        await expect(page.locator('#pf-hidden-badge')).toHaveText('[0 hidden]');
-        await expect(page.locator('.ranked-row')).toHaveCount(5);
+        await filter.locator('input[data-kind="seed_demo"]').click();  // uncheck -> hide
+        await expect(page.locator('#pf-hidden-badge')).toHaveText('[2 hidden]');
+        await expect(page.locator('.ranked-row')).toHaveCount(3);
+        await expect(page.locator('.ranked-row[data-bio-id="seed-bio.png"]')).toHaveCount(0);
         expect(requestCounts, 'second toggle also stays client-side')
             .toEqual(routeCountsAfterRender);
 

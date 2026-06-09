@@ -234,10 +234,12 @@ test.describe('F16 provenance tagging + suggester filter — desktop only', () =
         await expect(canonicalCb, 'canonical checked by default').toBeChecked();
         await expect(manualCb, 'manual checked by default').toBeChecked();
         await expect(legacyCb, 'legacy checked by default').toBeChecked();
-        await expect(expOutCb, 'experiment_output unchecked by default').not.toBeChecked();
-        await expect(seedDemoCb, 'seed_demo unchecked by default').not.toBeChecked();
+        // efb5c432a: default-SHOW all kinds (no hidden-by-default; the operator's
+        // "no fake/hidden outputs no composed interface can reach" tenet).
+        await expect(expOutCb, 'experiment_output checked by default (show)').toBeChecked();
+        await expect(seedDemoCb, 'seed_demo checked by default (show)').toBeChecked();
 
-        // ── (4) Default filter hides experiment_output + seed_demo cards.
+        // ── (4) Default filter SHOWS everything (default-show) — 0 hidden.
         // The current suggester fires doRank automatically via ST's event
         // system (no manual input field exists in this design). In the test
         // environment there is no live ST chat, so activeChatHasContent()
@@ -258,36 +260,36 @@ test.describe('F16 provenance tagging + suggester filter — desktop only', () =
         expect(hiddenMatch, `hidden badge has count, got ${badgeText}`).not.toBeNull();
         const hiddenCount = Number(hiddenMatch[1]);
         expect(hiddenCount,
-            `default filter hides count matches fixture (got ${hiddenCount}, fixture has ${fixtureHiddenCount} hidden)`)
-            .toBe(fixtureHiddenCount);
+            `default-show hides nothing (got ${hiddenCount} hidden)`)
+            .toBe(0);
 
         const visibleCount = await visibleRows.count();
-        expect(visibleCount + hiddenCount,
-            `visible (${visibleCount}) + hidden (${hiddenCount}) = total fixture rows (${rows.length})`)
+        expect(visibleCount,
+            `default-show shows all fixture rows (visible ${visibleCount} = total ${rows.length})`)
             .toBe(rows.length);
 
-        // ── (5) Toggling experiment_output reveals hidden rows.
+        // ── (5) Toggling experiment_output OFF hides its rows (reversible hide).
         const beforeToggleVisible = await visibleRows.count();
-        await expOutCb.click();
-        await expect(expOutCb).toBeChecked();
+        await expOutCb.click();  // uncheck -> hide
+        await expect(expOutCb).not.toBeChecked();
         // Re-application is synchronous (no re-fetch).
         const afterToggleVisible = await visibleRows.count();
         const afterToggleBadgeText = await hiddenBadge.textContent();
         const afterToggleHidden = Number(afterToggleBadgeText.match(/\[(\d+) hidden\]/)[1]);
         expect(afterToggleVisible,
-            `toggling experiment_output ON grows visible row count (was ${beforeToggleVisible}, now ${afterToggleVisible})`)
-            .toBeGreaterThanOrEqual(beforeToggleVisible);
+            `toggling experiment_output OFF lowers visible row count (was ${beforeToggleVisible}, now ${afterToggleVisible})`)
+            .toBeLessThanOrEqual(beforeToggleVisible);
         expect(afterToggleHidden,
-            `toggling experiment_output ON lowers hidden count (was ${hiddenCount}, now ${afterToggleHidden})`)
-            .toBeLessThanOrEqual(hiddenCount);
+            `toggling experiment_output OFF raises hidden count (was ${hiddenCount}, now ${afterToggleHidden})`)
+            .toBeGreaterThanOrEqual(hiddenCount);
 
         // ── (6) Persistence: reload and assert checkboxes preserve state.
         await sugIframeEl.evaluate(el => el.contentWindow.location.reload());
         await expect(iframe.locator('h1')).toBeVisible({ timeout: 15_000 });
         await expect(iframe.locator('input[data-kind="experiment_output"]'),
-            'experiment_output checkbox state persists across reload').toBeChecked();
+            'experiment_output checkbox state (unchecked) persists across reload').not.toBeChecked();
         await expect(iframe.locator('input[data-kind="seed_demo"]'),
-            'seed_demo checkbox state persists across reload').not.toBeChecked();
+            'seed_demo checkbox state (checked default) persists across reload').toBeChecked();
 
         // Restore default state to be tidy for downstream tests.
         await sugIframeEl.evaluate(el => {
