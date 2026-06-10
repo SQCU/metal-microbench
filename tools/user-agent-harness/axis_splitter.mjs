@@ -143,21 +143,36 @@ function diagnoseGap(byCtx, parentAxis) {
         const vs = turns.map(t => t.original_sig[parentAxis]).filter(Number.isFinite);
         summary[ctx] = { n: turns.length, ...meanStd(vs) };
     }
-    const ctxNames = Object.keys(summary);
+    // The gap is defined over ALL context means (max − min). The contrast
+    // PAIR that realizes it is the evaluation yardstick downstream: with
+    // >2 contexts (e.g. 2 agent overlays × 3 counterparties = 6), taking
+    // "the first two" instead compared two counterparties under the SAME
+    // overlay — orthogonal to the detected entanglement — and produced
+    // parent d≈0 false NO_SPLITs on the strongest candidates (observed:
+    // star_sign gap 3.50 → parent d 0.00, 2026-06-10 sweep).
+    let ctxMax = null, ctxMin = null;
+    for (const [ctx, s] of Object.entries(summary)) {
+        if (!Number.isFinite(s.mean)) continue;
+        if (ctxMax === null || s.mean > summary[ctxMax].mean) ctxMax = ctx;
+        if (ctxMin === null || s.mean < summary[ctxMin].mean) ctxMin = ctx;
+    }
     const means = Object.values(summary).map(s => s.mean).filter(Number.isFinite);
     const gap = Math.max(...means) - Math.min(...means);
-    // Compute parent Cohen's d between the first two contexts so we have
-    // a directly comparable yardstick for the children to beat.
+    // gap_pair = [high-mean ctx, low-mean ctx]; parent d on that pair is
+    // the directly comparable yardstick for the children to beat.
+    const gap_pair = (ctxMax !== null && ctxMin !== null && ctxMax !== ctxMin)
+        ? [ctxMax, ctxMin]
+        : null;
     let parent_cohens_d = null;
     let parent_sign = null;
-    if (ctxNames.length >= 2) {
-        const [cA, cB] = ctxNames;
+    if (gap_pair) {
+        const [cA, cB] = gap_pair;
         const vA = byCtx.get(cA).map(t => t.original_sig[parentAxis]).filter(Number.isFinite);
         const vB = byCtx.get(cB).map(t => t.original_sig[parentAxis]).filter(Number.isFinite);
         parent_cohens_d = cohensD(vA, vB);
         parent_sign = parent_cohens_d == null ? null : Math.sign(parent_cohens_d);
     }
-    return { summary, gap, parent_cohens_d, parent_sign };
+    return { summary, gap, gap_pair, parent_cohens_d, parent_sign };
 }
 
 // ── DESIGNER_S: propose split hypotheses ─────────────────────────────
@@ -261,7 +276,7 @@ function cohensD(arrA, arrB) {
 
 // ── evaluate a single hypothesis: re-judge every turn under the pair ─
 
-async function evaluateSplit(hypothesis, byCtx, contextLabels) {
+async function evaluateSplit(hypothesis, byCtx, contextLabels, contrastPair = null) {
     const evals = {};  // ctxLabel → { name1: [scores], name2: [scores] }
     for (const ctx of contextLabels) evals[ctx] = { [hypothesis.name1]: [], [hypothesis.name2]: [] };
     // Re-judge every turn (one bridge call each), bounded to the engine kernel
@@ -278,11 +293,17 @@ async function evaluateSplit(hypothesis, byCtx, contextLabels) {
         evals[ctx][hypothesis.name2].push(j.sig[hypothesis.name2]);
         perTurn.push({ ctx, turn_excerpt: t.turn.slice(0, 120), sig: j.sig, raw: j.raw });
     }
-    // Per-axis stats and Cohen's d between the two contexts (assume 2)
-    if (contextLabels.length !== 2) {
-        console.warn(`[axis_splitter] cohens-d expects 2 contexts, got ${contextLabels.length}; using first two.`);
+    // Cohen's d is computed on the CONTRAST PAIR — the two contexts whose
+    // parent-axis means realize the detected gap (diagnoseGap.gap_pair).
+    // With >2 contexts, defaulting to "the first two" compared contexts
+    // orthogonal to the entanglement (same overlay, different counterparty)
+    // and yielded d≈0 false NO_SPLITs. Fallback to first two only when no
+    // pair was derivable (e.g. <2 finite context means).
+    let [cA, cB] = contrastPair || [];
+    if (!cA || !cB) {
+        console.warn(`[axis_splitter] no contrast pair derived; falling back to first two of ${contextLabels.length} contexts.`);
+        [cA, cB] = contextLabels;
     }
-    const [cA, cB] = contextLabels;
     const stats = {
         [hypothesis.name1]: {
             [cA]: meanStd(evals[cA][hypothesis.name1]),
@@ -303,7 +324,8 @@ async function evaluateSplit(hypothesis, byCtx, contextLabels) {
         [hypothesis.name1]: { d: d1, sign: d1 == null ? null : Math.sign(d1), absd: Math.abs(d1 || 0) },
         [hypothesis.name2]: { d: d2, sign: d2 == null ? null : Math.sign(d2), absd: Math.abs(d2 || 0) },
     };
-    return { hypothesis, stats, perTurn, max_abs_cohens_d: maxAbsD, sub_axis_d: subAxisD };
+    return { hypothesis, stats, perTurn, max_abs_cohens_d: maxAbsD, sub_axis_d: subAxisD,
+             contrast_pair: [cA, cB] };
 }
 
 // ── main orchestrator ────────────────────────────────────────────────
@@ -326,6 +348,9 @@ async function runSplitter(trajFile, parentAxisName) {
         console.log(`            ${ctx}: mean ${parentAxisName}=${s.mean?.toFixed(2)} (n=${s.n})`);
     }
     console.log(`[splitter] gap: ${gapSummary.gap.toFixed(2)}`);
+    if (gapSummary.gap_pair) {
+        console.log(`[splitter] contrast pair (gap-defining): ${gapSummary.gap_pair[0]} vs ${gapSummary.gap_pair[1]}`);
+    }
 
     if (gapSummary.gap < 0.5) {
         console.log(`[splitter] gap too small (< 0.5) — no entanglement to split. Done.`);
@@ -343,9 +368,9 @@ async function runSplitter(trajFile, parentAxisName) {
     const evaluations = [];
     for (const h of hypotheses) {
         process.stdout.write(`  H${h.id}: `);
-        const ev = await evaluateSplit(h, byCtx, contexts);
+        const ev = await evaluateSplit(h, byCtx, contexts, gapSummary.gap_pair);
         evaluations.push(ev);
-        const [cA, cB] = contexts;
+        const [cA, cB] = ev.contrast_pair;
         const s = ev.stats;
         console.log(`max|d|=${ev.max_abs_cohens_d.toFixed(2)}`);
         console.log(`    ${h.name1}: ${cA}=${s[h.name1][cA].mean?.toFixed(2)}±${s[h.name1][cA].std?.toFixed(2)} ${cB}=${s[h.name1][cB].mean?.toFixed(2)}±${s[h.name1][cB].std?.toFixed(2)} d=${s[h.name1].cohens_d?.toFixed(2)}`);
@@ -389,11 +414,11 @@ async function runSplitter(trajFile, parentAxisName) {
         try {
             const r1 = await registerDerivedAxis({
                 name: h.name1, kind: parentAxis.kind, def: h.def1,
-                derived_from: { parent: parentAxisName, contexts: contexts.join(' vs '), hypothesis_id: h.id, sibling: h.name2 },
+                derived_from: { parent: parentAxisName, contexts: (gapSummary.gap_pair || contexts).join(' vs '), hypothesis_id: h.id, sibling: h.name2 },
             });
             const r2 = await registerDerivedAxis({
                 name: h.name2, kind: parentAxis.kind, def: h.def2,
-                derived_from: { parent: parentAxisName, contexts: contexts.join(' vs '), hypothesis_id: h.id, sibling: h.name1 },
+                derived_from: { parent: parentAxisName, contexts: (gapSummary.gap_pair || contexts).join(' vs '), hypothesis_id: h.id, sibling: h.name1 },
             });
             registered = [r1, r2];
             console.log(`[splitter] registered derived axes: ${h.name1}, ${h.name2}`);
