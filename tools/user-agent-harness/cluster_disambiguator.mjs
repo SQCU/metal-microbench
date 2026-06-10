@@ -257,7 +257,12 @@ async function runDisambiguator(specPath) {
     for (const bio of spec.bios) {
         await saveBio(bio);
         const agentText = await designCheapAgent(bio);
-        const agentId = `${spec.cluster_id}-${bio.canonical_key.replace(/\.png$/, '')}-cheap`;
+        // Plugin agent ID_RE is /^[a-z0-9_-]+$/ (lowercase only) — bio
+        // canonical_keys carry case + dots ("1778…-DespoticMiscreant.png"),
+        // so sanitize the whole id or POST /agents 400s (observed live
+        // 2026-06-10, second disambiguator dispatch ever).
+        const agentId = `${spec.cluster_id}-${bio.canonical_key.replace(/\.png$/, '')}-cheap`
+            .toLowerCase().replace(/[^a-z0-9_-]/g, '-');
         await saveAgent(agentId, `${bio.name} (cheap)`, agentText, bio.canonical_key);
         agentIds[bio.canonical_key] = { id: agentId, text: agentText };
         console.log(`  ${bio.canonical_key}: cheap_agent="${agentText.slice(0, 80).replace(/\n/g, ' ')}…"`);

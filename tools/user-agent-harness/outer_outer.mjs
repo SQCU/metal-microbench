@@ -267,7 +267,11 @@ async function autoDispatchSweep(originalSpec, completedTrajectories, axesNow) {
             const spread = Math.max(...vs) - Math.min(...vs);
             if (spread < tightSpread) { tightSpread = spread; tightAxis = ax; }
         }
-        const clusterId = `oo-collapse-${RUN_ID}`.replace(/[^A-Za-z0-9._-]/g, '-');
+        // Agent ids derived from this (disambiguator: `${cluster_id}-${bio}-cheap`)
+        // must satisfy the plugin's ID_RE = /^[a-z0-9_-]+$/ — LOWERCASE only —
+        // and stay short enough to read. Use the run id's unique tail.
+        const clusterId = `oo-collapse-${RUN_ID.slice(-8)}`
+            .toLowerCase().replace(/[^a-z0-9_-]/g, '-');
         const clusterSpec = {
             cluster_id: clusterId,
             label: `outer-outer collapse cluster (${originalSpec.id}, ε=${CLUSTER_DISTANCE_EPS})`,
