@@ -228,9 +228,48 @@ async function autoDispatchSweep(originalSpec, completedTrajectories, axesNow) {
     let disambResult = null;
     if (collapsedPairs.length > 0) {
         console.log(`[outer_outer]   ${collapsedPairs.length} bio pairs within ε=${CLUSTER_DISTANCE_EPS} → dispatching cluster_disambiguator`);
+        // The disambiguator consumes a CLUSTER spec ({cluster_id,
+        // nominal_tight_axis, counterparty_avatar, bios:[{canonical_key,
+        // name, prose}]}), NOT an experiment spec. Passing the experiment
+        // card here produced cluster_id=undefined → "undefined-…-cheap"
+        // agent ids → 400 → child exit 1 on every dispatch (observed
+        // 2026-06-10). Synthesize a transient cluster spec from the
+        // collapsed pairs instead.
+        const memberIds = [...new Set(collapsedPairs.flatMap(p => [p.a, p.b]))];
+        const members = allBios.filter(b => memberIds.includes(b.id));
+        // nominal_tight_axis = the axis the cluster is TIGHTEST on,
+        // measured from the members' own signatures (empirical, not
+        // authored): smallest max−min spread across members, requiring
+        // the axis to be present on every member.
+        let tightAxis = null, tightSpread = Infinity;
+        const axisIds = [...new Set(members.flatMap(b => Object.keys(b.signature || {})))];
+        for (const ax of axisIds) {
+            const vs = members.map(b => b.signature?.[ax]).filter(Number.isFinite);
+            if (vs.length !== members.length) continue;
+            const spread = Math.max(...vs) - Math.min(...vs);
+            if (spread < tightSpread) { tightSpread = spread; tightAxis = ax; }
+        }
+        const clusterId = `oo-collapse-${RUN_ID}`.replace(/[^A-Za-z0-9._-]/g, '-');
+        const clusterSpec = {
+            cluster_id: clusterId,
+            label: `outer-outer collapse cluster (${originalSpec.id}, ε=${CLUSTER_DISTANCE_EPS})`,
+            nominal_tight_axis: tightAxis,
+            counterparty_avatar: originalSpec.counterparty_avatar || 'the-rock.png',
+            bios: members.map(b => ({
+                canonical_key: b.id,
+                name: b.name || b.id,
+                prose: b.bio || '',
+            })),
+            collapsed_pairs: collapsedPairs,
+        };
         const pluginDir = process.env.USER_PERSONAS_PLUGIN_DIR
             || path.resolve(HARNESS_DIR, '..');
-        const specPath = path.join(pluginDir, 'experiments', `${originalSpec.id}.json`);
+        const clustersDir = process.env.USER_PERSONAS_CLUSTERS_DATA_DIR
+            || path.join(pluginDir, 'data', 'clusters');
+        fs.mkdirSync(clustersDir, { recursive: true });
+        const specPath = path.join(clustersDir, `${clusterId}.json`);
+        fs.writeFileSync(specPath, JSON.stringify(clusterSpec, null, 2));
+        console.log(`[outer_outer]   cluster spec: ${specPath} (${members.length} bios, tight axis: ${tightAxis})`);
         disambResult = await spawnAndWait(
             'cluster_disambiguator.mjs', [specPath],
             'cluster_disambiguator', { LOCK_IN_RUN_ID: RUN_ID });
