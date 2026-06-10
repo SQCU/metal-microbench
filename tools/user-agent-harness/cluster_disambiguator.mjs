@@ -44,10 +44,27 @@ import {
 const { ST, PLUGIN } = ENDPOINTS;
 
 // Project id → name to keep compatibility with code that uses `.name`.
+// derived_from retained: the membership idempotency gate below needs it.
 const _AXES_CACHE = (await fetchAxes()).map(a => ({
-    name: a.id, def: a.def, kind: a.kind,
+    name: a.id, def: a.def, kind: a.kind, derived_from: a.derived_from || null,
 }));
 function allAxes() { return _AXES_CACHE; }
+
+// Membership idempotency gate — same family as the splitter's
+// children-gate. A cluster that already produced a spread axis for the
+// SAME member set stays disambiguated: re-running on unchanged
+// membership registers a paraphrase spread axis per dispatch (observed
+// 2026-06-10: sensory_specificity then discursive_velocity for one
+// identical 4-bio cluster across two outer_outer passes). Keyed on the
+// sorted member list recorded in derived_from.cluster_members.
+// CLUSTER_DISAMBIG_FORCE=1 overrides for deliberate re-runs.
+function priorSpreadAxisForMembers(memberKeys) {
+    const key = [...memberKeys].sort().join('|');
+    return _AXES_CACHE.find(a =>
+        a.derived_from?.reason === 'spread_axis'
+        && Array.isArray(a.derived_from?.cluster_members)
+        && [...a.derived_from.cluster_members].sort().join('|') === key) || null;
+}
 async function registerDerivedAxis({ name, kind, def, derived_from }) {
     const card = await http('POST', `${PLUGIN}/axes/${encodeURIComponent(name)}`, {
         name, kind, def, derived_from,
@@ -249,6 +266,15 @@ async function runDisambiguator(specPath) {
     console.log(`[disambig] cluster: ${spec.cluster_id} (${spec.bios.length} bios)`);
     console.log(`[disambig] counterparty: ${spec.counterparty_avatar}`);
     console.log(`[disambig] nominal tight axis: ${spec.nominal_tight_axis}`);
+
+    // Idempotency: this exact membership already has a registered spread
+    // axis → done (the new axis needs corpus SCORES, not a re-derivation;
+    // membership changes → new key → fresh disambiguation).
+    const prior = priorSpreadAxisForMembers(spec.bios.map(b => b.canonical_key));
+    if (prior && process.env.CLUSTER_DISAMBIG_FORCE !== '1') {
+        console.log(`[disambig] membership already disambiguated → spread axis '${prior.name}' — skipping (idempotent; CLUSTER_DISAMBIG_FORCE=1 to re-run). Done.`);
+        return null;
+    }
 
     // 1. Install bios + design cheap agents
     console.log(`\n[disambig] installing bios + designing cheap agents (K=1 each)…`);

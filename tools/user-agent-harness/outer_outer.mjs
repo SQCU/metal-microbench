@@ -254,6 +254,18 @@ async function autoDispatchSweep(originalSpec, completedTrajectories, axesNow) {
         // 2026-06-10). Synthesize a transient cluster spec from the
         // collapsed pairs instead.
         const memberIds = [...new Set(collapsedPairs.flatMap(p => [p.a, p.b]))];
+        // Membership idempotency (mirrors the disambiguator's own gate,
+        // saves the spawn): this exact member set already produced a
+        // spread axis → skip with disclosure.
+        const memberKey = [...memberIds].sort().join('|');
+        const priorSpread = axesNow.find(a =>
+            a.derived_from?.reason === 'spread_axis'
+            && Array.isArray(a.derived_from?.cluster_members)
+            && [...a.derived_from.cluster_members].sort().join('|') === memberKey);
+        if (priorSpread) {
+            console.log(`[outer_outer]   collapse membership already disambiguated → spread axis '${priorSpread.id}' — skipping dispatch.`);
+            return { splitterResults, collapsedPairs, disambResult: { skipped: 'membership_already_disambiguated', spread_axis: priorSpread.id } };
+        }
         const members = allBios.filter(b => memberIds.includes(b.id));
         // nominal_tight_axis = the axis the cluster is TIGHTEST on,
         // measured from the members' own signatures (empirical, not
