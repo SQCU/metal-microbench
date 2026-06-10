@@ -21,10 +21,10 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -33,36 +33,19 @@ from axes import AXIS_NAMES, N_AXES
 from discovery import _load_assistant_card
 from probe_persist import parse_elementwise, stage1_summary, stage2_likert
 from signature import mahalanobis
-
-import os as _os_for_bridge_url
-BRIDGE_URL = _os_for_bridge_url.environ["BRIDGE_URL"] + "/v1/chat/completions"
-PLUGIN_PLAYERS_DIR = Path("/Users/mdot/sillytavern-fork/plugins/user-personas/players")
+from llm_client import llm_call, plugin_get
 
 
 def bridge_chat(messages, max_tokens=None, temperature=1.0):
-    # Generation-config moratorium: no hidden caps. Caller-omitted
-    # max_tokens means "use the bridge default" (matches the SillyTavern
-    # GUI). temperature=1.0 is the root config (no other value allowed
-    # without a documented exemption). See
-    # plugins/user-personas/scripts/lint_generation_config.mjs.
-    body = {"model": "gemma-4-a4b", "messages": messages,
-            "temperature": temperature, "stream": False}
-    if max_tokens is not None and max_tokens > 0:
-        body["max_tokens"] = max_tokens
-    req = urllib.request.Request(BRIDGE_URL,
-                                  data=json.dumps(body).encode(),
-                                  headers={"Content-Type": "application/json"},
-                                  method="POST")
-    with urllib.request.urlopen(req, timeout=180) as r:
-        d = json.loads(r.read())
-    return d["choices"][0]["message"]["content"]
+    del temperature
+    return llm_call(messages, max_tokens=max_tokens)
 
 
 def load_user_agent_card(card_id):
-    p = PLUGIN_PLAYERS_DIR / card_id / "manifest.json"
-    if not p.is_file():
-        sys.exit(f"user-agent card {card_id!r} not found at {p}")
-    return json.loads(p.read_text())
+    for agent in plugin_get("/agents").get("agents", []):
+        if agent.get("id") == card_id:
+            return agent
+    sys.exit(f"user-agent card {card_id!r} not found in /api/plugins/user-personas/agents")
 
 
 def measure_turn(turn_text):
@@ -245,7 +228,7 @@ def pairwise_mahalanobis(signatures, cov_inv):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--user-cards", required=True,
-                   help="comma-separated user-agent card_ids in players/")
+                   help="comma-separated user-agent ids from /api/plugins/user-personas/agents")
     p.add_argument("--target-assistant", required=True,
                    help="assistant card name (e.g. python-only-coder)")
     p.add_argument("--k", type=int, default=5, help="turns per session")

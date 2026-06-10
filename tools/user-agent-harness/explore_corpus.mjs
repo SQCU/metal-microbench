@@ -43,17 +43,17 @@ const N_TURNS_PER_CHAT     = 4;
 // TEMP_BIO_DESIGN removed: per moratorium, no per-call temperature override.
 // Bridge default = 1.0 (the value this constant carried anyway).
 
-// The 6-axis bio-side subset we measure on. Includes the cluster-derived
-// normative_directionality so the disambiguator's contribution flows into
-// the eff-dim optimization.
-const BIO_AXIS_NAMES = [
-    'astrology_sagittarian',
-    'astrology_cancerian',
-    'normative_directionality',
-    'trope_density',
-    'register_colloquial',
-    'warm',
-];
+// Bio-side axes are discovered from the plugin's axis cards. Older
+// versions hardcoded a stale six-axis list from a prior experiment
+// (`normative_directionality`, `warm`, etc.); that made the supposedly
+// self-contained cloned repo depend on an axis registry it no longer
+// shipped. The current source of truth is axes/*.json.
+const BIO_AXIS_NAMES = allAxes()
+    .filter(a => a.kind === 'bio' || a.kind === 'either')
+    .map(a => a.name);
+if (BIO_AXIS_NAMES.length === 0) {
+    throw new Error('explore_corpus: no bio/either axis cards loaded from plugin');
+}
 
 // ── state I/O ────────────────────────────────────────────────────────
 
@@ -202,8 +202,8 @@ async function exploreOneIteration(state, iter, rng, cp, kCandidates) {
     const turns = L.userTurns(chat);
     console.log(`            ran ${turns.length} user turns vs ${cp.name}`);
 
-    // 5. Judge all turns on all bio axes (parallel, one call per turn,
-    //    multi-axis in one prompt via judgeOnAxes).
+    // 5. Judge all turns on all bio axes (kernel-width-bounded, one call per
+    //    turn, multi-axis in one prompt via judgeOnAxes).
     const axisRecords = BIO_AXIS_NAMES.map(n => {
         const r = allAxes().find(a => a.name === n);
         return { name: n, def: r.def };

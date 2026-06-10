@@ -20,48 +20,21 @@ Per-turn summaries still happen, but in a final all-at-once batch
 after the conversations conclude (one parallel pass over every turn).
 """
 import argparse
-import base64
 import json
 import os
-import struct
 import sys
 import time
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # tools/ for batch_scaler
-import batch_scaler as bs  # noqa: E402  saturate engine kernel width, never guess it
+sys.path.insert(0, str(Path(__file__).resolve().parent / "elicitation"))
+from llm_client import llm_call, plugin_get, st_character_card
 
-BRIDGE = os.environ["BRIDGE_URL"].rstrip("/")
-MODEL = "gemma-4-a4b"
-
-PLAYERS_DIR = Path("/Users/mdot/sillytavern-fork/plugins/user-personas/players")
-SCRINGLO_PNG = Path("/Users/mdot/sillytavern-fork/default/content/scringlo_scrambler.png")
-
-
-def read_chara_from_png(path):
-    with path.open("rb") as f:
-        data = f.read()
-    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
-        raise ValueError(f"{path} not a PNG")
-    i = 8
-    while i < len(data):
-        n = struct.unpack(">I", data[i:i+4])[0]
-        typ = data[i+4:i+8]
-        payload = data[i+8:i+8+n]
-        if typ == b"tEXt":
-            sep = payload.find(b"\x00")
-            if sep >= 0 and payload[:sep] == b"chara":
-                return json.loads(base64.b64decode(payload[sep+1:]))
-        if typ == b"IEND":
-            break
-        i += 8 + n + 4
-    raise ValueError(f"no chara tEXt chunk in {path}")
+MODEL = os.environ.get("USER_PERSONAS_MODEL", "gemma-4-a4b")
 
 
 def scringlo_system_prompt():
-    card = read_chara_from_png(SCRINGLO_PNG)
+    card = st_character_card("scringlo_scrambler.png", timeout=10)
     parts = []
     for k in ("description", "personality", "scenario"):
         v = card.get(k) or ""
@@ -72,40 +45,22 @@ def scringlo_system_prompt():
 
 def load_personas():
     out = []
-    for d in sorted(PLAYERS_DIR.iterdir()):
-        if not d.is_dir():
+    for data in plugin_get("/personas").get("personas", []):
+        name = data.get("name") or data.get("id")
+        bio = data.get("bio") or data.get("description") or ""
+        if not bio.strip():
             continue
-        manifest = d / "manifest.json"
-        if not manifest.exists():
-            continue
-        out.append(json.load(manifest.open()))
+        out.append({
+            "id": data.get("id"),
+            "name": name,
+            "bio": bio,
+            "system_prompt": data.get("system_prompt") or f"You are {name}. {bio}",
+        })
     return out
 
 
 def bridge_call(messages, *, seed=None):
-    """One non-streaming chat/completions call. Returns assistant text.
-
-    Per the generation-config moratorium (see
-    tools/st-debug/sillytavern-fork/plugins/user-personas/scripts/
-    lint_generation_config.mjs): no temperature / no max_tokens at the
-    caller layer. Bridge default temperature=1.0 + EOS termination apply.
-    Diversity in this study comes from the per-call seed.
-    """
-    body = {
-        "model": MODEL,
-        "messages": messages,
-        "stream": False,
-    }
-    if seed is not None:
-        body["seed"] = seed
-    req = urllib.request.Request(
-        f"{BRIDGE}/v1/chat/completions",
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=180) as r:
-        resp = json.loads(r.read())
-    return (resp.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+    return llm_call(messages, seed=seed)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -150,7 +105,7 @@ def summary_call(text, role_label, seed):
     ], seed=seed)
 
 
-def run_vectorized(personas, scringlo_sys, *, n_conversations, n_turns, base_seed, max_workers=None):
+def run_vectorized(personas, scringlo_sys, *, n_conversations, n_turns, base_seed, max_workers=12):
     """Lockstep rounds. All conversations advance one step at a time, in parallel."""
     states = []
     for p_idx, persona in enumerate(personas):
@@ -158,10 +113,6 @@ def run_vectorized(personas, scringlo_sys, *, n_conversations, n_turns, base_see
             states.append(make_conversation_state(persona, scringlo_sys, c,
                                                   base_seed + p_idx * 1_000_000))
 
-    # Each round issues one LLM call per ACTIVE conversation; saturate the
-    # engine's kernel width (clamped to the conversation count), from batch_scaler.
-    if max_workers is None:
-        max_workers = bs.target_workers(n_items=len(states), base=BRIDGE)
     print(f"[vec] {len(states)} conversations, {n_turns} turns each, max_workers={max_workers}")
 
     # Round 0: all user-agents open simultaneously.
@@ -226,10 +177,11 @@ def run_vectorized(personas, scringlo_sys, *, n_conversations, n_turns, base_see
 
 
 def render_markdown(personas, results, out_path, n_conversations):
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
-        f.write("# User-agent × scringlo diversity study (vectorized)\n\n")
+        f.write("# User-agent x scringlo diversity study (vectorized)\n\n")
         f.write(f"- Model: `{MODEL}`\n")
-        f.write(f"- Bridge: `{BRIDGE}`\n")
+        f.write("- Provider: SillyTavern user-personas /llm-call\n")
         f.write(f"- Personas: {len(personas)}\n")
         f.write(f"- Conversations per persona: {n_conversations}\n")
         f.write(f"- Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
@@ -263,9 +215,8 @@ def main():
     p.add_argument("--n-conversations", type=int, default=3)
     p.add_argument("--n-turns", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--max-workers", type=int, default=None,
-                   help="parallelism per lockstep round; default = engine kernel width "
-                        "(batch_scaler), so each round saturates one decode step")
+    p.add_argument("--max-workers", type=int, default=12,
+                   help="parallelism per lockstep round")
     p.add_argument("--out", default="output/diversity_report_vectorized.md")
     args = p.parse_args()
 

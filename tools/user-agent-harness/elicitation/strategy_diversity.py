@@ -31,28 +31,16 @@ import json
 import re
 import sys
 import time
-import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import os as _os_for_bridge_url
-BRIDGE_URL = _os_for_bridge_url.environ["BRIDGE_URL"] + "/v1/chat/completions"
+from llm_client import llm_call
 
 
 def bridge_chat(messages, max_tokens=None, temperature=1.0):
-    # Moratorium-compliant — no hidden caps.
-    body = {"model": "gemma-4-a4b", "messages": messages,
-            "temperature": temperature, "stream": False}
-    if max_tokens is not None and max_tokens > 0:
-        body["max_tokens"] = max_tokens
-    req = urllib.request.Request(BRIDGE_URL,
-                                  data=json.dumps(body).encode(),
-                                  headers={"Content-Type": "application/json"},
-                                  method="POST")
-    with urllib.request.urlopen(req, timeout=180) as r:
-        d = json.loads(r.read())
-    return d["choices"][0]["message"]["content"]
+    del temperature
+    return llm_call(messages, max_tokens=max_tokens)
 
 
 # ─── Session-grouping ────────────────────────────────────────────────
@@ -138,7 +126,7 @@ def score_session(session: Session) -> dict:
         f"...\n"
         f"turn {k-1}: <label>\n"
         f"</STRATEGIES>\n"
-        f"<DIVERSITY>integer 1-5</DIVERSITY>\n"
+        f"<DIVERSITY>number 1-5</DIVERSITY>\n"
         f"<ARC>one sentence describing the trajectory the user-agent took across the K turns</ARC>\n\n"
         f"## Tactic-label guidance\n\n"
         f"Strategy labels should name the TACTIC, not the topic. Examples: "
@@ -175,7 +163,7 @@ def score_session(session: Session) -> dict:
 
 
 def parse_score_response(text: str, k: int) -> dict:
-    """Pull strategies (per-turn dict), diversity (int), arc (str) out
+    """Pull strategies (per-turn dict), diversity (number), arc (str) out
     of the model's tagged response. Tolerant of partial/missing tags."""
     out: dict = {"raw": text}
 
@@ -190,8 +178,8 @@ def parse_score_response(text: str, k: int) -> dict:
                 strategies[i] = m.group(1).strip()
     out["strategies"] = strategies
 
-    dm = re.search(r"<DIVERSITY>\s*([1-5])\s*</DIVERSITY>", text, re.IGNORECASE)
-    out["diversity"] = int(dm.group(1)) if dm else None
+    dm = re.search(r"<DIVERSITY>\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*</DIVERSITY>", text, re.IGNORECASE)
+    out["diversity"] = max(1.0, min(5.0, float(f"{float(dm.group(1)):.3g}"))) if dm else None
 
     # ARC parse: prefer matched-tag, but fall back to open-tag-only if
     # the model truncated before emitting </ARC>. The ARC is a single

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""User-agent × scringlo diversity study.
+"""User-agent x scringlo diversity study.
 
-For each user-persona in plugins/user-personas/players/, run N independent
+For each user-persona in the plugin corpus, run N independent
 M-turn conversations with scringlo (using the canonical scringlo
 system prompt). For each turn, generate a 1-sentence summary via a
 separate LLM call. Output a markdown grid showing the K × N
@@ -15,55 +15,25 @@ If rows are visibly distinct → the architecture works; we can scale
 up the persona count and conversation count, and graduate the
 summarizer from this inline LLM call to a real toolcard.
 
-Talks to the bridge directly at $BRIDGE_URL.
-No SillyTavern in the loop — we're measuring user-agent diversity,
-not ST integration. (ST e2e gets its own Playwright test once the
-diversity invariant holds.)
+Generation goes through the user-personas plugin /llm-call shim, which
+uses SillyTavern's configured provider profile.
 """
 import argparse
-import base64
 import json
 import os
-import struct
 import sys
 import time
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # tools/ for batch_scaler
-import batch_scaler as bs  # noqa: E402  saturate engine kernel width, never guess it
+sys.path.insert(0, str(Path(__file__).resolve().parent / "elicitation"))
+from llm_client import llm_call, plugin_get, st_character_card
 
-BRIDGE = os.environ["BRIDGE_URL"].rstrip("/")
-MODEL = "gemma-4-a4b"
-
-PLAYERS_DIR = Path("/Users/mdot/sillytavern-fork/plugins/user-personas/players")
-SCRINGLO_PNG = Path("/Users/mdot/sillytavern-fork/default/content/scringlo_scrambler.png")
-
-
-def read_chara_from_png(path):
-    """Pull the embedded chara_card_v3 JSON from a SillyTavern character PNG."""
-    with path.open("rb") as f:
-        data = f.read()
-    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
-        raise ValueError(f"{path} not a PNG")
-    i = 8
-    while i < len(data):
-        n = struct.unpack(">I", data[i:i+4])[0]
-        typ = data[i+4:i+8]
-        payload = data[i+8:i+8+n]
-        if typ == b"tEXt":
-            sep = payload.find(b"\x00")
-            if sep >= 0 and payload[:sep] == b"chara":
-                return json.loads(base64.b64decode(payload[sep+1:]))
-        if typ == b"IEND":
-            break
-        i += 8 + n + 4
-    raise ValueError(f"no chara tEXt chunk in {path}")
+MODEL = os.environ.get("USER_PERSONAS_MODEL", "gemma-4-a4b")
 
 
 def scringlo_system_prompt():
-    card = read_chara_from_png(SCRINGLO_PNG)
+    card = st_character_card("scringlo_scrambler.png", timeout=10)
     parts = []
     for k in ("description", "personality", "scenario"):
         v = card.get(k) or ""
@@ -74,44 +44,23 @@ def scringlo_system_prompt():
 
 def load_personas():
     out = []
-    for d in sorted(PLAYERS_DIR.iterdir()):
-        if not d.is_dir():
+    for data in plugin_get("/personas").get("personas", []):
+        name = data.get("name") or data.get("id")
+        bio = data.get("bio") or data.get("description") or ""
+        if not bio.strip():
             continue
-        manifest = d / "manifest.json"
-        if not manifest.exists():
-            continue
-        out.append(json.load(manifest.open()))
+        out.append({
+            "id": data.get("id"),
+            "name": name,
+            "bio": bio,
+            "system_prompt": data.get("system_prompt") or f"You are {name}. {bio}",
+        })
     return out
 
 
 def bridge_call(messages, *, seed=None, reasoning_effort=None):
-    """One non-streaming chat/completions call. Returns assistant text or None.
-
-    Per the generation-config moratorium (see
-    tools/st-debug/sillytavern-fork/plugins/user-personas/scripts/
-    lint_generation_config.mjs): no temperature / no max_tokens at the
-    caller layer. Bridge default temperature=1.0 + EOS termination apply.
-    Diversity in this study comes from the per-call seed, not from
-    sampler tweaks.
-    """
-    body = {
-        "model": MODEL,
-        "messages": messages,
-        "stream": False,
-    }
-    if seed is not None:
-        body["seed"] = seed
-    if reasoning_effort:
-        body["reasoning_effort"] = reasoning_effort
-    req = urllib.request.Request(
-        f"{BRIDGE}/v1/chat/completions",
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=180) as r:
-        resp = json.loads(r.read())
-    choice = (resp.get("choices") or [{}])[0]
-    return (choice.get("message") or {}).get("content") or ""
+    del reasoning_effort
+    return llm_call(messages, seed=seed)
 
 
 def run_conversation(persona, scringlo_sys, *, n_turns, seed):
@@ -177,7 +126,7 @@ def run_conversation(persona, scringlo_sys, *, n_turns, seed):
 def run_all(personas, scringlo_sys, *, n_conversations, n_turns, base_seed):
     """For each persona × n_conversations independent runs, in parallel."""
     futures = {}
-    with ThreadPoolExecutor(max_workers=bs.target_workers(base=BRIDGE)) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         for p_idx, persona in enumerate(personas):
             for conv_i in range(n_conversations):
                 seed = base_seed + p_idx * 1_000_000 + conv_i * 1000
@@ -196,10 +145,11 @@ def run_all(personas, scringlo_sys, *, n_conversations, n_turns, base_seed):
 
 
 def render_markdown(personas, results, out_path, n_conversations):
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
-        f.write("# User-agent × scringlo diversity study\n\n")
+        f.write("# User-agent x scringlo diversity study\n\n")
         f.write(f"- Model: `{MODEL}`\n")
-        f.write(f"- Bridge: `{BRIDGE}`\n")
+        f.write("- Provider: SillyTavern user-personas /llm-call\n")
         f.write(f"- Personas: {len(personas)}\n")
         f.write(f"- Conversations per persona: {n_conversations}\n")
         f.write(f"- Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")

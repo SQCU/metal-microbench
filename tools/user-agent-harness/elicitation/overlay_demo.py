@@ -33,9 +33,9 @@ regenerating full personas).
 
 import argparse
 import json
+import os
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -43,9 +43,7 @@ import numpy as np
 from axes import AXIS_NAMES, N_AXES
 from discovery import _load_assistant_card
 from probe_persist import parse_elementwise, stage1_summary, stage2_likert
-
-import os as _os_for_bridge_url
-BRIDGE_URL = _os_for_bridge_url.environ["BRIDGE_URL"] + "/v1/chat/completions"
+from llm_client import llm_call, plugin_get
 
 # Two hand-authored elicitation overlays for the validation. Both pair
 # with the SAME root bio. The aim is to demonstrate that they elicit
@@ -79,18 +77,8 @@ OVERLAYS = {
 
 
 def bridge_chat(messages, max_tokens=None, temperature=1.0):
-    # Moratorium-compliant — see factorization_multiturn.bridge_chat for the rationale.
-    body = {"model": "gemma-4-a4b", "messages": messages,
-            "temperature": temperature, "stream": False}
-    if max_tokens is not None and max_tokens > 0:
-        body["max_tokens"] = max_tokens
-    req = urllib.request.Request(BRIDGE_URL,
-                                  data=json.dumps(body).encode(),
-                                  headers={"Content-Type": "application/json"},
-                                  method="POST")
-    with urllib.request.urlopen(req, timeout=180) as r:
-        d = json.loads(r.read())
-    return d["choices"][0]["message"]["content"]
+    del temperature
+    return llm_call(messages, max_tokens=max_tokens)
 
 
 def measure_turn(turn_text):
@@ -228,17 +216,25 @@ def per_overlay_signatures(records):
 
 
 def load_overlay_card(card_id):
-    """Load a plugin players/ overlay-mode card and return its bio +
-    library + default_overlay. Returns None if no such card exists."""
-    p = Path("/Users/mdot/sillytavern-fork/plugins/user-personas/players") / card_id / "manifest.json"
-    if not p.is_file():
+    """Load a user-agent card through the plugin API."""
+    m = None
+    for agent in plugin_get("/agents").get("agents", []):
+        if agent.get("id") == card_id:
+            m = agent
+            break
+    if not m:
         return None
-    m = json.loads(p.read_text())
+    bio = m.get("bio")
+    if not bio and m.get("designed_for_bio_id"):
+        for persona in plugin_get("/personas").get("personas", []):
+            if persona.get("id") == m["designed_for_bio_id"]:
+                bio = persona.get("bio") or persona.get("description")
+                break
     return {
-        "bio": m.get("bio"),
+        "bio": bio,
         "library": m.get("elicitation_overlay_library") or {},
         "default": m.get("default_overlay"),
-        "schema": m.get("card_schema"),
+        "schema": m.get("agent_schema") or m.get("card_schema"),
     }
 
 
@@ -253,7 +249,7 @@ def main():
                         "when you want a minimal hand-authored compact bio "
                         "rather than the full ST card description)")
     g.add_argument("--user-agent-card",
-                   help="name of a plugin players/ card with overlay-v1 schema; "
+                   help="id of a user-personas agent card; "
                         "loads bio + elicitation_overlay_library from the card. "
                         "Overrides the inline OVERLAYS dict — all overlays in "
                         "the card's library are run as separate conditions.")
@@ -270,8 +266,8 @@ def main():
 
     # Resolve bio + overlay set. Three input modes:
     #
-    #  - --user-agent-card: load both bio AND library from an overlay-v1
-    #    card under plugins/user-personas/players/. All library entries
+    #  - --user-agent-card: load both bio AND library from the plugin
+    #    /agents API. All library entries
     #    are run as separate conditions.
     #  - --root-bio-card or --root-bio-text: bio comes from there;
     #    inline OVERLAYS dict (hand-authored in this script) is used.

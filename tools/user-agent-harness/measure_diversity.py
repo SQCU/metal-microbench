@@ -35,18 +35,16 @@ import argparse
 import json
 import math
 import os
+import sys
 import time
-import urllib.request
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import sys as _sys
-_sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # tools/ for batch_scaler
-import batch_scaler as bs  # noqa: E402  saturate engine kernel width, never guess it
+sys.path.insert(0, str(Path(__file__).resolve().parent / "elicitation"))
+from llm_client import llm_call
 
-BRIDGE = os.environ["BRIDGE_URL"].rstrip("/")
-MODEL = "gemma-4-a4b"
+MODEL = os.environ.get("USER_PERSONAS_MODEL", "gemma-4-a4b")
 
 
 FUNCTION_WORDS = [
@@ -301,9 +299,7 @@ def conv_summary_to_text(summary_list):
 
 def judge_pair(pair_idx, conv_a, conv_b, label_a, label_b):
     """One pairwise gemma comparison. Returns (label_a, label_b, score, reason)."""
-    body = {
-        "model": MODEL,
-        "messages": [
+    messages = [
             {"role": "system", "content": JUDGE_SYSTEM},
             {"role": "user", "content": (
                 f"=== Conversation A (from persona '{label_a}') ===\n"
@@ -312,20 +308,9 @@ def judge_pair(pair_idx, conv_a, conv_b, label_a, label_b):
                 f"{conv_summary_to_text(conv_b)}\n\n"
                 "Rate distinguishability."
             )},
-        ],
-        "stream": False,
-        "max_tokens": 200,
-        "temperature": 0.2,
-    }
-    req = urllib.request.Request(
-        f"{BRIDGE}/v1/chat/completions",
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
-    )
+        ]
     try:
-        with urllib.request.urlopen(req, timeout=120) as r:
-            resp = json.loads(r.read())
-        content = (resp.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        content = llm_call(messages, seed=70_000 + pair_idx, timeout=120)
         parsed = json.loads(content)
         score = int(parsed.get("score", -1))
         reason = parsed.get("reason", "")
@@ -334,7 +319,7 @@ def judge_pair(pair_idx, conv_a, conv_b, label_a, label_b):
     return (label_a, label_b, score, reason)
 
 
-def run_gemma_judge(summaries_by_persona, *, max_workers=None):
+def run_gemma_judge(summaries_by_persona, *, max_workers=4):
     """Pairwise comparison of one conversation per persona-pair.
 
     Conservative budget: take conversation[0] from each persona, do
@@ -347,8 +332,6 @@ def run_gemma_judge(summaries_by_persona, *, max_workers=None):
         for j, pb in enumerate(pids):
             if i < j:
                 pairs.append((pa, pb, summaries_by_persona[pa][0], summaries_by_persona[pb][0]))
-    if max_workers is None:
-        max_workers = bs.target_workers(n_items=len(pairs), base=BRIDGE)
     print(f"[judge] {len(pairs)} pairwise comparisons; running with {max_workers} workers...")
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -482,6 +465,7 @@ def render_report(personas_features, signatures, lexical_matrix,
         lines.append(f"- **Narratively farthest pair (gemma judge)**: `{pairs_judge[-1][0]}` vs `{pairs_judge[-1][1]}` (score {pairs_judge[-1][2]})")
     lines.append("")
 
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     Path(out_path).write_text("\n".join(lines))
 
 

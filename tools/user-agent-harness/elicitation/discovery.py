@@ -38,25 +38,14 @@ from signature import (
     records_to_matrix, top_loadings,
 )
 
+from llm_client import llm_call
 
-import os as _os_for_bridge_url
-BRIDGE_URL = _os_for_bridge_url.environ["BRIDGE_URL"] + "/v1/chat/completions"
+import os as _os_for_runtime
 
 
 def _bridge_call(messages, max_tok=None, temperature=1.0):
-    # Moratorium-compliant — no hidden caps. Caller-omitted max_tok
-    # means "use the bridge default (matches ST GUI)".
-    body = {"model": "gemma-4-a4b", "messages": messages,
-            "temperature": temperature, "stream": False}
-    if max_tok is not None and max_tok > 0:
-        body["max_tokens"] = max_tok
-    req = urllib.request.Request(BRIDGE_URL,
-                                  data=json.dumps(body).encode(),
-                                  headers={"Content-Type": "application/json"},
-                                  method="POST")
-    with urllib.request.urlopen(req, timeout=180) as resp:
-        d = json.loads(resp.read())
-    return d["choices"][0]["message"]["content"]
+    del temperature
+    return llm_call(messages, max_tokens=max_tok)
 
 
 # ─── Target generation ──────────────────────────────────────────────
@@ -96,49 +85,16 @@ def pc_interpretation(pca_layer, pc_idx: int, k: int = 5) -> str:
 
 # ─── Brief + DESIGNER prompt ────────────────────────────────────────
 
-_ST_BASE_URL = _os_for_bridge_url.environ["ST_URL"]
+_ST_BASE_URL = (_os_for_runtime.environ.get("USER_PERSONAS_ST_URL")
+                or _os_for_runtime.environ.get("ST_URL")
+                or "").rstrip("/")
 
 
 def _load_assistant_card(path_or_name: str) -> dict | None:
-    """Load a SillyTavern Character Card.
-
-    Tries, in order:
-      1. Absolute path to a .json sidecar (for hand-authored cards).
-      2. .json sidecar lookup in the standard characters dir.
-      3. ST's own `/api/characters/get` endpoint, which uses the
-         project's battle-tested PNG/JSON v3 parser. This handles
-         PNG-embedded Character Cards without reimplementing the
-         tEXt/chunk extraction logic on our side. Bare names get
-         `.png` appended so `target_assistant=scringlo_scrambler`
-         resolves to `scringlo_scrambler.png` in ST's avatar
-         namespace.
-
-    Returns the v3 `data` block (or legacy top-level fields if the
-    v3 spec is absent), or None if nothing was found.
-    """
-    # 1 + 2: direct .json sidecar lookup
-    candidates = []
-    if path_or_name.endswith(".json") and Path(path_or_name).is_file():
-        candidates.append(Path(path_or_name))
-    else:
-        for d in [
-            Path("/Users/mdot/metal-microbench/tools/st-debug/_data/default-user/characters"),
-        ]:
-            p = d / f"{path_or_name}.json"
-            if p.is_file(): candidates.append(p)
-    for p in candidates:
-        try:
-            with p.open() as f:
-                card = json.load(f)
-            return card.get("data") or card
-        except Exception:
-            continue
-
-    # 3: ST's parser via HTTP. Bare names get .png appended; an
-    # already-suffixed name passes through. Anything with a .json
-    # extension that didn't resolve in step 1 won't match here either,
-    # so we return None.
+    """Load a SillyTavern Character Card through the live ST API."""
     avatar = path_or_name if path_or_name.endswith(".png") else f"{path_or_name}.png"
+    if not _ST_BASE_URL:
+        return None
     try:
         req = urllib.request.Request(
             f"{_ST_BASE_URL}/api/characters/get",

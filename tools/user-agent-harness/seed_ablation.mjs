@@ -52,9 +52,9 @@ const CELLS = [
 ];
 const ITER_OUT_DIR = process.env.USER_PERSONAS_LOCK_IN_OUT
     || process.env.USER_PERSONAS_LOCK_IN_DATA_DIR
-    || '/Users/mdot/metal-microbench/data/lock_in_iterative';
+    || path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'data', 'lock_in_iterative');
 const ABLATION_OUT_DIR = process.env.USER_PERSONAS_SEED_ABLATION_DIR
-    || '/Users/mdot/metal-microbench/data/seed_ablation';
+    || path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'data', 'seed_ablation');
 
 // ── helpers ────────────────────────────────────────────────────────────
 

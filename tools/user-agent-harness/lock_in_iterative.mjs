@@ -6,8 +6,8 @@
 //
 // Scope:
 //   - Inner (user-agent) designer iterates K_max_inner times. Each pass:
-//       DESIGNER_A → agent_text → /poll → N user turns vs counterparty
-//       → judgeOnAxes(agent_axes) per turn → mean per axis → compare
+//       DESIGNER_A → agent_text → /poll → N user turns vs at least three
+//       counterparties → judgeOnAxes(agent_axes) per turn → mean per axis → compare
 //       to target on agent axes → either convergence (early exit) or
 //       feedback to designer for next iteration.
 //   - Outer (bio) designer iterates K_max_outer times. Each pass:
@@ -16,7 +16,7 @@
 //       compare to bio target → convergence or feedback.
 //
 // EVERYTHING experiment-specific (which bios, which agent_targets,
-// which axes, which counterparty, loop control values) lives on the
+// which axes, which counterparties, loop control values) lives on the
 // experiment-spec card at experiments/<id>.json. This script is the
 // pure algorithm; experiments/lock_in_tetrad.json is the canonical
 // demo configuration (RPG Wizard/Rogue × Steals/Romances-and-Steals).
@@ -41,7 +41,7 @@ import {
     fetchAxes, fetchExperiment,
     bridgeCall,
 } from './harness_lib.mjs';
-const { ST, BRIDGE, PLUGIN } = ENDPOINTS;
+const { ST, PLUGIN } = ENDPOINTS;
 
 const EXPERIMENT_ID = process.argv[2] || 'lock_in_tetrad';
 // F16 provenance. The plugin's /experiments/:id/run handler sets
@@ -98,10 +98,16 @@ const N_TURNS_PER_CHAT = spec.loop_control.n_turns_per_chat;
 const EPS_PER_AXIS    = spec.loop_control.eps_per_axis;
 const STALL_WINDOW    = spec.loop_control.stall_window;
 const STALL_THRESHOLD = spec.loop_control.stall_threshold;
+const INFERENCE_CONCURRENCY = Math.max(1, Number.isInteger(spec.loop_control.inference_concurrency)
+    ? spec.loop_control.inference_concurrency
+    : 4);
+const COUNTERPARTY_AVATARS = Array.isArray(spec.counterparty_avatars) && spec.counterparty_avatars.length
+    ? spec.counterparty_avatars
+    : [spec.counterparty_avatar];
 
 const LOCK_IN_OUT_BASE = process.env.USER_PERSONAS_LOCK_IN_OUT
     || process.env.USER_PERSONAS_LOCK_IN_DATA_DIR
-    || '/Users/mdot/metal-microbench/data/lock_in_iterative';
+    || path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'data', 'lock_in_iterative');
 const OUT_DIR = path.join(LOCK_IN_OUT_BASE, EXPERIMENT_ID);
 
 // ── judge ────────────────────────────────────────────────────────────
@@ -137,6 +143,19 @@ function maxOffAxes(distancePerAxis) {
 
 function fmtSig(sig) {
     return Object.entries(sig).map(([k, v]) => `${k.split('_').map(p => p.slice(0,3)).join('_')}=${v == null ? '?' : v.toFixed(2)}`).join(' ');
+}
+
+async function mapLimit(items, limit, fn) {
+    const out = new Array(items.length);
+    let next = 0;
+    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (next < items.length) {
+            const i = next++;
+            out[i] = await fn(items[i], i);
+        }
+    });
+    await Promise.all(workers);
+    return out;
 }
 
 /**
@@ -225,11 +244,11 @@ async function designAgentPass(bio, agentTarget, prior_attempts) {
 
 // Counterparty fetch + chat-running + user-turn filter are imported
 // from harness_lib at the top. The specific counterparty for this
-// run is named in the experiment spec (spec.counterparty_avatar).
+// run is named in the experiment spec (spec.counterparty_avatars).
 
 // ── INNER LOOP: user-agent designer with judge feedback ──────────────
 
-async function designAgentToConvergence(bio, agentTarget, rock, outerIter = 0) {
+async function designAgentToConvergence(bio, agentTarget, counterparties, outerIter = 0) {
     const attempts = [];
     let bestAttempt = null;
     let bestMaxDist = Infinity;
@@ -250,19 +269,32 @@ async function designAgentToConvergence(bio, agentTarget, rock, outerIter = 0) {
         };
         await saveAgent(agent_id, `${bio.name} — ${agentTarget.slug} (iter ${k})`,
                         agent_text, bio.canonical_key, provenance);
-        const chat = await runChat(bio, agent_id, rock, N_TURNS_PER_CHAT);
-        // Judge each user turn on the agent axes ONLY (the inner loop's target is in A)
-        const turnJudgments = [];
-        for (const turn of userTurns(chat)) {
-            const { sig, raw } = await judgeOneTurn(turn, AGENT_AXES);
-            turnJudgments.push({ turn, sig, raw });
-        }
+        const chats = await mapLimit(counterparties, INFERENCE_CONCURRENCY, async cp => {
+            const chat = await runChat(bio, agent_id, cp, N_TURNS_PER_CHAT);
+            return { counterparty: cp.avatar_url, counterparty_name: cp.name, chat };
+        });
+        // Judge each user turn on the agent axes ONLY (the inner loop's target is in A).
+        // The fixed-point loop's measurement is defined over a coverage of
+        // assistant contexts, so judge records carry the counterparty tag.
+        const turnJobs = chats.flatMap(c =>
+            userTurns(c.chat).map(turn => ({ ...c, turn })));
+        const turnJudgments = await mapLimit(turnJobs, INFERENCE_CONCURRENCY, async job => {
+            const { sig, raw } = await judgeOneTurn(job.turn, AGENT_AXES);
+            return {
+                turn: job.turn,
+                sig,
+                raw,
+                context: job.counterparty,
+                counterparty: job.counterparty,
+                counterparty_name: job.counterparty_name,
+            };
+        });
         const measured_agent = meanSig(turnJudgments.map(j => j.sig), AGENT_AXES);
         const dist = distancePerAxis(measured_agent, agentTarget.target_agent, AGENT_AXES);
         const maxDist = maxOffAxes(dist);
         const attempt = {
             iter: k, agent_text, agent_id,
-            chat, turnJudgments, measured: measured_agent, dist_per_axis: dist, max_off_axis: maxDist,
+            chat: chats[0]?.chat || [], chats, turnJudgments, measured: measured_agent, dist_per_axis: dist, max_off_axis: maxDist,
             elapsed_ms: Date.now() - t0,
         };
         attempts.push(attempt);
@@ -284,7 +316,7 @@ async function designAgentToConvergence(bio, agentTarget, rock, outerIter = 0) {
 
 // ── OUTER LOOP: bio designer with judge feedback aggregated across agents ──
 
-async function designBioToConvergence(bio, rock) {
+async function designBioToConvergence(bio, counterparties) {
     const attempts = [];
     let bestAttempt = null;
     let bestMaxDist = Infinity;
@@ -303,13 +335,14 @@ async function designBioToConvergence(bio, rock) {
             : { kind: 'manual' };
         await saveBio({ ...bio, prose: bioProse, provenance: bioProvenance });
         console.log(`  [outer k=${k}] bio prose: ${bioProse.slice(0,120).replace(/\n/g,' ')}…`);
-        // Run inner for each agent target
-        const innerResults = [];
-        for (const agentTarget of AGENT_TARGETS) {
+        // Run inner for each agent target. Agent targets are independent
+        // within an outer bio pass, so dispatch them concurrently to exercise
+        // the backend's batched decode path instead of serializing it away.
+        const innerResults = await mapLimit(AGENT_TARGETS, INFERENCE_CONCURRENCY, async agentTarget => {
             console.log(`    → inner: agent target = ${agentTarget.slug} (${fmtSig(agentTarget.target_agent)})`);
-            const innerR = await designAgentToConvergence(bio, agentTarget, rock, k);
-            innerResults.push({ agentTarget, ...innerR });
-        }
+            const innerR = await designAgentToConvergence(bio, agentTarget, counterparties, k);
+            return { agentTarget, ...innerR };
+        });
         // Aggregate BIO-axis measurements across all user turns of all best
         // inner runs. Bio axes are scored per-turn but in a separate judge
         // call (so the inner loop's judge isn't muddled with bio-axis noise).
@@ -319,14 +352,20 @@ async function designBioToConvergence(bio, rock) {
         // came from which agent_target. Without the tag, bio-axis splits
         // can't be diagnosed and axis_splitter no-ops with "gap too small".
         const bioTurnJudgments = [];
+        const bioTurnJobs = [];
         for (const r of innerResults) {
-            const ctx = r.agentTarget.slug;
-            const turns = userTurns(r.best.chat);
-            for (const turn of turns) {
-                const { sig, raw } = await judgeOneTurn(turn, BIO_AXES);
-                bioTurnJudgments.push({ turn, sig, raw, context: ctx });
+            for (const chatBundle of r.best.chats || [{ counterparty: 'legacy', chat: r.best.chat }]) {
+                const ctx = `${r.agentTarget.slug}:${chatBundle.counterparty}`;
+                for (const turn of userTurns(chatBundle.chat)) {
+                    bioTurnJobs.push({ turn, context: ctx, agent_target: r.agentTarget.slug, counterparty: chatBundle.counterparty });
+                }
             }
         }
+        const judgedBioTurns = await mapLimit(bioTurnJobs, INFERENCE_CONCURRENCY, async job => {
+                const { sig, raw } = await judgeOneTurn(job.turn, BIO_AXES);
+                return { turn: job.turn, sig, raw, context: job.context, agent_target: job.agent_target, counterparty: job.counterparty };
+        });
+        bioTurnJudgments.push(...judgedBioTurns);
         const measured_bio = meanSig(bioTurnJudgments.map(j => j.sig), BIO_AXES);
         const dist = distancePerAxis(measured_bio, bio.target_bio, BIO_AXES);
         const maxDist = maxOffAxes(dist);
@@ -355,22 +394,30 @@ async function designBioToConvergence(bio, rock) {
 // ── main ─────────────────────────────────────────────────────────────
 
 fs.mkdirSync(OUT_DIR, { recursive: true });
-console.log(`[lock_in_iterative] K_max_inner=${K_MAX_INNER}, K_max_outer=${K_MAX_OUTER}, n_turns=${N_TURNS_PER_CHAT}, eps=${EPS_PER_AXIS}`);
+console.log(`[lock_in_iterative] K_max_inner=${K_MAX_INNER}, K_max_outer=${K_MAX_OUTER}, n_turns=${N_TURNS_PER_CHAT}, eps=${EPS_PER_AXIS}, inference_concurrency=${INFERENCE_CONCURRENCY}`);
 console.log(`[lock_in_iterative] output: ${OUT_DIR}`);
 
-const rock = await fetchCounterparty(spec.counterparty_avatar);
-console.log(`[rock] system_prompt length=${rock.system_prompt.length}`);
+if (COUNTERPARTY_AVATARS.length < 3) {
+    throw new Error(`[lock_in_iterative] experiment ${EXPERIMENT_ID} must declare at least 3 counterparty_avatars; got ${COUNTERPARTY_AVATARS.length}`);
+}
+const counterparties = await mapLimit(COUNTERPARTY_AVATARS, INFERENCE_CONCURRENCY, async avatar => {
+    const cp = await fetchCounterparty(avatar);
+    return { ...cp, avatar_url: avatar };
+});
+console.log(`[counterparties] ${counterparties.map(cp => `${cp.avatar_url}:${cp.system_prompt.length}`).join(', ')}`);
 
 const tAll = Date.now();
 for (const bio of BIOS) {
     console.log(`\n[bio ${bio.slug}] target_bio ${fmtSig(bio.target_bio)} — running outer loop`);
-    const result = await designBioToConvergence(bio, rock);
+    const result = await designBioToConvergence(bio, counterparties);
     const outFile = path.join(OUT_DIR, `${bio.slug}.json`);
     fs.writeFileSync(outFile, JSON.stringify({
         bio: { slug: bio.slug, canonical_key: bio.canonical_key, name: bio.name,
                target_bio: bio.target_bio, design_brief: bio.design_brief },
         agent_targets: AGENT_TARGETS,
         bio_axes: BIO_AXES, agent_axes: AGENT_AXES,
+        counterparty_avatars: COUNTERPARTY_AVATARS,
+        inference_concurrency: INFERENCE_CONCURRENCY,
         result,
         elapsed_ms_total: Date.now() - tAll,
     }, null, 2));

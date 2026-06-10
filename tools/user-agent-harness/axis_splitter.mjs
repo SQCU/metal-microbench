@@ -36,6 +36,17 @@ import path from 'node:path';
 import * as L from './harness_lib.mjs';
 import { bridgeCall, meanStd } from './harness_lib.mjs';
 
+function toThreeSigFigs(n) {
+    if (!Number.isFinite(n) || n === 0) return n;
+    return Number(n.toPrecision(3));
+}
+
+function normalizeLikertNumber(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return null;
+    return Math.max(1, Math.min(5, toThreeSigFigs(n)));
+}
+
 // Project id → name to keep compatibility with code that uses `.name`.
 const _AXES_CACHE = (await L.fetchAxes()).map(a => ({
     name: a.id, def: a.def, kind: a.kind,
@@ -51,7 +62,7 @@ async function registerDerivedAxis({ name, kind, def, derived_from }) {
 }
 
 const OUT_DIR = process.env.USER_PERSONAS_AXIS_SPLITS_DIR
-    || '/Users/mdot/metal-microbench/data/axis_splits';
+    || path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'data', 'axis_splits');
 
 const SEPARATION_THRESHOLD = 0.8;   // Cohen's d ≥ 0.8 = "large effect"
 const N_HYPOTHESES = 3;
@@ -208,10 +219,10 @@ async function judgeOnPair(turn, pair) {
     const template = `${pair.name1}: ?\n${pair.name2}: ?`;
     const sys =
         'You are a behavioural-axis judge. You read ONE user-side chat ' +
-        'turn and score it on the listed axes (integer 1-5 each). The ' +
+        'turn and score it on the listed axes (number 1-5 each). The ' +
         'turn is the only ground truth. Be willing to score 1 (absence) ' +
         'when the turn genuinely shows no expression. Output ONLY the axis ' +
-        'lines below — one per line as "axis_name: <integer 1-5>". No ' +
+        'lines below — one per line as "axis_name: <number 1-5>". No ' +
         'preamble, no commentary, no markdown.';
     const usr =
         '## Axes (each 1-5)\n\n' + rubric + '\n\n' +
@@ -225,10 +236,11 @@ async function judgeOnPair(turn, pair) {
     for (const line of raw.split('\n')) {
         for (const aname of [pair.name1, pair.name2]) {
             const re = new RegExp(
-                '^\\s*[-*]?\\s*\\**["\']?' + aname.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '["\']?\\**\\s*[:=]\\s*([1-5])',
+                '^\\s*[-*]?\\s*\\**["\']?' + aname.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '["\']?\\**\\s*[:=]\\s*([+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+))',
                 'i');
             const m = line.match(re);
-            if (m) sig[aname] = Number(m[1]);
+            const parsed = m ? normalizeLikertNumber(m[1]) : null;
+            if (parsed != null) sig[aname] = parsed;
         }
     }
     return { sig, raw };

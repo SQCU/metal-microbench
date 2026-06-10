@@ -33,13 +33,11 @@ import json
 import re
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 from axes import AXIS_NAMES, LIKERT_AXES, N_AXES
+from llm_client import judge_metadata, llm_call
 
-import os as _os_for_bridge_url
-BRIDGE_URL = _os_for_bridge_url.environ["BRIDGE_URL"] + "/v1/chat/completions"
 SCHEMA_VERSION = 1
 
 
@@ -97,40 +95,14 @@ def blockquote(s: str) -> str:
 
 
 def call(messages, max_tok=None):
-    # Moratorium-compliant — no hidden caps. Caller-omitted max_tok
-    # means "use the bridge default (matches ST GUI)".
-    body = {"model": "gemma-4-a4b", "messages": messages,
-            "temperature": 1.0, "stream": False}
-    if max_tok is not None and max_tok > 0:
-        body["max_tokens"] = max_tok
-    req = urllib.request.Request(BRIDGE_URL,
-                                  data=json.dumps(body).encode(),
-                                  headers={"Content-Type": "application/json"},
-                                  method="POST")
-    with urllib.request.urlopen(req) as resp:
-        d = json.loads(resp.read())
-    return d["choices"][0]["message"]["content"]
+    return llm_call(messages, max_tokens=max_tok)
 
 
 def get_judge_metadata():
-    """Snapshot which judge model + GGUF the bridge is serving, so the
+    """Snapshot which judge model + optional backend build the plugin is serving, so the
     JSONL store records what produced each judgment. Different GGUFs =
     different distributions; we want to be able to filter by them."""
-    try:
-        _bridge_health_url = _os_for_bridge_url.environ["BRIDGE_URL"] + "/health"
-        with urllib.request.urlopen(_bridge_health_url, timeout=5) as r:
-            h = json.loads(r.read())
-        model = h.get("model", "unknown")
-    except Exception:
-        model = "unknown"
-    # Try to capture the GGUF basename too — it's in the config.toml.
-    try:
-        cfg = Path("/Users/mdot/metal-microbench/server/config.toml").read_text()
-        m = re.search(r'gguf_filename\s*=\s*"([^"]+)"', cfg)
-        gguf = m.group(1) if m else "unknown"
-    except Exception:
-        gguf = "unknown"
-    return model, gguf
+    return judge_metadata()
 
 
 def stage1_summary(turn):
@@ -170,7 +142,7 @@ def stage2_likert(summary):
             "## Likert axes (each scored 1–5)\n\n"
             + legend + "\n\n"
             "## Emission format\n\n"
-            "Emit one line per axis in this exact format (replace `?` with an integer 1–5):\n\n"
+            "Emit one line per axis in this exact format (replace `?` with a number 1–5):\n\n"
             + template + "\n\n"
             "## Behavioural summary to score\n\n"
             + blockquote(summary) + "\n\n"
@@ -184,10 +156,10 @@ def parse_elementwise(text):
     out = {}
     for axis in AXIS_NAMES:
         m = re.search(
-            r'^\s*[-*]?\s*\**["\']?' + axis + r'["\']?\**\s*[:=]\s*["\']?([1-5])',
+            r'^\s*[-*]?\s*\**["\']?' + axis + r'["\']?\**\s*[:=]\s*["\']?([+-]?(?:\d+(?:\.\d+)?|\.\d+))',
             text, re.MULTILINE | re.IGNORECASE)
         if m:
-            out[axis] = int(m.group(1))
+            out[axis] = max(1.0, min(5.0, float(f"{float(m.group(1)):.3g}")))
     return out
 
 

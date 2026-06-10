@@ -44,34 +44,34 @@ export const FORMATS = ['prose-lines', 'json', 'yaml', 'toml'];
  * instruction is the per-call suffix.
  *
  * `axisNames` is an array of strings. The schema is implicitly:
- * every axis is an integer 1..5.
+ * every axis is a number 1..5.
  */
 export function renderInstruction(format, axisNames) {
     switch (format) {
         case 'prose-lines': {
             const template = axisNames.map(a => `${a}: ?`).join('\n');
             return (
-                'Emit ONE LINE per axis as "axis_name: N" where N is an integer 1-5. ' +
+                'Emit ONE LINE per axis as "axis_name: N" where N is a number from 1 to 5. ' +
                 'No preamble, no commentary, no fences.\n\n' +
                 '## Emit\n\n' + template
             );
         }
         case 'json': {
-            const obj = '{ ' + axisNames.map(a => `"${a}": <integer 1-5>`).join(', ') + ' }';
+            const obj = '{ ' + axisNames.map(a => `"${a}": <number 1-5>`).join(', ') + ' }';
             return (
                 'Emit ONLY a JSON object with exactly these keys (no preamble, no markdown fences):\n' +
                 obj
             );
         }
         case 'yaml': {
-            const lines = axisNames.map(a => `${a}: <integer 1-5>`).join('\n');
+            const lines = axisNames.map(a => `${a}: <number 1-5>`).join('\n');
             return (
                 'Emit ONLY YAML key:value pairs, one per line, no fences:\n\n' +
                 lines
             );
         }
         case 'toml': {
-            const lines = axisNames.map(a => `${a} = <integer 1-5>`).join('\n');
+            const lines = axisNames.map(a => `${a} = <number 1-5>`).join('\n');
             return (
                 'Emit ONLY TOML key = value pairs, one per line, no fences, no section headers:\n\n' +
                 lines
@@ -86,7 +86,7 @@ export function renderInstruction(format, axisNames) {
 //
 // All parsers obey the same contract:
 //   parse(axisNames, raw) → { scores, missing, error? }
-// scores is a partial object axis → int 1-5; missing lists axis names
+// scores is a partial object axis → number 1-5; missing lists axis names
 // that couldn't be extracted; error is set only on whole-output parse
 // failure (e.g. JSON.parse throws).
 //
@@ -172,7 +172,7 @@ function parseKeyedLines(axisNames, text, sep, extra = {}) {
         // sep is interpolated literal; sanitize the only allowed chars (`:` or `=`).
         const sepEsc = sep === '=' ? '=' : ':';
         const re = new RegExp(
-            '^\\s*[-*]?\\s*\\**["\']?' + esc + '["\']?\\**\\s*' + sepEsc + '\\s*"?([1-5])"?',
+            '^\\s*[-*]?\\s*\\**["\']?' + esc + '["\']?\\**\\s*' + sepEsc + '\\s*"?([+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+))"?',
             'im');
         let v = null;
         for (const line of lines) {
@@ -185,7 +185,11 @@ function parseKeyedLines(axisNames, text, sep, extra = {}) {
     return { scores, missing, ...extra };
 }
 
-function clamp(v) { return Math.max(1, Math.min(5, Math.round(v))); }
+function clamp(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return null;
+    return Math.max(1, Math.min(5, Number(n.toPrecision(3))));
+}
 
 // ── Agent-in-the-loop fixup retry ───────────────────────────────────────
 //
@@ -209,7 +213,7 @@ export function feedbackTurnFor(format, missing, parseError) {
         parts.push(`These axes were not parseable: ${missing.join(', ')}.`);
     }
     if (parts.length === 0) return null;
-    parts.push(`Please re-emit the COMPLETE output for ALL axes in the EXACT format specified above. All values are integers 1-5. No preamble.`);
+    parts.push(`Please re-emit the COMPLETE output for ALL axes in the EXACT format specified above. All values are numbers 1-5. No preamble.`);
     return parts.join(' ');
 }
 
@@ -247,7 +251,7 @@ export async function judgeWithFeedback({
 
     const sys =
         `You are a behavioural-axis scorer. ${instruction}\n` +
-        'Score the text below on each axis (integer 1-5).';
+        'Score the text below on each axis (number 1-5).';
     const userPrimary =
         '## Axes (each 1-5)\n\n' + rubric + '\n\n' +
         '## Text to score\n\n' + prose + '\n\n' +

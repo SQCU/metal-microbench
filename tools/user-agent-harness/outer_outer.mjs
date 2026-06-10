@@ -49,9 +49,9 @@ const RUN_ID = process.env.LOCK_IN_RUN_ID
 const HARNESS_DIR = path.dirname(new URL(import.meta.url).pathname);
 const LOCK_IN_OUT = process.env.USER_PERSONAS_LOCK_IN_OUT
     || process.env.USER_PERSONAS_LOCK_IN_DATA_DIR
-    || '/Users/mdot/metal-microbench/data/lock_in_iterative';
+    || path.resolve(HARNESS_DIR, '..', 'data', 'lock_in_iterative');
 const OUTER_OUTER_OUT_BASE = process.env.USER_PERSONAS_OUTER_OUTER_DIR
-    || '/Users/mdot/metal-microbench/data/outer_outer';
+    || path.resolve(HARNESS_DIR, '..', 'data', 'outer_outer');
 const OUT_DIR = path.join(OUTER_OUTER_OUT_BASE, EXPERIMENT_ID);
 fs.mkdirSync(OUT_DIR, { recursive: true });
 
@@ -229,7 +229,7 @@ async function autoDispatchSweep(originalSpec, completedTrajectories, axesNow) {
     if (collapsedPairs.length > 0) {
         console.log(`[outer_outer]   ${collapsedPairs.length} bio pairs within ε=${CLUSTER_DISTANCE_EPS} → dispatching cluster_disambiguator`);
         const pluginDir = process.env.USER_PERSONAS_PLUGIN_DIR
-            || '/Users/mdot/metal-microbench/tools/st-debug/sillytavern-fork/plugins/user-personas';
+            || path.resolve(HARNESS_DIR, '..');
         const specPath = path.join(pluginDir, 'experiments', `${originalSpec.id}.json`);
         disambResult = await spawnAndWait(
             'cluster_disambiguator.mjs', [specPath],
@@ -290,7 +290,7 @@ for (let k = 1; k < K_OUTER_OUTER; k++) {
     // LINT-OK-PREFIX-SAFE: transient experiment id (filesystem + DB key), not prompt content.
     // Prefix with "outer-outer-" so bio provenance.experiment_id is unambiguously
     // traceable to this outer-outer run (acceptance check: startsWith("outer-outer-")).
-    const transientId = `outer-outer-${EXPERIMENT_ID}-pass${k}-${Date.now().toString(36)}`;
+    const transientId = `outer-outer-${EXPERIMENT_ID}-pass${k}-${Date.now().toString(36)}`; // LINT-OK-PREFIX-SAFE: transient experiment id, not prompt content.
     const newBioSlug = `oo-${EXPERIMENT_ID}-pass${k}`;
     const newBio = {
         canonical_key: `user-personas-${newBioSlug}.png`,

@@ -16,8 +16,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import * as L from './harness_lib.mjs';
 
+function normalizeLikertNumber(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return null;
+    return Math.max(1, Math.min(5, Number(n.toPrecision(3))));
+}
+
 const N_TRIALS = 5;
-const OUT_DIR = '/Users/mdot/metal-microbench/data/judge_prompt_ab';
+const OUT_DIR = process.env.USER_PERSONAS_JUDGE_PROMPT_AB_DIR
+    || path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'data', 'judge_prompt_ab');
 
 // ── fixtures: real turns from explore_corpus run2 + hand-graded expected ──
 
@@ -65,11 +72,11 @@ const VARIANTS = {
     V0_floor: {
         description: 'Original prompt with "be willing to score 1 (absence)" license',
         sys: 'You are a behavioural-axis judge. You read ONE user-side chat ' +
-             'turn and score it on the listed axes (integer 1-5 each). The ' +
+             'turn and score it on the listed axes (number 1-5 each). The ' +
              'turn is the only ground truth — do not infer from anything else. ' +
              'Be willing to score 1 (absence) when the turn genuinely shows no ' +
              'expression of an axis. Output ONLY the axis lines below — one ' +
-             'axis per line, each as "axis_name: <integer 1-5>". No preamble, ' +
+             'axis per line, each as "axis_name: <number 1-5>". No preamble, ' +
              'no commentary, no markdown.',
         usrFmt: (rubric, turn, template) =>
             '## Axes (each 1-5)\n\n' + rubric + '\n\n' +
@@ -80,13 +87,13 @@ const VARIANTS = {
     V1_full_range: {
         description: 'Retuned: removed "score 1" license, added "use full range"',
         sys: 'You are a behavioural-axis judge. You read ONE user-side chat ' +
-             'turn and score it on the listed axes (integer 1-5 each). The ' +
+             'turn and score it on the listed axes (number 1-5 each). The ' +
              'turn is the only ground truth. USE THE FULL 1-5 RANGE. A turn ' +
              'that moderately expresses an axis should score 3, not 1. Score ' +
              '1 only when the axis is genuinely absent from this turn; score ' +
              '5 when the turn is a textbook example of the high pole. Most ' +
              'real turns sit between 2 and 4. Output ONLY the axis lines ' +
-             'below — one axis per line, each as "axis_name: <integer 1-5>". ' +
+             'below — one axis per line, each as "axis_name: <number 1-5>". ' +
              'No preamble, no commentary, no markdown.',
         usrFmt: (rubric, turn, template) =>
             '## Axes (each 1-5)\n\n' + rubric + '\n\n' +
@@ -97,7 +104,7 @@ const VARIANTS = {
     V2_minimal: {
         description: 'Minimal: just task statement + rubric + turn',
         sys: 'You score user-side chat turns on behavioural axes. For each ' +
-             'listed axis, output one line "axis_name: <integer 1-5>" based ' +
+             'listed axis, output one line "axis_name: <number 1-5>" based ' +
              'on the axis rubric and the turn. Output only the axis lines.',
         usrFmt: (rubric, turn, template) =>
             '## Axes (each 1-5)\n\n' + rubric + '\n\n' +
@@ -110,7 +117,7 @@ const VARIANTS = {
         sys: 'You are a behavioural-axis judge. For each turn, first write ' +
              'ONE SHORT SENTENCE describing what the turn does behaviorally ' +
              '(starting with "DESCRIPTION:"), then output the axis scores ' +
-             '(integer 1-5 each, one per line, "axis_name: N"). Use the full ' +
+             '(number 1-5 each, one per line, "axis_name: N"). Use the full ' +
              'range — score 5 for textbook examples of the high pole, 1 only ' +
              'when an axis is genuinely absent, intermediates otherwise.',
         usrFmt: (rubric, turn, template) =>
@@ -122,13 +129,13 @@ const VARIANTS = {
     V4_anchored: {
         description: 'Explicit Likert anchors: 1=absent, 2=trace, 3=mixed, 4=clear, 5=textbook',
         sys: 'You are a behavioural-axis judge. For each listed axis, score ' +
-             'the turn (integer 1-5) using these anchors uniformly:\n' +
+             'the turn (number 1-5) using these anchors uniformly:\n' +
              '  1 = the axis is genuinely absent from this turn\n' +
              '  2 = trace / barely present\n' +
              '  3 = mixed / moderately present\n' +
              '  4 = clearly present\n' +
              '  5 = textbook example of the high pole described by the rubric\n' +
-             'Output ONLY axis lines, one per line: "axis_name: <integer 1-5>". ' +
+             'Output ONLY axis lines, one per line: "axis_name: <number 1-5>". ' +
              'No preamble, no commentary.',
         usrFmt: (rubric, turn, template) =>
             '## Axes (each 1-5)\n\n' + rubric + '\n\n' +
@@ -141,7 +148,7 @@ const VARIANTS = {
         sys: 'For each turn, first write ONE SHORT SENTENCE describing what ' +
              'the turn does behaviorally (starting with "DESCRIPTION:"), ' +
              'then output the axis scores. Each axis gets one line: ' +
-             '"axis_name: N" where N is an integer 1-5 per the axis rubric.',
+             '"axis_name: N" where N is a number from 1 to 5 per the axis rubric.',
         usrFmt: (rubric, turn, template) =>
             '## Axes (each 1-5)\n\n' + rubric + '\n\n' +
             '## Turn to score\n\n> ' + turn.replace(/\n/g, '\n> ') + '\n\n' +
@@ -151,7 +158,7 @@ const VARIANTS = {
     V6_pure_minimal: {
         description: 'Pure minimal — no calibration, no describe, no scoring philosophy',
         sys: 'Score the turn on each axis. Output one line per axis: ' +
-             '"axis_name: N" where N is an integer 1-5 per the rubric.',
+             '"axis_name: N" where N is a number from 1 to 5 per the rubric.',
         usrFmt: (rubric, turn, template) =>
             '## Axes (each 1-5)\n\n' + rubric + '\n\n' +
             '## Turn to score\n\n> ' + turn.replace(/\n/g, '\n> ') + '\n\n' +
@@ -176,9 +183,10 @@ async function judgeWithVariant(variant, turn) {
         for (const a of AXES) {
             const escName = a.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const re = new RegExp('^\\s*[-*]?\\s*\\**["\']?' + escName +
-                                  '["\']?\\**\\s*[:=]\\s*([1-5])', 'i');
+                                  '["\']?\\**\\s*[:=]\\s*([+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+))', 'i');
             const m = line.match(re);
-            if (m) sig[a.name] = Number(m[1]);
+            const parsed = m ? normalizeLikertNumber(m[1]) : null;
+            if (parsed != null) sig[a.name] = parsed;
         }
     }
     return { sig, raw };

@@ -1,46 +1,32 @@
 #!/usr/bin/env python3
-"""Measure: does the bridge actually parallelize concurrent requests?
+"""Measure: does the configured ST provider parallelize concurrent requests?
 
 Fire identical short generation requests at N=1,2,4,8 parallelism
-levels. If the bridge's multi-stream / batched-AR-decode story works,
+levels. If the provider's multi-stream / batched-AR-decode story works,
 wall time at N=8 should be much less than 8× wall time at N=1.
 
 If wall time scales linearly with N (e.g. N=4 takes 4× N=1), the
-bridge is effectively serial despite supporting concurrent streams,
+provider is effectively serial despite supporting concurrent streams,
 and something downstream of the handler is acting as a global mutex.
 """
-import json
-import os
+import sys
 import time
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
-BRIDGE = os.environ["BRIDGE_URL"].rstrip("/")
+sys.path.insert(0, str(Path(__file__).resolve().parent / "elicitation"))
+from llm_client import llm_call
 
-# Identical small request so per-call work is constant.
-BODY = {
-    "model": "gemma-4-a4b",
-    "messages": [
-        {"role": "system", "content": "You are a brief, factual assistant."},
-        {"role": "user", "content": "say the word 'pong' once, no other text."},
-    ],
-    "stream": False,
-    "max_tokens": 16,
-    "temperature": 0.1,
-}
+MESSAGES = [
+    {"role": "system", "content": "You are a brief, factual assistant."},
+    {"role": "user", "content": "Say the word pong once, no other text."},
+]
 
 
 def one_call(idx):
     t0 = time.monotonic()
-    req = urllib.request.Request(
-        f"{BRIDGE}/v1/chat/completions",
-        data=json.dumps(BODY).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=60) as r:
-        resp = json.loads(r.read())
+    content = llm_call(MESSAGES, seed=90_000 + idx, timeout=60)
     elapsed = time.monotonic() - t0
-    content = (resp.get("choices") or [{}])[0].get("message", {}).get("content") or ""
     return idx, elapsed, len(content)
 
 

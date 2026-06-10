@@ -41,7 +41,7 @@ import {
     fetchAxes,
     saturatedMap,
 } from './harness_lib.mjs';
-const { ST, BRIDGE, PLUGIN } = ENDPOINTS;
+const { ST, PLUGIN } = ENDPOINTS;
 
 // Project id → name to keep compatibility with code that uses `.name`.
 const _AXES_CACHE = (await fetchAxes()).map(a => ({
@@ -56,7 +56,7 @@ async function registerDerivedAxis({ name, kind, def, derived_from }) {
 }
 
 const OUT_DIR = process.env.USER_PERSONAS_CLUSTER_DISAMBIG_DIR
-    || '/Users/mdot/metal-microbench/data/cluster_disambig';
+    || path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'data', 'cluster_disambig');
 
 // ── tunables (see §6 Acceptance Thresholds) ──────────────────────────
 const N_TRAJ_PER_BIO     = 2;
@@ -179,7 +179,7 @@ function pairs(arr) {
 async function judgeSimilarity(promptLabel, defText, blockA, blockB) {
     const sys =
         'You score similarity between two blocks of text on a 1-5 Likert ' +
-        'scale. Output ONLY the line "similarity: <integer 1-5>". No ' +
+        'scale. Output ONLY the line "similarity: <number 1-5>". No ' +
         'preamble, no markdown.';
     const usr =
         `## What "similarity" means here\n\n${defText}\n\n` +
@@ -188,8 +188,11 @@ async function judgeSimilarity(promptLabel, defText, blockA, blockB) {
     // Per moratorium: no max_tokens at caller. Bridge default + EOS apply.
     const raw = await bridgeCall(
         [{ role: 'system', content: sys }, { role: 'user', content: usr }]);
-    const m = raw.match(/similarity\s*:\s*([1-5])/i);
-    return m ? Number(m[1]) : null;
+    const m = raw.match(/similarity\s*:\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))/i);
+    if (!m) return null;
+    const n = Number(m[1]);
+    if (!Number.isFinite(n)) return null;
+    return Math.max(1, Math.min(5, Number(n.toPrecision(3))));
 }
 
 async function pairwiseProseSim(bios) {
@@ -218,18 +221,15 @@ async function pairwiseBehaviorSim(bios, trajs) {
 
 async function evaluateSpread(hypothesis, bios, trajs) {
     const perBioRaw = {};   // bio_id → [score per turn]
-    // Build the work-list of (bio, turn) judgements first, THEN run them through
-    // saturatedMap so concurrency is bounded to the engine kernel width. The old
-    // pre-started Promise.all fired every (bio×turn) call at once.
-    const work = [];
+    const work = [];        // flat (bio, turn, idx) list, judged kernel-width-bounded
     for (const bio of bios) {
         const turns = trajs[bio.canonical_key].flatMap(userTurns);
         perBioRaw[bio.canonical_key] = new Array(turns.length).fill(null);
         for (let i = 0; i < turns.length; i++) {
-            work.push({ key: bio.canonical_key, idx: i, turn: turns[i] });
+            work.push({ key: bio.canonical_key, turn: turns[i], idx: i });
         }
     }
-    await saturatedMap(work, ({ key, idx, turn }) =>
+    await saturatedMap(work, ({ key, turn, idx }) =>
         judgeOnAxis(turn, hypothesis.name, hypothesis.def)
             .then(score => { perBioRaw[key][idx] = score; }));
     const perBio = {};
@@ -267,20 +267,17 @@ async function runDisambiguator(specPath) {
     console.log(`\n[disambig] running ${N_TRAJ_PER_BIO} trajectories × ${N_TURNS_PER_TRAJ} turns per bio…`);
     const trajs = {};
     const tChat0 = Date.now();
-    // Work-list of chats, run through saturatedMap so at most kernel-width chats
-    // are in flight at once (each chat is itself a sequential call-chain). The
-    // old pre-started Promise.all launched every bio×trajectory chat at once.
     const chatWork = [];
     for (const bio of spec.bios) {
         trajs[bio.canonical_key] = [];
         for (let r = 0; r < N_TRAJ_PER_BIO; r++) {
             const taskIdx = trajs[bio.canonical_key].push(null) - 1;
-            chatWork.push({ bioRef: bio, taskIdx });
+            chatWork.push({ bio, taskIdx });
         }
     }
-    await saturatedMap(chatWork, ({ bioRef, taskIdx }) =>
-        runChat(bioRef, agentIds[bioRef.canonical_key].id, cp, N_TURNS_PER_TRAJ)
-            .then(chat => { trajs[bioRef.canonical_key][taskIdx] = chat; }));
+    await saturatedMap(chatWork, ({ bio, taskIdx }) =>
+        runChat(bio, agentIds[bio.canonical_key].id, cp, N_TURNS_PER_TRAJ)
+            .then(chat => { trajs[bio.canonical_key][taskIdx] = chat; }));
     // LINT-OK-PREFIX-SAFE: stderr-style timing log, not prompt content.
     console.log(`[disambig] chats done in ${((Date.now()-tChat0)/1000).toFixed(1)}s`);
 

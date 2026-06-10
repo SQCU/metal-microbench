@@ -177,7 +177,8 @@ printTable(rows);
 
 // Write the raw records to JSONL for downstream analysis.
 import * as fs from 'fs';
-const outDir = '/Users/mdot/metal-microbench/data/format_ablation';
+const outDir = process.env.USER_PERSONAS_FORMAT_ABLATION_DIR
+    || path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'data', 'format_ablation');
 fs.mkdirSync(outDir, { recursive: true });
 const ts = new Date().toISOString().replace(/[:.]/g, '-');
 const outPath = `${outDir}/run_${ts}.jsonl`;

@@ -41,7 +41,7 @@ function allAxes() { return _AXES_CACHE; }
 const DEFAULT_K_ACTIVE = 2;
 const DEFAULT_K_DISABLED = 2;
 const DATA_ROOT = process.env.USER_PERSONAS_DATA_DIR
-    || '/Users/mdot/metal-microbench/data';
+    || path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'data');
 const OUT_DIR = path.join(DATA_ROOT, 'context_suggester');
 
 // ── manifest loader: scan data/ files for measured signatures ────────
@@ -166,7 +166,7 @@ async function judgeContext(messages, kTotal, manifest) {
         `${kTotal} target persona vectors. Each target describes ONE KIND ` +
         'of user-persona who would be appropriate for this conversation — ' +
         'targets should be diverse from one another, not minor variants. ' +
-        'Each target is a sparse map of axis_name → integer 1-5 — only ' +
+        'Each target is a sparse map of axis_name → number 1-5 — only ' +
         'set axes that matter for that target, leave others out. Each ' +
         'target also has a short human-readable label (5-10 words) ' +
         'naming what kind of persona it represents. You do not see the ' +

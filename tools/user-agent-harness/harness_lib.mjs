@@ -9,7 +9,7 @@
 // (and did) silently break every deployment that isn't the local-canonical
 // setup. The plugin that spawns this harness exports its own resolved URLs
 // as env vars so the child inherits them. There are intentionally no default
-// ports here: ad-hoc shell invocations must pass ST_URL and BRIDGE_URL.
+// ports here: ad-hoc shell invocations must pass ST_URL or PLUGIN_URL.
 //
 // Lint rule (scripts/lint_port_hardcodes.mjs) forbids new literal
 // `127.0.0.1:80\d+` / `localhost:80\d+` in any source file under
@@ -22,11 +22,80 @@ function requireEnv(name) {
 }
 
 const ST     = requireEnv('ST_URL');
-const BRIDGE = requireEnv('BRIDGE_URL');
 const PLUGIN = process.env.PLUGIN_URL || `${ST}/api/plugins/user-personas`;
 const MODEL  = process.env.GEMMA_MODEL_NAME || 'gemma-4-a4b';
 
-export const ENDPOINTS = { ST, BRIDGE, PLUGIN, MODEL };
+export const ENDPOINTS = { ST, PLUGIN, MODEL };
+
+function toThreeSigFigs(n) {
+    if (!Number.isFinite(n) || n === 0) return n;
+    return Number(n.toPrecision(3));
+}
+
+function normalizeLikertNumber(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return null;
+    return Math.max(1, Math.min(5, toThreeSigFigs(n)));
+}
+
+// ── Auth (loopback into an AUTHENTICATED ST deploy) ──────────────────
+//
+// The plugin that spawns this harness runs INSIDE ST; the harness fetches
+// BACK into ST's HTTP surface — plugin routes (/api/plugins/user-personas/*)
+// plus a few core routes (e.g. /api/characters/get). A real deployment gates
+// those behind basicAuth (Authorization: Basic) AND CSRF (csrf-sync: an
+// X-CSRF-Token header bound to a session cookie, required on writes). A
+// spawned child has no inbound request to forward, so it must authenticate on
+// its own — otherwise the very first GET /experiments/:id 401s and the
+// synthesis run dies code=1 before writing any agent (the "synthesis never
+// concludes / personas never get agents" bug). The spawning plugin passes the
+// basicAuth creds in USER_PERSONAS_ST_BASIC_AUTH ("user:pass"); we attach the
+// Basic header to every call and lazily run the GET /csrf-token handshake to
+// obtain a token + session cookie for write methods. Unauthenticated ST (e.g.
+// the st-debug instance with --disableCsrf and no basicAuth) leaves the env
+// unset and both layers are no-ops.
+const _basicAuthCreds = process.env.USER_PERSONAS_ST_BASIC_AUTH || '';
+const _basicAuthHeader = _basicAuthCreds
+    ? 'Basic ' + Buffer.from(_basicAuthCreds).toString('base64')
+    : '';
+let _csrfCache = null;   // { token, cookie } once handshaked (or sentinel)
+
+function _isWriteMethod(method) {
+    return !['GET', 'HEAD', 'OPTIONS'].includes(String(method || 'GET').toUpperCase());
+}
+
+async function _ensureCsrf() {
+    if (_csrfCache) return _csrfCache;
+    try {
+        const headers = {};
+        if (_basicAuthHeader) headers.Authorization = _basicAuthHeader;
+        const r = await fetch(`${ST}/csrf-token`, { headers });
+        if (!r.ok) { _csrfCache = { token: '', cookie: '' }; return _csrfCache; }
+        const setCookies = typeof r.headers.getSetCookie === 'function'
+            ? r.headers.getSetCookie()
+            : [r.headers.get('set-cookie')].filter(Boolean);
+        const cookie = setCookies.map(c => c.split(';')[0]).join('; ');
+        let token = '';
+        try { token = (await r.json()).token || ''; } catch { /* no token field */ }
+        _csrfCache = { token, cookie };
+    } catch {
+        // CSRF endpoint unreachable (unauthenticated dev ST) — sentinel so we
+        // don't re-handshake on every write.
+        _csrfCache = { token: '', cookie: '' };
+    }
+    return _csrfCache;
+}
+
+async function _authedHeaders(method) {
+    const headers = { 'Content-Type': 'application/json' };
+    if (_basicAuthHeader) headers.Authorization = _basicAuthHeader;
+    if (_isWriteMethod(method)) {
+        const { token, cookie } = await _ensureCsrf();
+        if (token) headers['X-CSRF-Token'] = token;
+        if (cookie) headers.Cookie = cookie;
+    }
+    return headers;
+}
 
 // ── http / bridge ────────────────────────────────────────────────────
 
@@ -36,13 +105,13 @@ export const ENDPOINTS = { ST, BRIDGE, PLUGIN, MODEL };
 // did not succeed.
 //
 // For STOCHASTIC sampling endpoints (anything that maps to a model
-// inference behind the bridge), use httpRetrying() — these are inherently
+// inference behind ST's configured provider), use httpRetrying() — these are inherently
 // allowed to fail in expectation and the right response to a transient
 // 5xx is to sample again with a fresh seed, not to crash the loop.
 export async function http(method, url, body) {
     const r = await fetch(url, {
         method,
-        headers: { 'Content-Type': 'application/json' },
+        headers: await _authedHeaders(method),
         body: body ? JSON.stringify(body) : undefined,
     });
     const text = await r.text();
@@ -95,39 +164,46 @@ export async function httpRetrying(method, url, body, { attempts = 4 } = {}) {
 }
 
 export async function bridgeCall(messages, { max_tokens = null, temperature = 1.0, seed = null } = {}) {
-    const body = { model: MODEL, messages, stream: false, temperature };
+    void temperature;
+    const body = { messages };
     if (max_tokens) body.max_tokens = max_tokens;
-    if (seed != null) body.seed = seed;  // OpenAI-compatible field, threads through to bridge sampler
-    const r = await http('POST', `${BRIDGE}/v1/chat/completions`, body);
-    return (r.choices?.[0]?.message?.content || '').trim();
+    if (seed != null) body.seed = seed;  // OpenAI-compatible field, threads through ST to the provider when supported.
+    const r = await http('POST', `${PLUGIN}/llm-call`, body);
+    return (r.text || '').trim();
 }
 
 // ── batch saturation ─────────────────────────────────────────────────
-// The engine decodes through a fixed-width kernel (B=8 streams/step,
-// bootstrap.swift:431) behind an M=64 session cap. Running fewer than B
-// concurrent calls wastes the kernel; an UNBOUNDED Promise.all (one call
-// per turn/bio, dozens at once) oversubscribes it. Both are the same
-// "guessed a concurrency number" bug the Python tools/batch_scaler.py
-// kills — this is its JS twin. The width comes from the engine
-// (/health capabilities.kernel_batch), cached, with env + default fallback.
+// The local engine decodes through a fixed-width kernel (B=8 streams/step)
+// behind an M=64 session cap. Running fewer than B concurrent calls wastes
+// the kernel; an UNBOUNDED Promise.all (one call per turn/bio, dozens at
+// once) oversubscribes it. Both are the same "guessed a concurrency number"
+// bug tools/batch_scaler.py kills — this is its JS twin (ported from
+// tools/user-agent-harness/harness_lib.mjs, adapted: this copy routes
+// inference via PLUGIN /llm-call so it has no BRIDGE endpoint; the width
+// comes from GEMMA_KERNEL_BATCH env, else the optional bridge-diagnostics
+// /health probe (USER_PERSONAS_BRIDGE_DIAGNOSTICS_URL, exported by the
+// spawning plugin when configured), else the engine defaults. When ST's
+// provider is NOT the local bridge the defaults are still a sane bound —
+// the point is never to fire 50 calls at once).
 let _batchShape = null;
 async function _resolveBatchShape() {
     if (_batchShape) return _batchShape;
     let kb = 8, ms = 64, source = 'default';
     const env = process.env.GEMMA_KERNEL_BATCH;
+    const diagUrl = (process.env.USER_PERSONAS_BRIDGE_DIAGNOSTICS_URL || '').replace(/\/+$/, '');
     if (env && Number(env) > 0) { kb = Number(env); source = 'env'; }
-    else {
+    else if (diagUrl) {
         try {
-            const h = await http('GET', `${BRIDGE}/health`);
-            const caps = h?.capabilities || {};
+            const r = await fetch(`${diagUrl}/health`);
+            const caps = (r.ok ? (await r.json())?.capabilities : null) || {};
             if (Number(caps.kernel_batch) > 0) { kb = Number(caps.kernel_batch); source = 'health'; }
             if (Number(caps.max_sessions) > 0) ms = Number(caps.max_sessions);
-        } catch { /* old/dead engine → keep defaults */ }
+        } catch { /* unreachable diagnostics → keep defaults */ }
     }
     ms = Math.max(ms, kb);
     _batchShape = { kernelBatch: kb, maxSessions: ms, source };
     process.stderr.write(`[batch_scaler] saturating at kernel_batch=${kb} `
-        + `(max_sessions=${ms}, source=${source}) base=${BRIDGE}\n`);
+        + `(max_sessions=${ms}, source=${source})\n`);
     return _batchShape;
 }
 
@@ -291,16 +367,21 @@ export async function fetchCounterparty(avatarUrl) {
 
 export async function runChat(bio, agent_id, cp, n_turns) {
     const chat = [{ name: cp.name, is_user: false, mes: cp.first_mes }];
+    const counterpartySystem = [
+        cp.system_prompt,
+        'Measurement harness turn contract: reply with one short in-character chat turn only. No markdown fences, no code, no dice tables, no analysis, no extended scene writeup. End with at most one direct prompt back to the user.',
+    ].filter(Boolean).join('\n\n');
     for (let i = 0; i < n_turns; i++) {
         const pollResp = await http('POST', `${PLUGIN}/poll`, {
             persona_id: bio.canonical_key, agent_id, chat, n_candidates: 1,
+            shareable_prefix: true,
         });
         const cand = (pollResp.candidates || [])[0];
         const userText = (cand?.text || cand?.mes || '').trim();
         if (!userText) throw new Error(`empty user turn on turn ${i+1} (bio=${bio.canonical_key})`);
         chat.push({ name: bio.name, is_user: true, mes: userText });
         const cpMessages = [
-            { role: 'system', content: cp.system_prompt },
+            { role: 'system', content: counterpartySystem },
             ...chat.map(m => ({ role: m.is_user ? 'user' : 'assistant', content: m.mes })),
         ];
         // No max_tokens cap: the counterparty plays a chat turn ending
@@ -347,11 +428,11 @@ export async function designCheapAgent(bio) {
 export async function judgeOnAxis(turn, axisName, axisDef) {
     const sys =
         'You are a behavioural-axis judge. You read ONE user-side chat ' +
-        'turn and score it on the named axis (integer 1-5). The turn is ' +
+        'turn and score it on the named axis (number 1-5). The turn is ' +
         'the only ground truth — do not infer from anything else. Be ' +
         'willing to score 1 (absence) when the turn genuinely shows no ' +
         'expression of the axis. Output ONLY the axis line below as ' +
-        '"axis_name: <integer 1-5>". No preamble, no commentary.';
+        '"axis_name: <number 1-5>". No preamble, no commentary.';
     const usr =
         `## Axis (1-5)\n\n- **${axisName}** — ${axisDef}\n\n` +
         '## Turn to score\n\n> ' + turn.replace(/\n/g, '\n> ') + '\n\n' +
@@ -364,9 +445,9 @@ export async function judgeOnAxis(turn, axisName, axisDef) {
         [{ role: 'system', content: sys }, { role: 'user', content: usr }]);
     const escName = axisName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const re = new RegExp('^\\s*[-*]?\\s*\\**["\']?' + escName +
-                          '["\']?\\**\\s*[:=]\\s*([1-5])', 'im');
+                          '["\']?\\**\\s*[:=]\\s*([+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+))', 'im');
     const m = raw.match(re);
-    return m ? Number(m[1]) : null;
+    return m ? normalizeLikertNumber(m[1]) : null;
 }
 
 // ── judge: multiple axes in one prompt (cheaper, prose-line emission) ──
@@ -388,7 +469,7 @@ export async function judgeOnAxes(turn, axes) {
     const template = axes.map(a => `${a.name}: ?`).join('\n');
     const sys =
         'Score the turn on each axis. Output one line per axis: ' +
-        '"axis_name: N" where N is an integer 1-5 per the rubric.';
+        '"axis_name: N" where N is a number from 1 to 5 per the rubric.';
     const usr =
         '## Axes (each 1-5)\n\n' + rubric + '\n\n' +
         '## Turn to score\n\n' +
@@ -407,10 +488,11 @@ export async function judgeOnAxes(turn, axes) {
         for (const a of axes) {
             const escName = a.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const re = new RegExp(
-                '^\\s*[-*]?\\s*\\**["\']?' + escName + '["\']?\\**\\s*[:=]\\s*([1-5])',
+                '^\\s*[-*]?\\s*\\**["\']?' + escName + '["\']?\\**\\s*[:=]\\s*([+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+))',
                 'i');
             const m = line.match(re);
-            if (m) sig[a.name] = Number(m[1]);
+            const parsed = m ? normalizeLikertNumber(m[1]) : null;
+            if (parsed != null) sig[a.name] = parsed;
         }
     }
     return { sig, raw };
