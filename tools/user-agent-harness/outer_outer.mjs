@@ -119,8 +119,12 @@ function sigsByBio(bios) {
     return out;
 }
 
-function pickNextTarget(bios, axisNames, kCandidates, rng) {
-    const baseline = L.effDimParticipationRatio(sigsByBio(bios), axisNames);
+function pickNextTarget(bios, axisNames, kCandidates, rng, lineageWeights = null) {
+    // lineageWeights (L.lineageWeightsFromCards): keeps the ΔPR objective
+    // honest as the registry grows — duplicated/descendant axes share one
+    // unit of variance weight, so the picker maximizes BEHAVIORAL
+    // diversity, not bookkeeping multiplicity.
+    const baseline = L.effDimParticipationRatio(sigsByBio(bios), axisNames, lineageWeights);
     const candidates = Array.from({ length: kCandidates }, () => randomTargetForAxes(axisNames, rng));
     if (bios.length < 2) {
         return {
@@ -132,7 +136,7 @@ function pickNextTarget(bios, axisNames, kCandidates, rng) {
     const scored = candidates.map(c => {
         const sigs = sigsByBio(bios);
         sigs.__candidate__ = c;
-        const after = L.effDimParticipationRatio(sigs, axisNames);
+        const after = L.effDimParticipationRatio(sigs, axisNames, lineageWeights);
         const delta = (after.effDim ?? 0) - (baseline.effDim ?? 0);
         return { candidate: c, after_eff_dim: after.effDim, delta };
     });
@@ -193,7 +197,21 @@ function loadTrajectory(experimentId, bioSlug) {
 }
 
 async function autoDispatchSweep(originalSpec, completedTrajectories, axesNow) {
-    const bioKindAxes = axesNow.filter(a => a.kind === 'bio' || a.kind === 'either');
+    // Idempotency: parents that already have registered children are not
+    // re-split (the splitter self-gates too, but skipping here saves a
+    // spawn per candidate and keeps the sweep arithmetic honest). The
+    // children themselves remain candidates — they accrue per-turn scores
+    // in later trajectories and split further when evidence justifies it.
+    const factored = new Set(axesNow
+        .filter(a => a.derived_from?.parent)
+        .map(a => a.derived_from.parent));
+    const bioKindAxes = axesNow.filter(a =>
+        (a.kind === 'bio' || a.kind === 'either') && !factored.has(a.id));
+    const skipped = axesNow.filter(a =>
+        (a.kind === 'bio' || a.kind === 'either') && factored.has(a.id));
+    if (skipped.length > 0) {
+        console.log(`[outer_outer]   sweep skip (already factored): ${skipped.map(a => a.id).join(', ')}`);
+    }
     console.log(`[outer_outer]   sweep: ${completedTrajectories.length} bios × ${bioKindAxes.length} bio-kind axes = ${completedTrajectories.length * bioKindAxes.length} splitter candidates`);
 
     const splitterResults = [];
@@ -321,7 +339,8 @@ for (let k = 1; k < K_OUTER_OUTER; k++) {
 
     // Fetch current corpus bios for ΔPR baseline
     const allBios = (await L.http('GET', `${L.ENDPOINTS.PLUGIN}/personas`)).personas || [];
-    const pick = pickNextTarget(allBios, bioAxisNames, K_CANDIDATES, rng);
+    const lineageW = L.lineageWeightsFromCards(axesNow);
+    const pick = pickNextTarget(allBios, bioAxisNames, K_CANDIDATES, rng, lineageW);
     console.log(`[outer_outer]   pick: mode=${pick.mode} baseline_eff_dim=${pick.baseline_eff_dim?.toFixed(3) ?? 'n/a'} expected_after=${pick.expected_after_eff_dim?.toFixed(3) ?? 'n/a'} ΔPR=${pick.expected_delta_eff_dim?.toFixed(3) ?? 'n/a'}`);
     console.log(`[outer_outer]   target: ${bioAxisNames.map(a => `${a.slice(0,8)}=${pick.target[a]}`).join(' ')}`);
 

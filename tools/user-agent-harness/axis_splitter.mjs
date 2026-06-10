@@ -48,17 +48,49 @@ function normalizeLikertNumber(v) {
 }
 
 // Project id → name to keep compatibility with code that uses `.name`.
+// derived_from is retained: the idempotency gate below needs lineage links.
 const _AXES_CACHE = (await L.fetchAxes()).map(a => ({
-    name: a.id, def: a.def, kind: a.kind,
+    name: a.id, def: a.def, kind: a.kind, derived_from: a.derived_from || null,
 }));
 const _AXES_BY_ID = new Map(_AXES_CACHE.map(a => [a.name, a]));
 function allAxes() { return _AXES_CACHE; }
 function axisByName(name) { return _AXES_BY_ID.get(name) || null; }
+
+// Canonical axis-name form: lowercase snake_case. The designer-LLM emits
+// freeform names ("social-intent", "Social Projection") — without
+// normalization the registry accumulates hyphen/underscore/case variants
+// of the same concept that even EXACT-name dedup can't see (observed
+// 2026-06-10: interpersonal-presence registered alongside
+// interpersonal_presence).
+function normalizeAxisName(s) {
+    return String(s || '').trim().toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+}
+
+// Children already registered for a parent axis. The split loop is
+// idempotent over unchanged evidence: a parent that has been factored
+// STAYS factored — new evidence should split the CHILDREN (which accrue
+// scores in later trajectories), not re-split the parent into another
+// paraphrased sibling pair forever (observed 2026-06-10: performative
+// accumulated 5 sibling pairs in two sweep passes over the same data).
+function registeredChildrenOf(parentName) {
+    return _AXES_CACHE.filter(a => a.derived_from?.parent === parentName);
+}
+
 async function registerDerivedAxis({ name, kind, def, derived_from }) {
-    const card = await L.http('POST', `${L.ENDPOINTS.PLUGIN}/axes/${encodeURIComponent(name)}`, {
-        name, kind, def, derived_from,
+    const id = normalizeAxisName(name);
+    const existing = axisByName(id);
+    if (existing) {
+        console.log(`[splitter] axis '${id}' already registered — skipping (no clobber).`);
+        return existing;
+    }
+    const card = await L.http('POST', `${L.ENDPOINTS.PLUGIN}/axes/${encodeURIComponent(id)}`, {
+        name: id, kind, def, derived_from,
     });
-    return card.axis || card;
+    const created = card.axis || card;
+    _AXES_CACHE.push({ name: id, def, kind, derived_from });
+    _AXES_BY_ID.set(id, _AXES_CACHE[_AXES_CACHE.length - 1]);
+    return created;
 }
 
 const OUT_DIR = process.env.USER_PERSONAS_AXIS_SPLITS_DIR
@@ -338,6 +370,20 @@ async function runSplitter(trajFile, parentAxisName) {
     console.log(`[splitter] parent axis: ${parentAxisName} (${parentAxis.kind})`);
     console.log(`[splitter] trajectory:  ${trajFile}`);
 
+    // Idempotency gate: a factored parent stays factored. Re-splitting
+    // the same parent on (mostly unchanged) evidence registers paraphrase
+    // sibling pairs that multiply the metric weight of one latent
+    // direction. Descend instead: the children accrue per-turn scores in
+    // subsequent trajectories and become split candidates themselves.
+    // AXIS_SPLITTER_FORCE=1 overrides for deliberate re-factorization.
+    const priorChildren = registeredChildrenOf(parentAxisName);
+    if (priorChildren.length > 0 && process.env.AXIS_SPLITTER_FORCE !== '1') {
+        console.log(`[splitter] parent '${parentAxisName}' already factored into: `
+            + `${priorChildren.map(c => c.name).join(', ')} — skipping (idempotent; `
+            + `AXIS_SPLITTER_FORCE=1 to re-split). Done.`);
+        return null;
+    }
+
     const byCtx = bucketTurnsByContext(traj, parentAxis);
     const contexts = [...byCtx.keys()];
     console.log(`[splitter] contexts: ${contexts.map(c => `${c} (n=${byCtx.get(c).length})`).join(', ')}`);
@@ -359,6 +405,12 @@ async function runSplitter(trajFile, parentAxisName) {
 
     console.log(`\n[splitter] DESIGNER_S proposing ${N_HYPOTHESES} split hypotheses…`);
     const { hypotheses, raw: designerRaw } = await proposeSplits(parentAxis, byCtx, gapSummary);
+    // Canonicalize designer-emitted names before they touch judging or
+    // registration — kills hyphen/case variants of existing axes.
+    for (const h of hypotheses) {
+        h.name1 = normalizeAxisName(h.name1);
+        h.name2 = normalizeAxisName(h.name2);
+    }
     for (const h of hypotheses) {
         console.log(`  H${h.id}: ${h.name1} / ${h.name2}`);
         console.log(`    rationale: ${h.rationale}`);

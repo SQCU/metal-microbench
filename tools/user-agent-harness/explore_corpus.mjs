@@ -31,9 +31,13 @@ import * as L from './harness_lib.mjs';
 
 // Project id → name to keep compatibility with code that uses `.name`.
 const _AXES_CACHE = (await L.fetchAxes()).map(a => ({
-    name: a.id, def: a.def, kind: a.kind,
+    name: a.id, def: a.def, kind: a.kind, derived_from: a.derived_from || null,
 }));
 function allAxes() { return _AXES_CACHE; }
+// Lineage weights so the ΔPR objective counts each latent direction once
+// regardless of how many descendant/duplicate axes the splitter registered.
+const _LINEAGE_W = L.lineageWeightsFromCards(
+    _AXES_CACHE.map(a => ({ id: a.name, derived_from: a.derived_from })));
 
 // ── config ───────────────────────────────────────────────────────────
 
@@ -97,13 +101,13 @@ function sigsByBio(state) {
 }
 
 function effDim(state) {
-    return L.effDimParticipationRatio(sigsByBio(state), BIO_AXIS_NAMES);
+    return L.effDimParticipationRatio(sigsByBio(state), BIO_AXIS_NAMES, _LINEAGE_W);
 }
 
 function effDimWithCandidate(state, candidate) {
     const sigs = sigsByBio(state);
     sigs.__candidate__ = candidate;
-    return L.effDimParticipationRatio(sigs, BIO_AXIS_NAMES);
+    return L.effDimParticipationRatio(sigs, BIO_AXIS_NAMES, _LINEAGE_W);
 }
 
 function pickNextTarget(state, kCandidates, rng) {

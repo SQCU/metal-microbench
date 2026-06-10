@@ -527,13 +527,48 @@ export function meanStd(arr) {
  * singular values of the centered data matrix) once k or correlation
  * structure makes this misleading.
  */
-export function effDimParticipationRatio(sigsByBio, axisNames) {
+// Lineage weights from full axis cards: every axis reachable from the
+// same root via derived_from.parent links shares ONE unit of metric
+// weight (w = 1/|lineage|). Without this, every accepted split (and
+// every duplicate registration) multiplies the metric weight of its
+// latent direction by the number of registered descendants — the
+// comparison metric then measures registry bookkeeping (which axis got
+// split/re-split most) instead of behavior, and eff-dim objectives are
+// inflated by phantom near-collinear coordinates. Cycle-safe; axes with
+// dangling parents are treated as their own roots.
+export function lineageWeightsFromCards(cards) {
+    const byId = new Map(cards.map(c => [c.id ?? c.name, c]));
+    const rootOf = new Map();
+    function rootFor(id, seen = new Set()) {
+        if (rootOf.has(id)) return rootOf.get(id);
+        if (seen.has(id)) return id;            // cycle guard → treat as root
+        seen.add(id);
+        const parent = byId.get(id)?.derived_from?.parent;
+        const root = (parent && parent !== id && byId.has(parent)) ? rootFor(parent, seen) : id;
+        rootOf.set(id, root);
+        return root;
+    }
+    const sizes = new Map();
+    for (const id of byId.keys()) {
+        const r = rootFor(id);
+        sizes.set(r, (sizes.get(r) || 0) + 1);
+    }
+    const weights = {};
+    for (const id of byId.keys()) weights[id] = 1 / sizes.get(rootOf.get(id));
+    return weights;
+}
+
+export function effDimParticipationRatio(sigsByBio, axisNames, weights = null) {
     const bios = Object.keys(sigsByBio);
     if (bios.length < 2) return { effDim: null, perAxisVar: {}, n: bios.length, note: 'need ≥2 bios' };
     const perAxisVar = {};
     for (const a of axisNames) {
         const vals = bios.map(b => sigsByBio[b][a]).filter(Number.isFinite);
-        perAxisVar[a] = vals.length >= 2 ? meanStd(vals).var : 0;
+        // Optional lineage weighting (lineageWeightsFromCards): variance
+        // along duplicated/descendant axes is down-scaled so one latent
+        // direction never counts more than once however many times the
+        // splitter has factored it.
+        perAxisVar[a] = (vals.length >= 2 ? meanStd(vals).var : 0) * (weights?.[a] ?? 1);
     }
     const totalVar = Object.values(perAxisVar).reduce((a, b) => a + b, 0);
     if (totalVar <= 0) return { effDim: null, perAxisVar, n: bios.length, note: 'zero total variance' };
