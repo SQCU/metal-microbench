@@ -356,10 +356,35 @@ export async function saveAgent(agent_id, name, agent_text, designed_for_bio_id,
 
 // ── counterparty + chat ──────────────────────────────────────────────
 
-export async function fetchCounterparty(avatarUrl) {
-    const c = await http('POST', `${ST}/api/characters/get`, { avatar_url: avatarUrl });
+// Counterparty resolution. A counterparty is a PROMPT CONSTRUCT
+// ({name, system_prompt, first_mes}), not a file — which means the
+// synthesized bio corpus can serve as its own counterparty pool (the
+// MUD population effect: other players ARE the environment). Refs:
+//   "<avatar>.png"          → ST character card (classic instruments)
+//   "bio:<canonical_key>"   → live persona from the plugin corpus,
+//                             adapted to counterparty shape. Zero
+//                             authored content: prose/voice are the
+//                             bio's own (Gemma-synthesized); first_mes
+//                             is a structural stage direction only.
+// Instrument diversity then grows exactly as fast as the population,
+// with no hand-written counterparties.
+export async function fetchCounterparty(ref) {
+    if (typeof ref === 'string' && ref.startsWith('bio:')) {
+        const key = ref.slice(4);
+        const list = (await http('GET', `${PLUGIN}/personas`)).personas || [];
+        const p = list.find(b => b.id === key || b.canonical_key === key);
+        if (!p) throw new Error(`fetchCounterparty: no persona '${key}' in corpus for ref '${ref}'`);
+        const name = p.name && p.name !== '[Unnamed Persona]' ? p.name : key.replace(/\.png$/, '');
+        return {
+            name,
+            system_prompt: [p.system_prompt, p.bio].filter(Boolean).join('\n\n')
+                || `You are ${name}.`,
+            first_mes: `*${name} is here.*`,
+        };
+    }
+    const c = await http('POST', `${ST}/api/characters/get`, { avatar_url: ref });
     return {
-        name: c.name || avatarUrl.replace(/\.png$/, ''),
+        name: c.name || ref.replace(/\.png$/, ''),
         system_prompt: (c.system_prompt && c.system_prompt.trim()) || c.description || '',
         first_mes: c.first_mes || '*The scene begins.*',
     };
